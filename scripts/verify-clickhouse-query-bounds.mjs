@@ -65,11 +65,11 @@ function fakeClient() {
   };
 }
 
-function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false, maxMemoryMiB = 384 } = {}) {
+function assertBoundedSettings(call, { maxThreads = 2, smallBlocks = false, maxMemoryMiB = 384, spillMiB = 64 } = {}) {
   assert.equal(call.clickhouse_settings?.max_threads, maxThreads);
   assert.equal(call.clickhouse_settings?.max_memory_usage, String(maxMemoryMiB * 1024 * 1024));
-  assert.equal(call.clickhouse_settings?.max_bytes_before_external_group_by, String(64 * 1024 * 1024));
-  assert.equal(call.clickhouse_settings?.max_bytes_before_external_sort, String(64 * 1024 * 1024));
+  assert.equal(call.clickhouse_settings?.max_bytes_before_external_group_by, String(spillMiB * 1024 * 1024));
+  assert.equal(call.clickhouse_settings?.max_bytes_before_external_sort, String(spillMiB * 1024 * 1024));
   assert.equal(call.clickhouse_settings?.min_bytes_to_use_direct_io, String(1024 * 1024));
   assert.equal(call.clickhouse_settings?.max_block_size, smallBlocks ? '1024' : undefined);
   assert.equal(call.clickhouse_settings?.preferred_block_size_bytes, smallBlocks ? String(1024 * 1024) : undefined);
@@ -90,7 +90,7 @@ function assertRecentSettings(call) {
 }
 
 function assertEventSearchSettings(call) {
-  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true, maxMemoryMiB: 512 });
+  assertBoundedSettings(call, { maxThreads: 1, smallBlocks: true, maxMemoryMiB: 512, spillMiB: 256 });
 }
 
 const store = new ClickHouseStore();
@@ -133,7 +133,7 @@ assert.equal(fake.state.calls.length, 1);
 const hydrateCall = fake.state.calls[0];
 assertHydrateSettings(hydrateCall);
 assert.equal(hydrateCall.query_params.limit, 10_000);
-assert.equal(hydrateCall.query_params.scanLimit, 30_000);
+assert.equal(hydrateCall.query_params.scanLimit, 5_000);
 assert.match(hydrateCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
 assert.match(hydrateCall.query, /_part AS selectedPart/u);
 assert.match(hydrateCall.query, /tuple\(e\.at, e\._part, e\._part_offset\) IN/u);
@@ -263,7 +263,7 @@ const searchCall = fake.state.calls[0];
 assertEventSearchSettings(searchCall);
 assert.equal(searchCall.query_params.limit, 10_000,
   'durable search must cap complete-row materialization at 10k rows');
-assert.equal(searchCall.query_params.scanLimit, 30_000);
+assert.equal(searchCall.query_params.scanLimit, 5_000);
 assert.match(searchCall.query, /PREWHERE at >= \{since:UInt64\} AND at <= \{until:UInt64\}/u);
 assert.match(searchCall.query, /WHERE sourceId = \{sourceId:String\}/u);
 assert.match(searchCall.query, /\) = \{activityContext:String\}/u);
@@ -384,7 +384,7 @@ assert.equal(fake.state.calls.length, 1, 'equivalent concurrent durable searches
 assert.deepEqual(sameSearchRowsA, []);
 assert.deepEqual(sameSearchRowsB, []);
 assert.notStrictEqual(sameSearchRowsA, sameSearchRowsB, 'each durable-search caller must receive its own array');
-assert.equal(fake.state.calls[0].query_params.scanLimit, 6_000);
+assert.equal(fake.state.calls[0].query_params.scanLimit, 5_000);
 
 fake.state.calls.length = 0;
 const monitoredSearch = store.searchEvents({

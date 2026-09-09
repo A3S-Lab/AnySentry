@@ -370,12 +370,18 @@ spec:
             # Raw/Kernel canonical rows are a rebuildable side lane.  Do not make a slow
             # PostgreSQL checkpoint hold the Observer batch ACK; the service keeps bounded hot
             # facts and records an explicit CoverageGap while this queue drains asynchronously.
-            - { name: ANYSENTRY_CANONICAL_ASYNC_PERSIST, value: "on" }
-            - { name: ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT, value: "8" }
-            - { name: ANYSENTRY_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT, value: "32" }
-            - { name: ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "250" }
+            # Raw/Kernel canonical rows are a rebuildable side lane. Shared-node soak keeps
+            # PostgreSQL canonical/relational writes off the Observer ACK path; enable explicitly
+            # for formal semantic acceptance.
+            - { name: ANYSENTRY_CANONICAL_ASYNC_PERSIST, value: "off" }
+            - { name: ANYSENTRY_CANONICAL_PERSIST, value: "off" }
+            - { name: ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT, value: "1" }
+            - { name: ANYSENTRY_COMPATIBILITY_SNAPSHOT_PERSIST, value: "off" }
+            - { name: ANYSENTRY_RELATIONAL_PERSIST, value: "off" }
+            - { name: ANYSENTRY_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT, value: "8" }
+            - { name: ANYSENTRY_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "5000" }
             - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_MAX_IN_FLIGHT, value: "32" }
-            - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "250" }
+            - { name: ANYSENTRY_OBSERVER_POST_COMMIT_PROJECTION_TIMEOUT_MS, value: "5000" }
             - { name: ANYSENTRY_CANONICAL_DIRECTORY_PROJECTION_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SESSION_PROJECTION_TIMEOUT_MS, value: "2000" }
             - { name: ANYSENTRY_CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS, value: "2000" }
@@ -407,6 +413,11 @@ spec:
             # use your own ClickHouse instead — then delete the ClickHouse objects above.
             - { name: CLICKHOUSE_URL, value: "http://clickhouse:8123" }
             - { name: CLICKHOUSE_DB, value: "anysentry" }
+            # Coalesce event writes on shared development nodes to reduce tiny MergeTree parts.
+            - { name: ANYSENTRY_CLICKHOUSE_MICROBATCH, value: "on" }
+            - { name: ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS, value: "1000" }
+            - { name: ANYSENTRY_CLICKHOUSE_BATCH_MAX_DELAY_MS, value: "1000" }
+            - { name: ANYSENTRY_CLICKHOUSE_BATCH_MAX_BYTES, value: "4194304" }
             - name: CLICKHOUSE_USER
               valueFrom: { secretKeyRef: { name: anysentry-clickhouse, key: CLICKHOUSE_USER } }
             - name: CLICKHOUSE_PASSWORD
@@ -426,6 +437,12 @@ spec:
             - { name: ANYSENTRY_AGENT_LABEL_SELECTOR, value: "anysentry.io/workload-kind=agent" }
             # Change this to a stable, unique cluster asset ID when several clusters report here.
             - { name: ANYSENTRY_CLUSTER_ID, value: "default-cluster" }
+            # Stage gate: disable expensive cross-batch identity scans during Observer soak.
+            - { name: ANYSENTRY_REVISION_IMMUTABILITY, value: "off" }
+            - { name: ANYSENTRY_COLLECTOR_HEARTBEAT_LOOKBACK_MS, value: "86400000" }
+            - { name: ANYSENTRY_EVENT_SEARCH_SCAN_LIMIT_MAX, value: "5000" }
+            - { name: ANYSENTRY_EVENT_SEARCH_PAGE_MAX, value: "500" }
+            - { name: ANYSENTRY_UNKNOWN_LEARNING_PERSIST_INTERVAL_MS, value: "300000" }
             # - { name: ANYSENTRY_KUBE_ENRICH, value: "off" }
             # Optional: drive the dashboard with a synthetic event mix for a demo (sentry still
             # really judges it). Leave unset to show only real ingested events.

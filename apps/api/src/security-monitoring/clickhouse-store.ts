@@ -9,33 +9,62 @@
 // Connection comes from env (CLICKHOUSE_URL/USER/PASSWORD/DB). If ClickHouse is unreachable the store
 // degrades to in-memory-only (the dashboard keeps working; just no persistence) rather than crashing.
 
-import { ClickHouseClient, createClient, type ClickHouseSettings } from '@clickhouse/client';
-import { createHash, randomUUID } from 'node:crypto';
+import {
+  ClickHouseClient,
+  createClient,
+  type ClickHouseSettings,
+} from "@clickhouse/client";
+import { createHash, randomUUID } from "node:crypto";
 import {
   agentIdentityKeyForEvent,
   agentRuntimeInstanceIdForEvent,
   hasDirectAgentRootEvidence,
   isInternalAgentHelperRootEvent,
-} from './agent-identity';
-import { eventActivityContext, eventActivitySubtype, normalizeActivitySemantics } from './activity-context';
-import { correlationCaptureRollout } from './correlation-rollout';
-import { visibleClassificationSemantics, visibleProcessContext } from './classification-semantics';
-import { foldLatestEventRevisions } from './event-revision';
-import type { ProcessLifecycleFact } from './process-lifecycle';
+} from "./agent-identity";
+import {
+  eventActivityContext,
+  eventActivitySubtype,
+  normalizeActivitySemantics,
+} from "./activity-context";
+import { correlationCaptureRollout } from "./correlation-rollout";
+import {
+  visibleClassificationSemantics,
+  visibleProcessContext,
+} from "./classification-semantics";
+import { foldLatestEventRevisions } from "./event-revision";
+import type { ProcessLifecycleFact } from "./process-lifecycle";
 import {
   BucketCommitCursor,
   compareEventCommitCursor,
   PersistedDashboardBucket,
   validPersistedDashboardBuckets,
-} from './persisted-dashboard-bucket';
-import { PolicyConfig } from './policy-config';
-import { parseTrustedCorrelation } from './trusted-correlation';
+} from "./persisted-dashboard-bucket";
+import { PolicyConfig } from "./policy-config";
+import { parseTrustedCorrelation } from "./trusted-correlation";
 import {
   TOOL_EVIDENCE_RELATION_VERSION,
   toolEvidenceIndexFields,
   type ToolEvidenceItem,
-} from './tool-evidence-linker';
-import { AgentAttribution, AgentInteractionQuery, AgentInteractionRecord, AgentMetadataRecord, AlertRecord, AuditRecord, CollectorHeartbeatRecord, IdentityAiReviewRecord, Incident, IngestionSourceRecord, JudgedEvent, MaintenanceWindowRecord, NotificationDeliveryRecord, NotificationState, ObjectiveRecord, ProcessContext, RemediationRecord } from './types';
+} from "./tool-evidence-linker";
+import {
+  AgentAttribution,
+  AgentInteractionQuery,
+  AgentInteractionRecord,
+  AgentMetadataRecord,
+  AlertRecord,
+  AuditRecord,
+  CollectorHeartbeatRecord,
+  IdentityAiReviewRecord,
+  Incident,
+  IngestionSourceRecord,
+  JudgedEvent,
+  MaintenanceWindowRecord,
+  NotificationDeliveryRecord,
+  NotificationState,
+  ObjectiveRecord,
+  ProcessContext,
+  RemediationRecord,
+} from "./types";
 
 function boundedPositiveInt(
   raw: string | undefined,
@@ -53,9 +82,9 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const TABLE = 'events';
-const EVENT_LOCATOR_TABLE = 'event_locators_v1';
-const EVENT_LOCATOR_MV = 'event_locators_v1_mv';
+const TABLE = "events";
+const EVENT_LOCATOR_TABLE = "event_locators_v1";
+const EVENT_LOCATOR_MV = "event_locators_v1_mv";
 const EVENT_LOCATOR_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_LOCATOR_TABLE} (
   eventId String,
   at UInt64,
@@ -75,8 +104,8 @@ AS SELECT eventId, at, decisionRevision, decisionUpdatedAt, ingestedAt FROM ${TA
 // event attributes for compatibility. Keep a separate, tiny locator table ordered by that stable
 // ID so degraded point reads do not scan the wide events MergeTree. The MV only observes future
 // inserts; no historical MATERIALIZE/INSERT is run during bootstrap.
-const KERNEL_FACT_LOCATOR_TABLE = 'kernel_fact_locators_v1';
-const KERNEL_FACT_LOCATOR_MV = 'kernel_fact_locators_v1_mv';
+const KERNEL_FACT_LOCATOR_TABLE = "kernel_fact_locators_v1";
+const KERNEL_FACT_LOCATOR_MV = "kernel_fact_locators_v1_mv";
 const KERNEL_FACT_LOCATOR_DDL = `CREATE TABLE IF NOT EXISTS ${KERNEL_FACT_LOCATOR_TABLE} (
   kernelFactId String,
   eventId String,
@@ -107,10 +136,12 @@ WHERE match(JSONExtractString(attributes, 'anysentry.kernel_fact_id'), '^kf_[a-f
  * marker separate and transient: it is accepted only while classifying a durable replay and is
  * removed before a row is serialized to ClickHouse.
  */
-export const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
-export const OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.legacy_source_payload_sha256';
+export const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE =
+  "anysentry.observer.source_payload_sha256";
+export const OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE =
+  "anysentry.observer.legacy_source_payload_sha256";
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
-const AGENT_INTERACTION_TABLE = 'agent_interactions_v1';
+const AGENT_INTERACTION_TABLE = "agent_interactions_v1";
 const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TABLE} (
   interactionId String,
   revision UInt64,
@@ -287,57 +318,57 @@ const EVENT_WRITE_BACKOFF_BASE_MS = 250;
 const EVENT_WRITE_BACKOFF_MAX_MS = 2_000;
 
 const EVENT_ALTERS = [
-  'ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT \'anysentry.agent_event.v1\'',
-  'ADD COLUMN IF NOT EXISTS eventId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at',
-  'ADD COLUMN IF NOT EXISTS commitBatchId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS logicalKeyVersion UInt16 DEFAULT 1',
-  'ADD COLUMN IF NOT EXISTS eventLogicalKey String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS payloadFingerprintVersion UInt16 DEFAULT 1',
-  'ADD COLUMN IF NOT EXISTS payloadFingerprint String DEFAULT \'\'',
+  "ADD COLUMN IF NOT EXISTS schemaVersion LowCardinality(String) DEFAULT 'anysentry.agent_event.v1'",
+  "ADD COLUMN IF NOT EXISTS eventId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS sourceEventId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS ingestedAt UInt64 DEFAULT at",
+  "ADD COLUMN IF NOT EXISTS commitBatchId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS logicalKeyVersion UInt16 DEFAULT 1",
+  "ADD COLUMN IF NOT EXISTS eventLogicalKey String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS payloadFingerprintVersion UInt16 DEFAULT 1",
+  "ADD COLUMN IF NOT EXISTS payloadFingerprint String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS eventAtUnixNs String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS receivedAtUnixNs String DEFAULT ''",
-  'ADD COLUMN IF NOT EXISTS receivedAt UInt64 DEFAULT 0',
+  "ADD COLUMN IF NOT EXISTS receivedAt UInt64 DEFAULT 0",
   "ADD COLUMN IF NOT EXISTS eventTimeQuality LowCardinality(String) DEFAULT 'api_received'",
-  'ADD COLUMN IF NOT EXISTS captureEpoch UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureProfileCode UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureActionCode UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureAuthorityCode UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureDispositionCode UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureSelected UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS captureFlags UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS capturePolicyVersion UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT \'unknown\'',
+  "ADD COLUMN IF NOT EXISTS captureEpoch UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureProfileCode UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureActionCode UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureAuthorityCode UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureDispositionCode UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureSelected UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS captureFlags UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS capturePolicyVersion UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS eventCategory LowCardinality(String) DEFAULT 'unknown'",
   "ADD COLUMN IF NOT EXISTS activityContext LowCardinality(String) DEFAULT if(eventKind = 'ToolExec', 'agent_action', '')",
   "ADD COLUMN IF NOT EXISTS activitySubtype LowCardinality(String) DEFAULT ''",
-  'ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT \'observer\'',
-  'ADD COLUMN IF NOT EXISTS collectorId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS sourceId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS traceId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS invocationId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS toolCallId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS processInstanceKey String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS correlationMethod LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS correlationConfidence Float32 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS spanId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS parentSpanId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS runId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS taskId String DEFAULT \'\'',
+  "ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT 'observer'",
+  "ADD COLUMN IF NOT EXISTS collectorId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS sourceId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS traceId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS invocationId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS toolCallId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS processInstanceKey String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS correlationMethod LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS correlationConfidence Float32 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS spanId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS parentSpanId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS runId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS taskId String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS decisionStatus LowCardinality(String) DEFAULT 'succeeded'",
   "ADD COLUMN IF NOT EXISTS evaluationId String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS policyVersion String DEFAULT ''",
-  'ADD COLUMN IF NOT EXISTS decisionRevision UInt32 DEFAULT 1',
-  'ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at',
-  'ADD COLUMN IF NOT EXISTS attributes String DEFAULT \'{}\'',
-  'ADD COLUMN IF NOT EXISTS classificationSemantics String DEFAULT \'{}\'',
-  'ADD COLUMN IF NOT EXISTS process String DEFAULT \'{}\'',
+  "ADD COLUMN IF NOT EXISTS decisionRevision UInt32 DEFAULT 1",
+  "ADD COLUMN IF NOT EXISTS decisionUpdatedAt UInt64 DEFAULT at",
+  "ADD COLUMN IF NOT EXISTS attributes String DEFAULT '{}'",
+  "ADD COLUMN IF NOT EXISTS classificationSemantics String DEFAULT '{}'",
+  "ADD COLUMN IF NOT EXISTS process String DEFAULT '{}'",
   "ADD COLUMN IF NOT EXISTS processHostId String DEFAULT JSONExtractString(process, 'hostId')",
   "ADD COLUMN IF NOT EXISTS processBootId String DEFAULT JSONExtractString(process, 'bootId')",
   "ADD COLUMN IF NOT EXISTS processPid UInt64 DEFAULT JSONExtractUInt(process, 'pid')",
@@ -358,7 +389,7 @@ const EVENT_ALTERS = [
     eventKind = 'ToolExec', JSONExtractString(attributes, 'anysentry.kernel.command_hash'),
     ''
   )`,
-  'ADD COLUMN IF NOT EXISTS attribution String DEFAULT \'{}\'',
+  "ADD COLUMN IF NOT EXISTS attribution String DEFAULT '{}'",
   `ADD COLUMN IF NOT EXISTS agentIdentityKey String DEFAULT multiIf(
     JSONExtractString(attribution, 'physicalWorkloadId') != '', JSONExtractString(attribution, 'physicalWorkloadId'),
     JSONExtractString(attribution, 'agentInstanceId') != '', JSONExtractString(attribution, 'agentInstanceId'),
@@ -440,40 +471,40 @@ const EVENT_ALTERS = [
     )
     AND JSONExtractUInt(process, 'pid') = JSONExtractUInt(attribution, 'rootPid')
   )`,
-  'ADD COLUMN IF NOT EXISTS judgment String DEFAULT \'{}\'',
-  'ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT \'\'',
-  'ADD INDEX IF NOT EXISTS idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1',
-  'ADD INDEX IF NOT EXISTS idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1',
+  "ADD COLUMN IF NOT EXISTS judgment String DEFAULT '{}'",
+  "ADD COLUMN IF NOT EXISTS rawPreview String DEFAULT ''",
+  "ADD INDEX IF NOT EXISTS idx_event_id eventId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_invocation_id invocationId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_tool_call_id toolCallId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_trace_id traceId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_session_id sessionId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_run_id runId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_subject_asset_id subjectAssetId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_agent_instance_key agentInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1",
 ];
 const EVENT_EVIDENCE_INDEX_NAMES = [
-  'idx_event_id',
-  'idx_invocation_id',
-  'idx_tool_call_id',
-  'idx_trace_id',
-  'idx_session_id',
-  'idx_run_id',
-  'idx_subject_asset_id',
-  'idx_agent_instance_key',
-  'idx_process_boot_id',
-  'idx_process_pid_namespace',
-  'idx_process_host_id',
-  'idx_evidence_resource_hash',
-  'idx_evidence_command_hash',
+  "idx_event_id",
+  "idx_invocation_id",
+  "idx_tool_call_id",
+  "idx_trace_id",
+  "idx_session_id",
+  "idx_run_id",
+  "idx_subject_asset_id",
+  "idx_agent_instance_key",
+  "idx_process_boot_id",
+  "idx_process_pid_namespace",
+  "idx_process_host_id",
+  "idx_evidence_resource_hash",
+  "idx_evidence_command_hash",
 ] as const;
-const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v3';
+const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = "schema.events.evidence_indexes.v3";
 
-const COLLECTOR_HEARTBEAT_TABLE = 'collector_heartbeats';
+const COLLECTOR_HEARTBEAT_TABLE = "collector_heartbeats";
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
   collectorId String,
   at UInt64,
@@ -485,7 +516,7 @@ TTL ts + INTERVAL 90 DAY`;
 
 // Singleton policy config (the config panels' persistence). ReplacingMergeTree keeps only the latest
 // row per key; `FINAL` collapses to it on read.
-const CONFIG_TABLE = 'config';
+const CONFIG_TABLE = "config";
 const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
   key String,
   value String,
@@ -493,7 +524,14 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY key`;
 
-const NOTIFICATION_DELIVERY_TABLE = 'notification_delivery_facts';
+function compatibilitySnapshotPersistenceEnabled(): boolean {
+  const value = process.env.ANYSENTRY_COMPATIBILITY_SNAPSHOT_PERSIST
+    ?.trim()
+    .toLowerCase();
+  return value !== "off" && value !== "false" && value !== "0";
+}
+
+const NOTIFICATION_DELIVERY_TABLE = "notification_delivery_facts";
 const NOTIFICATION_DELIVERY_DDL = `CREATE TABLE IF NOT EXISTS ${NOTIFICATION_DELIVERY_TABLE} (
   deliveryId String,
   sentAt UInt64,
@@ -504,7 +542,7 @@ const NOTIFICATION_DELIVERY_DDL = `CREATE TABLE IF NOT EXISTS ${NOTIFICATION_DEL
 ORDER BY (deliveryId, sentAt, ingestedAt)
 TTL ts + INTERVAL 365 DAY`;
 
-const IDENTITY_AI_REVIEW_TABLE = 'identity_ai_review_revisions';
+const IDENTITY_AI_REVIEW_TABLE = "identity_ai_review_revisions";
 const IDENTITY_AI_REVIEW_DDL = `CREATE TABLE IF NOT EXISTS ${IDENTITY_AI_REVIEW_TABLE} (
   reviewId String,
   revision UInt32,
@@ -518,7 +556,7 @@ const IDENTITY_AI_REVIEW_DDL = `CREATE TABLE IF NOT EXISTS ${IDENTITY_AI_REVIEW_
 ORDER BY (reviewId, revision, ingestedAt)
 TTL ts + INTERVAL 365 DAY`;
 
-const AUDIT_FACT_TABLE = 'audit_facts';
+const AUDIT_FACT_TABLE = "audit_facts";
 const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
   auditId String,
   at UInt64,
@@ -531,7 +569,7 @@ TTL ts + INTERVAL 365 DAY`;
 
 // The journal observes inserts from every judge process, so cache invalidation is not limited to
 // this API process's local write queue.
-const EVENT_COMMIT_FACT_TABLE = 'event_commit_facts_v2';
+const EVENT_COMMIT_FACT_TABLE = "event_commit_facts_v2";
 const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TABLE} (
   eventId String,
   decisionRevision UInt32,
@@ -544,7 +582,7 @@ const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TA
 ) ENGINE = MergeTree
 ORDER BY (committedAt, commitBatchId, eventId, decisionRevision)
 TTL ts + INTERVAL 7 DAY`;
-const EVENT_COMMIT_FACT_MV = 'event_commit_facts_v2_mv';
+const EVENT_COMMIT_FACT_MV = "event_commit_facts_v2_mv";
 const EVENT_COMMIT_FACT_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_COMMIT_FACT_MV}
 TO ${EVENT_COMMIT_FACT_TABLE}
 AS SELECT
@@ -557,7 +595,7 @@ AS SELECT
   collectorId
 FROM ${TABLE}`;
 
-const EVENT_REVISION_CONFLICT_TABLE = 'event_revision_conflicts';
+const EVENT_REVISION_CONFLICT_TABLE = "event_revision_conflicts";
 const EVENT_REVISION_CONFLICT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION_CONFLICT_TABLE} (
   logicalKeyVersion UInt16,
   eventLogicalKey String,
@@ -576,7 +614,7 @@ const EVENT_REVISION_CONFLICT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION
 ORDER BY (eventLogicalKey, observedAt, commitBatchId)
 TTL ts + INTERVAL 90 DAY`;
 
-const EVENT_REVISION_IDENTITY_TABLE = 'event_revision_identities';
+const EVENT_REVISION_IDENTITY_TABLE = "event_revision_identities";
 const EVENT_REVISION_IDENTITY_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION_IDENTITY_TABLE} (
   eventLogicalKey String,
   payloadFingerprint String,
@@ -590,7 +628,7 @@ const EVENT_REVISION_IDENTITY_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION
 ) ENGINE = MergeTree
 ORDER BY (eventLogicalKey, committedAt, commitBatchId)
 TTL ts + INTERVAL 90 DAY`;
-const EVENT_REVISION_IDENTITY_MV = 'event_revision_identities_mv';
+const EVENT_REVISION_IDENTITY_MV = "event_revision_identities_mv";
 const EVENT_REVISION_IDENTITY_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_REVISION_IDENTITY_MV}
 TO ${EVENT_REVISION_IDENTITY_TABLE}
 AS SELECT
@@ -605,7 +643,7 @@ AS SELECT
 FROM ${TABLE}
 WHERE eventLogicalKey != '' AND payloadFingerprint != ''`;
 
-const SOURCE_COMMIT_PROGRESS_TABLE = 'source_commit_progress';
+const SOURCE_COMMIT_PROGRESS_TABLE = "source_commit_progress";
 const SOURCE_COMMIT_PROGRESS_DDL = `CREATE TABLE IF NOT EXISTS ${SOURCE_COMMIT_PROGRESS_TABLE} (
   sourceId String,
   collectorId String,
@@ -614,7 +652,7 @@ const SOURCE_COMMIT_PROGRESS_DDL = `CREATE TABLE IF NOT EXISTS ${SOURCE_COMMIT_P
   commitGenerationState AggregateFunction(uniq, UInt64)
 ) ENGINE = AggregatingMergeTree
 ORDER BY (sourceId, collectorId)`;
-const SOURCE_COMMIT_PROGRESS_MV = 'source_commit_progress_mv';
+const SOURCE_COMMIT_PROGRESS_MV = "source_commit_progress_mv";
 const SOURCE_COMMIT_PROGRESS_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${SOURCE_COMMIT_PROGRESS_MV}
 TO ${SOURCE_COMMIT_PROGRESS_TABLE}
 AS SELECT
@@ -626,7 +664,7 @@ AS SELECT
 FROM ${EVENT_COMMIT_FACT_TABLE}
 GROUP BY sourceId, collectorId`;
 
-const TOOL_EVIDENCE_RELATION_TABLE = 'tool_evidence_relations';
+const TOOL_EVIDENCE_RELATION_TABLE = "tool_evidence_relations";
 const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_RELATION_TABLE} (
   invocationId String,
   toolCallId String,
@@ -643,7 +681,7 @@ const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_R
 ORDER BY (invocationId, workspacePath, sourceId, agentInstanceId, toolCallId, relationVersion)
 TTL ts + INTERVAL 90 DAY`;
 
-const PROCESS_LIFECYCLE_FACT_TABLE = 'process_lifecycle_facts';
+const PROCESS_LIFECYCLE_FACT_TABLE = "process_lifecycle_facts";
 const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYCLE_FACT_TABLE} (
   factId String,
   eventId String,
@@ -691,21 +729,21 @@ ORDER BY (processInstanceKey, factKind, at, eventId)
 TTL ts + INTERVAL 30 DAY`;
 
 const PROCESS_LIFECYCLE_FACT_ALTERS = [
-  'MODIFY COLUMN exitStatus UInt32 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS exitStatusPresent UInt8 DEFAULT 0 AFTER exitStatus',
-  'ADD COLUMN IF NOT EXISTS exitSignal UInt32 DEFAULT 0 AFTER exitStatusPresent',
-  'ADD COLUMN IF NOT EXISTS exitSignalPresent UInt8 DEFAULT 0 AFTER exitSignal',
-  'ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS runtimeInstanceId String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS rootProcess UInt8 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0',
-  'ADD COLUMN IF NOT EXISTS processGenerationKey String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS parentProcessGenerationKey String DEFAULT \'\'',
-  'ADD COLUMN IF NOT EXISTS parentLinkAuthority LowCardinality(String) DEFAULT \'\'',
+  "MODIFY COLUMN exitStatus UInt32 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS exitStatusPresent UInt8 DEFAULT 0 AFTER exitStatus",
+  "ADD COLUMN IF NOT EXISTS exitSignal UInt32 DEFAULT 0 AFTER exitStatusPresent",
+  "ADD COLUMN IF NOT EXISTS exitSignalPresent UInt8 DEFAULT 0 AFTER exitSignal",
+  "ADD COLUMN IF NOT EXISTS subjectAssetId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS subjectAssetType LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS assetBindingQuality LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS assetBindingRevision UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS assetBindingReason LowCardinality(String) DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS runtimeInstanceId String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS rootProcess UInt8 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS identityRevision UInt64 DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS processGenerationKey String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS parentProcessGenerationKey String DEFAULT ''",
+  "ADD COLUMN IF NOT EXISTS parentLinkAuthority LowCardinality(String) DEFAULT ''",
 ];
 
 // Startup progress hydration must stay independent of the cardinality of the 90-day event table.
@@ -716,7 +754,7 @@ const EVENT_COMMIT_PROGRESS_HYDRATE_ROWS = 100_000;
 
 // These are complete, commit-cursor-qualified bucket snapshots. Revisions replace the complete
 // snapshot rather than incrementing a counter, which keeps late judgment updates exact.
-const DASHBOARD_BUCKET_SNAPSHOT_TABLE = 'dashboard_bucket_snapshots';
+const DASHBOARD_BUCKET_SNAPSHOT_TABLE = "dashboard_bucket_snapshots";
 // Cold dashboard snapshots are built from the raw, revisioned event table. At production
 // full-file volume a ten-minute fold can approach 400 MiB and monopolise ClickHouse long enough to
 // delay ingestion and the Observer control plane. A request only schedules a single-flight worker
@@ -787,7 +825,7 @@ const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
 const BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS: ClickHouseSettings = {
   ...BOUNDED_DASHBOARD_READ_SETTINGS,
   max_threads: 1,
-  max_block_size: '1024',
+  max_block_size: "1024",
   preferred_block_size_bytes: String(1024 * 1024),
 };
 
@@ -806,6 +844,10 @@ const BOUNDED_RECENT_READ_SETTINGS: ClickHouseSettings = {
 const BOUNDED_EVENT_SEARCH_READ_SETTINGS: ClickHouseSettings = {
   ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
   max_memory_usage: String(512 * 1024 * 1024),
+  // Keep the bounded final page in memory.  Spilling wide event rows at the dashboard's
+  // 64 MiB generic threshold generated large temporary files and saturated the shared NVMe.
+  max_bytes_before_external_sort: String(256 * 1024 * 1024),
+  max_bytes_before_external_group_by: String(256 * 1024 * 1024),
 };
 
 const BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS: ClickHouseSettings = {
@@ -823,8 +865,8 @@ const BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS: ClickHouseSettings = {
 const BOUNDED_KERNEL_FACT_LOCATOR_READ_SETTINGS: ClickHouseSettings = {
   max_threads: 1,
   max_memory_usage: String(32 * 1024 * 1024),
-  max_result_rows: '1',
-  result_overflow_mode: 'break',
+  max_result_rows: "1",
+  result_overflow_mode: "break",
   max_execution_time: 1,
 };
 
@@ -839,7 +881,28 @@ const BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS: ClickHouseSettings = {
 
 const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
-type Row = Omit<JudgedEvent, 'activityContext' | 'activitySubtype' | 'actionKind' | 'actionTarget' | 'attributes' | 'classificationSemantics' | 'process' | 'attribution' | 'judgment' | 'collectorId' | 'sourceId' | 'parentSpanId' | 'taskId' | 'rawPreview' | 'invocationId' | 'toolCallId' | 'captureSelected' | 'subjectAssetType' | 'assetBindingQuality'> & {
+type Row = Omit<
+  JudgedEvent,
+  | "activityContext"
+  | "activitySubtype"
+  | "actionKind"
+  | "actionTarget"
+  | "attributes"
+  | "classificationSemantics"
+  | "process"
+  | "attribution"
+  | "judgment"
+  | "collectorId"
+  | "sourceId"
+  | "parentSpanId"
+  | "taskId"
+  | "rawPreview"
+  | "invocationId"
+  | "toolCallId"
+  | "captureSelected"
+  | "subjectAssetType"
+  | "assetBindingQuality"
+> & {
   ingestedAt: number;
   commitBatchId: string;
   logicalKeyVersion: number;
@@ -906,7 +969,7 @@ interface EventWriteBatch {
   bytes: number;
   token: string;
   settings: ClickHouseSettings;
-  source: 'buffered' | 'direct';
+  source: "buffered" | "direct";
   waiters: EventWriteWaiter[];
   retryNotBefore: number;
   createdAt: number;
@@ -923,9 +986,9 @@ interface ImmediateWrite {
 }
 
 export interface EventBatchReceipt {
-  schemaVersion: 'anysentry.event-batch-receipt.v1';
+  schemaVersion: "anysentry.event-batch-receipt.v1";
   batchId: string;
-  result: 'durable_fact' | 'durable_dlq';
+  result: "durable_fact" | "durable_dlq";
   rowCount: number;
   byteCount: number;
   queuedAt: number;
@@ -941,15 +1004,25 @@ export interface EventBatchReceipt {
 }
 
 const EVENT_REVISION_DIGEST_CACHE_SIZE = 20_000;
-const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
-const EVENT_WRITE_BATCH_TOO_LARGE = 'ANYSENTRY_CLICKHOUSE_EVENT_BATCH_TOO_LARGE';
+const EVENT_REVISION_CONFLICT = "ANYSENTRY_EVENT_REVISION_CONFLICT";
+const EVENT_WRITE_BATCH_TOO_LARGE =
+  "ANYSENTRY_CLICKHOUSE_EVENT_BATCH_TOO_LARGE";
 
 interface EventWriteErrorDecision {
   retryable: boolean;
   ambiguous: boolean;
   code: string;
 }
-export type IncidentState = Pick<Incident, 'incidentId' | 'status' | 'owner' | 'note' | 'acknowledgedAt' | 'resolvedAt' | 'updatedAt'>;
+export type IncidentState = Pick<
+  Incident,
+  | "incidentId"
+  | "status"
+  | "owner"
+  | "note"
+  | "acknowledgedAt"
+  | "resolvedAt"
+  | "updatedAt"
+>;
 export interface StoredEventQuery {
   sinceMs: number;
   untilMs: number;
@@ -1043,34 +1116,55 @@ interface ClickHouseBootstrapState {
 // and hydrate fresh journal progress rather than reusing a successful but stale snapshot forever.
 // The target digest includes credentials without retaining a plaintext password in a module-level
 // map key.
-const clickHouseBootstrapByTarget = new Map<string, Promise<ClickHouseBootstrapState>>();
+const clickHouseBootstrapByTarget = new Map<
+  string,
+  Promise<ClickHouseBootstrapState>
+>();
 
-function clickHouseBootstrapTargetKey(config: ClickHouseBootstrapConfig): string {
-  return createHash('sha256')
-    .update(JSON.stringify([config.url, config.database, config.username, config.password]))
-    .digest('hex');
+function clickHouseBootstrapTargetKey(
+  config: ClickHouseBootstrapConfig,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        config.url,
+        config.database,
+        config.username,
+        config.password,
+      ]),
+    )
+    .digest("hex");
 }
 
-function sharedClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+function sharedClickHouseBootstrap(
+  config: ClickHouseBootstrapConfig,
+): Promise<ClickHouseBootstrapState> {
   const key = clickHouseBootstrapTargetKey(config);
   const current = clickHouseBootstrapByTarget.get(key);
   if (current) return current;
 
   const operation = runClickHouseBootstrap(config);
   clickHouseBootstrapByTarget.set(key, operation);
-  void operation.finally(() => {
-    if (clickHouseBootstrapByTarget.get(key) === operation) clickHouseBootstrapByTarget.delete(key);
-  }).catch(() => undefined);
+  void operation
+    .finally(() => {
+      if (clickHouseBootstrapByTarget.get(key) === operation)
+        clickHouseBootstrapByTarget.delete(key);
+    })
+    .catch(() => undefined);
   return operation;
 }
 
-async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promise<ClickHouseBootstrapState> {
+async function runClickHouseBootstrap(
+  config: ClickHouseBootstrapConfig,
+): Promise<ClickHouseBootstrapState> {
   const credentials = { username: config.username, password: config.password };
   let boot: ClickHouseClient | undefined;
   let schema: ClickHouseClient | undefined;
   try {
     boot = createClient({ url: config.url, ...credentials });
-    await boot.command({ query: `CREATE DATABASE IF NOT EXISTS ${config.database}` });
+    await boot.command({
+      query: `CREATE DATABASE IF NOT EXISTS ${config.database}`,
+    });
     await boot.close();
     boot = undefined;
 
@@ -1095,7 +1189,9 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
     });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
     // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
-    await schema.command({ query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(', ')}` });
+    await schema.command({
+      query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(", ")}`,
+    });
     await schema.command({
       query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
     });
@@ -1105,34 +1201,40 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
         query_params: { key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY },
         clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const migrationRows = (await migrationResult.json()) as Array<{ value?: string }>;
-      if (!['scheduled', 'complete'].includes(migrationRows[0]?.value ?? '')) {
+      const migrationRows = (await migrationResult.json()) as Array<{
+        value?: string;
+      }>;
+      if (!["scheduled", "complete"].includes(migrationRows[0]?.value ?? "")) {
         await schema.command({
-          query: `ALTER TABLE ${TABLE} ${EVENT_EVIDENCE_INDEX_NAMES
-            .map((name) => `MATERIALIZE INDEX ${name}`)
-            .join(', ')}`,
+          query: `ALTER TABLE ${TABLE} ${EVENT_EVIDENCE_INDEX_NAMES.map(
+            (name) => `MATERIALIZE INDEX ${name}`,
+          ).join(", ")}`,
           // Backfilling ninety days of parts is a server-side mutation and may take minutes. The
           // indexed query remains correct while it runs, so bootstrap must schedule it once rather
           // than blocking every API replica behind the HTTP command timeout.
-          clickhouse_settings: { mutations_sync: '0' },
+          clickhouse_settings: { mutations_sync: "0" },
         });
         await schema.insert({
           table: CONFIG_TABLE,
-          values: [{
-            key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY,
-            value: 'scheduled',
-            updated_at: Date.now(),
-          }],
-          format: 'JSONEachRow',
+          values: [
+            {
+              key: EVENT_EVIDENCE_INDEX_MIGRATION_KEY,
+              value: "scheduled",
+              updated_at: Date.now(),
+            },
+          ],
+          format: "JSONEachRow",
         });
       }
     } catch (error) {
       // Existing data remains queryable without materialized skipping indexes. Do not claim the
       // migration complete; a later healthy bootstrap retries it.
-      console.warn('[clickhouse] evidence index backfill deferred:',
-        error instanceof Error ? error.message : String(error));
+      console.warn(
+        "[clickhouse] evidence index backfill deferred:",
+        error instanceof Error ? error.message : String(error),
+      );
     }
     await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
     await schema.command({ query: NOTIFICATION_DELIVERY_DDL });
@@ -1148,7 +1250,7 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
     await schema.command({ query: TOOL_EVIDENCE_RELATION_DDL });
     await schema.command({ query: PROCESS_LIFECYCLE_FACT_DDL });
     await schema.command({
-      query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(', ')}`,
+      query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(", ")}`,
     });
     await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
     await schema.command({
@@ -1195,7 +1297,7 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
           GROUP BY sourceId, collectorId`,
         query_params: { journalRows: EVENT_COMMIT_PROGRESS_HYDRATE_ROWS },
         clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const progressRows = (await progress.json()) as Array<{
         sourceId?: string;
@@ -1203,21 +1305,31 @@ async function runClickHouseBootstrap(config: ClickHouseBootstrapConfig): Promis
         committedThrough?: string | number;
         committedAt?: string | number;
       }>;
-      committedSourceProgress = progressRows.flatMap((row): CommittedSourceProgress[] => {
-        const committedEventTimeMs = Number(row.committedThrough);
-        if (!Number.isFinite(committedEventTimeMs) || committedEventTimeMs <= 0) return [];
-        return [{
-          sourceId: row.sourceId?.trim() || undefined,
-          collectorId: row.collectorId?.trim() || undefined,
-          committedEventTimeMs,
-          committedAtMs: Number(row.committedAt) || committedEventTimeMs,
-        }];
-      });
+      committedSourceProgress = progressRows.flatMap(
+        (row): CommittedSourceProgress[] => {
+          const committedEventTimeMs = Number(row.committedThrough);
+          if (
+            !Number.isFinite(committedEventTimeMs) ||
+            committedEventTimeMs <= 0
+          )
+            return [];
+          return [
+            {
+              sourceId: row.sourceId?.trim() || undefined,
+              collectorId: row.collectorId?.trim() || undefined,
+              committedEventTimeMs,
+              committedAtMs: Number(row.committedAt) || committedEventTimeMs,
+            },
+          ];
+        },
+      );
     } catch (error) {
       // Progress is query metadata, not a prerequisite for durable reads/writes. Failing closed to
       // no boundary is correct and lets a healthy schema/client become ready under read pressure.
-      console.warn('[clickhouse] bounded startup progress hydration unavailable:',
-        error instanceof Error ? error.message : String(error));
+      console.warn(
+        "[clickhouse] bounded startup progress hydration unavailable:",
+        error instanceof Error ? error.message : String(error),
+      );
     }
     return { committedSourceProgress };
   } finally {
@@ -1233,7 +1345,7 @@ export interface EventCommitCursor {
   decisionRevision: number;
 }
 
-export type DurableReplayEventStatus = 'new' | 'duplicate' | 'conflict';
+export type DurableReplayEventStatus = "new" | "duplicate" | "conflict";
 
 export interface EventCommitChange {
   cursor: EventCommitCursor;
@@ -1319,10 +1431,10 @@ function eligibleAgentRuntimeRows(
   const groupFor = (row: Record<string, unknown>): string => {
     const instances = Array.isArray(row.instanceKeys)
       ? row.instanceKeys.map(String).filter(Boolean)
-      : [String(row.instanceKey ?? '')].filter(Boolean);
+      : [String(row.instanceKey ?? "")].filter(Boolean);
     return instances.length
-      ? `instance\u0000${instances.join('\u0001')}`
-      : `identity\u0000${String(row.identityKey ?? '')}`;
+      ? `instance\u0000${instances.join("\u0001")}`
+      : `identity\u0000${String(row.identityKey ?? "")}`;
   };
   const evidenceByRuntime = new Map<
     string,
@@ -1342,7 +1454,9 @@ function eligibleAgentRuntimeRows(
   }
   return rows.filter((row) => {
     const evidence = evidenceByRuntime.get(groupFor(row));
-    return Boolean(evidence && (evidence.physical || evidence.root) && !evidence.helper);
+    return Boolean(
+      evidence && (evidence.physical || evidence.root) && !evidence.helper,
+    );
   });
 }
 
@@ -1428,7 +1542,7 @@ export interface StoredTopologyBucketFact extends StoredTopologyWindowFact {
 }
 
 export interface DashboardWindowDimensionRow {
-  period: 'current' | 'previous';
+  period: "current" | "previous";
   monitored: boolean;
   verdict: string;
   tier: string;
@@ -1478,20 +1592,25 @@ export interface DashboardWindowHistory {
   }>;
 }
 
-function attrString(attributes: JudgedEvent['attributes'], key: string): string {
+function attrString(
+  attributes: JudgedEvent["attributes"],
+  key: string,
+): string {
   const value = attributes[key];
-  return value == null ? '' : String(value).trim();
+  return value == null ? "" : String(value).trim();
 }
 
 function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .filter((key) => record[key] !== undefined)
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-    .join(',')}}`;
+    .join(",")}}`;
 }
 
 /**
@@ -1505,34 +1624,43 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   logicalKey: string;
   fingerprint: string;
 } {
-  const sourceId = e.sourceId?.trim() || attrString(e.attributes, 'sourceId');
-  const collectorId = e.collectorId?.trim() || attrString(e.attributes, 'collectorId');
-  const tenantId = attrString(e.attributes, 'tenantId');
+  const sourceId = e.sourceId?.trim() || attrString(e.attributes, "sourceId");
+  const collectorId =
+    e.collectorId?.trim() || attrString(e.attributes, "collectorId");
+  const tenantId = attrString(e.attributes, "tenantId");
   const revision = Math.max(1, Math.trunc(e.decisionRevision ?? 1));
   const logicalKey = [
     tenantId,
     sourceId || `${e.source}:${collectorId}`,
     e.eventId,
     String(revision),
-  ].join('\u0000');
+  ].join("\u0000");
   const canonicalPayload = { ...e } as Record<string, unknown>;
   delete canonicalPayload.ingestedAt;
   delete canonicalPayload.storeCommittedAt;
   delete canonicalPayload.commitBatchId;
   delete canonicalPayload.kafkaOffset;
   delete canonicalPayload.deliveryAttempt;
-  const canonicalAttributes = { ...(e.attributes ?? {}) } as Record<string, unknown>;
+  const canonicalAttributes = { ...(e.attributes ?? {}) } as Record<
+    string,
+    unknown
+  >;
   delete canonicalAttributes.commitRequestBatchId;
   delete canonicalAttributes.writerId;
   delete canonicalAttributes.writerVersion;
   delete canonicalAttributes.idempotencyProtocolVersion;
   canonicalPayload.attributes = canonicalAttributes;
-  const sourcePayloadDigest = attrString(e.attributes, OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE);
+  const sourcePayloadDigest = attrString(
+    e.attributes,
+    OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE,
+  );
   return {
     logicalKey,
     fingerprint: SHA256_HEX.test(sourcePayloadDigest)
       ? `observer-source:${sourcePayloadDigest}`
-      : createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
+      : createHash("sha256")
+          .update(canonicalJson(canonicalPayload))
+          .digest("hex"),
   };
 }
 
@@ -1542,7 +1670,7 @@ export function eventRevisionIdentity(e: JudgedEvent): {
  * replace only malformed code units at the persistence boundary.
  */
 function clickHouseWellFormedText(value: string): string {
-  let repaired = '';
+  let repaired = "";
   let segmentStart = 0;
   let changed = false;
   for (let index = 0; index < value.length; index += 1) {
@@ -1556,7 +1684,7 @@ function clickHouseWellFormedText(value: string): string {
     } else if (unit < 0xdc00 || unit > 0xdfff) {
       continue;
     }
-    repaired += value.slice(segmentStart, index) + '\ufffd';
+    repaired += value.slice(segmentStart, index) + "\ufffd";
     segmentStart = index + 1;
     changed = true;
   }
@@ -1565,7 +1693,9 @@ function clickHouseWellFormedText(value: string): string {
 
 function clickHouseWellFormedRow(row: Row): Row {
   for (const [key, value] of Object.entries(row)) {
-    if (typeof value === 'string') (row as unknown as Record<string, unknown>)[key] = clickHouseWellFormedText(value);
+    if (typeof value === "string")
+      (row as unknown as Record<string, unknown>)[key] =
+        clickHouseWellFormedText(value);
   }
   return row;
 }
@@ -1577,10 +1707,13 @@ function toRow(e: JudgedEvent): Row {
     ? undefined
     : correlation
       ? { ...rawAttribution, correlation }
-      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) =>
+          legacyAttribution)(rawAttribution);
   const physical = attribution?.physicalWorkloadId?.trim();
   const instance = attribution?.agentInstanceId?.trim();
-  const classificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+  const classificationSemantics = visibleClassificationSemantics(
+    e.classificationSemantics,
+  );
   const process = visibleProcessContext(e.process);
   const evidenceIndex = toolEvidenceIndexFields(e);
   const revisionIdentity = eventRevisionIdentity(e);
@@ -1591,32 +1724,53 @@ function toRow(e: JudgedEvent): Row {
   const canonicalAttributes = {
     ...(e.attributes ?? {}),
     ...(e.sessionIdentityQuality
-      ? { 'anysentry.session.identity_quality': e.sessionIdentityQuality }
+      ? { "anysentry.session.identity_quality": e.sessionIdentityQuality }
       : {}),
-    ...(e.sessionIdSource ? { 'anysentry.session.id_source': e.sessionIdSource } : {}),
-    ...(e.legacySessionId ? { 'anysentry.session.legacy_id': e.legacySessionId } : {}),
-    ...(e.parentSessionId ? { 'anysentry.session.parent_id': e.parentSessionId } : {}),
-    ...(e.sessionMode ? { 'anysentry.session.mode': e.sessionMode } : {}),
-    ...(e.sessionLifecycle ? { 'anysentry.session.lifecycle': e.sessionLifecycle } : {}),
-    ...(e.runIdSource ? { 'anysentry.run.id_source': e.runIdSource } : {}),
-    ...(e.rawObservationId ? { 'anysentry.raw_observation_id': e.rawObservationId } : {}),
+    ...(e.sessionIdSource
+      ? { "anysentry.session.id_source": e.sessionIdSource }
+      : {}),
+    ...(e.legacySessionId
+      ? { "anysentry.session.legacy_id": e.legacySessionId }
+      : {}),
+    ...(e.parentSessionId
+      ? { "anysentry.session.parent_id": e.parentSessionId }
+      : {}),
+    ...(e.sessionMode ? { "anysentry.session.mode": e.sessionMode } : {}),
+    ...(e.sessionLifecycle
+      ? { "anysentry.session.lifecycle": e.sessionLifecycle }
+      : {}),
+    ...(e.runIdSource ? { "anysentry.run.id_source": e.runIdSource } : {}),
+    ...(e.rawObservationId
+      ? { "anysentry.raw_observation_id": e.rawObservationId }
+      : {}),
     ...(e.rawObservationRevision !== undefined
-      ? { 'anysentry.raw_observation_revision': e.rawObservationRevision }
+      ? { "anysentry.raw_observation_revision": e.rawObservationRevision }
       : {}),
-    ...(e.kernelFactId ? { 'anysentry.kernel_fact_id': e.kernelFactId } : {}),
-    ...(e.logicalAgentId ? { 'anysentry.logical_agent_id': e.logicalAgentId } : {}),
+    ...(e.kernelFactId ? { "anysentry.kernel_fact_id": e.kernelFactId } : {}),
+    ...(e.logicalAgentId
+      ? { "anysentry.logical_agent_id": e.logicalAgentId }
+      : {}),
     ...(e.logicalIdentityAuthority
-      ? { 'anysentry.logical_identity_authority': e.logicalIdentityAuthority } : {}),
-    ...(e.logicalAgentCandidateId
-      ? { 'anysentry.logical_agent_candidate_id': e.logicalAgentCandidateId }
+      ? { "anysentry.logical_identity_authority": e.logicalIdentityAuthority }
       : {}),
-    ...(e.logicalDefinitionId ? { 'anysentry.logical_definition_id': e.logicalDefinitionId } : {}),
-    ...(e.logicalScopeMode ? { 'anysentry.logical_scope_mode': e.logicalScopeMode } : {}),
-    ...(e.deploymentId ? { 'anysentry.deployment_id': e.deploymentId } : {}),
-    ...(e.deploymentRevision ? { 'anysentry.deployment_revision': e.deploymentRevision } : {}),
-    ...(e.environmentId ? { 'anysentry.environment_id': e.environmentId } : {}),
-    ...(e.terminalContextId ? { 'anysentry.terminal_context_id': e.terminalContextId } : {}),
-  } as JudgedEvent['attributes'];
+    ...(e.logicalAgentCandidateId
+      ? { "anysentry.logical_agent_candidate_id": e.logicalAgentCandidateId }
+      : {}),
+    ...(e.logicalDefinitionId
+      ? { "anysentry.logical_definition_id": e.logicalDefinitionId }
+      : {}),
+    ...(e.logicalScopeMode
+      ? { "anysentry.logical_scope_mode": e.logicalScopeMode }
+      : {}),
+    ...(e.deploymentId ? { "anysentry.deployment_id": e.deploymentId } : {}),
+    ...(e.deploymentRevision
+      ? { "anysentry.deployment_revision": e.deploymentRevision }
+      : {}),
+    ...(e.environmentId ? { "anysentry.environment_id": e.environmentId } : {}),
+    ...(e.terminalContextId
+      ? { "anysentry.terminal_context_id": e.terminalContextId }
+      : {}),
+  } as JudgedEvent["attributes"];
   // The legacy replay digest is an in-memory migration aid only.  Keep it on a non-enumerable
   // Row property so durable serialization never copies it (it may be derived from a body that
   // the current privacy contract intentionally excludes from fingerprints).
@@ -1624,13 +1778,13 @@ function toRow(e: JudgedEvent): Row {
   const row = clickHouseWellFormedRow({
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
-    sourceEventId: e.sourceEventId ?? '',
+    sourceEventId: e.sourceEventId ?? "",
     at: e.at,
-    eventAtUnixNs: e.eventAtUnixNs ?? '',
-    receivedAtUnixNs: e.receivedAtUnixNs ?? '',
+    eventAtUnixNs: e.eventAtUnixNs ?? "",
+    receivedAtUnixNs: e.receivedAtUnixNs ?? "",
     receivedAt: e.receivedAt ?? 0,
-    eventTimeQuality: e.eventTimeQuality ?? 'api_received',
-    captureEpoch: e.captureEpoch ?? '0',
+    eventTimeQuality: e.eventTimeQuality ?? "api_received",
+    captureEpoch: e.captureEpoch ?? "0",
     captureProfileCode: e.captureProfileCode ?? 0,
     captureActionCode: e.captureActionCode ?? 0,
     captureAuthorityCode: e.captureAuthorityCode ?? 0,
@@ -1639,65 +1793,68 @@ function toRow(e: JudgedEvent): Row {
     captureFlags: e.captureFlags ?? 0,
     capturePolicyVersion: e.capturePolicyVersion ?? 0,
     ingestedAt: Date.now(),
-    commitBatchId: '',
+    commitBatchId: "",
     logicalKeyVersion: 1,
     eventLogicalKey: revisionIdentity.logicalKey,
     payloadFingerprintVersion: 1,
     payloadFingerprint: revisionIdentity.fingerprint,
     eventKind: e.eventKind,
     eventCategory: e.eventCategory,
-    activityContext: eventActivityContext(e) ?? '',
-    activitySubtype: eventActivitySubtype(e) ?? '',
+    activityContext: eventActivityContext(e) ?? "",
+    activitySubtype: eventActivitySubtype(e) ?? "",
     source: e.source,
     subject: e.subject,
     workspacePath: e.workspacePath,
     agentId: e.agentId,
-    subjectAssetId: e.subjectAssetId ?? '',
-    subjectAssetType: e.subjectAssetType ?? '',
-    assetBindingQuality: e.assetBindingQuality ?? '',
+    subjectAssetId: e.subjectAssetId ?? "",
+    subjectAssetType: e.subjectAssetType ?? "",
+    assetBindingQuality: e.assetBindingQuality ?? "",
     assetBindingRevision: e.assetBindingRevision ?? 0,
-    assetBindingReason: e.assetBindingReason ?? '',
+    assetBindingReason: e.assetBindingReason ?? "",
     identityRevision: e.identityRevision ?? 0,
-    collectorId: e.collectorId?.trim() || attrString(e.attributes, 'collectorId'),
-    sourceId: e.sourceId?.trim() || attrString(e.attributes, 'sourceId'),
+    collectorId:
+      e.collectorId?.trim() || attrString(e.attributes, "collectorId"),
+    sourceId: e.sourceId?.trim() || attrString(e.attributes, "sourceId"),
     sessionId: e.sessionId,
     userId: e.userId,
     traceId: e.traceId,
     // These query columns are projections of the server-resolved correlation object. Producer
     // convenience fields are deliberately not an independent authority at the persistence edge.
-    invocationId: correlation?.invocationId?.trim() ?? '',
-    toolCallId: correlation?.toolCallId?.trim() ?? '',
-    processInstanceKey: correlation?.processInstanceId?.trim() ?? '',
-    processHostId: process?.hostId?.trim() ?? '',
-    processBootId: process?.bootId?.trim() ?? '',
+    invocationId: correlation?.invocationId?.trim() ?? "",
+    toolCallId: correlation?.toolCallId?.trim() ?? "",
+    processInstanceKey: correlation?.processInstanceId?.trim() ?? "",
+    processHostId: process?.hostId?.trim() ?? "",
+    processBootId: process?.bootId?.trim() ?? "",
     processPid: process?.pid ?? 0,
     processPpid: process?.ppid ?? 0,
-    processPidNamespace: process?.pidNamespace?.trim() ?? '',
+    processPidNamespace: process?.pidNamespace?.trim() ?? "",
     processNamespacePid: process?.namespacePid ?? 0,
     processNamespacePpid: process?.namespacePpid ?? 0,
-    processStartTimeTicks: process?.startTimeTicks?.trim() ?? '',
-    processStartTimeNs: process?.startTimeNs?.trim() ?? '',
-    evidenceResourceHash: evidenceIndex.resourceHash ?? '',
-    evidenceCommandHash: evidenceIndex.commandHash ?? '',
-    correlationMethod: correlation?.method ?? '',
-    correlationConfidence: typeof correlation?.confidence === 'number' && Number.isFinite(correlation.confidence)
-      ? correlation.confidence
-      : 0,
+    processStartTimeTicks: process?.startTimeTicks?.trim() ?? "",
+    processStartTimeNs: process?.startTimeNs?.trim() ?? "",
+    evidenceResourceHash: evidenceIndex.resourceHash ?? "",
+    evidenceCommandHash: evidenceIndex.commandHash ?? "",
+    correlationMethod: correlation?.method ?? "",
+    correlationConfidence:
+      typeof correlation?.confidence === "number" &&
+      Number.isFinite(correlation.confidence)
+        ? correlation.confidence
+        : 0,
     spanId: e.spanId,
-    parentSpanId: e.parentSpanId ?? '',
+    parentSpanId: e.parentSpanId ?? "",
     runId: e.runId,
-    taskId: e.taskId ?? '',
-    decisionStatus: e.decisionStatus ?? 'succeeded',
-    evaluationId: e.evaluationId ?? '',
-    policyVersion: e.policyVersion ?? '',
+    taskId: e.taskId ?? "",
+    decisionStatus: e.decisionStatus ?? "succeeded",
+    evaluationId: e.evaluationId ?? "",
+    policyVersion: e.policyVersion ?? "",
     decisionRevision: Math.max(1, Math.trunc(e.decisionRevision ?? 1)),
     decisionUpdatedAt: e.decisionUpdatedAt ?? e.at,
     verdict: e.verdict,
     tier: e.tier,
     severity: e.severity,
     reason: e.reason,
-    actionKind: e.actionKind ?? '',
-    actionTarget: e.actionTarget ?? '',
+    actionKind: e.actionKind ?? "",
+    actionTarget: e.actionTarget ?? "",
     riskCategory: e.riskCategory,
     riskName: e.riskName,
     riskType: e.riskType,
@@ -1712,26 +1869,30 @@ function toRow(e: JudgedEvent): Row {
     agentInstanceKey: agentRuntimeInstanceIdForEvent(e),
     agentMonitored: attribution?.monitored === true ? 1 : 0,
     agentSessionKey:
-      attribution?.agentSessionId?.trim()
-      || attribution?.agentDisplayName?.trim()
-      || attribution?.agentScopeId?.trim()
-      || e.agentId,
+      attribution?.agentSessionId?.trim() ||
+      attribution?.agentDisplayName?.trim() ||
+      attribution?.agentScopeId?.trim() ||
+      e.agentId,
     resolvedWorkspacePath:
-      process?.cwd?.trim()
-      || (attribution?.agentScopeId?.trim()
+      process?.cwd?.trim() ||
+      (attribution?.agentScopeId?.trim()
         ? `agent://${attribution.agentScopeId.trim()}`
         : e.workspacePath),
-    agentHasPhysicalIdentity: physical || instance || attribution?.workloadRef?.podUid ? 1 : 0,
-    agentHasRootIdentity: attribution?.rootStartTime && hasDirectAgentRootEvidence(e) ? 1 : 0,
+    agentHasPhysicalIdentity:
+      physical || instance || attribution?.workloadRef?.podUid ? 1 : 0,
+    agentHasRootIdentity:
+      attribution?.rootStartTime && hasDirectAgentRootEvidence(e) ? 1 : 0,
     agentHasInternalHelperRoot: isInternalAgentHelperRootEvent(e) ? 1 : 0,
     judgment: JSON.stringify(e.judgment ?? {}),
-    rawPreview: e.rawPreview ?? '',
+    rawPreview: e.rawPreview ?? "",
   });
   const legacyDigest = String(
-    e.attributes?.[OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? '',
-  ).trim().toLowerCase();
+    e.attributes?.[OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? "",
+  )
+    .trim()
+    .toLowerCase();
   if (SHA256_HEX.test(legacyDigest)) {
-    Object.defineProperty(row, '__legacyObserverSourcePayloadDigest', {
+    Object.defineProperty(row, "__legacyObserverSourcePayloadDigest", {
       value: legacyDigest,
       enumerable: false,
       configurable: false,
@@ -1751,11 +1912,13 @@ function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {
 }
 
 function parseObject<T extends object>(value: unknown): T | undefined {
-  const text = String(value ?? '').trim();
-  if (!text || text === '{}') return undefined;
+  const text = String(value ?? "").trim();
+  if (!text || text === "{}") return undefined;
   try {
     const parsed = JSON.parse(text) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as T) : undefined;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as T)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -1763,122 +1926,202 @@ function parseObject<T extends object>(value: unknown): T | undefined {
 
 function fromRow(r: Record<string, unknown>): JudgedEvent {
   const num = (v: unknown) => Number(v) || 0; // ClickHouse returns UInt64 as a string in JSON
-  const str = (v: unknown) => String(v ?? '');
-  let attributes: JudgedEvent['attributes'] = {};
+  const str = (v: unknown) => String(v ?? "");
+  let attributes: JudgedEvent["attributes"] = {};
   try {
-    attributes = JSON.parse(str(r.attributes) || '{}') as JudgedEvent['attributes'];
+    attributes = JSON.parse(
+      str(r.attributes) || "{}",
+    ) as JudgedEvent["attributes"];
   } catch {
     attributes = {};
   }
   const at = num(r.at);
   const agentId = str(r.agentId);
   const sessionId = str(r.sessionId);
-  const rawSessionIdentityQuality = str(attributes['anysentry.session.identity_quality']);
-  const sessionIdentityQuality = ['confirmed', 'strong', 'inferred', 'unresolved', 'ephemeral', 'unknown', 'conflict']
-    .includes(rawSessionIdentityQuality)
-    ? rawSessionIdentityQuality as JudgedEvent['sessionIdentityQuality']
+  const rawSessionIdentityQuality = str(
+    attributes["anysentry.session.identity_quality"],
+  );
+  const sessionIdentityQuality = [
+    "confirmed",
+    "strong",
+    "inferred",
+    "unresolved",
+    "ephemeral",
+    "unknown",
+    "conflict",
+  ].includes(rawSessionIdentityQuality)
+    ? (rawSessionIdentityQuality as JudgedEvent["sessionIdentityQuality"])
     : undefined;
-  const rawSessionIdSource = str(attributes['anysentry.session.id_source']);
-  const sessionIdSource = ['provider', 'authenticated_adapter', 'legacy_observer_session', 'legacy_agent_fallback', 'legacy_task_fallback', 'per_request', 'unresolved']
-    .includes(rawSessionIdSource)
-    ? rawSessionIdSource as JudgedEvent['sessionIdSource']
+  const rawSessionIdSource = str(attributes["anysentry.session.id_source"]);
+  const sessionIdSource = [
+    "provider",
+    "authenticated_adapter",
+    "legacy_observer_session",
+    "legacy_agent_fallback",
+    "legacy_task_fallback",
+    "per_request",
+    "unresolved",
+  ].includes(rawSessionIdSource)
+    ? (rawSessionIdSource as JudgedEvent["sessionIdSource"])
     : undefined;
-  const legacySessionId = str(attributes['anysentry.session.legacy_id']) || undefined;
-  const parentSessionId = str(attributes['anysentry.session.parent_id']) || undefined;
-  const rawSessionMode = str(attributes['anysentry.session.mode']);
-  const sessionMode = ['resumable', 'conversation', 'per_request', 'ephemeral', 'unknown']
-    .includes(rawSessionMode)
-    ? rawSessionMode as JudgedEvent['sessionMode']
+  const legacySessionId =
+    str(attributes["anysentry.session.legacy_id"]) || undefined;
+  const parentSessionId =
+    str(attributes["anysentry.session.parent_id"]) || undefined;
+  const rawSessionMode = str(attributes["anysentry.session.mode"]);
+  const sessionMode = [
+    "resumable",
+    "conversation",
+    "per_request",
+    "ephemeral",
+    "unknown",
+  ].includes(rawSessionMode)
+    ? (rawSessionMode as JudgedEvent["sessionMode"])
     : undefined;
-  const rawSessionLifecycle = str(attributes['anysentry.session.lifecycle']);
-  const sessionLifecycle = ['new', 'resume', 'fork'].includes(rawSessionLifecycle)
-    ? rawSessionLifecycle as JudgedEvent['sessionLifecycle']
+  const rawSessionLifecycle = str(attributes["anysentry.session.lifecycle"]);
+  const sessionLifecycle = ["new", "resume", "fork"].includes(
+    rawSessionLifecycle,
+  )
+    ? (rawSessionLifecycle as JudgedEvent["sessionLifecycle"])
     : undefined;
-  const rawRunIdSource = str(attributes['anysentry.run.id_source']);
-  const runIdSource = ['producer', 'derived_ephemeral', 'legacy'].includes(rawRunIdSource)
-    ? rawRunIdSource as JudgedEvent['runIdSource']
+  const rawRunIdSource = str(attributes["anysentry.run.id_source"]);
+  const runIdSource = ["producer", "derived_ephemeral", "legacy"].includes(
+    rawRunIdSource,
+  )
+    ? (rawRunIdSource as JudgedEvent["runIdSource"])
     : undefined;
-  const rawObservationId = str(attributes['anysentry.raw_observation_id']) || undefined;
-  const kernelFactId = str(attributes['anysentry.kernel_fact_id']) || undefined;
-  const parsedRawObservationRevision = Number(attributes['anysentry.raw_observation_revision']);
-  const rawObservationRevision = Number.isSafeInteger(parsedRawObservationRevision)
-    && parsedRawObservationRevision > 0 ? parsedRawObservationRevision : undefined;
-  const logicalAgentId = str(attributes['anysentry.logical_agent_id']) || undefined;
-  const rawLogicalIdentityAuthority = str(attributes['anysentry.logical_identity_authority']);
-  const logicalIdentityAuthority = ['management_registration', 'authenticated_adapter', 'inferred', 'unknown']
-    .includes(rawLogicalIdentityAuthority)
-    ? rawLogicalIdentityAuthority as JudgedEvent['logicalIdentityAuthority'] : undefined;
-  const logicalAgentCandidateId = str(attributes['anysentry.logical_agent_candidate_id']) || undefined;
-  const logicalDefinitionId = str(attributes['anysentry.logical_definition_id']) || undefined;
-  const rawLogicalScopeMode = str(attributes['anysentry.logical_scope_mode']);
-  const logicalScopeMode = ['registered_definition', 'workflow_definition', 'service_definition', 'terminal', 'unresolved']
-    .includes(rawLogicalScopeMode)
-    ? rawLogicalScopeMode as JudgedEvent['logicalScopeMode']
+  const rawObservationId =
+    str(attributes["anysentry.raw_observation_id"]) || undefined;
+  const kernelFactId = str(attributes["anysentry.kernel_fact_id"]) || undefined;
+  const parsedRawObservationRevision = Number(
+    attributes["anysentry.raw_observation_revision"],
+  );
+  const rawObservationRevision =
+    Number.isSafeInteger(parsedRawObservationRevision) &&
+    parsedRawObservationRevision > 0
+      ? parsedRawObservationRevision
+      : undefined;
+  const logicalAgentId =
+    str(attributes["anysentry.logical_agent_id"]) || undefined;
+  const rawLogicalIdentityAuthority = str(
+    attributes["anysentry.logical_identity_authority"],
+  );
+  const logicalIdentityAuthority = [
+    "management_registration",
+    "authenticated_adapter",
+    "inferred",
+    "unknown",
+  ].includes(rawLogicalIdentityAuthority)
+    ? (rawLogicalIdentityAuthority as JudgedEvent["logicalIdentityAuthority"])
     : undefined;
-  const terminalContextId = str(attributes['anysentry.terminal_context_id']) || undefined;
-  const deploymentId = str(attributes['anysentry.deployment_id']) || undefined;
-  const deploymentRevision = str(attributes['anysentry.deployment_revision']) || undefined;
-  const environmentId = str(attributes['anysentry.environment_id']) || undefined;
+  const logicalAgentCandidateId =
+    str(attributes["anysentry.logical_agent_candidate_id"]) || undefined;
+  const logicalDefinitionId =
+    str(attributes["anysentry.logical_definition_id"]) || undefined;
+  const rawLogicalScopeMode = str(attributes["anysentry.logical_scope_mode"]);
+  const logicalScopeMode = [
+    "registered_definition",
+    "workflow_definition",
+    "service_definition",
+    "terminal",
+    "unresolved",
+  ].includes(rawLogicalScopeMode)
+    ? (rawLogicalScopeMode as JudgedEvent["logicalScopeMode"])
+    : undefined;
+  const terminalContextId =
+    str(attributes["anysentry.terminal_context_id"]) || undefined;
+  const deploymentId = str(attributes["anysentry.deployment_id"]) || undefined;
+  const deploymentRevision =
+    str(attributes["anysentry.deployment_revision"]) || undefined;
+  const environmentId =
+    str(attributes["anysentry.environment_id"]) || undefined;
   const eventKind = str(r.eventKind);
   const rawActivityContext = str(r.activityContext);
   const rawActivitySubtype = str(r.activitySubtype);
-  const activity = normalizeActivitySemantics(eventKind, rawActivityContext, rawActivitySubtype);
-  const collectorId = str(r.collectorId) || attrString(attributes, 'collectorId') || undefined;
-  const sourceId = str(r.sourceId) || attrString(attributes, 'sourceId') || undefined;
+  const activity = normalizeActivitySemantics(
+    eventKind,
+    rawActivityContext,
+    rawActivitySubtype,
+  );
+  const collectorId =
+    str(r.collectorId) || attrString(attributes, "collectorId") || undefined;
+  const sourceId =
+    str(r.sourceId) || attrString(attributes, "sourceId") || undefined;
   const rawAttribution = parseObject<AgentAttribution>(r.attribution);
-  const parsedCorrelation = parseTrustedCorrelation(rawAttribution?.correlation);
+  const parsedCorrelation = parseTrustedCorrelation(
+    rawAttribution?.correlation,
+  );
   // Rows written before the additive columns existed may contain producer-controlled JSON under
   // attribution.correlation. Treat the server-written narrow projection as the persistence trust
   // marker, and make the kill switch restore the exact legacy read shape without rewriting data.
-  const correlation = correlationCaptureRollout().trustedCorrelation !== 'off' &&
+  const correlation =
+    correlationCaptureRollout().trustedCorrelation !== "off" &&
     parsedCorrelation &&
     str(r.correlationMethod) === parsedCorrelation.method &&
-    str(r.invocationId) === (parsedCorrelation.invocationId ?? '') &&
-    str(r.toolCallId) === (parsedCorrelation.toolCallId ?? '') &&
-    str(r.processInstanceKey) === (parsedCorrelation.processInstanceId ?? '') &&
-    Math.abs(num(r.correlationConfidence) - parsedCorrelation.confidence) <= 0.000_01
-    ? parsedCorrelation
-    : undefined;
+    str(r.invocationId) === (parsedCorrelation.invocationId ?? "") &&
+    str(r.toolCallId) === (parsedCorrelation.toolCallId ?? "") &&
+    str(r.processInstanceKey) === (parsedCorrelation.processInstanceId ?? "") &&
+    Math.abs(num(r.correlationConfidence) - parsedCorrelation.confidence) <=
+      0.000_01
+      ? parsedCorrelation
+      : undefined;
   const attribution = !rawAttribution
     ? undefined
     : correlation
       ? { ...rawAttribution, correlation }
-      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) => legacyAttribution)(rawAttribution);
+      : (({ correlation: _invalidCorrelation, ...legacyAttribution }) =>
+          legacyAttribution)(rawAttribution);
   const invocationId = correlation?.invocationId;
   const toolCallId = correlation?.toolCallId;
   const classificationSemantics = visibleClassificationSemantics(
     parseObject(r.classificationSemantics),
   );
   const captureEpoch = str(r.captureEpoch);
-  const hasCaptureDecision = captureEpoch !== '' && captureEpoch !== '0';
+  const hasCaptureDecision = captureEpoch !== "" && captureEpoch !== "0";
   return {
-    schemaVersion: (str(r.schemaVersion) || 'anysentry.agent_event.v1') as JudgedEvent['schemaVersion'],
+    schemaVersion: (str(r.schemaVersion) ||
+      "anysentry.agent_event.v1") as JudgedEvent["schemaVersion"],
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
     sourceEventId: str(r.sourceEventId) || undefined,
     at,
     eventAtUnixNs: str(r.eventAtUnixNs) || undefined,
     receivedAtUnixNs: str(r.receivedAtUnixNs) || undefined,
     receivedAt: num(r.receivedAt) || undefined,
-    eventTimeQuality: (str(r.eventTimeQuality) || 'api_received') as JudgedEvent['eventTimeQuality'],
+    eventTimeQuality: (str(r.eventTimeQuality) ||
+      "api_received") as JudgedEvent["eventTimeQuality"],
     captureEpoch: hasCaptureDecision ? captureEpoch : undefined,
-    captureProfileCode: hasCaptureDecision ? num(r.captureProfileCode) : undefined,
-    captureActionCode: hasCaptureDecision ? num(r.captureActionCode) : undefined,
-    captureAuthorityCode: hasCaptureDecision ? num(r.captureAuthorityCode) : undefined,
-    captureDispositionCode: hasCaptureDecision ? num(r.captureDispositionCode) : undefined,
-    captureSelected: hasCaptureDecision ? num(r.captureSelected) > 0 : undefined,
+    captureProfileCode: hasCaptureDecision
+      ? num(r.captureProfileCode)
+      : undefined,
+    captureActionCode: hasCaptureDecision
+      ? num(r.captureActionCode)
+      : undefined,
+    captureAuthorityCode: hasCaptureDecision
+      ? num(r.captureAuthorityCode)
+      : undefined,
+    captureDispositionCode: hasCaptureDecision
+      ? num(r.captureDispositionCode)
+      : undefined,
+    captureSelected: hasCaptureDecision
+      ? num(r.captureSelected) > 0
+      : undefined,
     captureFlags: hasCaptureDecision ? num(r.captureFlags) : undefined,
     capturePolicyVersion: num(r.capturePolicyVersion) || undefined,
     eventKind,
-    eventCategory: (str(r.eventCategory) || 'unknown') as JudgedEvent['eventCategory'],
+    eventCategory: (str(r.eventCategory) ||
+      "unknown") as JudgedEvent["eventCategory"],
     activityContext: activity.activityContext,
     activitySubtype: activity.activitySubtype,
-    source: (str(r.source) || 'observer') as JudgedEvent['source'],
+    source: (str(r.source) || "observer") as JudgedEvent["source"],
     subject: str(r.subject),
     workspacePath: str(r.workspacePath),
     agentId,
     subjectAssetId: str(r.subjectAssetId) || undefined,
-    subjectAssetType: str(r.subjectAssetType) as JudgedEvent['subjectAssetType'] || undefined,
-    assetBindingQuality: str(r.assetBindingQuality) as JudgedEvent['assetBindingQuality'] || undefined,
+    subjectAssetType:
+      (str(r.subjectAssetType) as JudgedEvent["subjectAssetType"]) || undefined,
+    assetBindingQuality:
+      (str(r.assetBindingQuality) as JudgedEvent["assetBindingQuality"]) ||
+      undefined,
     assetBindingRevision: num(r.assetBindingRevision) || undefined,
     assetBindingReason: str(r.assetBindingReason) || undefined,
     identityRevision: num(r.identityRevision) || undefined,
@@ -1910,22 +2153,23 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     spanId: str(r.spanId) || `sp_${at}_${eventKind}`,
     parentSpanId: str(r.parentSpanId) || undefined,
     runId: str(r.runId) || `legacy-run_${at}_${eventKind}`,
-    runIdSource: runIdSource ?? (str(r.runId) ? 'legacy' : 'legacy'),
+    runIdSource: runIdSource ?? (str(r.runId) ? "legacy" : "legacy"),
     taskId: str(r.taskId) || undefined,
-    decisionStatus: (str(r.decisionStatus) || 'succeeded') as JudgedEvent['decisionStatus'],
+    decisionStatus: (str(r.decisionStatus) ||
+      "succeeded") as JudgedEvent["decisionStatus"],
     evaluationId: str(r.evaluationId) || undefined,
     policyVersion: str(r.policyVersion) || undefined,
     decisionRevision: Math.max(1, num(r.decisionRevision) || 1),
     decisionUpdatedAt: num(r.decisionUpdatedAt) || at,
-    verdict: r.verdict as JudgedEvent['verdict'],
-    tier: r.tier as JudgedEvent['tier'],
-    severity: r.severity as JudgedEvent['severity'],
+    verdict: r.verdict as JudgedEvent["verdict"],
+    tier: r.tier as JudgedEvent["tier"],
+    severity: r.severity as JudgedEvent["severity"],
     reason: str(r.reason),
     actionKind: (r.actionKind as string) || undefined,
     actionTarget: (r.actionTarget as string) || undefined,
     riskCategory: str(r.riskCategory),
     riskName: str(r.riskName),
-    riskType: r.riskType as JudgedEvent['riskType'],
+    riskType: r.riskType as JudgedEvent["riskType"],
     riskScore: num(r.riskScore),
     tokenCount: num(r.tokenCount),
     latencyMs: num(r.latencyMs),
@@ -1933,7 +2177,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     ...(classificationSemantics ? { classificationSemantics } : {}),
     process: visibleProcessContext(parseObject<ProcessContext>(r.process)),
     attribution,
-    judgment: parseObject<NonNullable<JudgedEvent['judgment']>>(r.judgment),
+    judgment: parseObject<NonNullable<JudgedEvent["judgment"]>>(r.judgment),
     rawPreview: str(r.rawPreview) || undefined,
   };
 }
@@ -1945,24 +2189,36 @@ function storedToolEvidenceItem(
   evidenceVersion: string,
   updatedAt: number,
 ): ToolEvidenceItem | undefined {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    return undefined;
   const item = payload as Partial<ToolEvidenceItem>;
-  if (item.invocationId !== invocationId || item.toolCallId !== toolCallId) return undefined;
-  if (typeof item.toolName !== 'string' || item.toolName.length > 120) return undefined;
-  if (!['linked', 'semantic_only', 'ambiguous'].includes(item.status ?? '')) return undefined;
-  if (![
-    'exact_process_and_resource',
-    'exact_child_and_command',
-    'overlapping_exact_claims',
-    'kernel_read_not_captured',
-    'no_matching_kernel_evidence',
-  ].includes(item.reason ?? '')) return undefined;
-  if (!Array.isArray(item.adapterEventIds) || item.adapterEventIds.length > 2_000) return undefined;
-  if (!Array.isArray(item.kernelEvidence) || item.kernelEvidence.length > 256) return undefined;
+  if (item.invocationId !== invocationId || item.toolCallId !== toolCallId)
+    return undefined;
+  if (typeof item.toolName !== "string" || item.toolName.length > 120)
+    return undefined;
+  if (!["linked", "semantic_only", "ambiguous"].includes(item.status ?? ""))
+    return undefined;
+  if (
+    ![
+      "exact_process_and_resource",
+      "exact_child_and_command",
+      "overlapping_exact_claims",
+      "kernel_read_not_captured",
+      "no_matching_kernel_evidence",
+    ].includes(item.reason ?? "")
+  )
+    return undefined;
+  if (
+    !Array.isArray(item.adapterEventIds) ||
+    item.adapterEventIds.length > 2_000
+  )
+    return undefined;
+  if (!Array.isArray(item.kernelEvidence) || item.kernelEvidence.length > 256)
+    return undefined;
   return {
     ...(item as ToolEvidenceItem),
     relation: {
-      schemaVersion: 'anysentry.tool_evidence_relation.v1',
+      schemaVersion: "anysentry.tool_evidence_relation.v1",
       relationVersion: TOOL_EVIDENCE_RELATION_VERSION,
       evidenceVersion,
       updatedAt,
@@ -1973,7 +2229,11 @@ function storedToolEvidenceItem(
 export class ClickHouseStore {
   private client?: ClickHouseClient;
   private buf: QueuedEventRow[] = [];
-  private collectorHeartbeatBuf: Array<{ collectorId: string; at: number; payload: string }> = [];
+  private collectorHeartbeatBuf: Array<{
+    collectorId: string;
+    at: number;
+    payload: string;
+  }> = [];
   private bufferedEventBytes = 0;
   // Includes unsealed rows plus sealed/active batches. Keeping the active batch in these totals
   // prevents a slow HTTP request from becoming hidden memory outside the advertised buffer bound.
@@ -1987,6 +2247,8 @@ export class ClickHouseStore {
   // running. A durable cross-restart conflict registry belongs to the later outbox phase.
   private eventRevisionDigests = new Map<string, string>();
   private committedEventRevisionDigests = new Map<string, string>();
+  // Avoid repeating ClickHouse identity scans for hot event keys across WAL batches.
+  private readonly acceptedRevisionFingerprintCache = new Map<string, string>();
   private eventWriteDrainInFlight?: Promise<void>;
   private eventWriteRetryWakeTimer?: NodeJS.Timeout;
   private eventWriteRetrySleep?: { timer: NodeJS.Timeout; wake: () => void };
@@ -2024,7 +2286,10 @@ export class ClickHouseStore {
   // Until an explicit, durable full-backfill marker exists, no journal-derived/local maximum may
   // be exposed as a global read split: doing so could hide persisted rows above a partial boundary.
   private committedBoundaryComplete = false;
-  private readonly committedSourceProgress = new Map<string, CommittedSourceProgress>();
+  private readonly committedSourceProgress = new Map<
+    string,
+    CommittedSourceProgress
+  >();
   private earliestCommitCursorCache?: {
     expiresAt: number;
     value: Promise<EventCommitCursor | null>;
@@ -2050,7 +2315,7 @@ export class ClickHouseStore {
   private eventWriteRetryDelayMs = (failedAttempt: number): number => {
     const exponential = Math.min(
       EVENT_WRITE_BACKOFF_MAX_MS,
-      EVENT_WRITE_BACKOFF_BASE_MS * (2 ** Math.max(0, failedAttempt - 1)),
+      EVENT_WRITE_BACKOFF_BASE_MS * 2 ** Math.max(0, failedAttempt - 1),
     );
     return Math.max(1, Math.round(exponential * (0.8 + Math.random() * 0.4)));
   };
@@ -2090,14 +2355,14 @@ export class ClickHouseStore {
 
   dashboardBucketSnapshotStatus() {
     return {
-      schemaVersion: 'anysentry.dashboard-bucket-snapshots.v1' as const,
-      enabled: process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off',
+      schemaVersion: "anysentry.dashboard-bucket-snapshots.v1" as const,
+      enabled: process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== "off",
       ...this.dashboardSnapshotStats,
     };
   }
 
   private eventMicrobatchEnabled(): boolean {
-    return process.env.ANYSENTRY_CLICKHOUSE_MICROBATCH === 'on';
+    return process.env.ANYSENTRY_CLICKHOUSE_MICROBATCH === "on";
   }
 
   private eventBatchMaxRows(): number {
@@ -2131,10 +2396,10 @@ export class ClickHouseStore {
     const head = this.eventWriteBatches[0];
     const receiptHead = this.immediateWriteQueue[0];
     return {
-      schemaVersion: 'anysentry.event-write-batch.v1' as const,
+      schemaVersion: "anysentry.event-write-batch.v1" as const,
       enabled: this.eventMicrobatchEnabled(),
       revisionImmutabilityEnforced:
-        process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce',
+        process.env.ANYSENTRY_REVISION_IMMUTABILITY === "enforce",
       maxRows: this.eventBatchMaxRows(),
       maxDelayMs: this.eventBatchMaxDelayMs(),
       maxBytes: this.eventBatchMaxBytes(),
@@ -2144,18 +2409,24 @@ export class ClickHouseStore {
       queuedBytes: this.eventWriteBytes + this.immediateWriteQueueBytes,
       bufferedRows: this.buf.length,
       sealedBatches: this.eventWriteBatches.length,
-      pendingReceipts: [...this.immediateWriteEventTimes.values()]
-        .reduce((sum, count) => sum + count, 0),
-      oldestQueuedMs: head || receiptHead
-        ? Math.max(
-            0,
-            this.eventWriteNow() - Math.min(
-              head?.createdAt ?? Number.POSITIVE_INFINITY,
-              receiptHead?.queuedAt ?? Number.POSITIVE_INFINITY,
-            ),
-          )
-        : 0,
-      inFlight: Boolean(this.eventWriteDrainInFlight || this.immediateWriteInFlight),
+      pendingReceipts: [...this.immediateWriteEventTimes.values()].reduce(
+        (sum, count) => sum + count,
+        0,
+      ),
+      oldestQueuedMs:
+        head || receiptHead
+          ? Math.max(
+              0,
+              this.eventWriteNow() -
+                Math.min(
+                  head?.createdAt ?? Number.POSITIVE_INFINITY,
+                  receiptHead?.queuedAt ?? Number.POSITIVE_INFINITY,
+                ),
+            )
+          : 0,
+      inFlight: Boolean(
+        this.eventWriteDrainInFlight || this.immediateWriteInFlight,
+      ),
       retrying: Boolean(head?.lastError),
       permanentError: this.eventWritePermanentError?.message,
       ...this.eventWriteReceiptStats,
@@ -2186,7 +2457,7 @@ export class ClickHouseStore {
       250,
       30_000,
     );
-    let errorMessage = 'unknown error';
+    let errorMessage = "unknown error";
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const result = await this.connect();
       if (result.ok) return true;
@@ -2206,11 +2477,11 @@ export class ClickHouseStore {
   }
 
   private connect(): Promise<{ ok: boolean; error: string }> {
-    if (this.ready) return Promise.resolve({ ok: true, error: '' });
+    if (this.ready) return Promise.resolve({ ok: true, error: "" });
     if (this.connectInFlight) {
       return this.connectInFlight.then((ok) => ({
         ok,
-        error: ok ? '' : 'connection attempt failed',
+        error: ok ? "" : "connection attempt failed",
       }));
     }
     const operation = this.connectOnce();
@@ -2222,16 +2493,25 @@ export class ClickHouseStore {
 
   private async connectOnce(): Promise<{ ok: boolean; error: string }> {
     const url = process.env.CLICKHOUSE_URL;
-    if (!url || this.closed) return { ok: false, error: 'ClickHouse is not configured or store is closed' };
-    const database = process.env.CLICKHOUSE_DB || 'anysentry';
+    if (!url || this.closed)
+      return {
+        ok: false,
+        error: "ClickHouse is not configured or store is closed",
+      };
+    const database = process.env.CLICKHOUSE_DB || "anysentry";
     const credentials = {
-      username: process.env.CLICKHOUSE_USER || 'default',
-      password: process.env.CLICKHOUSE_PASSWORD || '',
+      username: process.env.CLICKHOUSE_USER || "default",
+      password: process.env.CLICKHOUSE_PASSWORD || "",
     };
     let nextClient: ClickHouseClient | undefined;
     try {
-      const bootstrap = await sharedClickHouseBootstrap({ url, database, ...credentials });
-      if (this.closed) throw new Error('ClickHouse store closed during bootstrap');
+      const bootstrap = await sharedClickHouseBootstrap({
+        url,
+        database,
+        ...credentials,
+      });
+      if (this.closed)
+        throw new Error("ClickHouse store closed during bootstrap");
 
       // Schema/progress state is shared, while every store keeps its own client, buffers, retry
       // lane, and shutdown lifecycle.
@@ -2239,7 +2519,7 @@ export class ClickHouseStore {
       const ping = await nextClient.ping({ select: true });
       if (!ping.success) throw ping.error;
       for (const entry of bootstrap.committedSourceProgress) {
-        const key = `${entry.sourceId ?? ''}\0${entry.collectorId ?? ''}`;
+        const key = `${entry.sourceId ?? ""}\0${entry.collectorId ?? ""}`;
         const previous = this.committedSourceProgress.get(key);
         this.committedSourceProgress.set(key, {
           sourceId: entry.sourceId,
@@ -2248,7 +2528,10 @@ export class ClickHouseStore {
             previous?.committedEventTimeMs ?? 0,
             entry.committedEventTimeMs,
           ),
-          committedAtMs: Math.max(previous?.committedAtMs ?? 0, entry.committedAtMs),
+          committedAtMs: Math.max(
+            previous?.committedAtMs ?? 0,
+            entry.committedAtMs,
+          ),
         });
       }
       await this.client?.close().catch(() => undefined);
@@ -2262,8 +2545,8 @@ export class ClickHouseStore {
       if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
       this.ready = true;
-      console.info('[clickhouse] connection ready');
-      return { ok: true, error: '' };
+      console.info("[clickhouse] connection ready");
+      return { ok: true, error: "" };
     } catch (error) {
       this.ready = false;
       await nextClient?.close().catch(() => undefined);
@@ -2275,7 +2558,13 @@ export class ClickHouseStore {
   }
 
   private scheduleReconnect(): void {
-    if (this.closed || this.ready || this.reconnectTimer || !process.env.CLICKHOUSE_URL) return;
+    if (
+      this.closed ||
+      this.ready ||
+      this.reconnectTimer ||
+      !process.env.CLICKHOUSE_URL
+    )
+      return;
     const reconnectMs = boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_RECONNECT_MS,
       15_000,
@@ -2286,10 +2575,12 @@ export class ClickHouseStore {
       this.reconnectTimer = undefined;
       void this.connect().then((result) => {
         if (result.ok) {
-          console.info('[clickhouse] background reconnect succeeded');
+          console.info("[clickhouse] background reconnect succeeded");
           return;
         }
-        console.warn(`[clickhouse] background reconnect failed; retrying in ${reconnectMs}ms: ${result.error}`);
+        console.warn(
+          `[clickhouse] background reconnect failed; retrying in ${reconnectMs}ms: ${result.error}`,
+        );
         this.scheduleReconnect();
       });
     }, reconnectMs);
@@ -2297,7 +2588,7 @@ export class ClickHouseStore {
 
   /** Buffer one event; flush opportunistically when the batch is large. */
   enqueue(e: JudgedEvent): void {
-    if (this.closing) throw new Error('ClickHouse event writer is closing');
+    if (this.closing) throw new Error("ClickHouse event writer is closing");
     if (!this.ready) return;
     if (this.eventWritePermanentError) throw this.eventWritePermanentError;
     const queued = this.queuedEventRow(toRow(e));
@@ -2328,10 +2619,10 @@ export class ClickHouseStore {
    */
   async insertNowWithReceipt(e: JudgedEvent): Promise<EventBatchReceipt> {
     if (!this.client || !this.ready || this.closed || this.closing) {
-      throw new Error('ClickHouse is not ready');
+      throw new Error("ClickHouse is not ready");
     }
     const row = toRow(e);
-    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    const bytes = Buffer.byteLength(JSON.stringify(row), "utf8") + 1;
     const maxQueuedRows = boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_MAX_QUEUED_ROWS,
       20_000,
@@ -2345,13 +2636,13 @@ export class ClickHouseStore {
       1024 * 1024 * 1024,
     );
     if (
-      this.immediateWriteQueue.length >= maxQueuedRows
-      || this.immediateWriteQueueBytes + bytes > maxQueuedBytes
+      this.immediateWriteQueue.length >= maxQueuedRows ||
+      this.immediateWriteQueueBytes + bytes > maxQueuedBytes
     ) {
       this.eventWriteReceiptStats.backpressureRejects += 1;
       throw new Error(
-        `ClickHouse event queue is full (${this.immediateWriteQueue.length} rows, `
-        + `${this.immediateWriteQueueBytes} bytes)`,
+        `ClickHouse event queue is full (${this.immediateWriteQueue.length} rows, ` +
+          `${this.immediateWriteQueueBytes} bytes)`,
       );
     }
     this.immediateWriteEventTimes.set(
@@ -2369,8 +2660,8 @@ export class ClickHouseStore {
       });
       this.immediateWriteQueueBytes += bytes;
       if (
-        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
-        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows() ||
+        this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
       ) {
         void this.drainImmediateWrites();
         return;
@@ -2381,11 +2672,12 @@ export class ClickHouseStore {
 
   private scheduleImmediateWriteDrain(): void {
     if (
-      this.immediateWriteTimer
-      || this.immediateWriteInFlight
-      || !this.immediateWriteQueue.length
-      || this.closing
-    ) return;
+      this.immediateWriteTimer ||
+      this.immediateWriteInFlight ||
+      !this.immediateWriteQueue.length ||
+      this.closing
+    )
+      return;
     const oldest = this.immediateWriteQueue[0]?.queuedAt ?? Date.now();
     const waitMs = Math.max(
       0,
@@ -2405,12 +2697,13 @@ export class ClickHouseStore {
 
     let tracked!: Promise<void>;
     tracked = this.flushImmediateWrites().finally(() => {
-      if (this.immediateWriteInFlight === tracked) this.immediateWriteInFlight = undefined;
+      if (this.immediateWriteInFlight === tracked)
+        this.immediateWriteInFlight = undefined;
       if (this.closing && this.immediateWriteQueue.length) {
         void this.drainImmediateWrites();
       } else if (
-        this.immediateWriteQueue.length >= this.eventBatchMaxRows()
-        || this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
+        this.immediateWriteQueue.length >= this.eventBatchMaxRows() ||
+        this.immediateWriteQueueBytes >= this.eventBatchMaxBytes()
       ) {
         void this.drainImmediateWrites();
       } else {
@@ -2425,6 +2718,15 @@ export class ClickHouseStore {
     logicalKeys: string[],
   ): Promise<Map<string, string>> {
     if (!this.client || this.closed || !logicalKeys.length) return new Map();
+    const uniqueKeys = [...new Set(logicalKeys)].filter(Boolean);
+    const found = new Map<string, string>();
+    const missing: string[] = [];
+    for (const key of uniqueKeys) {
+      const cached = this.acceptedRevisionFingerprintCache.get(key);
+      if (cached) found.set(key, cached);
+      else missing.push(key);
+    }
+    if (!missing.length) return found;
     const result = await this.client.query({
       query: `
         SELECT
@@ -2433,23 +2735,32 @@ export class ClickHouseStore {
         FROM ${EVENT_REVISION_IDENTITY_TABLE}
         WHERE eventLogicalKey IN {logicalKeys:Array(String)}
         GROUP BY eventLogicalKey`,
-      query_params: { logicalKeys: [...new Set(logicalKeys)] },
+      query_params: { logicalKeys: missing },
       clickhouse_settings: {
         max_threads: 1,
         max_memory_usage: String(32 * 1024 * 1024),
         max_execution_time: 5,
       },
-      format: 'JSONEachRow',
+      format: "JSONEachRow",
     });
-    const rows = await result.json() as Array<{
+    const rows = (await result.json()) as Array<{
       eventLogicalKey?: string;
       acceptedFingerprint?: string;
     }>;
-    return new Map(rows.flatMap((entry) => {
+    for (const entry of rows) {
       const key = entry.eventLogicalKey?.trim();
       const fingerprint = entry.acceptedFingerprint?.trim();
-      return key && fingerprint ? [[key, fingerprint] as const] : [];
-    }));
+      if (key && fingerprint) {
+        found.set(key, fingerprint);
+        this.acceptedRevisionFingerprintCache.set(key, fingerprint);
+      }
+    }
+    while (this.acceptedRevisionFingerprintCache.size > 8192) {
+      const oldest = this.acceptedRevisionFingerprintCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.acceptedRevisionFingerprintCache.delete(oldest);
+    }
+    return found;
   }
 
   private async flushImmediateWrites(): Promise<void> {
@@ -2470,7 +2781,7 @@ export class ClickHouseStore {
     }
 
     const enforceRevisionImmutability =
-      process.env.ANYSENTRY_REVISION_IMMUTABILITY === 'enforce';
+      process.env.ANYSENTRY_REVISION_IMMUTABILITY === "enforce";
     let existingFingerprints = new Map<string, string>();
     if (enforceRevisionImmutability) {
       try {
@@ -2498,10 +2809,17 @@ export class ClickHouseStore {
         physicalEntries.push(entry);
         continue;
       }
-      const existingFingerprint = existingFingerprints.get(entry.row.eventLogicalKey);
+      const existingFingerprint = existingFingerprints.get(
+        entry.row.eventLogicalKey,
+      );
       if (existingFingerprint) {
-        if (existingFingerprint === entry.row.payloadFingerprint) factEntries.push(entry);
-        else conflictEntries.push({ entry, acceptedFingerprint: existingFingerprint });
+        if (existingFingerprint === entry.row.payloadFingerprint)
+          factEntries.push(entry);
+        else
+          conflictEntries.push({
+            entry,
+            acceptedFingerprint: existingFingerprint,
+          });
         continue;
       }
       const first = firstByLogicalKey.get(entry.row.eventLogicalKey);
@@ -2509,7 +2827,9 @@ export class ClickHouseStore {
         firstByLogicalKey.set(entry.row.eventLogicalKey, entry);
         factEntries.push(entry);
         physicalEntries.push(entry);
-      } else if (first.row.payloadFingerprint === entry.row.payloadFingerprint) {
+      } else if (
+        first.row.payloadFingerprint === entry.row.payloadFingerprint
+      ) {
         factEntries.push(entry);
       } else {
         conflictEntries.push({
@@ -2533,7 +2853,8 @@ export class ClickHouseStore {
     while (attempts < maxAttempts) {
       attempts += 1;
       try {
-        if (!this.client || this.closed) throw new Error('ClickHouse is not ready');
+        if (!this.client || this.closed)
+          throw new Error("ClickHouse is not ready");
         if (conflictEntries.length) {
           await this.client.insert({
             table: EVENT_REVISION_CONFLICT_TABLE,
@@ -2551,19 +2872,33 @@ export class ClickHouseStore {
               observedAt: Date.now(),
               payloadPreview: JSON.stringify(entry.row).slice(0, 64 * 1024),
             })),
-            format: 'JSONEachRow',
+            format: "JSONEachRow",
           });
         }
         if (rows.length) {
           await this.client.insert({
             table: TABLE,
             values: rows,
-            format: 'JSONEachRow',
+            format: "JSONEachRow",
             clickhouse_settings: {
               insert_deduplicate: 1,
               insert_deduplication_token: `receipt-${batchId}`,
             },
           });
+          // Successful immutable writes seed the bounded process-local side lane. This avoids
+          // revisiting event_revision_identities for later replay checks in the same process; the
+          // indexed ClickHouse lookup remains the restart/eviction fallback when `enforce` is on.
+          for (const entry of physicalEntries) {
+            this.acceptedRevisionFingerprintCache.set(
+              entry.row.eventLogicalKey,
+              entry.row.payloadFingerprint,
+            );
+          }
+          while (this.acceptedRevisionFingerprintCache.size > 8192) {
+            const oldest = this.acceptedRevisionFingerprintCache.keys().next().value;
+            if (oldest === undefined) break;
+            this.acceptedRevisionFingerprintCache.delete(oldest);
+          }
         }
         const durableAt = Date.now();
         if (rows.length) {
@@ -2581,15 +2916,15 @@ export class ClickHouseStore {
           ? {
               committedAtMs: durableAt,
               commitBatchId: batchId,
-              eventId: rows.at(-1)?.eventId ?? '',
+              eventId: rows.at(-1)?.eventId ?? "",
               decisionRevision: rows.at(-1)?.decisionRevision ?? 0,
             }
           : undefined;
         for (const entry of factEntries) {
           entry.resolve({
-            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            schemaVersion: "anysentry.event-batch-receipt.v1",
             batchId,
-            result: 'durable_fact',
+            result: "durable_fact",
             rowCount: rows.length,
             byteCount: batchBytes,
             queuedAt: entry.queuedAt,
@@ -2601,9 +2936,9 @@ export class ClickHouseStore {
         }
         for (const { entry, acceptedFingerprint } of conflictEntries) {
           entry.resolve({
-            schemaVersion: 'anysentry.event-batch-receipt.v1',
+            schemaVersion: "anysentry.event-batch-receipt.v1",
             batchId,
-            result: 'durable_dlq',
+            result: "durable_dlq",
             rowCount: 0,
             byteCount: entry.bytes,
             queuedAt: entry.queuedAt,
@@ -2631,7 +2966,9 @@ export class ClickHouseStore {
           10_000,
         );
         const waitMs = Math.min(5_000, baseMs * 2 ** (attempts - 1));
-        await delay(waitMs + Math.floor(Math.random() * Math.max(1, waitMs / 4)));
+        await delay(
+          waitMs + Math.floor(Math.random() * Math.max(1, waitMs / 4)),
+        );
       }
     }
     if (finalError !== undefined) {
@@ -2643,7 +2980,8 @@ export class ClickHouseStore {
 
   private finishImmediateWriteAccounting(batch: ImmediateWrite[]): void {
     for (const entry of batch) {
-      const remainingAtTime = (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
+      const remainingAtTime =
+        (this.immediateWriteEventTimes.get(entry.eventAt) ?? 1) - 1;
       if (remainingAtTime > 0) {
         this.immediateWriteEventTimes.set(entry.eventAt, remainingAtTime);
       } else {
@@ -2652,12 +2990,16 @@ export class ClickHouseStore {
     }
   }
 
-  async eventById(eventId: string, eventAt?: number): Promise<JudgedEvent | undefined> {
+  async eventById(
+    eventId: string,
+    eventAt?: number,
+  ): Promise<JudgedEvent | undefined> {
     const normalized = eventId.trim();
     if (!normalized) return undefined;
-    const boundedAt = Number.isSafeInteger(eventAt) && Number(eventAt) >= 0
-      ? Number(eventAt)
-      : undefined;
+    const boundedAt =
+      Number.isSafeInteger(eventAt) && Number(eventAt) >= 0
+        ? Number(eventAt)
+        : undefined;
     return (await this.eventsByIds([normalized], boundedAt, boundedAt))[0];
   }
 
@@ -2666,9 +3008,12 @@ export class ClickHouseStore {
    * table is populated by a forward-only materialized view, so this point read is safe during a
    * rolling migration: old facts simply return null and the caller can use its bounded fallback.
    */
-  async loadKernelFactLocator(kernelFactId: string): Promise<KernelFactLocator | null> {
+  async loadKernelFactLocator(
+    kernelFactId: string,
+  ): Promise<KernelFactLocator | null> {
     const normalized = kernelFactId.trim();
-    if (!this.client || !this.ready || !/^kf_[a-f0-9]{24}$/u.test(normalized)) return null;
+    if (!this.client || !this.ready || !/^kf_[a-f0-9]{24}$/u.test(normalized))
+      return null;
     try {
       const result = await this.client.query({
         query: `
@@ -2679,21 +3024,22 @@ export class ClickHouseStore {
           LIMIT 1`,
         query_params: { kernelFactId: normalized },
         clickhouse_settings: BOUNDED_KERNEL_FACT_LOCATOR_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const row = (await result.json() as Array<Record<string, unknown>>)[0];
-      const rowKernelFactId = String(row?.kernelFactId ?? '').trim();
-      const eventId = String(row?.eventId ?? '').trim();
+      const row = ((await result.json()) as Array<Record<string, unknown>>)[0];
+      const rowKernelFactId = String(row?.kernelFactId ?? "").trim();
+      const eventId = String(row?.eventId ?? "").trim();
       const at = Number(row?.at);
       const decisionRevision = Number(row?.decisionRevision);
       if (
-        rowKernelFactId !== normalized
-        || !eventId
-        || !Number.isSafeInteger(at)
-        || at < 0
-        || !Number.isSafeInteger(decisionRevision)
-        || decisionRevision < 1
-      ) return null;
+        rowKernelFactId !== normalized ||
+        !eventId ||
+        !Number.isSafeInteger(at) ||
+        at < 0 ||
+        !Number.isSafeInteger(decisionRevision) ||
+        decisionRevision < 1
+      )
+        return null;
       return {
         kernelFactId: rowKernelFactId,
         eventId,
@@ -2703,7 +3049,10 @@ export class ClickHouseStore {
     } catch (error) {
       // A missing table during a rolling upgrade is an expected compatibility state. Keep the
       // event-scan fallback available and avoid turning a locator read failure into ingest loss.
-      console.warn('[clickhouse] kernel fact locator query unavailable:', (error as Error).message);
+      console.warn(
+        "[clickhouse] kernel fact locator query unavailable:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -2715,30 +3064,51 @@ export class ClickHouseStore {
   async classifyDurableReplayEvents(
     events: readonly JudgedEvent[],
   ): Promise<DurableReplayEventStatus[] | null> {
-    if (!this.client || !this.ready || this.closing || this.eventWritePermanentError) return null;
+    if (
+      !this.client ||
+      !this.ready ||
+      this.closing ||
+      this.eventWritePermanentError
+    )
+      return null;
+    // Revision history verification is intentionally deploy-time selectable. Stability and
+    // canary profiles set immutability to `off`; in that mode the in-memory event index plus the
+    // ClickHouse insert deduplication token already make an exact Forwarder retry safe. Avoid
+    // scanning the multi-billion-row identity table on every replay batch. Formal acceptance can
+    // restore `enforce`, which uses the bounded cache and the indexed identity lookup below.
+    if (process.env.ANYSENTRY_REVISION_IMMUTABILITY !== "enforce") {
+      return events.map(() => "new");
+    }
     const incomingRows = events.map(toRow);
     const existing = await this.existingRevisionFingerprints(
       incomingRows.map((row) => row.eventLogicalKey),
     );
     return incomingRows.map((row) => {
       const existingFingerprint = existing.get(row.eventLogicalKey);
-      if (!existingFingerprint) return 'new';
+      if (!existingFingerprint) return "new";
       // New writers bind the exact authenticated Forwarder body into a namespaced fingerprint.
       // Old rows predate that field; their durable logical key plus the hot-cache comparison in
       // SentryJudge is the bounded migration proof. Never run a wide events-table scan in ingest.
-      if (existingFingerprint.startsWith('observer-source:')) {
-        if (existingFingerprint === row.payloadFingerprint) return 'duplicate';
+      if (existingFingerprint.startsWith("observer-source:")) {
+        if (existingFingerprint === row.payloadFingerprint) return "duplicate";
         // Before the privacy-safe digest migration, Observer rows stored the raw JSON digest in
         // the same source-payload attribute.  A replay of such a row carries a transient legacy
         // digest computed from the exact WAL body.  Compare it here, without persisting the
         // legacy value, so an unchanged fact is acknowledged instead of being dead-lettered while
         // a genuinely changed payload still fails closed as a revision conflict.
-        const legacyDigest = String(row.__legacyObserverSourcePayloadDigest ?? '').trim().toLowerCase();
-        if (SHA256_HEX.test(legacyDigest)
-          && existingFingerprint === `observer-source:${legacyDigest}`) return 'duplicate';
-        return 'conflict';
+        const legacyDigest = String(
+          row.__legacyObserverSourcePayloadDigest ?? "",
+        )
+          .trim()
+          .toLowerCase();
+        if (
+          SHA256_HEX.test(legacyDigest) &&
+          existingFingerprint === `observer-source:${legacyDigest}`
+        )
+          return "duplicate";
+        return "conflict";
       }
-      return 'duplicate';
+      return "duplicate";
     });
   }
 
@@ -2749,9 +3119,13 @@ export class ClickHouseStore {
    * joins an in-flight write or reuses the same ClickHouse deduplication token. Callers must not
    * mutate a batch while retaining its key.
    */
-  async insertManyNow(events: readonly JudgedEvent[], idempotencyKey?: string): Promise<void> {
+  async insertManyNow(
+    events: readonly JudgedEvent[],
+    idempotencyKey?: string,
+  ): Promise<void> {
     if (events.length === 0) return;
-    if (!this.client || !this.ready || this.closing) throw new Error('ClickHouse is not ready');
+    if (!this.client || !this.ready || this.closing)
+      throw new Error("ClickHouse is not ready");
     if (this.eventWritePermanentError) throw this.eventWritePermanentError;
     let queued = events.map((event) => this.queuedEventRow(toRow(event)));
     this.assertEventRevisionConsistency(queued.map(({ row }) => row));
@@ -2762,7 +3136,10 @@ export class ClickHouseStore {
     }
     queued = [...uniqueRevisions.values()];
     const requestedBytes = queued.reduce((sum, row) => sum + row.bytes, 0);
-    if (queued.length > EVENT_WRITE_BATCH_ROWS || requestedBytes > EVENT_WRITE_BATCH_BYTES) {
+    if (
+      queued.length > EVENT_WRITE_BATCH_ROWS ||
+      requestedBytes > EVENT_WRITE_BATCH_BYTES
+    ) {
       throw Object.assign(
         new Error(
           `ClickHouse direct event batch exceeds ${EVENT_WRITE_BATCH_ROWS} rows or ${EVENT_WRITE_BATCH_BYTES} bytes`,
@@ -2782,7 +3159,8 @@ export class ClickHouseStore {
     this.sealBufferedEventBatches(true);
     const pendingByRevision = new Map<string, EventWriteBatch>();
     for (const batch of this.eventWriteBatches) {
-      for (const row of batch.rows) pendingByRevision.set(this.eventRevisionKey(row), batch);
+      for (const row of batch.rows)
+        pendingByRevision.set(this.eventRevisionKey(row), batch);
     }
     const joinedBatches = new Set<EventWriteBatch>();
     queued = queued.filter(({ row }) => {
@@ -2794,9 +3172,12 @@ export class ClickHouseStore {
       joinedBatches.add(pending);
       return false;
     });
-    const completions = [...joinedBatches].map((batch) => (
-      new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }))
-    ));
+    const completions = [...joinedBatches].map(
+      (batch) =>
+        new Promise<void>((resolve, reject) =>
+          batch.waiters.push({ resolve, reject }),
+        ),
+    );
     if (queued.length === 0) {
       this.startEventWriteDrain();
       await Promise.all(completions);
@@ -2804,15 +3185,20 @@ export class ClickHouseStore {
     }
 
     const bytes = queued.reduce((sum, row) => sum + row.bytes, 0);
-    const token = this.directEventWriteToken(queued.map(({ row }) => row), idempotencyKey);
+    const token = this.directEventWriteToken(
+      queued.map(({ row }) => row),
+      idempotencyKey,
+    );
     this.assertEventWriteBatchCapacity(queued.length, bytes);
-    const batch = this.createEventWriteBatch(queued, token, 'direct');
+    const batch = this.createEventWriteBatch(queued, token, "direct");
     this.rememberEventRevisionDigests(batch.rows);
     this.eventWriteRows += queued.length;
     this.eventWriteBytes += bytes;
     this.eventWriteBatches.push(batch);
     this.eventWriteBatchesByToken.set(token, batch);
-    const completion = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }));
+    const completion = new Promise<void>((resolve, reject) =>
+      batch.waiters.push({ resolve, reject }),
+    );
     completions.push(completion);
     this.startEventWriteDrain();
     await Promise.all(completions);
@@ -2846,22 +3232,30 @@ export class ClickHouseStore {
       await client.insert({
         table: COLLECTOR_HEARTBEAT_TABLE,
         values: heartbeatValues,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
     } catch (error) {
-      this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
-      console.error('[clickhouse] collector heartbeat insert failed (batch queued for retry):', (error as Error).message);
+      this.collectorHeartbeatBuf = [
+        ...heartbeatValues,
+        ...this.collectorHeartbeatBuf,
+      ];
+      console.error(
+        "[clickhouse] collector heartbeat insert failed (batch queued for retry):",
+        (error as Error).message,
+      );
     }
   }
 
   private queuedEventRow(row: Row): QueuedEventRow {
-    const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+    const bytes = Buffer.byteLength(JSON.stringify(row), "utf8") + 1;
     if (bytes > EVENT_WRITE_BATCH_BYTES) {
       const error = Object.assign(
-        new Error(`ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`),
-        { code: 'ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE' },
+        new Error(
+          `ClickHouse event row is ${bytes} bytes, above the ${EVENT_WRITE_BATCH_BYTES}-byte insert bound`,
+        ),
+        { code: "ANYSENTRY_CLICKHOUSE_EVENT_ROW_TOO_LARGE" },
       );
-      console.error('[clickhouse] event write rejected:', {
+      console.error("[clickhouse] event write rejected:", {
         code: error.code,
         eventId: row.eventId,
         bytes,
@@ -2876,21 +3270,30 @@ export class ClickHouseStore {
     this.assertEventWriteBatchCapacity(1, additionalBytes);
   }
 
-  private assertEventWriteBatchCapacity(additionalRows: number, additionalBytes: number): void {
+  private assertEventWriteBatchCapacity(
+    additionalRows: number,
+    additionalBytes: number,
+  ): void {
     if (
       this.eventWriteRows + additionalRows <= EVENT_WRITE_MAX_BUFFERED_ROWS &&
       this.eventWriteBytes + additionalBytes <= EVENT_WRITE_MAX_BUFFERED_BYTES
-    ) return;
+    )
+      return;
     const error = Object.assign(
-      new Error('ClickHouse event write buffer is full; retry the ingest request'),
+      new Error(
+        "ClickHouse event write buffer is full; retry the ingest request",
+      ),
       // Capacity is checked before the row joins any batch or enters an HTTP request. Callers may
       // expose this exact failure as retryable only while they can still prove no earlier stage
       // accepted the event.
-      { code: 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL', retrySafe: true as const },
+      {
+        code: "ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL",
+        retrySafe: true as const,
+      },
     );
     // enqueue() intentionally remains synchronous for the existing judge path. Throwing is the
     // only available backpressure signal; silently dropping here would falsely claim durability.
-    console.error('[clickhouse] event write buffer capacity reached:', {
+    console.error("[clickhouse] event write buffer capacity reached:", {
       code: error.code,
       rows: this.eventWriteRows,
       bytes: this.eventWriteBytes,
@@ -2903,9 +3306,12 @@ export class ClickHouseStore {
   private createEventWriteBatch(
     queued: QueuedEventRow[],
     token: string,
-    source: EventWriteBatch['source'],
+    source: EventWriteBatch["source"],
   ): EventWriteBatch {
-    const rows = prepareCommitBatch(queued.map(({ row }) => row), token);
+    const rows = prepareCommitBatch(
+      queued.map(({ row }) => row),
+      token,
+    );
     return {
       rows,
       bytes: queued.reduce((sum, row) => sum + row.bytes, 0),
@@ -2926,7 +3332,9 @@ export class ClickHouseStore {
     let sealed = false;
     while (
       this.buf.length > 0 &&
-      (forceTail || this.buf.length >= EVENT_WRITE_BATCH_ROWS || this.bufferedEventBytes >= EVENT_WRITE_BATCH_BYTES)
+      (forceTail ||
+        this.buf.length >= EVENT_WRITE_BATCH_ROWS ||
+        this.bufferedEventBytes >= EVENT_WRITE_BATCH_BYTES)
     ) {
       let count = 0;
       let bytes = 0;
@@ -2940,7 +3348,7 @@ export class ClickHouseStore {
       const queued = this.buf.splice(0, count);
       this.bufferedEventBytes = Math.max(0, this.bufferedEventBytes - bytes);
       const token = `events-${randomUUID()}`;
-      const batch = this.createEventWriteBatch(queued, token, 'buffered');
+      const batch = this.createEventWriteBatch(queued, token, "buffered");
       this.eventWriteBatches.push(batch);
       this.eventWriteBatchesByToken.set(token, batch);
       sealed = true;
@@ -2976,10 +3384,10 @@ export class ClickHouseStore {
     delete stableRevision.correlationMethod;
     delete stableRevision.correlationConfidence;
     delete stableRevision.classificationSemantics;
-    const process = String(stableRevision.process ?? '');
+    const process = String(stableRevision.process ?? "");
     try {
       const parsed = JSON.parse(process) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         delete parsed.lifecycleSource;
         delete parsed.lifecycleReason;
         stableRevision.process = JSON.stringify(parsed);
@@ -2987,10 +3395,15 @@ export class ClickHouseStore {
     } catch {
       // Preserve malformed legacy payloads byte-for-byte in the token.
     }
-    const attribution = String(stableRevision.attribution ?? '');
+    const attribution = String(stableRevision.attribution ?? "");
     try {
       const parsed = JSON.parse(attribution) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'correlation' in parsed) {
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        "correlation" in parsed
+      ) {
         delete parsed.correlation;
         // Reassigning an existing property does not change its insertion order.
         stableRevision.attribution = JSON.stringify(parsed);
@@ -3007,17 +3420,23 @@ export class ClickHouseStore {
 
   private eventRevisionSourcePayloadDigest(row: Row): string {
     try {
-      const attributes = JSON.parse(String(row.attributes ?? '{}')) as Record<string, unknown>;
-      const digest = String(attributes?.[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? '').trim();
-      return SHA256_HEX.test(digest) ? digest : '';
+      const attributes = JSON.parse(String(row.attributes ?? "{}")) as Record<
+        string,
+        unknown
+      >;
+      const digest = String(
+        attributes?.[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? "",
+      ).trim();
+      return SHA256_HEX.test(digest) ? digest : "";
     } catch {
-      return '';
+      return "";
     }
   }
 
   private eventRevisionDigest(row: Row, preferSourcePayload = true): string {
     const sourcePayloadDigest = this.eventRevisionSourcePayloadDigest(row);
-    if (preferSourcePayload && sourcePayloadDigest) return `observer-source:${sourcePayloadDigest}`;
+    if (preferSourcePayload && sourcePayloadDigest)
+      return `observer-source:${sourcePayloadDigest}`;
     // Receipt timestamps and generated span ids may legitimately change when an old observer client
     // retries a sourceEventId. They do not change the semantic revision. Every decision/evidence
     // field remains covered so a real revision conflict is still rejected.
@@ -3052,20 +3471,20 @@ export class ClickHouseStore {
       attribution,
       ...semanticRevision
     } = row;
-    const attributes = String(semanticRevision.attributes ?? '');
+    const attributes = String(semanticRevision.attributes ?? "");
     try {
       const parsed = JSON.parse(attributes) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         delete parsed[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE];
         semanticRevision.attributes = JSON.stringify(parsed);
       }
     } catch {
       // Preserve malformed legacy payloads byte-for-byte in the digest.
     }
-    const process = String(semanticRevision.process ?? '');
+    const process = String(semanticRevision.process ?? "");
     try {
       const parsed = JSON.parse(process) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         delete parsed.lifecycleSource;
         delete parsed.lifecycleReason;
         // Reassigning preserves the legacy Row property order used by rolling versions.
@@ -3081,16 +3500,18 @@ export class ClickHouseStore {
     let stableAttribution = attribution;
     try {
       const parsed = JSON.parse(attribution) as Record<string, unknown>;
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         delete parsed.correlation;
         stableAttribution = JSON.stringify(parsed);
       }
     } catch {
       // Preserve malformed legacy payloads byte-for-byte in the digest.
     }
-    return createHash('sha256')
-      .update(JSON.stringify({ ...semanticRevision, attribution: stableAttribution }))
-      .digest('hex');
+    return createHash("sha256")
+      .update(
+        JSON.stringify({ ...semanticRevision, attribution: stableAttribution }),
+      )
+      .digest("hex");
   }
 
   private assertEventRevisionConsistency(rows: readonly Row[]): void {
@@ -3101,7 +3522,9 @@ export class ClickHouseStore {
       const existing = pending.get(key) ?? this.eventRevisionDigests.get(key);
       if (existing && existing !== digest) {
         throw Object.assign(
-          new Error(`event revision conflict for ${row.eventId} revision ${row.decisionRevision}`),
+          new Error(
+            `event revision conflict for ${row.eventId} revision ${row.decisionRevision}`,
+          ),
           {
             code: EVENT_REVISION_CONFLICT,
             eventId: row.eventId,
@@ -3116,11 +3539,13 @@ export class ClickHouseStore {
   private rememberEventRevisionDigests(rows: readonly Row[]): void {
     for (const row of rows) {
       const key = this.eventRevisionKey(row);
-      if (this.eventRevisionDigests.has(key)) this.eventRevisionDigests.delete(key);
+      if (this.eventRevisionDigests.has(key))
+        this.eventRevisionDigests.delete(key);
       this.eventRevisionDigests.set(key, this.eventRevisionDigest(row));
     }
     while (this.eventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
-      const oldest = this.eventRevisionDigests.keys().next().value as string | undefined;
+      const oldest = this.eventRevisionDigests.keys().next().value as
+        string | undefined;
       if (oldest === undefined) break;
       this.eventRevisionDigests.delete(oldest);
     }
@@ -3129,26 +3554,36 @@ export class ClickHouseStore {
   private rememberCommittedEventRevisionDigests(rows: readonly Row[]): void {
     for (const row of rows) {
       const key = this.eventRevisionKey(row);
-      if (this.committedEventRevisionDigests.has(key)) this.committedEventRevisionDigests.delete(key);
-      this.committedEventRevisionDigests.set(key, this.eventRevisionDigest(row));
+      if (this.committedEventRevisionDigests.has(key))
+        this.committedEventRevisionDigests.delete(key);
+      this.committedEventRevisionDigests.set(
+        key,
+        this.eventRevisionDigest(row),
+      );
     }
-    while (this.committedEventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE) {
-      const oldest = this.committedEventRevisionDigests.keys().next().value as string | undefined;
+    while (
+      this.committedEventRevisionDigests.size > EVENT_REVISION_DIGEST_CACHE_SIZE
+    ) {
+      const oldest = this.committedEventRevisionDigests.keys().next().value as
+        string | undefined;
       if (oldest === undefined) break;
       this.committedEventRevisionDigests.delete(oldest);
     }
   }
 
-  private directEventWriteToken(rows: readonly Row[], idempotencyKey?: string): string {
-    const hash = createHash('sha256');
-    if (idempotencyKey) hash.update('upstream\0').update(idempotencyKey);
+  private directEventWriteToken(
+    rows: readonly Row[],
+    idempotencyKey?: string,
+  ): string {
+    const hash = createHash("sha256");
+    if (idempotencyKey) hash.update("upstream\0").update(idempotencyKey);
     else {
-      hash.update('revisions\0');
+      hash.update("revisions\0");
       for (const row of rows) {
-        hash.update(JSON.stringify(this.stableEventRevision(row))).update('\n');
+        hash.update(JSON.stringify(this.stableEventRevision(row))).update("\n");
       }
     }
-    return `event-${hash.digest('hex')}`;
+    return `event-${hash.digest("hex")}`;
   }
 
   private startEventWriteDrain(): void {
@@ -3168,14 +3603,11 @@ export class ClickHouseStore {
       const head = this.eventWriteBatches[0];
       const now = this.eventWriteNow();
       const mayRestart = this.closing
-        ? this.eventWriteClosingDeadline !== undefined && now < this.eventWriteClosingDeadline
+        ? this.eventWriteClosingDeadline !== undefined &&
+          now < this.eventWriteClosingDeadline
         : Boolean(head && head.retryNotBefore <= now);
-      if (
-        head &&
-        this.client &&
-        !this.eventWritePermanentError &&
-        mayRestart
-      ) this.startEventWriteDrain();
+      if (head && this.client && !this.eventWritePermanentError && mayRestart)
+        this.startEventWriteDrain();
     });
     this.eventWriteDrainInFlight = tracked;
     return tracked;
@@ -3188,10 +3620,13 @@ export class ClickHouseStore {
       const now = this.eventWriteNow();
       if (!this.closing && batch.retryNotBefore > now) {
         this.scheduleEventWriteRetry(batch.retryNotBefore);
-        throw batch.lastError ?? new Error('ClickHouse event batch is waiting for its retry cooldown');
+        throw (
+          batch.lastError ??
+          new Error("ClickHouse event batch is waiting for its retry cooldown")
+        );
       }
       const outcome = await this.insertEventWriteBatch(batch);
-      if (outcome.status === 'success') {
+      if (outcome.status === "success") {
         this.committedThroughMs = Math.max(
           this.committedThroughMs ?? 0,
           ...batch.rows.map((row) => Number(row.at) || 0),
@@ -3200,24 +3635,31 @@ export class ClickHouseStore {
         this.rememberCommittedEventRevisionDigests(batch.rows);
         this.eventWriteBatches.shift();
         this.eventWriteBatchesByToken.delete(batch.token);
-        this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
+        this.eventWriteRows = Math.max(
+          0,
+          this.eventWriteRows - batch.rows.length,
+        );
         this.eventWriteBytes = Math.max(0, this.eventWriteBytes - batch.bytes);
         for (const waiter of batch.waiters.splice(0)) waiter.resolve();
         continue;
       }
 
       batch.lastError = outcome.error;
-      if (outcome.status === 'permanent') {
+      if (outcome.status === "permanent") {
         this.eventWritePermanentError = outcome.error;
-        for (const waiter of batch.waiters.splice(0)) waiter.reject(outcome.error);
-        console.error('[clickhouse] event insert permanently blocked; batch retained:', {
-          token: batch.token,
-          rows: batch.rows.length,
-          bytes: batch.bytes,
-          code: outcome.decision.code,
-          ambiguous: outcome.decision.ambiguous,
-          message: outcome.error.message,
-        });
+        for (const waiter of batch.waiters.splice(0))
+          waiter.reject(outcome.error);
+        console.error(
+          "[clickhouse] event insert permanently blocked; batch retained:",
+          {
+            token: batch.token,
+            rows: batch.rows.length,
+            bytes: batch.bytes,
+            code: outcome.decision.code,
+            ambiguous: outcome.decision.ambiguous,
+            message: outcome.error.message,
+          },
+        );
         throw outcome.error;
       }
 
@@ -3225,47 +3667,63 @@ export class ClickHouseStore {
       // waiters at the head, then retry after a cooldown rather than spinning. Rejecting a waiter
       // here while retaining and later applying the batch would let its caller advance lifecycle
       // work under the false belief that this revision was never persisted.
-      batch.retryNotBefore = this.closing ? 0 : this.eventWriteNow() + EVENT_WRITE_RETRY_COOLDOWN_MS;
+      batch.retryNotBefore = this.closing
+        ? 0
+        : this.eventWriteNow() + EVENT_WRITE_RETRY_COOLDOWN_MS;
       if (!this.closing) this.scheduleEventWriteRetry(batch.retryNotBefore);
-      console.error('[clickhouse] event insert retry deadline reached; batch retained:', {
-        token: batch.token,
-        rows: batch.rows.length,
-        bytes: batch.bytes,
-        code: outcome.decision.code,
-        ambiguous: outcome.decision.ambiguous,
-        message: outcome.error.message,
-      });
+      console.error(
+        "[clickhouse] event insert retry deadline reached; batch retained:",
+        {
+          token: batch.token,
+          rows: batch.rows.length,
+          bytes: batch.bytes,
+          code: outcome.decision.code,
+          ambiguous: outcome.decision.ambiguous,
+          message: outcome.error.message,
+        },
+      );
       throw outcome.error;
     }
   }
 
-  private async insertEventWriteBatch(batch: EventWriteBatch): Promise<
-    | { status: 'success' }
-    | { status: 'retry_later'; error: Error; decision: EventWriteErrorDecision }
-    | { status: 'permanent'; error: Error; decision: EventWriteErrorDecision }
+  private async insertEventWriteBatch(
+    batch: EventWriteBatch,
+  ): Promise<
+    | { status: "success" }
+    | { status: "retry_later"; error: Error; decision: EventWriteErrorDecision }
+    | { status: "permanent"; error: Error; decision: EventWriteErrorDecision }
   > {
     const cycleDeadline = this.eventWriteNow() + this.eventWriteRetryDeadlineMs;
-    const activeDeadline = (): number => Math.min(
-      cycleDeadline,
-      this.eventWriteClosingDeadline ?? Number.POSITIVE_INFINITY,
-    );
+    const activeDeadline = (): number =>
+      Math.min(
+        cycleDeadline,
+        this.eventWriteClosingDeadline ?? Number.POSITIVE_INFINITY,
+      );
     let failedAttempts = 0;
-    let lastError = new Error('ClickHouse event insert retry deadline reached');
-    let lastDecision: EventWriteErrorDecision = { retryable: true, ambiguous: true, code: 'DEADLINE' };
+    let lastError = new Error("ClickHouse event insert retry deadline reached");
+    let lastDecision: EventWriteErrorDecision = {
+      retryable: true,
+      ambiguous: true,
+      code: "DEADLINE",
+    };
 
     while (this.eventWriteNow() < activeDeadline()) {
       try {
         await this.insertEventWriteAttempt(batch, activeDeadline());
-        return { status: 'success' };
+        return { status: "success" };
       } catch (error) {
         lastError = this.asEventWriteError(error);
         lastDecision = this.classifyEventWriteError(lastError);
         if (!lastDecision.retryable) {
-          return { status: 'permanent', error: lastError, decision: lastDecision };
+          return {
+            status: "permanent",
+            error: lastError,
+            decision: lastDecision,
+          };
         }
         failedAttempts += 1;
         const delayMs = this.eventWriteRetryDelayMs(failedAttempts);
-        console.error('[clickhouse] event insert retrying:', {
+        console.error("[clickhouse] event insert retrying:", {
           token: batch.token,
           attempt: failedAttempts,
           delayMs,
@@ -3277,35 +3735,43 @@ export class ClickHouseStore {
         await this.sleepBeforeEventWriteRetry(delayMs);
       }
     }
-    return { status: 'retry_later', error: lastError, decision: lastDecision };
+    return { status: "retry_later", error: lastError, decision: lastDecision };
   }
 
-  private async insertEventWriteAttempt(batch: EventWriteBatch, cycleDeadline: number): Promise<void> {
+  private async insertEventWriteAttempt(
+    batch: EventWriteBatch,
+    cycleDeadline: number,
+  ): Promise<void> {
     const client = this.client;
-    if (!client) throw new Error('ClickHouse client is unavailable');
+    if (!client) throw new Error("ClickHouse client is unavailable");
     const controller = new AbortController();
     this.eventWriteAbortController = controller;
     let attemptTimedOut = false;
     const remainingMs = Math.max(1, cycleDeadline - this.eventWriteNow());
-    const timer = setTimeout(() => {
-      attemptTimedOut = true;
-      controller.abort('ClickHouse event insert attempt timed out');
-    }, Math.min(this.eventWriteAttemptTimeoutMs, remainingMs));
+    const timer = setTimeout(
+      () => {
+        attemptTimedOut = true;
+        controller.abort("ClickHouse event insert attempt timed out");
+      },
+      Math.min(this.eventWriteAttemptTimeoutMs, remainingMs),
+    );
     try {
       await client.insert({
         table: TABLE,
         values: batch.rows,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
         clickhouse_settings: batch.settings,
         abort_signal: controller.signal,
       });
     } catch (error) {
       const normalized = this.asEventWriteError(error);
-      if (attemptTimedOut) Object.assign(normalized, { eventWriteAttemptTimedOut: true });
+      if (attemptTimedOut)
+        Object.assign(normalized, { eventWriteAttemptTimedOut: true });
       throw normalized;
     } finally {
       clearTimeout(timer);
-      if (this.eventWriteAbortController === controller) this.eventWriteAbortController = undefined;
+      if (this.eventWriteAbortController === controller)
+        this.eventWriteAbortController = undefined;
     }
   }
 
@@ -3321,53 +3787,77 @@ export class ClickHouseStore {
       statusCode?: string | number;
       eventWriteAttemptTimedOut?: boolean;
     };
-    const code = detail.code == null ? '' : String(detail.code);
-    const type = detail.type ?? '';
-    if (detail.eventWriteAttemptTimedOut) return { retryable: true, ambiguous: true, code: 'ATTEMPT_TIMEOUT' };
+    const code = detail.code == null ? "" : String(detail.code);
+    const type = detail.type ?? "";
+    if (detail.eventWriteAttemptTimedOut)
+      return { retryable: true, ambiguous: true, code: "ATTEMPT_TIMEOUT" };
 
     const status = Number(detail.status ?? detail.statusCode);
     const retryableHttpStatuses = new Set([408, 425, 429, 502, 503, 504]);
     if (retryableHttpStatuses.has(status)) {
       // A 408 may be returned after an upstream accepted bytes; the remaining explicit gateway/
       // overload responses are known unsuccessful responses rather than ambiguous applications.
-      return { retryable: true, ambiguous: status === 408, code: `HTTP_${status}` };
+      return {
+        retryable: true,
+        ambiguous: status === 408,
+        code: `HTTP_${status}`,
+      };
     }
 
     const transientServerTypes = new Set([
-      'MEMORY_LIMIT_EXCEEDED',
-      'TOO_MANY_SIMULTANEOUS_QUERIES',
-      'TOO_MANY_PARTS',
+      "MEMORY_LIMIT_EXCEEDED",
+      "TOO_MANY_SIMULTANEOUS_QUERIES",
+      "TOO_MANY_PARTS",
     ]);
-    if (code === '241' || transientServerTypes.has(type)) {
+    if (code === "241" || transientServerTypes.has(type)) {
       return { retryable: true, ambiguous: false, code: type || code };
     }
     const ambiguousServerTypes = new Set([
-      'TIMEOUT_EXCEEDED',
-      'NETWORK_ERROR',
-      'SOCKET_TIMEOUT',
-      'UNKNOWN_STATUS_OF_INSERT',
+      "TIMEOUT_EXCEEDED",
+      "NETWORK_ERROR",
+      "SOCKET_TIMEOUT",
+      "UNKNOWN_STATUS_OF_INSERT",
     ]);
-    if (ambiguousServerTypes.has(type)) return { retryable: true, ambiguous: true, code: type };
+    if (ambiguousServerTypes.has(type))
+      return { retryable: true, ambiguous: true, code: type };
 
     const transportCodes = new Set([
-      'ECONNREFUSED',
-      'ENOTFOUND',
-      'EHOSTUNREACH',
-      'ENETUNREACH',
-      'EAI_AGAIN',
-      'ECONNRESET',
-      'EPIPE',
-      'ETIMEDOUT',
-      'UND_ERR_CONNECT_TIMEOUT',
+      "ECONNREFUSED",
+      "ENOTFOUND",
+      "EHOSTUNREACH",
+      "ENETUNREACH",
+      "EAI_AGAIN",
+      "ECONNRESET",
+      "EPIPE",
+      "ETIMEDOUT",
+      "UND_ERR_CONNECT_TIMEOUT",
     ]);
     if (transportCodes.has(code)) {
-      const definitelyBeforeApply = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
-      return { retryable: true, ambiguous: !definitelyBeforeApply.has(code), code };
+      const definitelyBeforeApply = new Set([
+        "ECONNREFUSED",
+        "ENOTFOUND",
+        "EHOSTUNREACH",
+        "ENETUNREACH",
+        "EAI_AGAIN",
+      ]);
+      return {
+        retryable: true,
+        ambiguous: !definitelyBeforeApply.has(code),
+        code,
+      };
     }
     if (/timeout error|socket hang up|aborted a request/i.test(error.message)) {
-      return { retryable: true, ambiguous: true, code: code || 'TRANSPORT_TIMEOUT' };
+      return {
+        retryable: true,
+        ambiguous: true,
+        code: code || "TRANSPORT_TIMEOUT",
+      };
     }
-    return { retryable: false, ambiguous: false, code: type || code || 'PERMANENT_OR_UNKNOWN' };
+    return {
+      retryable: false,
+      ambiguous: false,
+      code: type || code || "PERMANENT_OR_UNKNOWN",
+    };
   }
 
   private sleepBeforeEventWriteRetry(milliseconds: number): Promise<void> {
@@ -3379,7 +3869,8 @@ export class ClickHouseStore {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (this.eventWriteRetrySleep?.wake === wake) this.eventWriteRetrySleep = undefined;
+        if (this.eventWriteRetrySleep?.wake === wake)
+          this.eventWriteRetrySleep = undefined;
         resolve();
       };
       timer = setTimeout(wake, milliseconds);
@@ -3393,7 +3884,8 @@ export class ClickHouseStore {
 
   private scheduleEventWriteRetry(at: number): void {
     if (this.closing || this.eventWritePermanentError) return;
-    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    if (this.eventWriteRetryWakeTimer)
+      clearTimeout(this.eventWriteRetryWakeTimer);
     const delayMs = Math.max(0, at - this.eventWriteNow());
     this.eventWriteRetryWakeTimer = setTimeout(() => {
       this.eventWriteRetryWakeTimer = undefined;
@@ -3413,20 +3905,28 @@ export class ClickHouseStore {
     if (this.collectorHeartbeatBuf.length >= 100) void this.flush();
   }
 
-  async queryCollectorHeartbeats(sinceMs: number, untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+  async queryCollectorHeartbeats(
+    sinceMs: number,
+    untilMs: number,
+  ): Promise<CollectorHeartbeatRecord[] | null> {
     if (!this.client || !this.ready) return null;
     try {
       const result = await this.client.query({
         query: `
-          SELECT argMax(payload, at) AS payload
+          /* Heartbeats are already append-only rows keyed by (collectorId, at).
+             Re-aggregating the full JSON payload with argMax/group-by makes a wide
+             last_30d health read consume the entire ClickHouse query budget.  Read
+             the bounded operational window directly instead; health callers only
+             need the recent heartbeat stream and latest heads. */
+          SELECT payload
           FROM ${COLLECTOR_HEARTBEAT_TABLE}
           WHERE at >= {since:UInt64} AND at <= {until:UInt64}
-          GROUP BY collectorId, at
-          ORDER BY at`,
+          ORDER BY at
+          LIMIT 100000`,
         query_params: { since: sinceMs, until: untilMs },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<{ payload: string }>;
+      const rows = (await result.json()) as Array<{ payload: string }>;
       return rows.flatMap((row) => {
         try {
           return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
@@ -3435,24 +3935,36 @@ export class ClickHouseStore {
         }
       });
     } catch (error) {
-      console.error('[clickhouse] collector heartbeat query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] collector heartbeat query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
 
-  async latestCollectorHeartbeats(untilMs: number): Promise<CollectorHeartbeatRecord[] | null> {
+  async latestCollectorHeartbeats(
+    untilMs: number,
+  ): Promise<CollectorHeartbeatRecord[] | null> {
     if (!this.client || !this.ready) return null;
     try {
+      const configuredLookback = Number(
+        process.env.ANYSENTRY_COLLECTOR_HEARTBEAT_LOOKBACK_MS ?? "86400000",
+      );
+      const lookbackMs = Number.isFinite(configuredLookback)
+        ? Math.max(10 * 60_000, Math.min(7 * 24 * 60 * 60_000, configuredLookback))
+        : 24 * 60 * 60_000;
+      const minAt = Math.max(0, untilMs - lookbackMs);
       const result = await this.client.query({
         query: `
           SELECT argMax(payload, at) AS payload
           FROM ${COLLECTOR_HEARTBEAT_TABLE}
-          WHERE at <= {until:UInt64}
+          PREWHERE at >= {minAt:UInt64} AND at <= {until:UInt64}
           GROUP BY collectorId`,
-        query_params: { until: untilMs },
-        format: 'JSONEachRow',
+        query_params: { minAt, until: untilMs },
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<{ payload: string }>;
+      const rows = (await result.json()) as Array<{ payload: string }>;
       return rows.flatMap((row) => {
         try {
           return [JSON.parse(row.payload) as CollectorHeartbeatRecord];
@@ -3461,7 +3973,10 @@ export class ClickHouseStore {
         }
       });
     } catch (error) {
-      console.error('[clickhouse] latest collector heartbeat query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] latest collector heartbeat query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -3469,7 +3984,10 @@ export class ClickHouseStore {
   /** Load the most-recent `limit` events at/after `sinceMs`, oldest-first (to seed the hot ring). */
 
   async hydrate(sinceMs: number, limit: number): Promise<JudgedEvent[]> {
-    const safeLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(limit)));
+    const safeLimit = Math.max(
+      1,
+      Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(limit)),
+    );
     // Reuse the durable search's narrow locator sort and late materialization. The former
     // SELECT-* Top-N hydration path could exhaust 640 MiB merely reading `attributes` from a busy
     // 30-day part, leaving the API healthy but its hot cache empty after every restart.
@@ -3478,7 +3996,9 @@ export class ClickHouseStore {
       untilMs: Date.now(),
       limit: safeLimit,
     });
-    return (events ?? []).sort((left, right) => left.at - right.at).slice(-safeLimit);
+    return (events ?? [])
+      .sort((left, right) => left.at - right.at)
+      .slice(-safeLimit);
   }
 
   /** Read the latest persisted events from a bounded interval for dashboard timelines. */
@@ -3492,8 +4012,14 @@ export class ClickHouseStore {
     const client = this.client;
     const safeLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
     const monitoredOnly = Boolean(options.monitoredOnly);
-    const tier = options.tier ?? '';
-    const queryKey = JSON.stringify([String(sinceMs), String(untilMs), safeLimit, monitoredOnly, tier]);
+    const tier = options.tier ?? "";
+    const queryKey = JSON.stringify([
+      String(sinceMs),
+      String(untilMs),
+      safeLimit,
+      monitoredOnly,
+      tier,
+    ]);
     const current = this.recentQueryInFlight;
     if (current) {
       if (current.key !== queryKey) return null;
@@ -3505,28 +4031,44 @@ export class ClickHouseStore {
     // Attribution is copied unchanged into every judgment revision, so monitored can safely narrow
     // the primary-key sample. Tier changes across L1/L2/L3 and must be filtered only after the
     // latest revision is selected.
-    const scanFilters = monitoredOnly ? ["JSONExtractBool(attribution, 'monitored')"] : [];
-    const latestFilters = tier ? ['tier = {tier:String}'] : [];
+    const scanFilters = monitoredOnly
+      ? ["JSONExtractBool(attribution, 'monitored')"]
+      : [];
+    const latestFilters = tier ? ["tier = {tier:String}"] : [];
     const value = (async (): Promise<JudgedEvent[] | null> => {
       try {
         const rs = await client.query({
+          // Keep the dashboard read late-materialized.  The previous nested SELECT * made every
+          // refresh read the wide process/attributes/rawPreview columns before LIMIT 1 BY, which
+          // turned a small recent window into multi-megabyte scans on a busy file probe.  Resolve
+          // bounded physical locators from the narrow revision index first, then fetch payloads
+          // only for the selected latest event revisions.
           query: `
-          SELECT *
-          FROM (
-            SELECT *
-            FROM (
-              SELECT *
-              FROM ${TABLE}
-              PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
-              ${scanFilters.length ? `WHERE ${scanFilters.join(' AND ')}` : ''}
-              ORDER BY at DESC
-              LIMIT {scanLimit:UInt32} WITH TIES
+          SELECT e.*
+          FROM ${TABLE} AS e
+          PREWHERE
+            e.at >= {since:UInt64} AND e.at <= {until:UInt64}
+            AND tuple(e.at, e._part, e._part_offset) IN (
+              SELECT at, selectedPart, selectedPartOffset
+              FROM (
+                SELECT *
+                FROM (
+                  SELECT eventId, at, decisionUpdatedAt,
+                    _part AS selectedPart, _part_offset AS selectedPartOffset
+                  FROM ${TABLE}
+                  PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
+                  ${scanFilters.length ? `WHERE ${scanFilters.join(" AND ")}` : ""}
+                  ORDER BY at DESC
+                  LIMIT {scanLimit:UInt32} WITH TIES
+                )
+                ORDER BY at DESC, decisionUpdatedAt DESC
+                LIMIT 1 BY eventId
+              )
+              ${latestFilters.length ? `WHERE ${latestFilters.join(" AND ")}` : ""}
+              ORDER BY at DESC, decisionUpdatedAt DESC
+              LIMIT {limit:UInt32}
             )
-            ORDER BY at DESC, decisionUpdatedAt DESC
-            LIMIT 1 BY eventId
-          )
-          ${latestFilters.length ? `WHERE ${latestFilters.join(' AND ')}` : ''}
-          ORDER BY at DESC, decisionUpdatedAt DESC
+          ORDER BY e.at DESC, e.decisionUpdatedAt DESC
           LIMIT {limit:UInt32}`,
           query_params: {
             since: sinceMs,
@@ -3536,11 +4078,16 @@ export class ClickHouseStore {
             limit: safeLimit,
           },
           clickhouse_settings: BOUNDED_RECENT_READ_SETTINGS,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        return (await rs.json() as Array<Record<string, unknown>>).map(fromRow);
+        return ((await rs.json()) as Array<Record<string, unknown>>).map(
+          fromRow,
+        );
       } catch (error) {
-        console.error('[clickhouse] recent dashboard events query failed:', (error as Error).message);
+        console.error(
+          "[clickhouse] recent dashboard events query failed:",
+          (error as Error).message,
+        );
         return null;
       }
     })();
@@ -3549,7 +4096,8 @@ export class ClickHouseStore {
       const rows = await value;
       return rows ? [...rows] : null;
     } finally {
-      if (this.recentQueryInFlight?.value === value) this.recentQueryInFlight = undefined;
+      if (this.recentQueryInFlight?.value === value)
+        this.recentQueryInFlight = undefined;
       release();
     }
   }
@@ -3585,35 +4133,38 @@ export class ClickHouseStore {
           replayFrom,
           limit: safeLimit + 1,
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
       const hasMore = rows.length > safeLimit;
       const selected = hasMore ? rows.slice(0, safeLimit) : rows;
       const changes = selected.map<EventCommitChange>((row) => ({
         cursor: {
           committedAtMs: Number(row.committedAt) || 0,
-          commitBatchId: String(row.commitBatchId ?? ''),
-          eventId: String(row.eventId ?? ''),
+          commitBatchId: String(row.commitBatchId ?? ""),
+          eventId: String(row.eventId ?? ""),
           decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
         },
         eventAtMs: Number(row.eventAt) || 0,
-        sourceId: String(row.sourceId ?? '').trim() || undefined,
-        collectorId: String(row.collectorId ?? '').trim() || undefined,
+        sourceId: String(row.sourceId ?? "").trim() || undefined,
+        collectorId: String(row.collectorId ?? "").trim() || undefined,
       }));
       const selectedCursor = changes.at(-1)?.cursor;
-      const cursor = selectedCursor && (
-        !after || compareEventCommitCursor(selectedCursor, after) >= 0
-      )
-        ? selectedCursor
-        : after;
+      const cursor =
+        selectedCursor &&
+        (!after || compareEventCommitCursor(selectedCursor, after) >= 0)
+          ? selectedCursor
+          : after;
       return {
         changes,
         cursor,
         hasMore,
       };
     } catch (error) {
-      console.error('[clickhouse] event commit journal query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] event commit journal query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -3627,18 +4178,21 @@ export class ClickHouseStore {
           FROM ${EVENT_COMMIT_FACT_TABLE}
           ORDER BY committedAt DESC, commitBatchId DESC, eventId DESC, decisionRevision DESC
           LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const row = (await result.json() as Array<Record<string, unknown>>)[0];
-      if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
+      const row = ((await result.json()) as Array<Record<string, unknown>>)[0];
+      if (!row) return { committedAtMs: 0, eventId: "", decisionRevision: 0 };
       return {
         committedAtMs: Number(row.committedAt) || 0,
-        commitBatchId: String(row.commitBatchId ?? ''),
-        eventId: String(row.eventId ?? ''),
+        commitBatchId: String(row.commitBatchId ?? ""),
+        eventId: String(row.eventId ?? ""),
         decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
       };
     } catch (error) {
-      console.error('[clickhouse] latest event commit cursor query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] latest event commit cursor query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -3677,18 +4231,21 @@ export class ClickHouseStore {
           FROM ${EVENT_COMMIT_FACT_TABLE}
           ORDER BY committedAt, commitBatchId, eventId, decisionRevision
           LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const row = (await result.json() as Array<Record<string, unknown>>)[0];
-      if (!row) return { committedAtMs: 0, eventId: '', decisionRevision: 0 };
+      const row = ((await result.json()) as Array<Record<string, unknown>>)[0];
+      if (!row) return { committedAtMs: 0, eventId: "", decisionRevision: 0 };
       return {
         committedAtMs: Number(row.committedAt) || 0,
-        commitBatchId: String(row.commitBatchId ?? ''),
-        eventId: String(row.eventId ?? ''),
+        commitBatchId: String(row.commitBatchId ?? ""),
+        eventId: String(row.eventId ?? ""),
         decisionRevision: Math.max(1, Number(row.decisionRevision) || 1),
       };
     } catch (error) {
-      console.error('[clickhouse] earliest event commit cursor query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] earliest event commit cursor query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -3698,7 +4255,10 @@ export class ClickHouseStore {
    * short (the Dashboard uses one absolute bucket), and the latest decision revision is selected before the
    * result is merged with the in-process hot ring.
    */
-  async dashboardTailEvents(startMs: number, endMs: number): Promise<JudgedEvent[] | null> {
+  async dashboardTailEvents(
+    startMs: number,
+    endMs: number,
+  ): Promise<JudgedEvent[] | null> {
     if (!this.client || !this.ready) return null;
     if (endMs < startMs) return [];
     try {
@@ -3730,11 +4290,16 @@ export class ClickHouseStore {
           end: Math.max(0, Math.trunc(endMs)),
         },
         clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      return (await result.json() as Array<Record<string, unknown>>).map(fromRow);
+      return ((await result.json()) as Array<Record<string, unknown>>).map(
+        fromRow,
+      );
     } catch (error) {
-      console.error('[clickhouse] dashboard tail query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] dashboard tail query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -3750,7 +4315,7 @@ export class ClickHouseStore {
     const start = Math.max(0, Math.trunc(startMs));
     const end = Math.max(0, Math.trunc(endExclusiveMs));
     const canPersist =
-      process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== 'off' &&
+      process.env.ANYSENTRY_PERSISTED_DASHBOARD_BUCKETS !== "off" &&
       start % size === 0 &&
       end % size === 0;
     if (!canPersist) {
@@ -3786,11 +4351,21 @@ export class ClickHouseStore {
       // Cold bootstrap must not fold several hours of high-cardinality events in one query. Split
       // missing history into fixed absolute chunks and build only a bounded number per request.
       // Successful chunks are durable, so later polls resume instead of repeating prior work.
-      const chunkMs = Math.max(size, Math.floor(DASHBOARD_BUCKET_BUILD_CHUNK_MS / size) * size);
+      const chunkMs = Math.max(
+        size,
+        Math.floor(DASHBOARD_BUCKET_BUILD_CHUNK_MS / size) * size,
+      );
       const buildRanges = missingRanges.flatMap((range) => {
         const chunks: Array<{ start: number; end: number }> = [];
-        for (let chunkStart = range.start; chunkStart < range.end; chunkStart += chunkMs) {
-          chunks.push({ start: chunkStart, end: Math.min(range.end, chunkStart + chunkMs) });
+        for (
+          let chunkStart = range.start;
+          chunkStart < range.end;
+          chunkStart += chunkMs
+        ) {
+          chunks.push({
+            start: chunkStart,
+            end: Math.min(range.end, chunkStart + chunkMs),
+          });
         }
         return chunks;
       });
@@ -3811,7 +4386,7 @@ export class ClickHouseStore {
     } catch (error) {
       this.dashboardSnapshotStats.fallbackErrors += 1;
       console.warn(
-        '[clickhouse] persisted dashboard bucket cache unavailable; returning bounded hot fallback:',
+        "[clickhouse] persisted dashboard bucket cache unavailable; returning bounded hot fallback:",
         (error as Error).message,
       );
       return null;
@@ -3822,7 +4397,12 @@ export class ClickHouseStore {
     buildRanges: ReadonlyArray<{ start: number; end: number }>,
     bucketMs: number,
   ): void {
-    if (this.dashboardSnapshotWarmInFlight || buildRanges.length === 0 || this.closing) return;
+    if (
+      this.dashboardSnapshotWarmInFlight ||
+      buildRanges.length === 0 ||
+      this.closing
+    )
+      return;
     const ranges = buildRanges.slice(0, DASHBOARD_BUCKET_BUILD_MAX_CHUNKS);
     let tracked!: Promise<void>;
     tracked = (async () => {
@@ -3856,14 +4436,15 @@ export class ClickHouseStore {
         const afterGlobal = await this.latestEventCommitCursor();
         if (!afterGlobal) return;
         const stableCursors = new Map<number, EventCommitCursor>();
-        const globalStable = compareEventCommitCursor(beforeGlobal, afterGlobal) === 0;
+        const globalStable =
+          compareEventCommitCursor(beforeGlobal, afterGlobal) === 0;
         for (let bucket = range.start; bucket < range.end; bucket += bucketMs) {
           const beforeCursor = before.get(bucket);
           const afterCursor = after.get(bucket);
           if (
-            beforeCursor
-            && afterCursor
-            && compareEventCommitCursor(beforeCursor, afterCursor) === 0
+            beforeCursor &&
+            afterCursor &&
+            compareEventCommitCursor(beforeCursor, afterCursor) === 0
           ) {
             stableCursors.set(bucket, afterCursor);
           } else if (!beforeCursor && !afterCursor && globalStable) {
@@ -3886,7 +4467,10 @@ export class ClickHouseStore {
     })()
       .catch((error) => {
         this.dashboardSnapshotStats.fallbackErrors += 1;
-        console.warn('[clickhouse] dashboard bucket background warm failed:', (error as Error).message);
+        console.warn(
+          "[clickhouse] dashboard bucket background warm failed:",
+          (error as Error).message,
+        );
       })
       .finally(() => {
         if (this.dashboardSnapshotWarmInFlight === tracked) {
@@ -3977,41 +4561,46 @@ export class ClickHouseStore {
           bucketMs: size,
         },
         clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const num = (value: unknown): number => Number(value) || 0;
-      return (await result.json() as Array<Record<string, unknown>>).map((row) => ({
-        bucketStartMs: num(row.bucketStart),
-        monitored: Boolean(num(row.monitored)),
-        decisionStatus: String(row.decisionStatus ?? ''),
-        verdict: String(row.verdict ?? ''),
-        tier: String(row.tier ?? ''),
-        riskType: String(row.riskType ?? ''),
-        riskCategory: String(row.riskCategory ?? ''),
-        riskName: String(row.riskName ?? ''),
-        severityRank: num(row.severityRank),
-        sessionKey: String(row.sessionKey ?? ''),
-        userId: String(row.userId ?? ''),
-        workspacePath: String(row.resolvedWorkspacePath ?? ''),
-        eventCount: num(row.eventCount),
-        blockedCount: num(row.blockedCount),
-        escalatedCount: num(row.escalatedCount),
-        l2Count: num(row.l2Count),
-        l3Count: num(row.l3Count),
-        riskActivationCount: num(row.riskActivationCount),
-        riskyEventCount: num(row.riskyEventCount),
-        tokenCount: num(row.tokenCount),
-        latencyTotal: num(row.latencyTotal),
-        riskScoreTotal: num(row.riskScoreTotal),
-        lastEventAt: num(row.lastEventAt),
-        commandDangerCount: num(row.commandDangerCount),
-        promptInjectionCount: num(row.promptInjectionCount),
-        dataLeakCount: num(row.dataLeakCount),
-        communicationRiskCount: num(row.communicationRiskCount),
-        systemicRiskCount: num(row.systemicRiskCount),
-      }));
+      return ((await result.json()) as Array<Record<string, unknown>>).map(
+        (row) => ({
+          bucketStartMs: num(row.bucketStart),
+          monitored: Boolean(num(row.monitored)),
+          decisionStatus: String(row.decisionStatus ?? ""),
+          verdict: String(row.verdict ?? ""),
+          tier: String(row.tier ?? ""),
+          riskType: String(row.riskType ?? ""),
+          riskCategory: String(row.riskCategory ?? ""),
+          riskName: String(row.riskName ?? ""),
+          severityRank: num(row.severityRank),
+          sessionKey: String(row.sessionKey ?? ""),
+          userId: String(row.userId ?? ""),
+          workspacePath: String(row.resolvedWorkspacePath ?? ""),
+          eventCount: num(row.eventCount),
+          blockedCount: num(row.blockedCount),
+          escalatedCount: num(row.escalatedCount),
+          l2Count: num(row.l2Count),
+          l3Count: num(row.l3Count),
+          riskActivationCount: num(row.riskActivationCount),
+          riskyEventCount: num(row.riskyEventCount),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          riskScoreTotal: num(row.riskScoreTotal),
+          lastEventAt: num(row.lastEventAt),
+          commandDangerCount: num(row.commandDangerCount),
+          promptInjectionCount: num(row.promptInjectionCount),
+          dataLeakCount: num(row.dataLeakCount),
+          communicationRiskCount: num(row.communicationRiskCount),
+          systemicRiskCount: num(row.systemicRiskCount),
+        }),
+      );
     } catch (error) {
-      console.error('[clickhouse] reusable dashboard bucket query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] reusable dashboard bucket query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -4064,7 +4653,7 @@ export class ClickHouseStore {
           end: endExclusiveMs,
           bucketMs,
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       }),
       this.client.query({
         query: `
@@ -4082,58 +4671,73 @@ export class ClickHouseStore {
           end: endExclusiveMs,
           bucketMs,
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       }),
       this.earliestEventCommitCursor(),
     ]);
     if (earliest === null) return new Map();
-    const snapshots = (await snapshotResult.json() as Array<Record<string, unknown>>)
-      .flatMap<PersistedDashboardBucket>((row) => {
-        try {
-          const factsJson = String(row.latestFactsJson ?? '[]');
-          const expectedChecksum = String(row.latestPayloadChecksum ?? '');
-          if (
+    const snapshots = (
+      (await snapshotResult.json()) as Array<Record<string, unknown>>
+    ).flatMap<PersistedDashboardBucket>((row) => {
+      try {
+        const factsJson = String(row.latestFactsJson ?? "[]");
+        const expectedChecksum = String(row.latestPayloadChecksum ?? "");
+        if (
+          expectedChecksum &&
+          createHash("sha256").update(factsJson).digest("hex") !==
             expectedChecksum
-            && createHash('sha256').update(factsJson).digest('hex') !== expectedChecksum
-          ) {
-            this.dashboardSnapshotStats.invalidated += 1;
-            return [];
-          }
-          const facts = JSON.parse(factsJson) as unknown;
-          if (!Array.isArray(facts)) return [];
-          return [{
+        ) {
+          this.dashboardSnapshotStats.invalidated += 1;
+          return [];
+        }
+        const facts = JSON.parse(factsJson) as unknown;
+        if (!Array.isArray(facts)) return [];
+        return [
+          {
             bucketStartMs: Number(row.bucketStart) || 0,
             bucketMs: Number(row.bucketMs) || bucketMs,
             cursor: {
               committedAtMs: Number(row.latestSnapshotCommittedAt) || 0,
-              commitBatchId: String(row.latestSnapshotCommitBatchId ?? ''),
-              eventId: String(row.latestSnapshotEventId ?? ''),
+              commitBatchId: String(row.latestSnapshotCommitBatchId ?? ""),
+              eventId: String(row.latestSnapshotEventId ?? ""),
               decisionRevision: Number(row.latestSnapshotDecisionRevision) || 0,
             },
             facts: facts as DashboardAggregateBucketFact[],
-          }];
-        } catch {
-          return [];
-        }
-      });
-    const latestCommits = (await commitResult.json() as Array<Record<string, unknown>>)
-      .map<BucketCommitCursor>((row) => ({
-        bucketStartMs: Number(row.bucketStart) || 0,
-        cursor: {
-          committedAtMs: Number(row.latestCommittedAt) || 0,
-          commitBatchId: String(row.latestCommitBatchId ?? ''),
-          eventId: String(row.latestEventId ?? ''),
-          decisionRevision: Number(row.latestDecisionRevision) || 0,
-        },
-      }));
-    const valid = validPersistedDashboardBuckets(snapshots, latestCommits, earliest);
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
+    const latestCommits = (
+      (await commitResult.json()) as Array<Record<string, unknown>>
+    ).map<BucketCommitCursor>((row) => ({
+      bucketStartMs: Number(row.bucketStart) || 0,
+      cursor: {
+        committedAtMs: Number(row.latestCommittedAt) || 0,
+        commitBatchId: String(row.latestCommitBatchId ?? ""),
+        eventId: String(row.latestEventId ?? ""),
+        decisionRevision: Number(row.latestDecisionRevision) || 0,
+      },
+    }));
+    const valid = validPersistedDashboardBuckets(
+      snapshots,
+      latestCommits,
+      earliest,
+    );
     const expectedBuckets = Math.max(
       0,
       Math.ceil((endExclusiveMs - startMs) / bucketMs),
     );
     this.dashboardSnapshotStats.hits += valid.size;
-    this.dashboardSnapshotStats.misses += Math.max(0, expectedBuckets - valid.size);
-    this.dashboardSnapshotStats.invalidated += Math.max(0, snapshots.length - valid.size);
+    this.dashboardSnapshotStats.misses += Math.max(
+      0,
+      expectedBuckets - valid.size,
+    );
+    this.dashboardSnapshotStats.invalidated += Math.max(
+      0,
+      snapshots.length - valid.size,
+    );
     return valid;
   }
 
@@ -4142,7 +4746,8 @@ export class ClickHouseStore {
     endExclusiveMs: number,
     bucketMs: number,
   ): Promise<Map<number, EventCommitCursor>> {
-    if (!this.client || !this.ready || endExclusiveMs <= startMs) return new Map();
+    if (!this.client || !this.ready || endExclusiveMs <= startMs)
+      return new Map();
     const result = await this.client.query({
       query: `
         SELECT
@@ -4159,18 +4764,20 @@ export class ClickHouseStore {
         end: endExclusiveMs,
         bucketMs,
       },
-      format: 'JSONEachRow',
+      format: "JSONEachRow",
     });
-    const rows = await result.json() as Array<Record<string, unknown>>;
-    return new Map(rows.map((row) => [
-      Number(row.bucketStart) || 0,
-      {
-        committedAtMs: Number(row.latestCommittedAt) || 0,
-        commitBatchId: String(row.latestCommitBatchId ?? ''),
-        eventId: String(row.latestEventId ?? ''),
-        decisionRevision: Number(row.latestDecisionRevision) || 0,
-      },
-    ]));
+    const rows = (await result.json()) as Array<Record<string, unknown>>;
+    return new Map(
+      rows.map((row) => [
+        Number(row.bucketStart) || 0,
+        {
+          committedAtMs: Number(row.latestCommittedAt) || 0,
+          commitBatchId: String(row.latestCommitBatchId ?? ""),
+          eventId: String(row.latestEventId ?? ""),
+          decisionRevision: Number(row.latestDecisionRevision) || 0,
+        },
+      ]),
+    );
   }
 
   private async writePersistedDashboardBuckets(
@@ -4193,7 +4800,7 @@ export class ClickHouseStore {
       snapshotDecisionRevision: number;
       snapshotVersion: number;
       snapshotSchemaVersion: string;
-      status: 'ready';
+      status: "ready";
       factsJson: string;
       payloadChecksum: string;
       computedAt: number;
@@ -4206,14 +4813,14 @@ export class ClickHouseStore {
         bucketStart: bucket,
         bucketMs,
         snapshotCommittedAt: cursor.committedAtMs,
-        snapshotCommitBatchId: cursor.commitBatchId ?? '',
+        snapshotCommitBatchId: cursor.commitBatchId ?? "",
         snapshotEventId: cursor.eventId,
         snapshotDecisionRevision: cursor.decisionRevision,
         snapshotVersion: baseVersion,
-        snapshotSchemaVersion: 'anysentry.dashboard-bucket-snapshot.v2',
-        status: 'ready',
+        snapshotSchemaVersion: "anysentry.dashboard-bucket-snapshot.v2",
+        status: "ready",
         factsJson,
-        payloadChecksum: createHash('sha256').update(factsJson).digest('hex'),
+        payloadChecksum: createHash("sha256").update(factsJson).digest("hex"),
         computedAt,
       });
     }
@@ -4222,7 +4829,7 @@ export class ClickHouseStore {
       await this.client.insert({
         table: DASHBOARD_BUCKET_SNAPSHOT_TABLE,
         values,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       this.dashboardSnapshotStats.writtenBuckets += values.length;
     } catch (error) {
@@ -4230,7 +4837,7 @@ export class ClickHouseStore {
       // Snapshot persistence is an optimisation only. Exact raw facts have already been computed;
       // a write failure must not make the Dashboard unavailable.
       console.warn(
-        '[clickhouse] dashboard bucket snapshot write failed:',
+        "[clickhouse] dashboard bucket snapshot write failed:",
         (error as Error).message,
       );
     }
@@ -4241,7 +4848,11 @@ export class ClickHouseStore {
    * decision revision is selected per eventId before grouping, so a pending event later judged by
    * L2/L3 is counted once with its final state.
    */
-  async dashboardWindowHistory(startMs: number, endMs: number, bucketCount = 180): Promise<DashboardWindowHistory | null> {
+  async dashboardWindowHistory(
+    startMs: number,
+    endMs: number,
+    bucketCount = 180,
+  ): Promise<DashboardWindowHistory | null> {
     if (!this.client || !this.ready) return null;
     const spanMs = Math.max(1, endMs - startMs);
     const queryStartMs = Math.max(0, startMs - spanMs);
@@ -4280,9 +4891,9 @@ export class ClickHouseStore {
           query,
           query_params: queryParams,
           clickhouse_settings: settings,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        return await result.json() as Array<Record<string, unknown>>;
+        return (await result.json()) as Array<Record<string, unknown>>;
       };
       const dimensionRows = await queryRows(
         `
@@ -4322,7 +4933,13 @@ export class ClickHouseStore {
             PREWHERE at >= {start:UInt64} AND at <= {end:UInt64}
             GROUP BY bucketIndex, monitored
             ORDER BY bucketIndex`,
-        { queryStart: queryStartMs, start: startMs, end: endMs, bucketCount: buckets, bucketMs },
+        {
+          queryStart: queryStartMs,
+          start: startMs,
+          end: endMs,
+          bucketCount: buckets,
+          bucketMs,
+        },
       );
       const [sessionResult, workspaceResult] = await Promise.allSettled([
         queryRows(
@@ -4398,24 +5015,26 @@ export class ClickHouseStore {
           BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
         ),
       ]);
-      if (sessionResult.status === 'rejected') throw sessionResult.reason;
-      if (workspaceResult.status === 'rejected') throw workspaceResult.reason;
+      if (sessionResult.status === "rejected") throw sessionResult.reason;
+      if (workspaceResult.status === "rejected") throw workspaceResult.reason;
       const sessionRows = sessionResult.value;
       const workspaceRows = workspaceResult.value;
       const num = (value: unknown): number => Number(value) || 0;
-      const dimensions = dimensionRows.map<DashboardWindowDimensionRow>((row) => ({
-        period: String(row.period) === 'previous' ? 'previous' : 'current',
-        monitored: Boolean(num(row.monitored)),
-        verdict: String(row.verdict ?? ''),
-        tier: String(row.tier ?? ''),
-        riskType: String(row.riskType ?? ''),
-        riskCategory: String(row.riskCategory ?? ''),
-        riskName: String(row.riskName ?? ''),
-        eventCount: num(row.eventCount),
-        tokenCount: num(row.tokenCount),
-        latencyTotal: num(row.latencyTotal),
-        riskScoreTotal: num(row.riskScoreTotal),
-      }));
+      const dimensions = dimensionRows.map<DashboardWindowDimensionRow>(
+        (row) => ({
+          period: String(row.period) === "previous" ? "previous" : "current",
+          monitored: Boolean(num(row.monitored)),
+          verdict: String(row.verdict ?? ""),
+          tier: String(row.tier ?? ""),
+          riskType: String(row.riskType ?? ""),
+          riskCategory: String(row.riskCategory ?? ""),
+          riskName: String(row.riskName ?? ""),
+          eventCount: num(row.eventCount),
+          tokenCount: num(row.tokenCount),
+          latencyTotal: num(row.latencyTotal),
+          riskScoreTotal: num(row.riskScoreTotal),
+        }),
+      );
       const bucketRows = bucketRowsRaw.map<DashboardWindowBucketRow>((row) => ({
         bucketIndex: num(row.bucketIndex),
         monitored: Boolean(num(row.monitored)),
@@ -4430,32 +5049,43 @@ export class ClickHouseStore {
         riskScoreTotal: num(row.riskScoreTotal),
       }));
       const top = sessionRows[0];
-      const topSession = top ? {
-        sessionId: String(top.sessionLabel ?? ''),
-        userId: String(top.userId ?? ''),
-        workspacePath: String(top.resolvedWorkspacePath ?? ''),
-        eventCount: num(top.eventCount),
-        riskyEventCount: num(top.riskyEventCount),
-        riskScoreTotal: num(top.riskScoreTotal),
-        lastEventAt: num(top.lastEventAt),
-        dimensionCounts: {
-          command_danger: num(top.commandDanger),
-          prompt_injection: num(top.promptInjection),
-          data_leak: num(top.dataLeak),
-          jailbreak: num(top.promptInjection),
-          communication_risk: num(top.communicationRisk),
-          systemic_risk: num(top.systemicRisk),
-        },
-      } : undefined;
+      const topSession = top
+        ? {
+            sessionId: String(top.sessionLabel ?? ""),
+            userId: String(top.userId ?? ""),
+            workspacePath: String(top.resolvedWorkspacePath ?? ""),
+            eventCount: num(top.eventCount),
+            riskyEventCount: num(top.riskyEventCount),
+            riskScoreTotal: num(top.riskScoreTotal),
+            lastEventAt: num(top.lastEventAt),
+            dimensionCounts: {
+              command_danger: num(top.commandDanger),
+              prompt_injection: num(top.promptInjection),
+              data_leak: num(top.dataLeak),
+              jailbreak: num(top.promptInjection),
+              communication_risk: num(top.communicationRisk),
+              systemic_risk: num(top.systemicRisk),
+            },
+          }
+        : undefined;
       const workspaces = workspaceRows.map((row) => ({
-        workspacePath: String(row.resolvedWorkspacePath ?? ''),
+        workspacePath: String(row.resolvedWorkspacePath ?? ""),
         sessionCount: num(row.sessionCount),
         totalRiskScore: num(row.totalRiskScore),
         worstSeverityRank: num(row.worstSeverityRank),
       }));
-      return { countsApproximate: true, dimensions, buckets: bucketRows, topSession, workspaces };
+      return {
+        countsApproximate: true,
+        dimensions,
+        buckets: bucketRows,
+        topSession,
+        workspaces,
+      };
     } catch (error) {
-      console.error('[clickhouse] dashboard window aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] dashboard window aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     } finally {
       release();
@@ -4472,9 +5102,9 @@ export class ClickHouseStore {
     if (input.eventId && effectiveUntilMs - effectiveSinceMs > 2_000) {
       const location = await this.locateEvent(input.eventId);
       if (
-        location
-        && location.at >= effectiveSinceMs
-        && location.at <= effectiveUntilMs
+        location &&
+        location.at >= effectiveSinceMs &&
+        location.at <= effectiveUntilMs
       ) {
         effectiveSinceMs = Math.max(effectiveSinceMs, location.at - 1);
         effectiveUntilMs = Math.min(effectiveUntilMs, location.at + 1);
@@ -4488,28 +5118,28 @@ export class ClickHouseStore {
       until: effectiveUntilMs,
     };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
-      ['eventId', 'eventId'],
-      ['sourceId', 'sourceId'],
-      ['collectorId', 'collectorId'],
-      ['agentId', 'agentId'],
-      ['subjectAssetId', 'subjectAssetId'],
-      ['agentInstanceId', 'agentInstanceKey'],
-      ['sessionId', 'sessionId'],
-      ['workspacePath', 'workspacePath'],
-      ['traceId', 'traceId'],
-      ['invocationId', 'invocationId'],
-      ['toolCallId', 'toolCallId'],
-      ['runId', 'runId'],
-      ['eventKind', 'eventKind'],
-      ['eventCategory', 'eventCategory'],
+      ["eventId", "eventId"],
+      ["sourceId", "sourceId"],
+      ["collectorId", "collectorId"],
+      ["agentId", "agentId"],
+      ["subjectAssetId", "subjectAssetId"],
+      ["agentInstanceId", "agentInstanceKey"],
+      ["sessionId", "sessionId"],
+      ["workspacePath", "workspacePath"],
+      ["traceId", "traceId"],
+      ["invocationId", "invocationId"],
+      ["toolCallId", "toolCallId"],
+      ["runId", "runId"],
+      ["eventKind", "eventKind"],
+      ["eventCategory", "eventCategory"],
     ];
     const mutableFields: Array<[keyof StoredEventQuery, string]> = [
-      ['verdict', 'verdict'],
-      ['tier', 'tier'],
+      ["verdict", "verdict"],
+      ["tier", "tier"],
     ];
     for (const [key, column] of stableFields) {
       const value = input[key];
-      if (typeof value !== 'string' || !value.trim()) continue;
+      if (typeof value !== "string" || !value.trim()) continue;
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
     }
@@ -4518,49 +5148,66 @@ export class ClickHouseStore {
       // KernelFact is an additive canonical projection while the compatibility events table is
       // the durable fallback on older deployments. Keep this predicate bounded and hash-only;
       // no product or payload parsing belongs in the ClickHouse query layer.
-      sampleConditions.push("JSONExtractString(attributes, 'anysentry.kernel_fact_id') = {kernelFactId:String}");
+      sampleConditions.push(
+        "JSONExtractString(attributes, 'anysentry.kernel_fact_id') = {kernelFactId:String}",
+      );
       queryParams.kernelFactId = kernelFactId;
     }
-    const processStringPredicates: Array<[
-      'processHostId' | 'processBootId' | 'processPidNamespace' | 'processStartTimeTicks' | 'processStartTimeNs',
-      string,
-    ]> = [
-      ['processHostId', 'processHostId'],
-      ['processBootId', 'processBootId'],
-      ['processPidNamespace', 'processPidNamespace'],
-      ['processStartTimeTicks', 'processStartTimeTicks'],
-      ['processStartTimeNs', 'processStartTimeNs'],
+    const processStringPredicates: Array<
+      [
+        (
+          | "processHostId"
+          | "processBootId"
+          | "processPidNamespace"
+          | "processStartTimeTicks"
+          | "processStartTimeNs"
+        ),
+        string,
+      ]
+    > = [
+      ["processHostId", "processHostId"],
+      ["processBootId", "processBootId"],
+      ["processPidNamespace", "processPidNamespace"],
+      ["processStartTimeTicks", "processStartTimeTicks"],
+      ["processStartTimeNs", "processStartTimeNs"],
     ];
     for (const [queryKey, column] of processStringPredicates) {
       const value = input[queryKey];
-      if (typeof value !== 'string' || !value.trim()) continue;
+      if (typeof value !== "string" || !value.trim()) continue;
       sampleConditions.push(`${column} = {${queryKey}:String}`);
       queryParams[queryKey] = value.trim();
     }
     for (const [queryKey, column] of [
-      ['processPid', 'processPid'],
-      ['processPpid', 'processPpid'],
-      ['processNamespacePid', 'processNamespacePid'],
-      ['processNamespacePpid', 'processNamespacePpid'],
+      ["processPid", "processPid"],
+      ["processPpid", "processPpid"],
+      ["processNamespacePid", "processNamespacePid"],
+      ["processNamespacePpid", "processNamespacePpid"],
     ] as const) {
       const value = input[queryKey];
       if (!Number.isSafeInteger(value) || Number(value) <= 0) continue;
       sampleConditions.push(`${column} = {${queryKey}:UInt64}`);
       queryParams[queryKey] = Number(value);
     }
-    const boundedEvidenceHashes = (values: string[] | undefined): string[] => [...new Set(
-      (values ?? [])
-        .map((value) => value.trim().toLowerCase())
-        .filter((value) => /^[a-f0-9]{64}$/u.test(value)),
-    )].slice(0, 1_000);
+    const boundedEvidenceHashes = (values: string[] | undefined): string[] =>
+      [
+        ...new Set(
+          (values ?? [])
+            .map((value) => value.trim().toLowerCase())
+            .filter((value) => /^[a-f0-9]{64}$/u.test(value)),
+        ),
+      ].slice(0, 1_000);
     const resourceHashes = boundedEvidenceHashes(input.evidenceResourceHashes);
     const commandHashes = boundedEvidenceHashes(input.evidenceCommandHashes);
     if (resourceHashes.length > 0) {
-      sampleConditions.push('evidenceResourceHash IN {evidenceResourceHashes:Array(String)}');
+      sampleConditions.push(
+        "evidenceResourceHash IN {evidenceResourceHashes:Array(String)}",
+      );
       queryParams.evidenceResourceHashes = resourceHashes;
     }
     if (commandHashes.length > 0) {
-      sampleConditions.push('evidenceCommandHash IN {evidenceCommandHashes:Array(String)}');
+      sampleConditions.push(
+        "evidenceCommandHash IN {evidenceCommandHashes:Array(String)}",
+      );
       queryParams.evidenceCommandHashes = commandHashes;
     }
     const activityContext = input.activityContext?.trim();
@@ -4584,22 +5231,39 @@ export class ClickHouseStore {
     // compatibility with the durable-query contract checks while retaining the late-materialized
     // split between stable and mutable filters.
     const conditions = sampleConditions;
-    if (input.monitoredOnly) conditions.push('agentMonitored = 1');
+    if (input.monitoredOnly) conditions.push("agentMonitored = 1");
     for (const [key, column] of mutableFields) {
       const value = input[key];
-      if (typeof value !== 'string' || !value.trim()) continue;
+      if (typeof value !== "string" || !value.trim()) continue;
       latestConditions.push(`${column} = {${String(key)}:String}`);
       activeMutableColumns.push(column);
       queryParams[String(key)] = value.trim();
     }
-    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
+    const rowLimit = Math.max(
+      1,
+      Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)),
+    );
     queryParams.limit = rowLimit;
     const requestedCandidateLimit = Number(input.candidateLimit);
-    queryParams.scanLimit = Math.min(300_000, Math.max(
-      rowLimit,
-      Number.isFinite(requestedCandidateLimit) ? Math.round(requestedCandidateLimit) : rowLimit * 3,
-      latestConditions.length ? 15_000 : 0,
-    ));
+    // A dashboard page is interactive, so an explicit candidateLimit must remain bounded even
+    // when a caller asks for a large historical page.  Scanning 20k wide event revisions on every
+    // refresh was the remaining source of multi-megabyte ClickHouse reads after old data cleanup.
+    const configuredScanLimitMax = Number(
+      process.env.ANYSENTRY_EVENT_SEARCH_SCAN_LIMIT_MAX ?? "5000",
+    );
+    const scanLimitMax = Number.isFinite(configuredScanLimitMax)
+      ? Math.max(1000, Math.min(50_000, Math.trunc(configuredScanLimitMax)))
+      : 5000;
+    queryParams.scanLimit = Math.min(
+      scanLimitMax,
+      Math.max(
+        rowLimit,
+        Number.isFinite(requestedCandidateLimit)
+          ? Math.round(requestedCandidateLimit)
+          : rowLimit * 3,
+        latestConditions.length ? 15_000 : 0,
+      ),
+    );
     const queryKey = JSON.stringify({
       queryParams,
       monitoredOnly: input.monitoredOnly === true,
@@ -4637,17 +5301,17 @@ export class ClickHouseStore {
                       decisionUpdatedAt,
                       _part AS selectedPart,
                       _part_offset AS selectedPartOffset
-                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(', ')}` : ''}
+                      ${activeMutableColumns.length ? `, ${activeMutableColumns.join(", ")}` : ""}
                     FROM ${TABLE}
                     PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}
-                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(' AND ')}` : ''}
+                    ${sampleConditions.length ? `WHERE ${sampleConditions.join(" AND ")}` : ""}
                     ORDER BY at DESC
                     LIMIT {scanLimit:UInt32} WITH TIES
                   )
                   ORDER BY at DESC, decisionUpdatedAt DESC
                   LIMIT 1 BY eventId
                 )
-                ${latestConditions.length ? `WHERE ${latestConditions.join(' AND ')}` : ''}
+                ${latestConditions.length ? `WHERE ${latestConditions.join(" AND ")}` : ""}
                 ORDER BY at DESC, decisionUpdatedAt DESC
                 LIMIT {limit:UInt32}
               )
@@ -4655,7 +5319,7 @@ export class ClickHouseStore {
             LIMIT {limit:UInt32}`,
           query_params: queryParams,
           clickhouse_settings: BOUNDED_EVENT_SEARCH_READ_SETTINGS,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
         const rows = (await rs.json()) as Array<Record<string, unknown>>;
         const latest = new Map<string, JudgedEvent>();
@@ -4665,7 +5329,10 @@ export class ClickHouseStore {
         }
         return [...latest.values()].sort((a, b) => b.at - a.at);
       } catch (err) {
-        console.error('[clickhouse] event search failed:', (err as Error).message);
+        console.error(
+          "[clickhouse] event search failed:",
+          (err as Error).message,
+        );
         return null;
       }
     })();
@@ -4674,16 +5341,20 @@ export class ClickHouseStore {
       const rows = await value;
       return rows ? [...rows] : null;
     } finally {
-      if (this.eventSearchInFlight?.value === value) this.eventSearchInFlight = undefined;
+      if (this.eventSearchInFlight?.value === value)
+        this.eventSearchInFlight = undefined;
       release();
     }
   }
 
   async locateEvent(
     eventId: string,
-  ): Promise<{ eventId: string; at: number; decisionRevision: number } | undefined> {
+  ): Promise<
+    { eventId: string; at: number; decisionRevision: number } | undefined
+  > {
     const normalized = eventId.trim();
-    if (!this.client || !normalized || normalized.length > 512) return undefined;
+    if (!this.client || !normalized || normalized.length > 512)
+      return undefined;
     try {
       const result = await this.client.query({
         query: `
@@ -4710,13 +5381,13 @@ export class ClickHouseStore {
         clickhouse_settings: {
           max_threads: 1,
           max_execution_time: 2,
-          max_result_rows: '1',
-          result_overflow_mode: 'break',
+          max_result_rows: "1",
+          result_overflow_mode: "break",
           max_memory_usage: String(32 * 1024 * 1024),
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<{
+      const rows = (await result.json()) as Array<{
         eventId?: string;
         at?: number | string;
         decisionRevision?: number | string;
@@ -4734,7 +5405,10 @@ export class ClickHouseStore {
           }
         : undefined;
     } catch (error) {
-      console.error('[clickhouse] event locator query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] event locator query failed:",
+        (error as Error).message,
+      );
       return undefined;
     }
   }
@@ -4742,9 +5416,23 @@ export class ClickHouseStore {
   /** Return durable latest-per-event facts with an explicit completeness marker. The optimized
    * late-materialized search remains the single query implementation; one extra row supplies the
    * bounded pagination signal without loading the full historical result. */
-  async searchEventsPage(input: StoredEventQuery): Promise<StoredEventSearchResult> {
-    const rowLimit = Math.max(1, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.round(input.limit)));
-    const events = await this.searchEvents({ ...input, limit: Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, rowLimit + 1) });
+  async searchEventsPage(
+    input: StoredEventQuery,
+  ): Promise<StoredEventSearchResult> {
+    const configuredPageMax = Number(
+      process.env.ANYSENTRY_EVENT_SEARCH_PAGE_MAX ?? "2000",
+    );
+    const pageMax = Number.isFinite(configuredPageMax)
+      ? Math.max(100, Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, Math.trunc(configuredPageMax)))
+      : 2000;
+    const rowLimit = Math.max(
+      1,
+      Math.min(pageMax, Math.round(input.limit)),
+    );
+    const events = await this.searchEvents({
+      ...input,
+      limit: Math.min(MAX_DURABLE_EVENT_SEARCH_ROWS, rowLimit + 1),
+    });
     if (!events) {
       return {
         events: [],
@@ -4767,7 +5455,13 @@ export class ClickHouseStore {
   ): Promise<StoredToolEvidenceRelations | null> {
     const invocationId = invocationIdInput.trim();
     const toolCallId = toolCallIdInput?.trim();
-    if (!this.client || !this.ready || !invocationId || invocationId.length > 512) return null;
+    if (
+      !this.client ||
+      !this.ready ||
+      !invocationId ||
+      invocationId.length > 512
+    )
+      return null;
     try {
       const result = await this.client.query({
         query: `
@@ -4775,22 +5469,26 @@ export class ClickHouseStore {
             relationVersion, evidenceVersion, itemCount, updatedAt, payload
           FROM ${TOOL_EVIDENCE_RELATION_TABLE} FINAL
           WHERE invocationId = {invocationId:String}
-            ${toolCallId ? 'AND toolCallId = {toolCallId:String}' : ''}
-            ${scope.workspacePath ? 'AND workspacePath = {workspacePath:String}' : ''}
-            ${scope.sourceId ? 'AND sourceId = {sourceId:String}' : ''}
-            ${scope.agentInstanceId ? 'AND agentInstanceId = {agentInstanceId:String}' : ''}
+            ${toolCallId ? "AND toolCallId = {toolCallId:String}" : ""}
+            ${scope.workspacePath ? "AND workspacePath = {workspacePath:String}" : ""}
+            ${scope.sourceId ? "AND sourceId = {sourceId:String}" : ""}
+            ${scope.agentInstanceId ? "AND agentInstanceId = {agentInstanceId:String}" : ""}
             AND relationVersion = ${TOOL_EVIDENCE_RELATION_VERSION}
           ORDER BY toolCallId
           LIMIT 1000`,
         query_params: {
           invocationId,
           ...(toolCallId ? { toolCallId } : {}),
-          ...(scope.workspacePath ? { workspacePath: scope.workspacePath } : {}),
+          ...(scope.workspacePath
+            ? { workspacePath: scope.workspacePath }
+            : {}),
           ...(scope.sourceId ? { sourceId: scope.sourceId } : {}),
-          ...(scope.agentInstanceId ? { agentInstanceId: scope.agentInstanceId } : {}),
+          ...(scope.agentInstanceId
+            ? { agentInstanceId: scope.agentInstanceId }
+            : {}),
         },
         clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await result.json()) as Array<Record<string, unknown>>;
       const items: ToolEvidenceItem[] = [];
@@ -4799,12 +5497,18 @@ export class ClickHouseStore {
       let expectedCount: number | undefined;
       let relationScopeKey: string | undefined;
       for (const row of rows) {
-        const rowInvocationId = String(row.invocationId ?? '');
-        const rowToolCallId = String(row.toolCallId ?? '');
-        const rowEvidenceVersion = String(row.evidenceVersion ?? '');
+        const rowInvocationId = String(row.invocationId ?? "");
+        const rowToolCallId = String(row.toolCallId ?? "");
+        const rowEvidenceVersion = String(row.evidenceVersion ?? "");
         const rowUpdatedAt = Number(row.updatedAt);
         const rowCount = Number(row.itemCount);
-        const rowScopeKey = [row.workspacePath, row.sourceId, row.agentInstanceId].map(String).join('\0');
+        const rowScopeKey = [
+          row.workspacePath,
+          row.sourceId,
+          row.agentInstanceId,
+        ]
+          .map(String)
+          .join("\0");
         if (
           rowInvocationId !== invocationId ||
           !rowToolCallId ||
@@ -4813,13 +5517,17 @@ export class ClickHouseStore {
           !Number.isSafeInteger(rowCount) ||
           rowCount < 1 ||
           rowCount > 1_000
-        ) continue;
-        if (evidenceVersion && evidenceVersion !== rowEvidenceVersion) return { items: [] };
-        if (expectedCount !== undefined && expectedCount !== rowCount) return { items: [] };
-        if (relationScopeKey && relationScopeKey !== rowScopeKey) return { items: [] };
+        )
+          continue;
+        if (evidenceVersion && evidenceVersion !== rowEvidenceVersion)
+          return { items: [] };
+        if (expectedCount !== undefined && expectedCount !== rowCount)
+          return { items: [] };
+        if (relationScopeKey && relationScopeKey !== rowScopeKey)
+          return { items: [] };
         let payload: unknown;
         try {
-          payload = JSON.parse(String(row.payload ?? '')) as unknown;
+          payload = JSON.parse(String(row.payload ?? "")) as unknown;
         } catch {
           continue;
         }
@@ -4837,12 +5545,19 @@ export class ClickHouseStore {
         relationScopeKey = rowScopeKey;
         updatedAt = Math.max(updatedAt ?? 0, rowUpdatedAt);
       }
-      if (!toolCallId && expectedCount !== undefined && items.length !== expectedCount) {
+      if (
+        !toolCallId &&
+        expectedCount !== undefined &&
+        items.length !== expectedCount
+      ) {
         return { items: [] };
       }
       return { items, evidenceVersion, updatedAt };
     } catch (error) {
-      console.error('[clickhouse] ToolEvidence relation query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] ToolEvidence relation query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -4853,7 +5568,13 @@ export class ClickHouseStore {
     scope: Required<ToolEvidenceRelationScope>,
     updatedAt = Date.now(),
   ): Promise<boolean> {
-    if (!this.client || !this.ready || items.length === 0 || items.length > 1_000) return false;
+    if (
+      !this.client ||
+      !this.ready ||
+      items.length === 0 ||
+      items.length > 1_000
+    )
+      return false;
     if (!/^[a-f0-9]{64}$/u.test(evidenceVersion)) return false;
     const invocationIds = new Set(items.map((item) => item.invocationId));
     if (
@@ -4862,7 +5583,8 @@ export class ClickHouseStore {
       !scope.workspacePath ||
       !scope.sourceId ||
       !scope.agentInstanceId
-    ) return false;
+    )
+      return false;
     try {
       await this.client.insert({
         table: TOOL_EVIDENCE_RELATION_TABLE,
@@ -4878,74 +5600,121 @@ export class ClickHouseStore {
           updatedAt,
           payload: JSON.stringify(item),
         })),
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (error) {
-      console.error('[clickhouse] ToolEvidence relation insert failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] ToolEvidence relation insert failed:",
+        (error as Error).message,
+      );
       return false;
     }
   }
 
-  private processLifecycleFactFromRow(row: Record<string, unknown>): ProcessLifecycleFact {
+  private processLifecycleFactFromRow(
+    row: Record<string, unknown>,
+  ): ProcessLifecycleFact {
     return {
-      schemaVersion: 'anysentry.process_lifecycle_fact.v1',
-      factId: String(row.factId ?? ''),
-      eventId: String(row.eventId ?? ''),
-      ...(String(row.sourceEventId ?? '') ? { sourceEventId: String(row.sourceEventId) } : {}),
-      factKind: row.factKind === 'exit' ? 'exit' : 'exec',
+      schemaVersion: "anysentry.process_lifecycle_fact.v1",
+      factId: String(row.factId ?? ""),
+      eventId: String(row.eventId ?? ""),
+      ...(String(row.sourceEventId ?? "")
+        ? { sourceEventId: String(row.sourceEventId) }
+        : {}),
+      factKind: row.factKind === "exit" ? "exit" : "exec",
       at: Number(row.at),
       receivedAt: Number(row.receivedAt),
-      source: String(row.source ?? 'observer') as ProcessLifecycleFact['source'],
-      ...(String(row.sourceId ?? '') ? { sourceId: String(row.sourceId) } : {}),
-      ...(String(row.collectorId ?? '') ? { collectorId: String(row.collectorId) } : {}),
-      workspacePath: String(row.workspacePath ?? ''),
-      ...(String(row.subjectAssetId ?? '') ? { subjectAssetId: String(row.subjectAssetId) } : {}),
-      ...(String(row.subjectAssetType ?? '')
-        ? { subjectAssetType: String(row.subjectAssetType) as ProcessLifecycleFact['subjectAssetType'] }
+      source: String(
+        row.source ?? "observer",
+      ) as ProcessLifecycleFact["source"],
+      ...(String(row.sourceId ?? "") ? { sourceId: String(row.sourceId) } : {}),
+      ...(String(row.collectorId ?? "")
+        ? { collectorId: String(row.collectorId) }
         : {}),
-      ...(String(row.assetBindingQuality ?? '')
-        ? { assetBindingQuality: String(row.assetBindingQuality) as ProcessLifecycleFact['assetBindingQuality'] }
+      workspacePath: String(row.workspacePath ?? ""),
+      ...(String(row.subjectAssetId ?? "")
+        ? { subjectAssetId: String(row.subjectAssetId) }
         : {}),
-      ...(Number(row.assetBindingRevision) > 0 ? { assetBindingRevision: Number(row.assetBindingRevision) } : {}),
-      ...(String(row.assetBindingReason ?? '') ? { assetBindingReason: String(row.assetBindingReason) } : {}),
-      ...(String(row.runtimeInstanceId ?? '') ? { runtimeInstanceId: String(row.runtimeInstanceId) } : {}),
+      ...(String(row.subjectAssetType ?? "")
+        ? {
+            subjectAssetType: String(
+              row.subjectAssetType,
+            ) as ProcessLifecycleFact["subjectAssetType"],
+          }
+        : {}),
+      ...(String(row.assetBindingQuality ?? "")
+        ? {
+            assetBindingQuality: String(
+              row.assetBindingQuality,
+            ) as ProcessLifecycleFact["assetBindingQuality"],
+          }
+        : {}),
+      ...(Number(row.assetBindingRevision) > 0
+        ? { assetBindingRevision: Number(row.assetBindingRevision) }
+        : {}),
+      ...(String(row.assetBindingReason ?? "")
+        ? { assetBindingReason: String(row.assetBindingReason) }
+        : {}),
+      ...(String(row.runtimeInstanceId ?? "")
+        ? { runtimeInstanceId: String(row.runtimeInstanceId) }
+        : {}),
       ...(Number(row.rootProcess) > 0 ? { rootProcess: true } : {}),
-      ...(Number(row.identityRevision) > 0 ? { identityRevision: Number(row.identityRevision) } : {}),
-      processInstanceKey: String(row.processInstanceKey ?? ''),
-      ...(String(row.processGenerationKey ?? '')
+      ...(Number(row.identityRevision) > 0
+        ? { identityRevision: Number(row.identityRevision) }
+        : {}),
+      processInstanceKey: String(row.processInstanceKey ?? ""),
+      ...(String(row.processGenerationKey ?? "")
         ? { processGenerationKey: String(row.processGenerationKey) }
         : {}),
-      ...(String(row.parentProcessGenerationKey ?? '')
+      ...(String(row.parentProcessGenerationKey ?? "")
         ? { parentProcessGenerationKey: String(row.parentProcessGenerationKey) }
         : {}),
-      ...(row.parentLinkAuthority === 'forwarder_process_graph'
+      ...(row.parentLinkAuthority === "forwarder_process_graph"
         ? { parentLinkAuthority: row.parentLinkAuthority }
         : {}),
-      ...(String(row.physicalWorkloadId ?? '') ? { physicalWorkloadId: String(row.physicalWorkloadId) } : {}),
-      ...(String(row.hostId ?? '') ? { hostId: String(row.hostId) } : {}),
-      bootId: String(row.bootId ?? ''),
+      ...(String(row.physicalWorkloadId ?? "")
+        ? { physicalWorkloadId: String(row.physicalWorkloadId) }
+        : {}),
+      ...(String(row.hostId ?? "") ? { hostId: String(row.hostId) } : {}),
+      bootId: String(row.bootId ?? ""),
       pid: Number(row.pid),
       ...(Number(row.ppid) > 0 ? { ppid: Number(row.ppid) } : {}),
-      ...(String(row.pidNamespace ?? '') ? { pidNamespace: String(row.pidNamespace) } : {}),
-      ...(Number(row.namespacePid) > 0 ? { namespacePid: Number(row.namespacePid) } : {}),
-      ...(Number(row.namespacePpid) > 0 ? { namespacePpid: Number(row.namespacePpid) } : {}),
-      startTime: String(row.startTime ?? ''),
-      ...(String(row.lifecycleSource ?? '')
-        ? { lifecycleSource: String(row.lifecycleSource) as ProcessLifecycleFact['lifecycleSource'] }
+      ...(String(row.pidNamespace ?? "")
+        ? { pidNamespace: String(row.pidNamespace) }
         : {}),
-      ...(row.factKind === 'exit' && Number(row.exitStatusPresent) > 0
+      ...(Number(row.namespacePid) > 0
+        ? { namespacePid: Number(row.namespacePid) }
+        : {}),
+      ...(Number(row.namespacePpid) > 0
+        ? { namespacePpid: Number(row.namespacePpid) }
+        : {}),
+      startTime: String(row.startTime ?? ""),
+      ...(String(row.lifecycleSource ?? "")
+        ? {
+            lifecycleSource: String(
+              row.lifecycleSource,
+            ) as ProcessLifecycleFact["lifecycleSource"],
+          }
+        : {}),
+      ...(row.factKind === "exit" && Number(row.exitStatusPresent) > 0
         ? { exitStatus: Number(row.exitStatus) }
         : {}),
-      ...(row.factKind === 'exit' && Number(row.exitSignalPresent) > 0
+      ...(row.factKind === "exit" && Number(row.exitSignalPresent) > 0
         ? { exitSignal: Number(row.exitSignal) }
         : {}),
-      ...(String(row.executableHash ?? '') ? { executableHash: String(row.executableHash) } : {}),
-      ...(String(row.commandHash ?? '') ? { commandHash: String(row.commandHash) } : {}),
+      ...(String(row.executableHash ?? "")
+        ? { executableHash: String(row.executableHash) }
+        : {}),
+      ...(String(row.commandHash ?? "")
+        ? { commandHash: String(row.commandHash) }
+        : {}),
     };
   }
 
-  async writeProcessLifecycleFacts(facts: readonly ProcessLifecycleFact[]): Promise<boolean> {
+  async writeProcessLifecycleFacts(
+    facts: readonly ProcessLifecycleFact[],
+  ): Promise<boolean> {
     if (facts.length === 0) return true;
     if (!this.client || !this.ready || facts.length > 5_000) return false;
     try {
@@ -4954,48 +5723,51 @@ export class ClickHouseStore {
         values: facts.map((fact) => ({
           factId: fact.factId,
           eventId: fact.eventId,
-          sourceEventId: fact.sourceEventId ?? '',
+          sourceEventId: fact.sourceEventId ?? "",
           factKind: fact.factKind,
           at: fact.at,
           receivedAt: fact.receivedAt,
           source: fact.source,
-          sourceId: fact.sourceId ?? '',
-          collectorId: fact.collectorId ?? '',
+          sourceId: fact.sourceId ?? "",
+          collectorId: fact.collectorId ?? "",
           workspacePath: fact.workspacePath,
-          subjectAssetId: fact.subjectAssetId ?? '',
-          subjectAssetType: fact.subjectAssetType ?? '',
-          assetBindingQuality: fact.assetBindingQuality ?? '',
+          subjectAssetId: fact.subjectAssetId ?? "",
+          subjectAssetType: fact.subjectAssetType ?? "",
+          assetBindingQuality: fact.assetBindingQuality ?? "",
           assetBindingRevision: fact.assetBindingRevision ?? 0,
-          assetBindingReason: fact.assetBindingReason ?? '',
-          runtimeInstanceId: fact.runtimeInstanceId ?? '',
+          assetBindingReason: fact.assetBindingReason ?? "",
+          runtimeInstanceId: fact.runtimeInstanceId ?? "",
           rootProcess: fact.rootProcess === true ? 1 : 0,
           identityRevision: fact.identityRevision ?? 0,
           processInstanceKey: fact.processInstanceKey,
-          processGenerationKey: fact.processGenerationKey ?? '',
-          parentProcessGenerationKey: fact.parentProcessGenerationKey ?? '',
-          parentLinkAuthority: fact.parentLinkAuthority ?? '',
-          physicalWorkloadId: fact.physicalWorkloadId ?? '',
-          hostId: fact.hostId ?? '',
+          processGenerationKey: fact.processGenerationKey ?? "",
+          parentProcessGenerationKey: fact.parentProcessGenerationKey ?? "",
+          parentLinkAuthority: fact.parentLinkAuthority ?? "",
+          physicalWorkloadId: fact.physicalWorkloadId ?? "",
+          hostId: fact.hostId ?? "",
           bootId: fact.bootId,
           pid: fact.pid,
           ppid: fact.ppid ?? 0,
-          pidNamespace: fact.pidNamespace ?? '',
+          pidNamespace: fact.pidNamespace ?? "",
           namespacePid: fact.namespacePid ?? 0,
           namespacePpid: fact.namespacePpid ?? 0,
           startTime: fact.startTime,
-          lifecycleSource: fact.lifecycleSource ?? '',
+          lifecycleSource: fact.lifecycleSource ?? "",
           exitStatus: fact.exitStatus ?? 0,
           exitStatusPresent: fact.exitStatus !== undefined ? 1 : 0,
           exitSignal: fact.exitSignal ?? 0,
           exitSignalPresent: fact.exitSignal !== undefined ? 1 : 0,
-          executableHash: fact.executableHash ?? '',
-          commandHash: fact.commandHash ?? '',
+          executableHash: fact.executableHash ?? "",
+          commandHash: fact.commandHash ?? "",
         })),
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (error) {
-      console.error('[clickhouse] Process lifecycle fact insert failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] Process lifecycle fact insert failed:",
+        (error as Error).message,
+      );
       return false;
     }
   }
@@ -5007,7 +5779,12 @@ export class ClickHouseStore {
     limit = 1_000,
   ): Promise<ProcessLifecycleFact[] | null> {
     const processInstanceKey = processInstanceKeyInput.trim();
-    if (!this.client || !this.ready || !/^pri_[a-f0-9]{24}$/u.test(processInstanceKey)) return null;
+    if (
+      !this.client ||
+      !this.ready ||
+      !/^pri_[a-f0-9]{24}$/u.test(processInstanceKey)
+    )
+      return null;
     const rowLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
     try {
       const result = await this.client.query({
@@ -5021,12 +5798,15 @@ export class ClickHouseStore {
           LIMIT {rowLimit:UInt32}`,
         query_params: { processInstanceKey, sinceMs, untilMs, rowLimit },
         clickhouse_settings: BOUNDED_TOOL_EVIDENCE_RELATION_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await result.json()) as Array<Record<string, unknown>>;
       return rows.map((row) => this.processLifecycleFactFromRow(row));
     } catch (error) {
-      console.error('[clickhouse] Process lifecycle fact query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] Process lifecycle fact query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5049,12 +5829,15 @@ export class ClickHouseStore {
           LIMIT {rowLimit:UInt32}`,
         query_params: { sinceMs, untilMs, rowLimit },
         clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await result.json()) as Array<Record<string, unknown>>;
       return rows.map((row) => this.processLifecycleFactFromRow(row)).reverse();
     } catch (error) {
-      console.error('[clickhouse] Recent Process lifecycle fact query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] Recent Process lifecycle fact query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5066,9 +5849,7 @@ export class ClickHouseStore {
     excludedEventIds: string[] = [],
   ): Promise<StoredAgentWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly
-      ? 'AND raw.agentMonitored = 1'
-      : '';
+    const monitoredClause = monitoredOnly ? "AND raw.agentMonitored = 1" : "";
     const latestEvents = `
       SELECT
         eventId,
@@ -5152,69 +5933,92 @@ export class ClickHouseStore {
           GROUP BY identityKey, instanceKey`,
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
         clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = (await result.json()) as Array<Record<string, unknown>>;
       const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
-        .map((row) => String(row.representativeEventId ?? ''))
+        .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
-      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        untilMs,
+      );
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredAgentWindowFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        const sessionKeys = Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [];
-        const runKeys = Array.isArray(row.runKeys) ? row.runKeys.map(String).filter(Boolean) : [];
-        const traceKeys = Array.isArray(row.traceKeys) ? row.traceKeys.map(String).filter(Boolean) : [];
-        const collectorKeys = Array.isArray(row.collectorKeys) ? row.collectorKeys.map(String).filter(Boolean) : [];
-        const instanceKeys = Array.isArray(row.instanceKeys) ? row.instanceKeys.map(String).filter(Boolean) : [];
-        return [{
-          identityKey: String(row.identityKey ?? ''),
-          representativeEvent,
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          sessionCount: sessionKeys.length,
-          runCount: runKeys.length,
-          traceCount: traceKeys.length,
-          sessionKeys,
-          runKeys,
-          traceKeys,
-          collectorKeys,
-          eventsWithoutCollector: num(row.eventsWithoutCollector),
-          tokenCount: num(row.tokenCount),
-          latencyTotal: num(row.latencyTotal),
-          instanceCount: instanceKeys.length,
-          instanceKeys,
-          worstSeverityRank: num(row.worstSeverityRank),
-          topRiskAt: num(row.topRiskAt) || undefined,
-          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
-          topRiskName: String(row.topRiskName ?? '') || undefined,
-          eventCategoryCounts: {
-            tool: num(row.toolCount),
-            file: num(row.fileCount),
-            network: num(row.networkCount),
-            process: num(row.processCount),
-            llm: num(row.llmCount),
-            security: num(row.securityCount),
-            runtime: num(row.runtimeCount),
-            unknown: num(row.unknownCount),
+        const sessionKeys = Array.isArray(row.sessionKeys)
+          ? row.sessionKeys.map(String).filter(Boolean)
+          : [];
+        const runKeys = Array.isArray(row.runKeys)
+          ? row.runKeys.map(String).filter(Boolean)
+          : [];
+        const traceKeys = Array.isArray(row.traceKeys)
+          ? row.traceKeys.map(String).filter(Boolean)
+          : [];
+        const collectorKeys = Array.isArray(row.collectorKeys)
+          ? row.collectorKeys.map(String).filter(Boolean)
+          : [];
+        const instanceKeys = Array.isArray(row.instanceKeys)
+          ? row.instanceKeys.map(String).filter(Boolean)
+          : [];
+        return [
+          {
+            identityKey: String(row.identityKey ?? ""),
+            representativeEvent,
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            sessionCount: sessionKeys.length,
+            runCount: runKeys.length,
+            traceCount: traceKeys.length,
+            sessionKeys,
+            runKeys,
+            traceKeys,
+            collectorKeys,
+            eventsWithoutCollector: num(row.eventsWithoutCollector),
+            tokenCount: num(row.tokenCount),
+            latencyTotal: num(row.latencyTotal),
+            instanceCount: instanceKeys.length,
+            instanceKeys,
+            worstSeverityRank: num(row.worstSeverityRank),
+            topRiskAt: num(row.topRiskAt) || undefined,
+            topRiskCategory: String(row.topRiskCategory ?? "") || undefined,
+            topRiskName: String(row.topRiskName ?? "") || undefined,
+            eventCategoryCounts: {
+              tool: num(row.toolCount),
+              file: num(row.fileCount),
+              network: num(row.networkCount),
+              process: num(row.processCount),
+              llm: num(row.llmCount),
+              security: num(row.securityCount),
+              runtime: num(row.runtimeCount),
+              unknown: num(row.unknownCount),
+            },
+            sourceCounts: {
+              observer: num(row.observerCount),
+              api: num(row.apiCount),
+              synthetic: num(row.syntheticCount),
+            },
+            hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+            hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+            hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
           },
-          sourceCounts: {
-            observer: num(row.observerCount),
-            api: num(row.apiCount),
-            synthetic: num(row.syntheticCount),
-          },
-          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
-          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
-          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
-        }];
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] agent window aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent window aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5231,7 +6035,7 @@ export class ClickHouseStore {
     monitoredOnly: boolean,
   ): Promise<StoredAgentBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'AND raw.agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "AND raw.agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5311,74 +6115,93 @@ export class ClickHouseStore {
           bucketMs: Math.max(1, Math.trunc(bucketMs)),
         },
         clickhouse_settings: BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = (await result.json()) as Array<Record<string, unknown>>;
       const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
-        .map((row) => String(row.representativeEventId ?? ''))
+        .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
       const representativeEvents = await this.eventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
       );
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredAgentBucketFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        const sessionKeys = Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [];
-        const runKeys = Array.isArray(row.runKeys) ? row.runKeys.map(String).filter(Boolean) : [];
-        const traceKeys = Array.isArray(row.traceKeys) ? row.traceKeys.map(String).filter(Boolean) : [];
-        const collectorKeys = Array.isArray(row.collectorKeys) ? row.collectorKeys.map(String).filter(Boolean) : [];
-        const instanceKeys = Array.isArray(row.instanceKeys) ? row.instanceKeys.map(String).filter(Boolean) : [];
-        return [{
-          bucketStartMs: num(row.bucketStartMs),
-          identityKey: String(row.identityKey ?? ''),
-          representativeEvent,
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          sessionCount: sessionKeys.length,
-          runCount: runKeys.length,
-          traceCount: traceKeys.length,
-          sessionKeys,
-          runKeys,
-          traceKeys,
-          collectorKeys,
-          eventsWithoutCollector: num(row.eventsWithoutCollector),
-          tokenCount: num(row.tokenCount),
-          latencyTotal: num(row.latencyTotal),
-          instanceCount: instanceKeys.length,
-          instanceKeys,
-          worstSeverityRank: num(row.worstSeverityRank),
-          topRiskAt: num(row.topRiskAt) || undefined,
-          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
-          topRiskName: String(row.topRiskName ?? '') || undefined,
-          eventCategoryCounts: {
-            tool: num(row.toolCount),
-            file: num(row.fileCount),
-            network: num(row.networkCount),
-            process: num(row.processCount),
-            llm: num(row.llmCount),
-            security: num(row.securityCount),
-            runtime: num(row.runtimeCount),
-            unknown: num(row.unknownCount),
+        const sessionKeys = Array.isArray(row.sessionKeys)
+          ? row.sessionKeys.map(String).filter(Boolean)
+          : [];
+        const runKeys = Array.isArray(row.runKeys)
+          ? row.runKeys.map(String).filter(Boolean)
+          : [];
+        const traceKeys = Array.isArray(row.traceKeys)
+          ? row.traceKeys.map(String).filter(Boolean)
+          : [];
+        const collectorKeys = Array.isArray(row.collectorKeys)
+          ? row.collectorKeys.map(String).filter(Boolean)
+          : [];
+        const instanceKeys = Array.isArray(row.instanceKeys)
+          ? row.instanceKeys.map(String).filter(Boolean)
+          : [];
+        return [
+          {
+            bucketStartMs: num(row.bucketStartMs),
+            identityKey: String(row.identityKey ?? ""),
+            representativeEvent,
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            sessionCount: sessionKeys.length,
+            runCount: runKeys.length,
+            traceCount: traceKeys.length,
+            sessionKeys,
+            runKeys,
+            traceKeys,
+            collectorKeys,
+            eventsWithoutCollector: num(row.eventsWithoutCollector),
+            tokenCount: num(row.tokenCount),
+            latencyTotal: num(row.latencyTotal),
+            instanceCount: instanceKeys.length,
+            instanceKeys,
+            worstSeverityRank: num(row.worstSeverityRank),
+            topRiskAt: num(row.topRiskAt) || undefined,
+            topRiskCategory: String(row.topRiskCategory ?? "") || undefined,
+            topRiskName: String(row.topRiskName ?? "") || undefined,
+            eventCategoryCounts: {
+              tool: num(row.toolCount),
+              file: num(row.fileCount),
+              network: num(row.networkCount),
+              process: num(row.processCount),
+              llm: num(row.llmCount),
+              security: num(row.securityCount),
+              runtime: num(row.runtimeCount),
+              unknown: num(row.unknownCount),
+            },
+            sourceCounts: {
+              observer: num(row.observerCount),
+              api: num(row.apiCount),
+              synthetic: num(row.syntheticCount),
+            },
+            hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+            hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+            hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
           },
-          sourceCounts: {
-            observer: num(row.observerCount),
-            api: num(row.apiCount),
-            synthetic: num(row.syntheticCount),
-          },
-          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
-          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
-          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
-        }];
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] agent bucket aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent bucket aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5398,8 +6221,11 @@ export class ClickHouseStore {
   ): Promise<StoredAgentMetricBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
     const buckets = Math.max(1, Math.min(72, Math.round(bucketCount)));
-    const bucketMs = Math.max(1, Math.ceil(Math.max(1, untilMs - sinceMs) / buckets));
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    const bucketMs = Math.max(
+      1,
+      Math.ceil(Math.max(1, untilMs - sinceMs) / buckets),
+    );
+    const monitoredClause = monitoredOnly ? "AND agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5464,18 +6290,22 @@ export class ClickHouseStore {
           bucketMs,
           excludedEventIds,
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
       const groupFor = (row: Record<string, unknown>): string =>
-        `${String(row.identityKey ?? '')}\u0000${String(row.instanceKey ?? '')}`;
-      const representativeRowByGroup = new Map<string, Record<string, unknown>>();
+        `${String(row.identityKey ?? "")}\u0000${String(row.instanceKey ?? "")}`;
+      const representativeRowByGroup = new Map<
+        string,
+        Record<string, unknown>
+      >();
       for (const row of rows) {
         const key = groupFor(row);
         const current = representativeRowByGroup.get(key);
         if (
           !current ||
-          Number(row.representativeEventAt) >= Number(current.representativeEventAt)
+          Number(row.representativeEventAt) >=
+            Number(current.representativeEventAt)
         ) {
           representativeRowByGroup.set(key, row);
         }
@@ -5484,13 +6314,16 @@ export class ClickHouseStore {
         ? [...representativeRowByGroup.values()]
         : [];
       const representativeIds = representativeRows
-        .map((row) => String(row.representativeEventId ?? ''))
+        .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
       const representativeEventTimes = new Map(
-        representativeRows.map((row) => [
-          String(row.representativeEventId ?? ''),
-          Number(row.representativeEventAt) || 0,
-        ] as const),
+        representativeRows.map(
+          (row) =>
+            [
+              String(row.representativeEventId ?? ""),
+              Number(row.representativeEventAt) || 0,
+            ] as const,
+        ),
       );
       const representativeEvents = await this.eventsByIds(
         representativeIds,
@@ -5498,49 +6331,60 @@ export class ClickHouseStore {
         untilMs,
         representativeEventTimes,
       );
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const representativeEventByGroup = new Map(
         representativeRows.flatMap((row) => {
-          const event = byId.get(String(row.representativeEventId ?? ''));
+          const event = byId.get(String(row.representativeEventId ?? ""));
           return event ? [[groupFor(row), event] as const] : [];
         }),
       );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredAgentMetricBucketFact[] => {
-        const representativeEvent = representativeEventByGroup.get(groupFor(row));
+        const representativeEvent = representativeEventByGroup.get(
+          groupFor(row),
+        );
         if (hydrateRepresentatives && !representativeEvent) return [];
-        return [{
-          bucketIndex: num(row.bucketIndex),
-          identityKey: String(row.identityKey ?? ''),
-          agentId: String(row.agentId ?? ''),
-          ...(representativeEvent ? { representativeEvent } : {}),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          blockedCount: num(row.blockedCount),
-          escalatedCount: num(row.escalatedCount),
-          toolCount: num(row.toolCount),
-          fileCount: num(row.fileCount),
-          networkCount: num(row.networkCount),
-          processCount: num(row.processCount),
-          llmCount: num(row.llmCount),
-          l1Count: num(row.l1Count),
-          l2Count: num(row.l2Count),
-          l3Count: num(row.l3Count),
-          failedCount: num(row.failedCount),
-          timeoutCount: num(row.timeoutCount),
-          tokenCount: num(row.tokenCount),
-          latencyTotal: num(row.latencyTotal),
-          maxRiskScore: num(row.maxRiskScore),
-          sessionKeys: Array.isArray(row.sessionKeys) ? row.sessionKeys.map(String).filter(Boolean) : [],
-          recentEventCount: num(row.recentEventCount),
-          recentCommCount: num(row.recentCommCount),
-          recentSessionKeys: Array.isArray(row.recentSessionKeys)
-            ? row.recentSessionKeys.map(String).filter(Boolean)
-            : [],
-        }];
+        return [
+          {
+            bucketIndex: num(row.bucketIndex),
+            identityKey: String(row.identityKey ?? ""),
+            agentId: String(row.agentId ?? ""),
+            ...(representativeEvent ? { representativeEvent } : {}),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            blockedCount: num(row.blockedCount),
+            escalatedCount: num(row.escalatedCount),
+            toolCount: num(row.toolCount),
+            fileCount: num(row.fileCount),
+            networkCount: num(row.networkCount),
+            processCount: num(row.processCount),
+            llmCount: num(row.llmCount),
+            l1Count: num(row.l1Count),
+            l2Count: num(row.l2Count),
+            l3Count: num(row.l3Count),
+            failedCount: num(row.failedCount),
+            timeoutCount: num(row.timeoutCount),
+            tokenCount: num(row.tokenCount),
+            latencyTotal: num(row.latencyTotal),
+            maxRiskScore: num(row.maxRiskScore),
+            sessionKeys: Array.isArray(row.sessionKeys)
+              ? row.sessionKeys.map(String).filter(Boolean)
+              : [],
+            recentEventCount: num(row.recentEventCount),
+            recentCommCount: num(row.recentCommCount),
+            recentSessionKeys: Array.isArray(row.recentSessionKeys)
+              ? row.recentSessionKeys.map(String).filter(Boolean)
+              : [],
+          },
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] agent metric bucket query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent metric bucket query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5566,7 +6410,7 @@ export class ClickHouseStore {
         recentSessionKeys: [],
       };
     }
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "AND agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5599,15 +6443,18 @@ export class ClickHouseStore {
           recentSince: Math.max(sinceMs, untilMs - 60_000),
         },
         clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const row = ((await result.json()) as Array<Record<string, unknown>>)[0] ?? {};
+      const row =
+        ((await result.json()) as Array<Record<string, unknown>>)[0] ?? {};
       const num = (value: unknown): number => Number(value) || 0;
       return {
         eventCount: num(row.eventCount),
         riskyEventCount: num(row.riskyEventCount),
         latencyTotal: num(row.latencyTotal),
-        agentIds: Array.isArray(row.agentIds) ? row.agentIds.map(String).filter(Boolean) : [],
+        agentIds: Array.isArray(row.agentIds)
+          ? row.agentIds.map(String).filter(Boolean)
+          : [],
         recentEventCount: num(row.recentEventCount),
         recentCommCount: num(row.recentCommCount),
         recentSessionKeys: Array.isArray(row.recentSessionKeys)
@@ -5615,7 +6462,10 @@ export class ClickHouseStore {
           : [],
       };
     } catch (error) {
-      console.error('[clickhouse] agent observability query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent observability query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5627,7 +6477,7 @@ export class ClickHouseStore {
     excludedEventIds: string[] = [],
   ): Promise<StoredWorkspaceWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "AND agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5684,39 +6534,54 @@ export class ClickHouseStore {
           GROUP BY workspacePath
           ORDER BY lastSeenAt DESC`,
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
-      const representativeIds = rows.map((row) => String(row.representativeEventId ?? '')).filter(Boolean);
-      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ""))
+        .filter(Boolean);
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        untilMs,
+      );
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const strings = (value: unknown): string[] =>
         Array.isArray(value) ? value.map(String).filter(Boolean) : [];
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredWorkspaceWindowFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        return [{
-          workspacePath: String(row.workspacePath ?? ''),
-          representativeEvent,
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          sessionKeys: strings(row.sessionKeys),
-          runKeys: strings(row.runKeys),
-          traceKeys: strings(row.traceKeys),
-          collectorKeys: strings(row.collectorKeys),
-          tokenCount: num(row.tokenCount),
-          latencyTotal: num(row.latencyTotal),
-          worstSeverityRank: num(row.worstSeverityRank),
-          topRiskAt: num(row.topRiskAt) || undefined,
-          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
-          topRiskName: String(row.topRiskName ?? '') || undefined,
-        }];
+        return [
+          {
+            workspacePath: String(row.workspacePath ?? ""),
+            representativeEvent,
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            sessionKeys: strings(row.sessionKeys),
+            runKeys: strings(row.runKeys),
+            traceKeys: strings(row.traceKeys),
+            collectorKeys: strings(row.collectorKeys),
+            tokenCount: num(row.tokenCount),
+            latencyTotal: num(row.latencyTotal),
+            worstSeverityRank: num(row.worstSeverityRank),
+            topRiskAt: num(row.topRiskAt) || undefined,
+            topRiskCategory: String(row.topRiskCategory ?? "") || undefined,
+            topRiskName: String(row.topRiskName ?? "") || undefined,
+          },
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] workspace window aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] workspace window aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5732,7 +6597,7 @@ export class ClickHouseStore {
     monitoredOnly: boolean,
   ): Promise<StoredWorkspaceBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'AND agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "AND agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5793,44 +6658,55 @@ export class ClickHouseStore {
           endExclusive: endExclusiveMs,
           bucketMs: Math.max(1, Math.round(bucketMs)),
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await result.json() as Array<Record<string, unknown>>;
-      const representativeIds = rows.map((row) => String(row.representativeEventId ?? '')).filter(Boolean);
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      const representativeIds = rows
+        .map((row) => String(row.representativeEventId ?? ""))
+        .filter(Boolean);
       const representativeEvents = await this.eventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
       );
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const strings = (value: unknown): string[] =>
         Array.isArray(value) ? value.map(String).filter(Boolean) : [];
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredWorkspaceBucketFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        return [{
-          bucketStartMs: num(row.bucketStartMs),
-          workspacePath: String(row.workspacePath ?? ''),
-          representativeEvent,
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          sessionKeys: strings(row.sessionKeys),
-          runKeys: strings(row.runKeys),
-          traceKeys: strings(row.traceKeys),
-          collectorKeys: strings(row.collectorKeys),
-          tokenCount: num(row.tokenCount),
-          latencyTotal: num(row.latencyTotal),
-          worstSeverityRank: num(row.worstSeverityRank),
-          topRiskAt: num(row.topRiskAt) || undefined,
-          topRiskCategory: String(row.topRiskCategory ?? '') || undefined,
-          topRiskName: String(row.topRiskName ?? '') || undefined,
-        }];
+        return [
+          {
+            bucketStartMs: num(row.bucketStartMs),
+            workspacePath: String(row.workspacePath ?? ""),
+            representativeEvent,
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            sessionKeys: strings(row.sessionKeys),
+            runKeys: strings(row.runKeys),
+            traceKeys: strings(row.traceKeys),
+            collectorKeys: strings(row.collectorKeys),
+            tokenCount: num(row.tokenCount),
+            latencyTotal: num(row.latencyTotal),
+            worstSeverityRank: num(row.worstSeverityRank),
+            topRiskAt: num(row.topRiskAt) || undefined,
+            topRiskCategory: String(row.topRiskCategory ?? "") || undefined,
+            topRiskName: String(row.topRiskName ?? "") || undefined,
+          },
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] workspace bucket aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] workspace bucket aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5847,7 +6723,7 @@ export class ClickHouseStore {
     excludedEventIds: string[] = [],
   ): Promise<StoredTopologyWindowFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "HAVING agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -5907,37 +6783,50 @@ export class ClickHouseStore {
             actionTarget,
             riskCategory`,
         query_params: { since: sinceMs, until: untilMs, excludedEventIds },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = (await result.json()) as Array<Record<string, unknown>>;
       const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
-        .map((row) => String(row.representativeEventId ?? ''))
+        .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
-      const representativeEvents = await this.eventsByIds(representativeIds, sinceMs, untilMs);
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const representativeEvents = await this.eventsByIds(
+        representativeIds,
+        sinceMs,
+        untilMs,
+      );
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredTopologyWindowFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        return [{
-          identityKey: String(row.identityKey ?? ''),
-          instanceKey: String(row.instanceKey ?? ''),
-          representativeEvent,
-          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
-          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
-          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          worstSeverityRank: num(row.worstSeverityRank),
-          riskCategory: String(row.riskCategory ?? '') || undefined,
-          riskName: String(row.riskName ?? '') || undefined,
-        }];
+        return [
+          {
+            identityKey: String(row.identityKey ?? ""),
+            instanceKey: String(row.instanceKey ?? ""),
+            representativeEvent,
+            hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+            hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+            hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            worstSeverityRank: num(row.worstSeverityRank),
+            riskCategory: String(row.riskCategory ?? "") || undefined,
+            riskName: String(row.riskName ?? "") || undefined,
+          },
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] topology window aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] topology window aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -5950,7 +6839,7 @@ export class ClickHouseStore {
     monitoredOnly: boolean,
   ): Promise<StoredTopologyBucketFact[] | null> {
     if (!this.client || !this.ready) return null;
-    const monitoredClause = monitoredOnly ? 'HAVING agentMonitored = 1' : '';
+    const monitoredClause = monitoredOnly ? "HAVING agentMonitored = 1" : "";
     try {
       const result = await this.client.query({
         query: `
@@ -6014,42 +6903,51 @@ export class ClickHouseStore {
           endExclusive: endExclusiveMs,
           bucketMs: Math.max(1, Math.trunc(bucketMs)),
         },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rawRows = await result.json() as Array<Record<string, unknown>>;
+      const rawRows = (await result.json()) as Array<Record<string, unknown>>;
       const rows = monitoredOnly ? eligibleAgentRuntimeRows(rawRows) : rawRows;
       const representativeIds = rows
-        .map((row) => String(row.representativeEventId ?? ''))
+        .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
       const representativeEvents = await this.eventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
       );
-      const byId = new Map(representativeEvents.map((event) => [event.eventId, event]));
+      const byId = new Map(
+        representativeEvents.map((event) => [event.eventId, event]),
+      );
       const num = (value: unknown): number => Number(value) || 0;
       return rows.flatMap((row): StoredTopologyBucketFact[] => {
-        const representativeEvent = byId.get(String(row.representativeEventId ?? ''));
+        const representativeEvent = byId.get(
+          String(row.representativeEventId ?? ""),
+        );
         if (!representativeEvent) return [];
-        return [{
-          bucketStartMs: num(row.bucketStartMs),
-          identityKey: String(row.identityKey ?? ''),
-          instanceKey: String(row.instanceKey ?? ''),
-          representativeEvent,
-          hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
-          hasRootIdentity: Boolean(num(row.hasRootIdentity)),
-          hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
-          firstSeenAt: num(row.firstSeenAt),
-          lastSeenAt: num(row.lastSeenAt),
-          eventCount: num(row.eventCount),
-          riskyEventCount: num(row.riskyEventCount),
-          worstSeverityRank: num(row.worstSeverityRank),
-          riskCategory: String(row.riskCategory ?? '') || undefined,
-          riskName: String(row.riskName ?? '') || undefined,
-        }];
+        return [
+          {
+            bucketStartMs: num(row.bucketStartMs),
+            identityKey: String(row.identityKey ?? ""),
+            instanceKey: String(row.instanceKey ?? ""),
+            representativeEvent,
+            hasPhysicalIdentity: Boolean(num(row.hasPhysicalIdentity)),
+            hasRootIdentity: Boolean(num(row.hasRootIdentity)),
+            hasInternalHelperRoot: Boolean(num(row.hasInternalHelperRootFlag)),
+            firstSeenAt: num(row.firstSeenAt),
+            lastSeenAt: num(row.lastSeenAt),
+            eventCount: num(row.eventCount),
+            riskyEventCount: num(row.riskyEventCount),
+            worstSeverityRank: num(row.worstSeverityRank),
+            riskCategory: String(row.riskCategory ?? "") || undefined,
+            riskName: String(row.riskName ?? "") || undefined,
+          },
+        ];
       });
     } catch (error) {
-      console.error('[clickhouse] topology bucket aggregation failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] topology bucket aggregation failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -6071,14 +6969,17 @@ export class ClickHouseStore {
       const rows = await Promise.all(
         batches.slice(index, index + 2).map(async (batch) => {
           const exactEventTimes = eventAtById
-            ? [...new Set(batch.map((eventId) => eventAtById.get(eventId) ?? 0))]
-                .filter((at) => at > 0)
+            ? [
+                ...new Set(
+                  batch.map((eventId) => eventAtById.get(eventId) ?? 0),
+                ),
+              ].filter((at) => at > 0)
             : [];
           const prewhereClause = exactEventTimes.length
-            ? 'PREWHERE at IN {eventTimes:Array(UInt64)}'
+            ? "PREWHERE at IN {eventTimes:Array(UInt64)}"
             : sinceMs === undefined || untilMs === undefined
-              ? ''
-              : 'PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}';
+              ? ""
+              : "PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}";
           const result = await this.client!.query({
             query: `
               SELECT *
@@ -6097,9 +6998,9 @@ export class ClickHouseStore {
               until: untilMs ?? Number.MAX_SAFE_INTEGER,
             },
             clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
-            format: 'JSONEachRow',
+            format: "JSONEachRow",
           });
-          return await result.json() as Array<Record<string, unknown>>;
+          return (await result.json()) as Array<Record<string, unknown>>;
         }),
       );
       events.push(...rows.flat().map(fromRow));
@@ -6131,13 +7032,13 @@ export class ClickHouseStore {
       const event = fromRow(row as unknown as Record<string, unknown>);
       const current = latest.get(event.eventId);
       if (
-        !current
-        || (event.decisionRevision ?? 1) > (current.decisionRevision ?? 1)
-        || (
-          (event.decisionRevision ?? 1) === (current.decisionRevision ?? 1)
-          && (event.decisionUpdatedAt ?? event.at) > (current.decisionUpdatedAt ?? current.at)
-        )
-      ) latest.set(event.eventId, event);
+        !current ||
+        (event.decisionRevision ?? 1) > (current.decisionRevision ?? 1) ||
+        ((event.decisionRevision ?? 1) === (current.decisionRevision ?? 1) &&
+          (event.decisionUpdatedAt ?? event.at) >
+            (current.decisionUpdatedAt ?? current.at))
+      )
+        latest.set(event.eventId, event);
     };
     for (const queued of this.buf) accept(queued.row);
     for (const batch of this.eventWriteBatches) {
@@ -6149,9 +7050,10 @@ export class ClickHouseStore {
   committedProgress(): CommittedSourceProgress[] {
     return [...this.committedSourceProgress.values()]
       .map((entry) => ({ ...entry }))
-      .sort((left, right) =>
-        (left.sourceId ?? '').localeCompare(right.sourceId ?? '') ||
-        (left.collectorId ?? '').localeCompare(right.collectorId ?? ''),
+      .sort(
+        (left, right) =>
+          (left.sourceId ?? "").localeCompare(right.sourceId ?? "") ||
+          (left.collectorId ?? "").localeCompare(right.collectorId ?? ""),
       );
   }
 
@@ -6160,12 +7062,15 @@ export class ClickHouseStore {
     for (const row of rows) {
       const sourceId = row.sourceId || undefined;
       const collectorId = row.collectorId || undefined;
-      const key = `${sourceId ?? ''}\u0000${collectorId ?? ''}`;
+      const key = `${sourceId ?? ""}\u0000${collectorId ?? ""}`;
       const previous = this.committedSourceProgress.get(key);
       this.committedSourceProgress.set(key, {
         sourceId,
         collectorId,
-        committedEventTimeMs: Math.max(previous?.committedEventTimeMs ?? 0, Number(row.at) || 0),
+        committedEventTimeMs: Math.max(
+          previous?.committedEventTimeMs ?? 0,
+          Number(row.at) || 0,
+        ),
         committedAtMs,
       });
     }
@@ -6177,27 +7082,33 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'policy' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       return rows.length ? (JSON.parse(rows[0].value) as PolicyConfig) : null;
     } catch (err) {
-      console.error('[clickhouse] loadConfig failed:', (err as Error).message);
+      console.error("[clickhouse] loadConfig failed:", (err as Error).message);
       return null;
     }
   }
 
   /** Persist the judge policy (survives restarts). No-op if ClickHouse is unconfigured/down. */
   async saveConfig(config: PolicyConfig): Promise<void> {
-    if (!this.client) return;
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'policy', value: JSON.stringify(config), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "policy",
+            value: JSON.stringify(config),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveConfig failed:', (err as Error).message);
+      console.error("[clickhouse] saveConfig failed:", (err as Error).message);
     }
   }
 
@@ -6206,21 +7117,32 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'incident_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
-      return rows.length ? (JSON.parse(rows[0].value) as Record<string, IncidentState>) : {};
+      return rows.length
+        ? (JSON.parse(rows[0].value) as Record<string, IncidentState>)
+        : {};
     } catch (err) {
-      console.error('[clickhouse] loadIncidentState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadIncidentState failed:",
+        (err as Error).message,
+      );
       return {};
     }
   }
 
   async saveIncidentState(incidents: Incident[]): Promise<void> {
-    if (!this.client) return;
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     const state: Record<string, IncidentState> = {};
     for (const i of incidents) {
-      if (i.status !== 'open' || i.owner || i.note || i.acknowledgedAt || i.resolvedAt) {
+      if (
+        i.status !== "open" ||
+        i.owner ||
+        i.note ||
+        i.acknowledgedAt ||
+        i.resolvedAt
+      ) {
         state[i.incidentId] = {
           incidentId: i.incidentId,
           status: i.status,
@@ -6235,11 +7157,20 @@ export class ClickHouseStore {
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'incident_state', value: JSON.stringify(state), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "incident_state",
+            value: JSON.stringify(state),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveIncidentState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveIncidentState failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6248,26 +7179,41 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'alert_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       return rows.length ? (JSON.parse(rows[0].value) as AlertRecord[]) : [];
     } catch (err) {
-      console.error('[clickhouse] loadAlertState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadAlertState failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
   async saveAlertState(alerts: AlertRecord[]): Promise<void> {
-    if (!this.client) return;
+    // PostgreSQL is the active mutable store. This ClickHouse row is only a migration fallback;
+    // disabling it during high-rate Observer canaries prevents rewriting multi-megabyte snapshots
+    // for every alert mutation while preserving the relational projection.
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'alert_state', value: JSON.stringify(alerts), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "alert_state",
+            value: JSON.stringify(alerts),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveAlertState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveAlertState failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6276,26 +7222,42 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'remediation_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
-      return rows.length ? (JSON.parse(rows[0].value) as RemediationRecord[]) : [];
+      return rows.length
+        ? (JSON.parse(rows[0].value) as RemediationRecord[])
+        : [];
     } catch (err) {
-      console.error('[clickhouse] loadRemediationState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadRemediationState failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
   async saveRemediationState(tasks: RemediationRecord[]): Promise<void> {
-    if (!this.client) return;
+    // See saveAlertState: the compatibility snapshot is optional when the relational store is
+    // authoritative, and is the dominant write-amplification source during event bursts.
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'remediation_state', value: JSON.stringify(tasks), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "remediation_state",
+            value: JSON.stringify(tasks),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveRemediationState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveRemediationState failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6309,7 +7271,7 @@ export class ClickHouseStore {
           GROUP BY auditId
           ORDER BY max(at) DESC
           LIMIT 5000`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const factRows = (await factResult.json()) as Array<{ payload: string }>;
       const facts = factRows.flatMap(({ payload }) => {
@@ -6325,7 +7287,7 @@ export class ClickHouseStore {
 
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'audit_log' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
@@ -6333,7 +7295,10 @@ export class ClickHouseStore {
       if (legacy.length > 0) await this.appendAuditFacts(legacy);
       return legacy;
     } catch (err) {
-      console.error('[clickhouse] loadAuditLog failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadAuditLog failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
@@ -6351,11 +7316,14 @@ export class ClickHouseStore {
           ingestedAt,
           payload: JSON.stringify(record),
         })),
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (err) {
-      console.error('[clickhouse] appendAuditFacts failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] appendAuditFacts failed:",
+        (err as Error).message,
+      );
       return false;
     }
   }
@@ -6370,40 +7338,52 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT key, value FROM ${CONFIG_TABLE} FINAL WHERE key IN ('agent_metadata', 'agent_metadata_v2') ORDER BY key DESC LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ key: string; value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
       if (Array.isArray(parsed)) return parsed as AgentMetadataRecord[];
       if (
         parsed &&
-        typeof parsed === 'object' &&
-        (parsed as { schemaVersion?: unknown }).schemaVersion === 'anysentry.agent_metadata.v2' &&
+        typeof parsed === "object" &&
+        (parsed as { schemaVersion?: unknown }).schemaVersion ===
+          "anysentry.agent_metadata.v2" &&
         Array.isArray((parsed as { assets?: unknown }).assets)
       ) {
         return (parsed as { assets: AgentMetadataRecord[] }).assets;
       }
       return [];
     } catch (err) {
-      console.error('[clickhouse] loadAgentMetadata failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadAgentMetadata failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
   async saveAgentMetadata(records: AgentMetadataRecord[]): Promise<void> {
-    if (!this.client) return;
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{
-          key: 'agent_metadata_v2',
-          value: JSON.stringify({ schemaVersion: 'anysentry.agent_metadata.v2', assets: records }),
-          updated_at: Date.now(),
-        }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "agent_metadata_v2",
+            value: JSON.stringify({
+              schemaVersion: "anysentry.agent_metadata.v2",
+              assets: records,
+            }),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveAgentMetadata failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveAgentMetadata failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6417,7 +7397,7 @@ export class ClickHouseStore {
           GROUP BY reviewId
           ORDER BY max(updatedAt) DESC
           LIMIT 1000`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const factRows = (await factResult.json()) as Array<{ payload: string }>;
       const facts = factRows.flatMap(({ payload }) => {
@@ -6431,24 +7411,33 @@ export class ClickHouseStore {
 
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'identity_ai_reviews' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
-      const legacy = Array.isArray(parsed) ? (parsed as IdentityAiReviewRecord[]) : [];
+      const legacy = Array.isArray(parsed)
+        ? (parsed as IdentityAiReviewRecord[])
+        : [];
       if (legacy.length > 0) await this.appendIdentityAiReviewRevisions(legacy);
       return legacy;
     } catch (err) {
-      console.error('[clickhouse] loadIdentityAiReviews failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadIdentityAiReviews failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
-  async appendIdentityAiReviewRevision(record: IdentityAiReviewRecord): Promise<boolean> {
+  async appendIdentityAiReviewRevision(
+    record: IdentityAiReviewRecord,
+  ): Promise<boolean> {
     return this.appendIdentityAiReviewRevisions([record]);
   }
 
-  private async appendIdentityAiReviewRevisions(records: IdentityAiReviewRecord[]): Promise<boolean> {
+  private async appendIdentityAiReviewRevisions(
+    records: IdentityAiReviewRecord[],
+  ): Promise<boolean> {
     if (!this.client || records.length === 0) return false;
     try {
       const ingestedAt = Date.now();
@@ -6456,24 +7445,37 @@ export class ClickHouseStore {
         table: IDENTITY_AI_REVIEW_TABLE,
         values: records.map((record) => ({
           reviewId: record.reviewId,
-          revision: Math.max(1, Math.floor(Number(record.revision) || (record.status === 'running' ? 1 : 2))),
+          revision: Math.max(
+            1,
+            Math.floor(
+              Number(record.revision) || (record.status === "running" ? 1 : 2),
+            ),
+          ),
           status: record.status,
           createdAt: Date.parse(record.createdAt) || ingestedAt,
-          updatedAt: Date.parse(record.updatedAt ?? record.completedAt ?? record.createdAt) || ingestedAt,
+          updatedAt:
+            Date.parse(
+              record.updatedAt ?? record.completedAt ?? record.createdAt,
+            ) || ingestedAt,
           ingestedAt,
           payload: JSON.stringify(record),
         })),
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (err) {
-      console.error('[clickhouse] appendIdentityAiReviewRevision failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] appendIdentityAiReviewRevision failed:",
+        (err as Error).message,
+      );
       return false;
     }
   }
 
   /** @deprecated Compatibility writer for callers predating append-only review revisions. */
-  async saveIdentityAiReviews(records: IdentityAiReviewRecord[]): Promise<void> {
+  async saveIdentityAiReviews(
+    records: IdentityAiReviewRecord[],
+  ): Promise<void> {
     await this.appendIdentityAiReviewRevisions(records.slice(-1_000));
   }
 
@@ -6482,27 +7484,41 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'maintenance_windows' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
       return Array.isArray(parsed) ? (parsed as MaintenanceWindowRecord[]) : [];
     } catch (err) {
-      console.error('[clickhouse] loadMaintenanceWindows failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadMaintenanceWindows failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
-  async saveMaintenanceWindows(records: MaintenanceWindowRecord[]): Promise<void> {
+  async saveMaintenanceWindows(
+    records: MaintenanceWindowRecord[],
+  ): Promise<void> {
     if (!this.client) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'maintenance_windows', value: JSON.stringify(records), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "maintenance_windows",
+            value: JSON.stringify(records),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveMaintenanceWindows failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveMaintenanceWindows failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6511,11 +7527,15 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'notification_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
-      const parsed = rows.length ? (JSON.parse(rows[0].value) as Partial<NotificationState>) : {};
-      const legacyDeliveries = Array.isArray(parsed.deliveries) ? parsed.deliveries : [];
+      const parsed = rows.length
+        ? (JSON.parse(rows[0].value) as Partial<NotificationState>)
+        : {};
+      const legacyDeliveries = Array.isArray(parsed.deliveries)
+        ? parsed.deliveries
+        : [];
       const deliveries = await this.loadNotificationDeliveryFacts();
       if (deliveries.length === 0 && legacyDeliveries.length > 0) {
         await this.appendNotificationDeliveryFacts(legacyDeliveries);
@@ -6526,7 +7546,10 @@ export class ClickHouseStore {
         deliveries: deliveries.length > 0 ? deliveries : legacyDeliveries,
       };
     } catch (err) {
-      console.error('[clickhouse] loadNotificationState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadNotificationState failed:",
+        (err as Error).message,
+      );
       return { channels: [], routes: [], deliveries: [] };
     }
   }
@@ -6538,19 +7561,30 @@ export class ClickHouseStore {
         table: CONFIG_TABLE,
         // Delivery history is immutable and lives in notification_delivery_facts. This row remains
         // only as the migration copy for mutable channel/route configuration.
-        values: [{
-          key: 'notification_state',
-          value: JSON.stringify({ channels: state.channels, routes: state.routes, deliveries: [] }),
-          updated_at: Date.now(),
-        }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "notification_state",
+            value: JSON.stringify({
+              channels: state.channels,
+              routes: state.routes,
+              deliveries: [],
+            }),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveNotificationState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveNotificationState failed:",
+        (err as Error).message,
+      );
     }
   }
 
-  async loadNotificationDeliveryFacts(limit = 1_000): Promise<NotificationDeliveryRecord[]> {
+  async loadNotificationDeliveryFacts(
+    limit = 1_000,
+  ): Promise<NotificationDeliveryRecord[]> {
     if (!this.client) return [];
     try {
       const result = await this.client.query({
@@ -6560,8 +7594,10 @@ export class ClickHouseStore {
           GROUP BY deliveryId
           ORDER BY max(sentAt) DESC
           LIMIT {limit:UInt32}`,
-        query_params: { limit: Math.max(1, Math.min(20_000, Math.floor(limit))) },
-        format: 'JSONEachRow',
+        query_params: {
+          limit: Math.max(1, Math.min(20_000, Math.floor(limit))),
+        },
+        format: "JSONEachRow",
       });
       const rows = (await result.json()) as Array<{ payload: string }>;
       return rows.flatMap(({ payload }) => {
@@ -6572,12 +7608,17 @@ export class ClickHouseStore {
         }
       });
     } catch (err) {
-      console.error('[clickhouse] loadNotificationDeliveryFacts failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadNotificationDeliveryFacts failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
-  async appendNotificationDeliveryFacts(records: NotificationDeliveryRecord[]): Promise<boolean> {
+  async appendNotificationDeliveryFacts(
+    records: NotificationDeliveryRecord[],
+  ): Promise<boolean> {
     if (records.length === 0) return true;
     if (!this.client) return false;
     try {
@@ -6590,11 +7631,14 @@ export class ClickHouseStore {
           ingestedAt,
           payload: JSON.stringify(record),
         })),
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (err) {
-      console.error('[clickhouse] appendNotificationDeliveryFacts failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] appendNotificationDeliveryFacts failed:",
+        (err as Error).message,
+      );
       return false;
     }
   }
@@ -6604,13 +7648,16 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'objective_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
       return Array.isArray(parsed) ? (parsed as ObjectiveRecord[]) : [];
     } catch (err) {
-      console.error('[clickhouse] loadObjectives failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadObjectives failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
@@ -6620,11 +7667,20 @@ export class ClickHouseStore {
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'objective_state', value: JSON.stringify(records), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "objective_state",
+            value: JSON.stringify(records),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveObjectives failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveObjectives failed:",
+        (err as Error).message,
+      );
     }
   }
 
@@ -6633,31 +7689,45 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = 'source_state' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       const rows = (await rs.json()) as Array<{ value: string }>;
       const parsed = rows.length ? (JSON.parse(rows[0].value) as unknown) : [];
       return Array.isArray(parsed) ? (parsed as IngestionSourceRecord[]) : [];
     } catch (err) {
-      console.error('[clickhouse] loadIngestionSources failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadIngestionSources failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
   async saveIngestionSources(records: IngestionSourceRecord[]): Promise<void> {
-    if (!this.client) return;
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return;
     try {
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'source_state', value: JSON.stringify(records), updated_at: Date.now() }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            key: "source_state",
+            value: JSON.stringify(records),
+            updated_at: Date.now(),
+          },
+        ],
+        format: "JSONEachRow",
       });
     } catch (err) {
-      console.error('[clickhouse] saveIngestionSources failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveIngestionSources failed:",
+        (err as Error).message,
+      );
     }
   }
 
-  async loadPlatformConfig<T>(configKeyInput: string): Promise<{ record: T; updatedAt: number } | undefined> {
+  async loadPlatformConfig<T>(
+    configKeyInput: string,
+  ): Promise<{ record: T; updatedAt: number } | undefined> {
     if (!this.client) return undefined;
     const configKey = configKeyInput.trim().slice(0, 160);
     if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return undefined;
@@ -6665,39 +7735,56 @@ export class ClickHouseStore {
       const rs = await this.client.query({
         query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = {configKey:String} LIMIT 1`,
         query_params: { configKey },
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = await rs.json() as Array<{ value: string; updated_at?: number | string }>;
+      const rows = (await rs.json()) as Array<{
+        value: string;
+        updated_at?: number | string;
+      }>;
       if (!rows.length) return undefined;
       const updatedAt = Number(rows[0].updated_at);
       const record = JSON.parse(rows[0].value) as T;
-      return { record, updatedAt: Number.isSafeInteger(updatedAt) ? updatedAt : 0 };
+      return {
+        record,
+        updatedAt: Number.isSafeInteger(updatedAt) ? updatedAt : 0,
+      };
     } catch (err) {
-      console.error(`[clickhouse] loadPlatformConfig ${configKey} failed:`, (err as Error).message);
+      console.error(
+        `[clickhouse] loadPlatformConfig ${configKey} failed:`,
+        (err as Error).message,
+      );
       return undefined;
     }
   }
 
-  async savePlatformConfig<T>(configKeyInput: string, record: T, updatedAtInput = Date.now()): Promise<boolean> {
-    if (!this.client) return false;
+  async savePlatformConfig<T>(
+    configKeyInput: string,
+    record: T,
+    updatedAtInput = Date.now(),
+  ): Promise<boolean> {
+    if (!this.client || !compatibilitySnapshotPersistenceEnabled()) return false;
     const configKey = configKeyInput.trim().slice(0, 160);
     if (!configKey || !/^[a-z0-9_.:-]+$/iu.test(configKey)) return false;
     try {
       const value = JSON.stringify(record);
-      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
-        throw new Error('platform config exceeds the 16 MiB persistence bound');
+      if (Buffer.byteLength(value, "utf8") > 16 * 1024 * 1024) {
+        throw new Error("platform config exceeds the 16 MiB persistence bound");
       }
-      const updatedAt = Number.isSafeInteger(updatedAtInput) && updatedAtInput >= 0
-        ? updatedAtInput
-        : Date.now();
+      const updatedAt =
+        Number.isSafeInteger(updatedAtInput) && updatedAtInput >= 0
+          ? updatedAtInput
+          : Date.now();
       await this.client.insert({
         table: CONFIG_TABLE,
         values: [{ key: configKey, value, updated_at: updatedAt }],
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
       return true;
     } catch (err) {
-      console.error(`[clickhouse] savePlatformConfig ${configKey} failed:`, (err as Error).message);
+      console.error(
+        `[clickhouse] savePlatformConfig ${configKey} failed:`,
+        (err as Error).message,
+      );
       return false;
     }
   }
@@ -6707,16 +7794,25 @@ export class ClickHouseStore {
     try {
       const rs = await this.client.query({
         query: `SELECT value, updated_at FROM ${CONFIG_TABLE} FINAL WHERE key = 'unknown_learning_state_v1' LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const rows = (await rs.json()) as Array<{ value: string; updated_at?: number | string }>;
+      const rows = (await rs.json()) as Array<{
+        value: string;
+        updated_at?: number | string;
+      }>;
       const persistedVersion = Number(rows[0]?.updated_at);
-      if (Number.isSafeInteger(persistedVersion) && persistedVersion > this.unknownLearningStateVersion) {
+      if (
+        Number.isSafeInteger(persistedVersion) &&
+        persistedVersion > this.unknownLearningStateVersion
+      ) {
         this.unknownLearningStateVersion = persistedVersion;
       }
-      return rows.length ? JSON.parse(rows[0].value) as unknown : undefined;
+      return rows.length ? (JSON.parse(rows[0].value) as unknown) : undefined;
     } catch (err) {
-      console.error('[clickhouse] loadUnknownLearningState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadUnknownLearningState failed:",
+        (err as Error).message,
+      );
       return undefined;
     }
   }
@@ -6727,32 +7823,56 @@ export class ClickHouseStore {
       const value = JSON.stringify(state);
       // The runtime service exports a stricter configured bound. This last storage guard prevents
       // a programming error from turning one config row into an unbounded ClickHouse insert.
-      if (Buffer.byteLength(value, 'utf8') > 16 * 1024 * 1024) {
-        throw new Error('Unknown learning state exceeds the 16 MiB persistence bound');
+      if (Buffer.byteLength(value, "utf8") > 16 * 1024 * 1024) {
+        throw new Error(
+          "Unknown learning state exceeds the 16 MiB persistence bound",
+        );
       }
-      const updatedAt = Math.max(Date.now(), this.unknownLearningStateVersion + 1);
+      const updatedAt = Math.max(
+        Date.now(),
+        this.unknownLearningStateVersion + 1,
+      );
       this.unknownLearningStateVersion = updatedAt;
       await this.client.insert({
         table: CONFIG_TABLE,
-        values: [{ key: 'unknown_learning_state_v1', value, updated_at: updatedAt }],
-        format: 'JSONEachRow',
+        values: [
+          { key: "unknown_learning_state_v1", value, updated_at: updatedAt },
+        ],
+        format: "JSONEachRow",
       });
       return true;
     } catch (err) {
-      console.error('[clickhouse] saveUnknownLearningState failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] saveUnknownLearningState failed:",
+        (err as Error).message,
+      );
       return false;
     }
   }
 
-  async loadCollectorHeartbeats(limit = 1_000): Promise<CollectorHeartbeatRecord[]> {
+  async loadCollectorHeartbeats(
+    limit = 1_000,
+  ): Promise<CollectorHeartbeatRecord[]> {
     if (!this.client) return [];
-    const safeLimit = Math.max(128, Math.min(2_000, Math.trunc(limit) || 1_000));
+    const safeLimit = Math.max(
+      128,
+      Math.min(2_000, Math.trunc(limit) || 1_000),
+    );
+    const configuredLookback = Number(
+      process.env.ANYSENTRY_COLLECTOR_HEARTBEAT_LOOKBACK_MS ?? "86400000",
+    );
+    const lookbackMs = Number.isFinite(configuredLookback)
+      ? Math.max(10 * 60_000, Math.min(7 * 24 * 60 * 60_000, configuredLookback))
+      : 24 * 60 * 60_000;
+    const minAt = Math.max(0, Date.now() - lookbackMs);
     try {
       const existenceResult = await this.client.query({
         query: `SELECT 1 AS present FROM ${COLLECTOR_HEARTBEAT_TABLE} LIMIT 1`,
-        format: 'JSONEachRow',
+        format: "JSONEachRow",
       });
-      const existenceRows = await existenceResult.json() as Array<{ present?: string | number }>;
+      const existenceRows = (await existenceResult.json()) as Array<{
+        present?: string | number;
+      }>;
       if (Number(existenceRows[0]?.present ?? 0) !== 1) {
         // One-time compatibility bridge. Slice the legacy JSON array inside ClickHouse so a large
         // historical snapshot is never transferred and expanded in the Node.js heap merely to
@@ -6764,9 +7884,11 @@ export class ClickHouseStore {
             WHERE key = 'collector_heartbeats'
             LIMIT 1`,
           query_params: { limit: safeLimit },
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        const legacyRows = await legacyResult.json() as Array<{ records?: string[] }>;
+        const legacyRows = (await legacyResult.json()) as Array<{
+          records?: string[];
+        }>;
         const records = (legacyRows[0]?.records ?? []).flatMap((value) => {
           try {
             return [JSON.parse(value) as CollectorHeartbeatRecord];
@@ -6782,7 +7904,7 @@ export class ClickHouseStore {
               at: record.at,
               payload: JSON.stringify(record),
             })),
-            format: 'JSONEachRow',
+            format: "JSONEachRow",
           });
         }
       }
@@ -6793,15 +7915,16 @@ export class ClickHouseStore {
           FROM (
             SELECT collectorId, at, payload
             FROM ${COLLECTOR_HEARTBEAT_TABLE}
+            PREWHERE at >= {minAt:UInt64}
             ORDER BY at DESC
             LIMIT {scanLimit:UInt32}
           )
           ORDER BY at DESC
           LIMIT {scanLimit:UInt32}`,
-        query_params: { scanLimit: safeLimit * 2 },
-        format: 'JSONEachRow',
+        query_params: { scanLimit: safeLimit * 2, minAt },
+        format: "JSONEachRow",
       });
-      const recentRows = await recentResult.json() as Array<{
+      const recentRows = (await recentResult.json()) as Array<{
         collectorId?: string;
         at?: string | number;
         payload?: string;
@@ -6811,7 +7934,10 @@ export class ClickHouseStore {
         try {
           if (!row.payload) continue;
           const record = JSON.parse(row.payload) as CollectorHeartbeatRecord;
-          unique.set(`${String(row.collectorId ?? record.collectorId)}\u0000${Number(row.at ?? record.at)}`, record);
+          unique.set(
+            `${String(row.collectorId ?? record.collectorId)}\u0000${Number(row.at ?? record.at)}`,
+            record,
+          );
         } catch {
           // A malformed legacy row must not prevent later valid heartbeats from hydrating.
         }
@@ -6819,111 +7945,148 @@ export class ClickHouseStore {
       }
       return [...unique.values()].reverse();
     } catch (err) {
-      console.error('[clickhouse] loadCollectorHeartbeats failed:', (err as Error).message);
+      console.error(
+        "[clickhouse] loadCollectorHeartbeats failed:",
+        (err as Error).message,
+      );
       return [];
     }
   }
 
-  async insertAgentInteraction(record: AgentInteractionRecord): Promise<boolean> {
+  async insertAgentInteraction(
+    record: AgentInteractionRecord,
+  ): Promise<boolean> {
     if (!this.client || !this.ready || this.closing) return false;
     try {
       await this.client.insert({
         table: AGENT_INTERACTION_TABLE,
-        values: [{
-          interactionId: record.interactionId,
-          revision: Math.max(record.receivedAt, Date.now()),
-          at: record.at,
-          tenantId: record.tenantId ?? '',
-          environmentId: record.environmentId ?? '',
-          workspacePath: record.workspacePath,
-          sourceId: record.sourceId ?? '',
-          collectorId: record.collectorId ?? '',
-          agentAssetId: record.agentAssetId,
-          agentInstanceId: record.agentInstanceId ?? '',
-          agentProduct: record.agentProduct ?? '',
-          classification: record.currentEffectiveClassification,
-          interactionType: record.interactionType,
-          transport: record.transport,
-          protocol: record.protocol,
-          tlsAdapterId: record.tlsAdapterId ?? '',
-          transportProtocol: record.transportProtocol ?? '',
-          wireTemplateId: record.wireTemplateId ?? '',
-          parseState: record.parseState ?? '',
-          endpoint: record.endpoint,
-          model: record.model ?? '',
-          completeness: record.completeness,
-          startedAtUnixNs: record.startedAtUnixNs,
-          endedAtUnixNs: record.endedAtUnixNs,
-          requestSha256: record.request.sha256,
-          responseSha256: record.response.sha256,
-          toolCallIds: [...new Set([
-            ...record.toolCalls.map((item) => item.toolCallId),
-            ...record.toolResults.map((item) => item.toolCallId),
-          ])],
-          payload: JSON.stringify(record),
-        }],
-        format: 'JSONEachRow',
+        values: [
+          {
+            interactionId: record.interactionId,
+            revision: Math.max(record.receivedAt, Date.now()),
+            at: record.at,
+            tenantId: record.tenantId ?? "",
+            environmentId: record.environmentId ?? "",
+            workspacePath: record.workspacePath,
+            sourceId: record.sourceId ?? "",
+            collectorId: record.collectorId ?? "",
+            agentAssetId: record.agentAssetId,
+            agentInstanceId: record.agentInstanceId ?? "",
+            agentProduct: record.agentProduct ?? "",
+            classification: record.currentEffectiveClassification,
+            interactionType: record.interactionType,
+            transport: record.transport,
+            protocol: record.protocol,
+            tlsAdapterId: record.tlsAdapterId ?? "",
+            transportProtocol: record.transportProtocol ?? "",
+            wireTemplateId: record.wireTemplateId ?? "",
+            parseState: record.parseState ?? "",
+            endpoint: record.endpoint,
+            model: record.model ?? "",
+            completeness: record.completeness,
+            startedAtUnixNs: record.startedAtUnixNs,
+            endedAtUnixNs: record.endedAtUnixNs,
+            requestSha256: record.request.sha256,
+            responseSha256: record.response.sha256,
+            toolCallIds: [
+              ...new Set([
+                ...record.toolCalls.map((item) => item.toolCallId),
+                ...record.toolResults.map((item) => item.toolCallId),
+              ]),
+            ],
+            payload: JSON.stringify(record),
+          },
+        ],
+        format: "JSONEachRow",
         clickhouse_settings: {
           insert_deduplication_token: `agent-interaction:${record.interactionId}:${record.response.sha256}`,
         },
       });
       return true;
     } catch (error) {
-      console.error('[clickhouse] agent interaction insert failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent interaction insert failed:",
+        (error as Error).message,
+      );
       return false;
     }
   }
 
-  async queryAgentInteractions(input: AgentInteractionQuery & {
-    startMs: number;
-    endMs: number;
-    fairPerAgentLimit?: number;
-    interactionIds?: readonly string[];
-  }): Promise<AgentInteractionRecord[] | null> {
+  async queryAgentInteractions(
+    input: AgentInteractionQuery & {
+      startMs: number;
+      endMs: number;
+      fairPerAgentLimit?: number;
+      interactionIds?: readonly string[];
+    },
+  ): Promise<AgentInteractionRecord[] | null> {
     if (!this.client || !this.ready) return null;
-    const interactionIds = [...new Set((input.interactionIds ?? [])
-      .map((value) => value.trim())
-      .filter(Boolean))].slice(0, 5_000);
+    const interactionIds = [
+      ...new Set(
+        (input.interactionIds ?? [])
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ].slice(0, 5_000);
     const exactMembershipRead = interactionIds.length > 0;
-    const fairPerAgentLimit = exactMembershipRead || input.fairPerAgentLimit === undefined
-      ? undefined
-      : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
+    const fairPerAgentLimit =
+      exactMembershipRead || input.fairPerAgentLimit === undefined
+        ? undefined
+        : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
     const limit = exactMembershipRead
       ? Math.max(1, Math.min(5_000, input.limit ?? interactionIds.length))
       : fairPerAgentLimit
-      ? Math.max(1, Math.min(2_000, input.limit ?? 2_000))
-      : Math.max(1, Math.min(500, input.limit ?? 100));
+        ? Math.max(1, Math.min(2_000, input.limit ?? 2_000))
+        : Math.max(1, Math.min(500, input.limit ?? 100));
     const conditions = [
       ...(exactMembershipRead
-        ? ['interactionId IN {interactionIds:Array(String)}']
-        : ['at >= {start:UInt64}', 'at <= {end:UInt64}']),
-      ...(input.agentAssetId ? ['agentAssetId = {agentAssetId:String}'] : []),
-      ...(input.agentInstanceId ? ['agentInstanceId = {agentInstanceId:String}'] : []),
-      ...(input.interactionId ? ['interactionId = {interactionId:String}'] : []),
-      ...(input.interactionType ? ['interactionType = {interactionType:String}'] : []),
-      ...(input.model ? ['model = {model:String}'] : []),
-      ...(input.transport ? ['transport = {transport:String}'] : []),
-      ...(input.tlsAdapterId ? ['tlsAdapterId = {tlsAdapterId:String}'] : []),
-      ...(input.transportProtocol ? ['transportProtocol = {transportProtocol:String}'] : []),
-      ...(input.wireTemplateId ? ['wireTemplateId = {wireTemplateId:String}'] : []),
-      ...(input.parseState ? ['parseState = {parseState:String}'] : []),
-      ...(input.completeness ? ['completeness = {completeness:String}'] : []),
+        ? ["interactionId IN {interactionIds:Array(String)}"]
+        : ["at >= {start:UInt64}", "at <= {end:UInt64}"]),
+      ...(input.agentAssetId ? ["agentAssetId = {agentAssetId:String}"] : []),
+      ...(input.agentInstanceId
+        ? ["agentInstanceId = {agentInstanceId:String}"]
+        : []),
+      ...(input.interactionId
+        ? ["interactionId = {interactionId:String}"]
+        : []),
+      ...(input.interactionType
+        ? ["interactionType = {interactionType:String}"]
+        : []),
+      ...(input.model ? ["model = {model:String}"] : []),
+      ...(input.transport ? ["transport = {transport:String}"] : []),
+      ...(input.tlsAdapterId ? ["tlsAdapterId = {tlsAdapterId:String}"] : []),
+      ...(input.transportProtocol
+        ? ["transportProtocol = {transportProtocol:String}"]
+        : []),
+      ...(input.wireTemplateId
+        ? ["wireTemplateId = {wireTemplateId:String}"]
+        : []),
+      ...(input.parseState ? ["parseState = {parseState:String}"] : []),
+      ...(input.completeness ? ["completeness = {completeness:String}"] : []),
     ];
     const queryParams = {
-      ...(exactMembershipRead ? { interactionIds } : {
-        start: Math.max(0, Math.trunc(input.startMs)),
-        end: Math.max(0, Math.trunc(input.endMs)),
-      }),
+      ...(exactMembershipRead
+        ? { interactionIds }
+        : {
+            start: Math.max(0, Math.trunc(input.startMs)),
+            end: Math.max(0, Math.trunc(input.endMs)),
+          }),
       limit,
       ...(fairPerAgentLimit ? { fairPerAgentLimit } : {}),
       ...(input.agentAssetId ? { agentAssetId: input.agentAssetId } : {}),
-      ...(input.agentInstanceId ? { agentInstanceId: input.agentInstanceId } : {}),
+      ...(input.agentInstanceId
+        ? { agentInstanceId: input.agentInstanceId }
+        : {}),
       ...(input.interactionId ? { interactionId: input.interactionId } : {}),
-      ...(input.interactionType ? { interactionType: input.interactionType } : {}),
+      ...(input.interactionType
+        ? { interactionType: input.interactionType }
+        : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.transport ? { transport: input.transport } : {}),
       ...(input.tlsAdapterId ? { tlsAdapterId: input.tlsAdapterId } : {}),
-      ...(input.transportProtocol ? { transportProtocol: input.transportProtocol } : {}),
+      ...(input.transportProtocol
+        ? { transportProtocol: input.transportProtocol }
+        : {}),
       ...(input.wireTemplateId ? { wireTemplateId: input.wireTemplateId } : {}),
       ...(input.parseState ? { parseState: input.parseState } : {}),
       ...(input.completeness ? { completeness: input.completeness } : {}),
@@ -6931,7 +8094,7 @@ export class ClickHouseStore {
     const settings = {
       max_execution_time: 10,
       max_result_rows: String(limit),
-      result_overflow_mode: 'break' as const,
+      result_overflow_mode: "break" as const,
     };
     try {
       let rows: Array<{ payload?: string }>;
@@ -6946,7 +8109,7 @@ export class ClickHouseStore {
                 max(at) AS latestAt,
                 argMax(agentAssetId, revision) AS latestAgentAssetId
               FROM ${AGENT_INTERACTION_TABLE}
-              WHERE ${conditions.join(' AND ')}
+              WHERE ${conditions.join(" AND ")}
               GROUP BY interactionId
             )
             ORDER BY latestAt DESC, interactionId DESC
@@ -6954,9 +8117,11 @@ export class ClickHouseStore {
             LIMIT {limit:UInt32}`,
           query_params: queryParams,
           clickhouse_settings: settings,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        const indexRows = await indexResult.json() as Array<{ interactionId?: string }>;
+        const indexRows = (await indexResult.json()) as Array<{
+          interactionId?: string;
+        }>;
         const interactionIds = indexRows
           .map((row) => row.interactionId)
           .filter((value): value is string => Boolean(value));
@@ -6970,35 +8135,40 @@ export class ClickHouseStore {
             LIMIT {limit:UInt32}`,
           query_params: { interactionIds, limit },
           clickhouse_settings: settings,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        rows = await payloadResult.json() as Array<{ payload?: string }>;
+        rows = (await payloadResult.json()) as Array<{ payload?: string }>;
       } else {
         const result = await this.client.query({
           query: `
             SELECT interactionId, argMax(payload, revision) AS payload, max(at) AS latestAt
             FROM ${AGENT_INTERACTION_TABLE}
-            WHERE ${conditions.join(' AND ')}
+            WHERE ${conditions.join(" AND ")}
             GROUP BY interactionId
             ORDER BY latestAt DESC, interactionId DESC
             LIMIT {limit:UInt32}`,
           query_params: queryParams,
           clickhouse_settings: settings,
-          format: 'JSONEachRow',
+          format: "JSONEachRow",
         });
-        rows = await result.json() as Array<{ payload?: string }>;
+        rows = (await result.json()) as Array<{ payload?: string }>;
       }
       return rows.flatMap((row) => {
         try {
           if (!row.payload) return [];
           const parsed = JSON.parse(row.payload) as AgentInteractionRecord;
-          return parsed.schemaVersion === 'anysentry.agent_interaction.v1' ? [parsed] : [];
+          return parsed.schemaVersion === "anysentry.agent_interaction.v1"
+            ? [parsed]
+            : [];
         } catch {
           return [];
         }
       });
     } catch (error) {
-      console.error('[clickhouse] agent interaction query failed:', (error as Error).message);
+      console.error(
+        "[clickhouse] agent interaction query failed:",
+        (error as Error).message,
+      );
       return null;
     }
   }
@@ -7013,7 +8183,8 @@ export class ClickHouseStore {
     this.flushTimer = undefined;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-    if (this.eventWriteRetryWakeTimer) clearTimeout(this.eventWriteRetryWakeTimer);
+    if (this.eventWriteRetryWakeTimer)
+      clearTimeout(this.eventWriteRetryWakeTimer);
     this.eventWriteRetryWakeTimer = undefined;
     if (this.immediateWriteTimer) clearTimeout(this.immediateWriteTimer);
     this.immediateWriteTimer = undefined;
@@ -7023,7 +8194,8 @@ export class ClickHouseStore {
       100,
       60_000,
     );
-    this.eventWriteClosingDeadline = this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
+    this.eventWriteClosingDeadline =
+      this.eventWriteNow() + this.eventWriteCloseDeadlineMs;
     this.wakeEventWriteRetrySleep();
     this.sealBufferedEventBatches(true);
     const value = this.finishClose();
@@ -7036,8 +8208,8 @@ export class ClickHouseStore {
     let closeError: Error | undefined;
     try {
       while (
-        this.immediateWriteQueue.length > 0
-        && this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+        this.immediateWriteQueue.length > 0 &&
+        this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
       ) {
         try {
           await this.drainImmediateWrites();
@@ -7063,37 +8235,58 @@ export class ClickHouseStore {
         closeError = Object.assign(
           new Error(
             `ClickHouse event writer closed with ${this.eventWriteRows} undrained rows` +
-            (head?.lastError ? `: ${head.lastError.message}` : ''),
+              (head?.lastError ? `: ${head.lastError.message}` : ""),
           ),
-          { code: 'ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED' },
+          { code: "ANYSENTRY_CLICKHOUSE_EVENT_SHUTDOWN_UNDRAINED" },
         );
-        console.error('[clickhouse] event writer shutdown deadline/terminal failure:', {
-          code: (closeError as Error & { code?: string }).code,
-          rows: this.eventWriteRows,
-          bytes: this.eventWriteBytes,
-          oldestBatchAgeMs: head ? Math.max(0, this.eventWriteNow() - head.createdAt) : 0,
-          token: head?.token,
-          cause: head?.lastError?.message ?? this.eventWritePermanentError?.message,
-        });
+        console.error(
+          "[clickhouse] event writer shutdown deadline/terminal failure:",
+          {
+            code: (closeError as Error & { code?: string }).code,
+            rows: this.eventWriteRows,
+            bytes: this.eventWriteBytes,
+            oldestBatchAgeMs: head
+              ? Math.max(0, this.eventWriteNow() - head.createdAt)
+              : 0,
+            token: head?.token,
+            cause:
+              head?.lastError?.message ??
+              this.eventWritePermanentError?.message,
+          },
+        );
       }
     } finally {
       this.closed = true;
-      this.eventWriteAbortController?.abort('ClickHouse event writer is closing');
+      this.eventWriteAbortController?.abort(
+        "ClickHouse event writer is closing",
+      );
       this.wakeEventWriteRetrySleep();
       for (const batch of this.eventWriteBatches) {
         for (const waiter of batch.waiters.splice(0)) {
-          waiter.reject(closeError ?? new Error('ClickHouse event writer closed before the direct write completed'));
+          waiter.reject(
+            closeError ??
+              new Error(
+                "ClickHouse event writer closed before the direct write completed",
+              ),
+          );
         }
       }
       const receiptShutdownError =
-        closeError ?? new Error('ClickHouse store closed before event receipt became durable');
-      for (const entry of this.immediateWriteQueue.splice(0)) entry.reject(receiptShutdownError);
+        closeError ??
+        new Error(
+          "ClickHouse store closed before event receipt became durable",
+        );
+      for (const entry of this.immediateWriteQueue.splice(0))
+        entry.reject(receiptShutdownError);
       this.immediateWriteQueueBytes = 0;
       this.immediateWriteEventTimes.clear();
       // A periodic flush may already own the heartbeat side buffer. Let it finish first, then
       // persist any tail accepted after its snapshot before closing the shared client.
       await this.flushInFlight?.catch((error) => {
-        console.error('[clickhouse] collector heartbeat shutdown flush failed:', (error as Error).message);
+        console.error(
+          "[clickhouse] collector heartbeat shutdown flush failed:",
+          (error as Error).message,
+        );
       });
       const heartbeatValues = this.collectorHeartbeatBuf;
       this.collectorHeartbeatBuf = [];
@@ -7102,11 +8295,17 @@ export class ClickHouseStore {
           await client.insert({
             table: COLLECTOR_HEARTBEAT_TABLE,
             values: heartbeatValues,
-            format: 'JSONEachRow',
+            format: "JSONEachRow",
           });
         } catch (error) {
-          this.collectorHeartbeatBuf = [...heartbeatValues, ...this.collectorHeartbeatBuf];
-          console.error('[clickhouse] collector heartbeat shutdown insert failed:', (error as Error).message);
+          this.collectorHeartbeatBuf = [
+            ...heartbeatValues,
+            ...this.collectorHeartbeatBuf,
+          ];
+          console.error(
+            "[clickhouse] collector heartbeat shutdown insert failed:",
+            (error as Error).message,
+          );
         }
       }
       try {
@@ -7123,15 +8322,18 @@ export class ClickHouseStore {
   private async waitForEventWriteDrainUntilCloseDeadline(): Promise<void> {
     const deadline = this.eventWriteClosingDeadline ?? this.eventWriteNow();
     const remainingMs = Math.max(0, deadline - this.eventWriteNow());
-    if (remainingMs === 0) throw new Error('ClickHouse event writer shutdown deadline reached');
+    if (remainingMs === 0)
+      throw new Error("ClickHouse event writer shutdown deadline reached");
     const drain = this.ensureEventWriteDrain();
     // A fake/misbehaving client may ignore AbortSignal. The outer wall-clock timer prevents Nest's
     // shutdown hook from consuming the full Kubernetes grace period before client.close destroys it.
     let timer!: NodeJS.Timeout;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        this.eventWriteAbortController?.abort('ClickHouse event writer shutdown deadline reached');
-        reject(new Error('ClickHouse event writer shutdown deadline reached'));
+        this.eventWriteAbortController?.abort(
+          "ClickHouse event writer shutdown deadline reached",
+        );
+        reject(new Error("ClickHouse event writer shutdown deadline reached"));
       }, remainingMs);
     });
     try {
