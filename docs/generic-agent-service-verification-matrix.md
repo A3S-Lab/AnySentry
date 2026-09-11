@@ -27,6 +27,7 @@
 | Observer Ring reader | `cargo test -p a3s-observer-collector 'ring_reader::tests::'` | 9 passed | malformed/TLS gap envelope、POD bound、capacity、delta conservation |
 | Observer TLS attach | `cargo test -p a3s-observer-collector 'tls_attach::tests::'` | 20 passed | product-neutral runtime selection、ABI fail-closed、bounded retry and scope membership |
 | Generic agent RPC route admission | Observer `8d17523` | passed | no implicit `/runs`; RPC route is an explicit deployment capability, while candidate/confirmed profiles provide bounded full capture |
+| Generic HTTP route shape persistence/query | `pnpm --filter @anysentry/api build`、`verify-canonical-observability.mjs`、`verify-clickhouse-query-bounds.mjs`；`e68cf45`、`e45ea8e`、`e98efa1`、`1eb82b8`、`5bbcce5` | passed locally; runtime durable point-read pending | raw path remains evidence; dynamic IDs normalize to `:param`; ClickHouse schema/write/API query and hot-delta filtering share the same route shape contract |
 
 ## 真实验收闸门
 
