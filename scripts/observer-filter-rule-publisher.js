@@ -158,6 +158,9 @@ function filterDecision(observerEvent, classification, options = {}) {
     authority,
     action,
     reasonCode,
+    ...(attribution.source === 'behavior' && identityClassification === 'probable_agent'
+      ? { ruleId: 'fr_builtin_behavior_candidate', ruleRevision: 1 }
+      : {}),
     source: text(attribution.source) || (classification?.state === 'infrastructure' ? 'configured_root' : 'none'),
     ...(behaviorEvidence?.length ? { evidence: behaviorEvidence } : {}),
     ...(text(attribution.algorithmVersion) ? { algorithmVersion: text(attribution.algorithmVersion) } : {}),

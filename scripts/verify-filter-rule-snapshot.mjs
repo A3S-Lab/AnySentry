@@ -49,6 +49,8 @@ const behaviorCandidate = filterDecision(event('85'), {
 });
 assert.equal(behaviorCandidate.action, 'keep');
 assert.equal(behaviorCandidate.source, 'behavior');
+assert.equal(behaviorCandidate.ruleId, 'fr_builtin_behavior_candidate');
+assert.equal(behaviorCandidate.ruleRevision, 1);
 assert.equal(behaviorCandidate.algorithmVersion, 'behavior-window-v1');
 assert.equal(behaviorCandidate.score, 12);
 assert.equal(behaviorCandidate.threshold, 8);
