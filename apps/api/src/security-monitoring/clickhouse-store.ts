@@ -164,6 +164,7 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
   wireTemplateId LowCardinality(String) DEFAULT '',
   parseState LowCardinality(String) DEFAULT '',
   endpoint String,
+  routeShape LowCardinality(String) DEFAULT '',
   model LowCardinality(String) DEFAULT '',
   completeness LowCardinality(String),
   startedAtUnixNs String,
@@ -1185,7 +1186,8 @@ async function runClickHouseBootstrap(
         ADD COLUMN IF NOT EXISTS tlsAdapterId LowCardinality(String) DEFAULT '' AFTER protocol,
         ADD COLUMN IF NOT EXISTS transportProtocol LowCardinality(String) DEFAULT '' AFTER tlsAdapterId,
         ADD COLUMN IF NOT EXISTS wireTemplateId LowCardinality(String) DEFAULT '' AFTER transportProtocol,
-        ADD COLUMN IF NOT EXISTS parseState LowCardinality(String) DEFAULT '' AFTER wireTemplateId`,
+        ADD COLUMN IF NOT EXISTS parseState LowCardinality(String) DEFAULT '' AFTER wireTemplateId,
+        ADD COLUMN IF NOT EXISTS routeShape LowCardinality(String) DEFAULT '' AFTER endpoint`,
     });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
     // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
@@ -7982,6 +7984,7 @@ export class ClickHouseStore {
             wireTemplateId: record.wireTemplateId ?? "",
             parseState: record.parseState ?? "",
             endpoint: record.endpoint,
+            routeShape: record.routeShape ?? "",
             model: record.model ?? "",
             completeness: record.completeness,
             startedAtUnixNs: record.startedAtUnixNs,
