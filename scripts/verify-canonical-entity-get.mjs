@@ -8,9 +8,9 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { localApiBase } from './local-api-base.mjs';
 
-const base = (process.env.ANYSENTRY_API_BASE
-  ?? `http://127.0.0.1:${process.env.PORT ?? '29654'}/security-center`).replace(/\/$/u, '');
+const base = await localApiBase(process.env.ANYSENTRY_API_BASE, 'http://127.0.0.1:29654/security-center');
 const adminToken = (process.env.ANYSENTRY_ADMIN_TOKEN
   ?? process.env.ANYSENTRY_MANAGEMENT_TOKEN
   ?? '').trim();
