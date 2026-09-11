@@ -77,9 +77,30 @@ function behaviorKey(observerEvent, attribution) {
         ?? attribution?.runtimeInstanceId
         ?? attribution?.runtime_instance_id,
     );
-    return generation
-      ? `workload:${text(attribution.physicalWorkloadId)}:generation:${generation}`
-      : text(attribution.physicalWorkloadId);
+    if (generation) return `workload:${text(attribution.physicalWorkloadId)}:generation:${generation}`;
+
+    // F0 may know the physical workload before its process graph has materialized. When the
+    // event still carries a root generation fence, use it so a restart cannot inherit the old
+    // window. Do not fall back to the event PID: child processes in one workload must continue
+    // contributing to the same window while the root start time remains stable.
+    const process = processInfo(observerEvent);
+    const rootPid = text(
+      process.rootPid ?? process.root_pid ?? attribution?.rootPid ?? attribution?.root_pid,
+    );
+    const rootStart = text(
+      process.rootStartTimeTicks
+        ?? process.root_start_time_ticks
+        ?? process.rootStartTime
+        ?? process.root_start_time
+        ?? attribution?.rootStartTimeTicks
+        ?? attribution?.root_start_time_ticks
+        ?? attribution?.rootStartTime
+        ?? attribution?.root_start_time,
+    );
+    if (rootPid && rootStart) {
+      return `workload:${text(attribution.physicalWorkloadId)}:root:${rootPid}:${rootStart}`;
+    }
+    return text(attribution.physicalWorkloadId);
   }
   const identity = eventIdentityCandidates(observerEvent);
   if (identity.candidates[0]) return `container:${identity.candidates[0]}`;

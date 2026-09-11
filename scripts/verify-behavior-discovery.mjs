@@ -80,6 +80,26 @@ assert.notEqual(
   behaviorKey(tool, generationTwo),
   'short-window behavior state is fenced by process generation inside one physical workload',
 );
+const rootGenerationOne = {
+  ...behaviorAttribution,
+  rootPid: 901,
+  rootStartTimeTicks: '10001',
+};
+const rootGenerationTwo = {
+  ...behaviorAttribution,
+  rootPid: 901,
+  rootStartTimeTicks: '20002',
+};
+assert.notEqual(
+  behaviorKey({ process: { rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  behaviorKey({ process: { rootPid: 901, rootStartTimeTicks: '20002' } }, rootGenerationTwo),
+  'root start time fences cold-start windows before the process graph is available',
+);
+assert.equal(
+  behaviorKey({ process: { pid: 902, rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  behaviorKey({ process: { pid: 903, rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  'child PIDs remain in the root generation window',
+);
 const generationDetector = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
 generationDetector.observe(event('Egress', { pid: 120, host: '10.0.0.8', path: '/v1/responses' }), generationOne);
 assert.equal(
