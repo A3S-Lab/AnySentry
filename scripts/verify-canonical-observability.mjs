@@ -43,6 +43,15 @@ assert.equal(
   '/invoke',
   'stable route segments remain unchanged',
 );
+assert.equal(
+  interactionParser.normalizeAgentRouteShape('/runs/123/nodes/550e8400-e29b-41d4-a716-446655440000'),
+  '/runs/:param/nodes/:param',
+  'numeric and UUID route identifiers are normalized generically',
+);
+assert.doesNotThrow(
+  () => interactionParser.normalizeAgentRouteShape('/runs/%E0%A4%A'),
+  'malformed percent encoding cannot break interaction parsing',
+);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 
 const semanticFixture = (eventKind, attributes = {}) => ({
