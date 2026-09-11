@@ -63,7 +63,24 @@ function processInfo(observerEvent) {
 }
 
 function behaviorKey(observerEvent, attribution) {
-  if (text(attribution?.physicalWorkloadId)) return text(attribution.physicalWorkloadId);
+  // A physical workload is the retention boundary, not a process-generation identity.  A
+  // restarted service (or two agent roots sharing one pod/cgroup) must not inherit the previous
+  // short-window score.  Prefer the generation key supplied by the attribution lane while still
+  // retaining workload-level aggregation for fixtures and older collectors that do not provide
+  // one yet.
+  if (text(attribution?.physicalWorkloadId)) {
+    const generation = text(
+      attribution?.processGenerationKey
+        ?? attribution?.process_generation_key
+        ?? attribution?.agentInstanceId
+        ?? attribution?.agent_instance_id
+        ?? attribution?.runtimeInstanceId
+        ?? attribution?.runtime_instance_id,
+    );
+    return generation
+      ? `workload:${text(attribution.physicalWorkloadId)}:generation:${generation}`
+      : text(attribution.physicalWorkloadId);
+  }
   const identity = eventIdentityCandidates(observerEvent);
   if (identity.candidates[0]) return `container:${identity.candidates[0]}`;
   const process = processInfo(observerEvent);

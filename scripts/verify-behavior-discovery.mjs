@@ -72,6 +72,25 @@ assert.equal(promoted.attribution.workloadRef.podName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.containerName, 'agent');
 assert.match(promoted.attribution.evidence[0], /behavior:score=/);
 
+const generationOne = { ...behaviorAttribution, agentInstanceId: 'runtime-generation-1' };
+const generationTwo = { ...behaviorAttribution, agentInstanceId: 'runtime-generation-2' };
+assert.notEqual(
+  behaviorKey(tool, generationOne),
+  behaviorKey(tool, generationTwo),
+  'short-window behavior state is fenced by process generation inside one physical workload',
+);
+const generationDetector = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+generationDetector.observe(event('Egress', { pid: 120, host: '10.0.0.8', path: '/v1/responses' }), generationOne);
+assert.equal(
+  generationDetector.observe(event('ToolExec', { pid: 120, argv: ['agent-tool', 'run'] }), generationOne)?.state,
+  'agent',
+);
+assert.equal(
+  generationDetector.observe(event('ToolExec', { pid: 220, argv: ['agent-tool', 'run'] }), generationTwo),
+  undefined,
+  'a restarted generation must not inherit the previous generation score',
+);
+
 const privateGatewayDetector = new BehavioralAgentDetector({
   now: () => now,
   threshold: 8,
