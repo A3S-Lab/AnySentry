@@ -26,7 +26,9 @@ function containerEvent(index) {
     identity: { agent: `pod-${identityIndex}`, task: String(10_000 + identityIndex), session: containerId },
     process: {
       pid: 10_000 + identityIndex,
-      ppid: 1,
+      // The benchmark represents a generation whose parent facts are intentionally unavailable;
+      // keeping ppid unset exercises the bounded hot path without forcing a synthetic /proc read.
+      ppid: 0,
       startTimeTicks: String(20_000 + identityIndex),
       cgroupId: 30_000 + identityIndex,
       comm: 'node',
@@ -54,11 +56,13 @@ function hostEvent(index) {
       cgroupId: 1,
       comm: 'codex',
       exe: '/usr/bin/codex',
+      cgroup: '0::/user.slice/codex.scope',
+      cwd: '/workspace',
     },
     event: {
       ToolExec: {
         pid,
-        ppid: 1,
+        ppid: 0,
         uid: 1_000,
         cwd: '/workspace',
         argv: ['codex', 'exec', `task-${index % 32}`],
@@ -104,6 +108,20 @@ const queue = new BoundedPriorityQueue(4_096, 5);
 
 // Populate direct cgroup bindings and JIT-compile the representative paths before measuring.
 for (let index = 0; index < identityCount; index++) workloadCache.classify(containerEvent(index));
+// Seed the parent generation supplied by every synthetic host event.  The benchmark
+// intentionally uses a warm process graph; forcing the public classifier to discover
+// pid 1 would measure the /proc fallback path instead of the steady-state filter path.
+attributor.procs.set({
+  pid: 1,
+  ppid: 0,
+  startTime: '1',
+  comm: 'init',
+  exe: '/sbin/init',
+  cgroup: '0::/',
+  cwd: '/',
+  state: 'unknown',
+  lastSeen: Date.now(),
+});
 for (let index = 0; index < 2_000; index++) attributor.classify(hostEvent(index));
 
 const rssBefore = process.memoryUsage().rss;
