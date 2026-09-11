@@ -197,6 +197,17 @@ const registryPromoted = registryDetector.observe(
   { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
 );
 assert.equal(registryPromoted?.attribution.algorithmVersion, 'behavior-window-test-v2');
+const updatedRegistry = registryDetector.updateSignalRegistry({
+  version: 'behavior-window-test-v3',
+  weights: { llm: 4 },
+});
+assert.equal(updatedRegistry.version, 'behavior-window-test-v3');
+const postReload = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(postReload?.attribution.algorithmVersion, 'behavior-window-test-v3',
+  'a live registry reload takes effect on the next observation');
 
 const semanticDetector = new BehavioralAgentDetector({
   now: () => now,

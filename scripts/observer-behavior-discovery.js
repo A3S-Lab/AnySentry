@@ -501,6 +501,13 @@ class BehavioralAgentDetector {
     this.operations = 0;
   }
 
+  /** Atomically replace the bounded signal registry for subsequent observations. */
+  updateSignalRegistry(registry) {
+    const next = normalizeSignalRegistry(registry);
+    this.signalRegistry = next;
+    return { version: next.version, weights: { ...next.weights }, caps: { ...next.caps } };
+  }
+
   observe(observerEvent, attribution) {
     if (!this.enabled) return undefined;
     this.stats.observed++;
