@@ -164,7 +164,7 @@ function memoryMiB(value) {
   return amount * factor;
 }
 
-async function assertSharedCapacity() {
+async function assertSharedCapacitySample() {
   if (!capacityGate) return;
   const result = await run('kubectl', [
     '-n', controlNamespace, 'top', 'pod', '--no-headers',
@@ -190,7 +190,20 @@ async function assertSharedCapacity() {
       + `clickhouse=${clickhouseMemory.toFixed(1)}MiB/${maxClickHouseMemoryMiB}MiB`,
     );
   }
-  console.error(`[real-discovery] capacity gate passed: anysentry=${apiMemory.toFixed(1)}MiB; clickhouse=${clickhouseMemory.toFixed(1)}MiB`);
+  return { apiMemory, clickhouseMemory };
+}
+
+async function assertSharedCapacity() {
+  if (!capacityGate) return;
+  const samples = Math.max(1, Math.min(10, Number(process.env.ANYSENTRY_REAL_CAPACITY_SAMPLES || 3)));
+  const intervalMs = Math.max(100, Math.min(10_000, Number(process.env.ANYSENTRY_REAL_CAPACITY_SAMPLE_INTERVAL_MS || 1_000)));
+  let latest;
+  for (let index = 0; index < samples; index += 1) {
+    latest = await assertSharedCapacitySample();
+    if (index + 1 < samples) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  console.error(`[real-discovery] capacity gate passed ${samples} samples: `
+    + `anysentry=${latest.apiMemory.toFixed(1)}MiB; clickhouse=${latest.clickhouseMemory.toFixed(1)}MiB`);
 }
 
 async function applyRealPod() {
