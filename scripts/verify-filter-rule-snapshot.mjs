@@ -40,7 +40,10 @@ const behaviorCandidate = filterDecision(event('85'), {
   attribution: {
     classification: 'probable_agent',
     source: 'behavior',
-    evidence: Array.from({ length: 30 }, (_, index) => `behavior:signal=${index}`),
+    evidence: [
+      ...Array.from({ length: 29 }, (_, index) => `behavior:signal=${index}`),
+      'behavior:pattern=model_transport',
+    ],
     algorithmVersion: 'behavior-window-v1',
     score: 12,
     threshold: 8,
@@ -57,6 +60,7 @@ assert.equal(behaviorCandidate.threshold, 8);
 assert.equal(behaviorCandidate.window, '300s');
 assert.equal(behaviorCandidate.evidence.length, 16, 'candidate evidence remains bounded in rule decisions');
 assert.equal(behaviorCandidate.evidence[0], 'behavior:signal=14');
+assert.equal(behaviorCandidate.evidence.at(-1), 'behavior:pattern=model_transport');
 assert.equal(filterDecision(event('invalid'), { state: 'unknown' }), undefined);
 
 const shadowPublisher = new FilterRulePublisher({
