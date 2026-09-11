@@ -2909,7 +2909,8 @@ function closeSpoolWhenIdle() {
     return true;
   } catch (error) {
     const status = spool.status();
-    const pending = status.pendingOperations > 0
+    const pending = status.asyncWriteActive
+      || status.pendingOperations > 0
       || status.pendingPutRecords > 0
       || status.asyncSyncActive;
     if (pending && Date.now() < spoolCloseDeadline) {
@@ -2921,7 +2922,9 @@ function closeSpoolWhenIdle() {
       spoolCloseTimer.unref();
       return false;
     }
-    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
+    console.error(`[observer-forward] durable spool close failed: ${error.message}; `
+      + `async_write=${status.asyncWriteActive}; operations=${status.pendingOperations}; `
+      + `pending_puts=${status.pendingPutRecords}; async_sync=${status.asyncSyncActive}`);
     process.exitCode = 1;
     return false;
   }
@@ -3760,6 +3763,7 @@ function flushAndClose() {
       || retryTasks.length > 0
       || walPendingEvents > 0
       || spoolStatus.pendingOperations > 0
+      || spoolStatus.asyncWriteActive
       || spoolStatus.asyncSyncActive;
     if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);

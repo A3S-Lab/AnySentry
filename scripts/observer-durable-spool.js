@@ -701,6 +701,7 @@ class DurableSpool {
       pendingPutRecords: this.pendingPutIds.size,
       pendingPutBytes: this.pendingPutBytes,
       pendingOperations: this.asyncOperations.length,
+      asyncWriteActive: this.asyncWriteActive,
       asyncSyncActive: this.asyncSyncActive,
       logicalBytes: Math.max(0, this.logicalBytes),
       walBytes: this.walBytes,
