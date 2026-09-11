@@ -116,6 +116,28 @@ function sanitizePath(value: string): string {
   return value.replace(/[?#].*$/u, '').slice(0, 2_000);
 }
 
+/**
+ * Produce a bounded protocol route shape for grouping generic HTTP Agent requests. Dynamic
+ * identifiers are replaced without depending on a framework, service name, tool name, or port;
+ * the raw sanitized path remains the evidence of record.
+ */
+export function normalizeAgentRouteShape(value: string): string {
+  const path = sanitizePath(value).trim();
+  if (!path) return '';
+  const segments = path.split('/').filter(Boolean).map((segment) => {
+    let decoded = segment;
+    try { decoded = decodeURIComponent(segment); } catch { /* preserve malformed evidence */ }
+    if (
+      /^\d{1,32}$/u.test(decoded)
+      || /^[a-f0-9]{16,}$/iu.test(decoded)
+      || /^[0-9a-f]{8}-[0-9a-f-]{27,}$/iu.test(decoded)
+      || /^(?:run|thread|session|request|trace|span)[-_][a-z0-9_-]{6,}$/iu.test(decoded)
+    ) return ':param';
+    return decoded.slice(0, 120);
+  });
+  return `/${segments.join('/')}`.slice(0, 512) || '/';
+}
+
 function strictRunIdentity(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim();
@@ -1194,6 +1216,7 @@ export function parseObserverAgentInteraction(
     endpoint,
     method,
     path,
+    routeShape: normalizeAgentRouteShape(path),
     statusCode,
     model: string(input.model, 500),
     startedAtUnixNs,

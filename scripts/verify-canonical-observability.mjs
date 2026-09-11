@@ -33,6 +33,16 @@ const {
   createEvidenceLink,
   validateRawObservation,
 } = canonical;
+assert.equal(
+  interactionParser.normalizeAgentRouteShape('/runs/thread-abc123/nodes/42?stream=true'),
+  '/runs/:param/nodes/:param',
+  'generic HTTP route shape removes request-specific identifiers without using service names',
+);
+assert.equal(
+  interactionParser.normalizeAgentRouteShape('/invoke'),
+  '/invoke',
+  'stable route segments remain unchanged',
+);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 
 const semanticFixture = (eventKind, attributes = {}) => ({

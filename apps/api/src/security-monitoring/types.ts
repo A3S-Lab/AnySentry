@@ -1804,6 +1804,8 @@ export interface AgentInteractionRecord {
   endpoint: string;
   method: string;
   path: string;
+  /** Normalized HTTP route shape; preserves the raw path separately and is never an identity key. */
+  routeShape?: string;
   statusCode: number;
   model?: string;
   startedAtUnixNs: string;
