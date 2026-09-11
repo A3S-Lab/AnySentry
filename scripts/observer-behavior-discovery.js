@@ -36,6 +36,30 @@ const DEFAULT_INFRASTRUCTURE_NAME_PATTERNS = [
   /(?:^|[-_.:/])ai-apm(?:[-_.:/]|$)/i,
 ];
 
+// Keep the scoring contract independent from any framework, tool name, or provider.  A
+// deployment may tune bounded weights, but the snapshot must carry an explicit version so a
+// candidate can always explain which signal registry produced it.
+const DEFAULT_BEHAVIOR_SIGNAL_REGISTRY = Object.freeze({
+  version: 'behavior-window-v1',
+  weights: Object.freeze({
+    llm: 4,
+    tool: 1,
+    uniqueTool: 1,
+    alternation: 2,
+    networkTarget: 1,
+    workspace: 1,
+    childFanout: 1,
+    agentSequence: 4,
+  }),
+  caps: Object.freeze({
+    llm: 8,
+    uniqueTool: 3,
+    alternation: 6,
+    networkTarget: 2,
+    agentSequence: 8,
+  }),
+});
+
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
@@ -315,15 +339,47 @@ function dominantCount(map) {
   return max;
 }
 
-function scoreRecord(record) {
-  const llm = Math.min(8, record.llmEvents * 4);
-  const tools = Math.min(4, record.toolExecs);
-  const uniqueTools = Math.min(3, record.uniqueTools.size);
-  const alternation = Math.min(6, record.alternations * 2);
-  const network = Math.min(2, record.networkTargets.size);
-  const workspace = record.workspaceFiles >= 2 ? 1 : 0;
-  const fanout = record.childPids.size >= 3 ? 1 : 0;
-  const sequences = Math.min(8, record.agentSequences * 4);
+function boundedWeight(value, fallback, max = 100) {
+  return boundedNumber(value, fallback, 0, max);
+}
+
+function normalizeSignalRegistry(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const weights = source.weights && typeof source.weights === 'object' ? source.weights : {};
+  const caps = source.caps && typeof source.caps === 'object' ? source.caps : {};
+  return {
+    version: text(source.version) || DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.version,
+    weights: {
+      llm: boundedWeight(weights.llm, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.llm),
+      tool: boundedWeight(weights.tool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.tool),
+      uniqueTool: boundedWeight(weights.uniqueTool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.uniqueTool),
+      alternation: boundedWeight(weights.alternation, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.alternation),
+      networkTarget: boundedWeight(weights.networkTarget, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.networkTarget),
+      workspace: boundedWeight(weights.workspace, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.workspace),
+      childFanout: boundedWeight(weights.childFanout, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.childFanout),
+      agentSequence: boundedWeight(weights.agentSequence, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.agentSequence),
+    },
+    caps: {
+      llm: boundedWeight(caps.llm, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.llm),
+      uniqueTool: boundedWeight(caps.uniqueTool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.uniqueTool),
+      alternation: boundedWeight(caps.alternation, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.alternation),
+      networkTarget: boundedWeight(caps.networkTarget, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.networkTarget),
+      agentSequence: boundedWeight(caps.agentSequence, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.agentSequence),
+    },
+  };
+}
+
+function scoreRecord(record, registry = DEFAULT_BEHAVIOR_SIGNAL_REGISTRY) {
+  const normalized = normalizeSignalRegistry(registry);
+  const { weights, caps } = normalized;
+  const llm = Math.min(caps.llm, record.llmEvents * weights.llm);
+  const tools = Math.min(4, record.toolExecs * weights.tool);
+  const uniqueTools = Math.min(caps.uniqueTool, record.uniqueTools.size * weights.uniqueTool);
+  const alternation = Math.min(caps.alternation, record.alternations * weights.alternation);
+  const network = Math.min(caps.networkTarget, record.networkTargets.size * weights.networkTarget);
+  const workspace = record.workspaceFiles >= 2 ? weights.workspace : 0;
+  const fanout = record.childPids.size >= 3 ? weights.childFanout : 0;
+  const sequences = Math.min(caps.agentSequence, record.agentSequences * weights.agentSequence);
   return llm + tools + uniqueTools + alternation + network + workspace + fanout + sequences;
 }
 
@@ -410,6 +466,9 @@ class BehavioralAgentDetector {
     );
     this.llmHostHints = normalizedHints(
       options.llmHostHints ?? process.env.ANYSENTRY_BEHAVIOR_LLM_HOST_HINTS,
+    );
+    this.signalRegistry = normalizeSignalRegistry(
+      options.signalRegistry ?? process.env.ANYSENTRY_BEHAVIOR_SIGNAL_REGISTRY,
     );
     this.maxWorkloads = boundedNumber(
       options.maxWorkloads ?? process.env.ANYSENTRY_BEHAVIOR_MAX_WORKLOADS,
@@ -528,7 +587,7 @@ class BehavioralAgentDetector {
     const signal = llm ? 'llm' : tool ? 'tool' : '';
     if (signal && record.lastSignal && signal !== record.lastSignal) record.alternations++;
     if (signal) record.lastSignal = signal;
-    record.score = scoreRecord(record);
+    record.score = scoreRecord(record, this.signalRegistry);
     const pattern = qualifies(record, this.threshold) ? qualificationPattern(record) : '';
     if (pattern && record.probableUntil < now) {
       record.probableUntil = now + this.probableTtlMs;
@@ -588,7 +647,7 @@ class BehavioralAgentDetector {
         confidence: Math.min(0.9, 0.5 + record.score / Math.max(20, this.threshold * 2) * 0.4),
         reason: 'hint_only',
         source: 'behavior',
-        algorithmVersion: 'behavior-window-v1',
+        algorithmVersion: this.signalRegistry.version,
         score: record.score,
         threshold: this.threshold,
         window: `${this.windowMs}ms`,
@@ -647,6 +706,8 @@ module.exports = {
   isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
+  DEFAULT_BEHAVIOR_SIGNAL_REGISTRY,
+  normalizeSignalRegistry,
   qualifies,
   scoreRecord,
   strongInfrastructurePattern,

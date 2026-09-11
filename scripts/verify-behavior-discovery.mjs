@@ -7,11 +7,24 @@ const require = createRequire(import.meta.url);
 const {
   BehavioralAgentDetector,
   behaviorKey,
+  DEFAULT_BEHAVIOR_SIGNAL_REGISTRY,
+  normalizeSignalRegistry,
   isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
 } = require('./observer-behavior-discovery');
 const { behaviorDiscoveryEligible } = require('./observer-workload-filter');
+
+assert.equal(DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.version, 'behavior-window-v1');
+const tunedRegistry = normalizeSignalRegistry({
+  version: 'behavior-window-test-v2',
+  weights: { llm: 2, tool: 0 },
+  caps: { llm: 4 },
+});
+assert.equal(tunedRegistry.version, 'behavior-window-test-v2');
+assert.equal(tunedRegistry.weights.llm, 2);
+assert.equal(tunedRegistry.weights.tool, 0);
+assert.equal(tunedRegistry.caps.llm, 4);
 
 let now = 1_000_000;
 const detector = new BehavioralAgentDetector({
@@ -153,6 +166,27 @@ assert.equal(modelOnlyCandidate?.state, 'agent',
   'a model-only HTTP service becomes a bounded probable candidate from kernel transport without a tool call');
 assert.equal(modelOnlyCandidate?.attribution.classification, 'probable_agent');
 assert(modelOnlyCandidate.attribution.evidence.includes('behavior:pattern=model_transport'));
+
+const registryDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 4,
+  llmHostHints: [],
+  signalRegistry: {
+    version: 'behavior-window-test-v2',
+    weights: { llm: 2, tool: 0 },
+    caps: { llm: 4 },
+  },
+});
+const registryCandidate = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(registryCandidate, undefined, 'one model signal remains below the custom threshold');
+const registryPromoted = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(registryPromoted?.attribution.algorithmVersion, 'behavior-window-test-v2');
 
 const semanticDetector = new BehavioralAgentDetector({
   now: () => now,
