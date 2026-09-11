@@ -233,7 +233,7 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
       FORWARD_RETAIN_NON_AGENT: 'false',
       FORWARD_NOISE_POLICY: 'balanced',
       FORWARD_BATCH_SIZE: '32',
-      FORWARD_BATCH_FLUSH_MS: '5',
+      FORWARD_BATCH_FLUSH_MS: options.completeFirstBatch ? '5000' : '5',
       ...env,
       ANYSENTRY_INGEST_URL: api,
       ANYSENTRY_BATCH_INGEST_URL: `${api}/batch`,
@@ -288,6 +288,10 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   ];
   if (options.driveInput) {
     await options.driveInput({ child, lines, batchRequests, heartbeats });
+  } else if (options.completeFirstBatch) {
+    child.stdin.write(`${lines.join('\n')}\n`);
+    await eventually(() => batchRequests.length > 0, 6_000, `${label} first batch`);
+    child.stdin.end();
   } else {
     child.stdin.end(`${lines.join('\n')}\n`);
   }
@@ -318,6 +322,10 @@ async function runConfig(label, env = {}, inputLines, options = {}) {
   await new Promise((resolve) => server.close(resolve));
   fs.rmSync(spoolDirectory, { recursive: true, force: true });
   assert.equal(exitCode, 0, stderr);
+  if (options.completeFirstBatch) {
+    assert.equal(batchRequests[0]?.length, Number(childEnv.FORWARD_BATCH_SIZE),
+      `${label} did not reach its configured initial batch size`);
+  }
   const heartbeat = matchingHeartbeat();
   assert.ok(heartbeat, `missing structured ${label} heartbeat: ${JSON.stringify(heartbeats)}`);
   return { batches, batchRequests, batchRequestBytes, heartbeat, heartbeats, runtimeSnapshots };
@@ -767,6 +775,7 @@ const policyDiscardAck = await runConfig('policy-discard-ack', {
   FORWARD_BATCH_SIZE: '3',
   FORWARD_MAX_INFLIGHT: '1',
 }, policyDiscardLines, {
+  completeFirstBatch: true,
   batchReply: (events) => ({
     statusCode: 200,
     body: wrapped({
@@ -890,6 +899,7 @@ const partialAck = await runConfig('partial-ack', {
   FORWARD_BATCH_SIZE: '3',
   FORWARD_MAX_INFLIGHT: '1',
 }, partialAckLines, {
+  completeFirstBatch: true,
   batchReply: (events) => ({
     statusCode: 200,
     body: wrapped({
@@ -929,6 +939,7 @@ const retryRecovery = await runConfig('retry-recovery', {
   FORWARD_RETRY_MAX_DELAY_MS: '20',
   FORWARD_RETRY_MAX_AGE_MS: '500',
 }, retryRecoveryLines, {
+  completeFirstBatch: true,
   heartbeatSecs: '60',
   batchReply: (events) => {
     retryRecoveryRequests++;
@@ -1019,6 +1030,7 @@ const nonSuffixRetry = await runConfig('non-suffix-retry', {
   FORWARD_BATCH_SIZE: '2',
   FORWARD_MAX_INFLIGHT: '1',
 }, nonSuffixRetryLines, {
+  completeFirstBatch: true,
   heartbeatSecs: '60',
   batchReply: () => ({
     statusCode: 200,
@@ -1653,6 +1665,7 @@ const split413 = await runConfig('split-413', {
   FORWARD_BATCH_ACK_MAX_BYTES: String(16 * 1024),
   FORWARD_HTTP_TIMEOUT_MS: '4000',
 }, splitLines, {
+  completeFirstBatch: true,
   batchReply: (events) => {
     if (events.length > 1) {
       multi413Attempts++;
@@ -1727,6 +1740,7 @@ const partial413 = await runConfig('partial-ack-after-413', {
   FORWARD_RETRY_MAX_DELAY_MS: '20',
   FORWARD_RETRY_MAX_AGE_MS: '500',
 }, partial413Lines, {
+  completeFirstBatch: true,
   heartbeatSecs: '60',
   batchReply: (events) => {
     partial413Requests++;
@@ -1790,6 +1804,7 @@ const shutdown413 = await runConfig('partial-413-shutdown', {
   FORWARD_HTTP_TIMEOUT_MS: '120000',
   FORWARD_SHUTDOWN_TIMEOUT_MS: '8000',
 }, shutdown413Lines, {
+  completeFirstBatch: true,
   heartbeatSecs: '60',
   timeoutMs: 20_000,
   batchReply: (events) => {
@@ -1917,7 +1932,11 @@ assert.ok(scopedIngest.batches.some((item) => item.line === scopedMarkerLine));
 assert.equal(scopedIngest.heartbeat.filterMetrics.observed, 6, 'scope must run after attribution');
 assert.equal(scopedIngest.heartbeat.filterMetrics.forwarded, 1);
 assert.equal(scopedIngest.heartbeat.filterMetrics.probableAgent, 1);
-assert.equal(scopedIngest.heartbeat.filterMetrics.wouldFilterUnknown, 0);
+assert.equal(
+  scopedIngest.heartbeat.filterMetrics.wouldFilterUnknown,
+  1,
+  'explicit retain_unknown=false is visible in shadow mode while the marker remains forwarded',
+);
 assert.equal(scopedIngest.heartbeat.filterMetrics.wouldDiscoveryBudgetDrop, 0);
 assert.match(scopedIngest.heartbeat.message, /e2e_marker_scope=enabled/u);
 assert.match(scopedIngest.heartbeat.message, /e2e_marker_scoped_out=5/u);
