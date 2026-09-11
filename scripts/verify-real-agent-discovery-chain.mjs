@@ -94,18 +94,27 @@ async function api(path, body) {
 }
 
 async function eventually(label, check, timeoutMs = 45_000) {
+  const startedAt = Date.now();
   const deadline = Date.now() + timeoutMs;
   let last;
+  let firstError;
+  let attempts = 0;
   while (Date.now() < deadline) {
+    attempts += 1;
     try {
       last = await check();
       if (last) return last;
     } catch (error) {
       last = error;
+      firstError ||= error;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`${label} did not converge: ${last instanceof Error ? last.message : JSON.stringify(last)}`);
+  const format = (value) => value instanceof Error ? value.message : JSON.stringify(value);
+  throw new Error(
+    `${label} did not converge after ${Date.now() - startedAt}ms (${attempts} attempts); `
+      + `first=${format(firstError)}; last=${format(last)}`,
+  );
 }
 
 async function applyRealPod() {
@@ -571,14 +580,20 @@ async function cleanup() {
 }
 
 try {
+  console.error(`[real-discovery] API probe: ${baseUrl}/stats`);
   await api('/stats');
   // Create Docker workloads before the finite-lived Kubernetes fixture. Slow local Docker
   // storage must not consume the Pod's entire test lifetime before collection starts.
+  console.error(`[real-discovery] starting template workload: ${templateName}`);
   await startTemplateContainer();
+  console.error(`[real-discovery] starting unknown workload: ${unknownName}`);
   await startUnknownContainer();
+  console.error(`[real-discovery] creating Kubernetes workload: ${podName}`);
   const pod = await applyRealPod();
   const snapshotPort = await createSnapshotServer(pod);
+  console.error(`[real-discovery] starting collector: ${collectorName}`);
   await startCollector(snapshotPort, pod.spec.nodeName);
+  console.error('[real-discovery] collector ready; triggering scenarios');
   await new Promise((resolve) => setTimeout(resolve, 2_000));
   await triggerScenarios();
   await verifyResults();
