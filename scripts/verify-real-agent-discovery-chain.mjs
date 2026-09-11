@@ -29,6 +29,10 @@ const unknownMarker = `marker-unknown-behavior-${suffix}`;
 const k8sAgentMarker = `marker-k8s-agent-${suffix}`;
 const k8sSidecarMarker = `marker-k8s-sidecar-${suffix}`;
 const namespace = process.env.ANYSENTRY_REAL_K8S_NAMESPACE || 'default';
+const controlNamespace = process.env.ANYSENTRY_REAL_CONTROL_NAMESPACE || 'anysentry';
+const capacityGate = process.env.ANYSENTRY_REAL_CAPACITY_GATE !== 'off';
+const maxApiMemoryMiB = Number(process.env.ANYSENTRY_REAL_MAX_API_MEMORY_MIB || 600);
+const maxClickHouseMemoryMiB = Number(process.env.ANYSENTRY_REAL_MAX_CLICKHOUSE_MEMORY_MIB || 1_800);
 const created = {
   source: false,
   collector: false,
@@ -71,7 +75,9 @@ function run(command, args, options = {}) {
       clearTimeout(timeout);
       reject(error);
     });
-    child.once('exit', (code, signal) => {
+    // `exit` can precede the final stdout data event for short-lived kubectl/docker commands;
+    // wait for stdio `close` so capacity and cleanup decisions use complete command output.
+    child.once('close', (code, signal) => {
       clearTimeout(timeout);
       if (code === 0 || options.allowFailure) {
         resolve({ code, signal, stdout, stderr });
@@ -148,6 +154,43 @@ async function eventually(label, check, timeoutMs = 45_000) {
     `${label} did not converge after ${Date.now() - startedAt}ms (${attempts} attempts); `
       + `first=${format(firstError)}; last=${format(last)}`,
   );
+}
+
+function memoryMiB(value) {
+  const match = String(value || '').trim().match(/^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)$/u);
+  if (!match) return undefined;
+  const amount = Number(match[1]);
+  const factor = { Ki: 1 / 1024, Mi: 1, Gi: 1024, Ti: 1024 * 1024 }[match[2]];
+  return amount * factor;
+}
+
+async function assertSharedCapacity() {
+  if (!capacityGate) return;
+  const result = await run('kubectl', [
+    '-n', controlNamespace, 'top', 'pod', '--no-headers',
+  ], { allowFailure: true, timeoutMs: 10_000 });
+  if (result.code !== 0) {
+    throw new Error(`capacity gate could not read kubectl top; refusing real workload creation: ${result.stderr.trim()}`);
+  }
+  const observed = new Map();
+  for (const line of result.stdout.split(/\r?\n/u).filter(Boolean)) {
+    const fields = line.trim().split(/\s+/u);
+    if (fields.length < 3) continue;
+    if (fields[0].startsWith('anysentry-')) observed.set('anysentry', memoryMiB(fields.at(-1)));
+    else if (fields[0].startsWith('clickhouse-')) observed.set('clickhouse', memoryMiB(fields.at(-1)));
+  }
+  const apiMemory = observed.get('anysentry');
+  const clickhouseMemory = observed.get('clickhouse');
+  if (!Number.isFinite(apiMemory) || !Number.isFinite(clickhouseMemory)) {
+    throw new Error(`capacity gate missing AnySentry/ClickHouse memory samples: ${JSON.stringify(Object.fromEntries(observed))}; code=${result.code}; stderr=${result.stderr.trim()}`);
+  }
+  if (apiMemory > maxApiMemoryMiB || clickhouseMemory > maxClickHouseMemoryMiB) {
+    throw new Error(
+      `capacity gate refused real workload: anysentry=${apiMemory.toFixed(1)}MiB/${maxApiMemoryMiB}MiB; `
+      + `clickhouse=${clickhouseMemory.toFixed(1)}MiB/${maxClickHouseMemoryMiB}MiB`,
+    );
+  }
+  console.error(`[real-discovery] capacity gate passed: anysentry=${apiMemory.toFixed(1)}MiB; clickhouse=${clickhouseMemory.toFixed(1)}MiB`);
 }
 
 async function applyRealPod() {
@@ -615,6 +658,7 @@ try {
   if (!image) {
     throw new Error('ANYSENTRY_REAL_OBSERVER_IMAGE is required; refusing to use an unverified Observer image');
   }
+  await assertSharedCapacity();
   console.error(`[real-discovery] API probe: ${baseUrl}/stats`);
   await api('/stats');
   await createEphemeralSource();
