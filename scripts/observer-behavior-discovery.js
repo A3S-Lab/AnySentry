@@ -327,7 +327,7 @@ function scoreRecord(record) {
   return llm + tools + uniqueTools + alternation + network + workspace + fanout + sequences;
 }
 
-function qualifies(record, threshold) {
+function qualificationPattern(record) {
   const llmToolPattern =
     record.llmEvents > 0 &&
     record.toolExecs > 0 &&
@@ -342,7 +342,14 @@ function qualifies(record, threshold) {
   // observations in one generation/window are enough for a bounded probable candidate; this is
   // deliberately weaker than confirmation and still carries the normal candidate TTL/profile.
   const modelServicePattern = record.llmEvents >= 2 && record.networkTargets.size > 0;
-  return record.score >= threshold && (llmToolPattern || autonomousToolPattern || modelServicePattern);
+  if (llmToolPattern) return 'llm_tool';
+  if (autonomousToolPattern) return 'autonomous_tool';
+  if (modelServicePattern) return 'model_transport';
+  return '';
+}
+
+function qualifies(record, threshold) {
+  return record.score >= threshold && Boolean(qualificationPattern(record));
 }
 
 function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {
@@ -522,7 +529,8 @@ class BehavioralAgentDetector {
     if (signal && record.lastSignal && signal !== record.lastSignal) record.alternations++;
     if (signal) record.lastSignal = signal;
     record.score = scoreRecord(record);
-    if (qualifies(record, this.threshold) && record.probableUntil < now) {
+    const pattern = qualifies(record, this.threshold) ? qualificationPattern(record) : '';
+    if (pattern && record.probableUntil < now) {
       record.probableUntil = now + this.probableTtlMs;
       this.stats.promoted++;
     }
@@ -586,6 +594,7 @@ class BehavioralAgentDetector {
         window: `${this.windowMs}ms`,
         evidence: [
           `behavior:score=${record.score}`,
+          `behavior:pattern=${pattern || 'hysteresis'}`,
           `behavior:llm=${record.llmEvents}`,
           `behavior:tools=${record.toolExecs}`,
           `behavior:unique_tools=${record.uniqueTools.size}`,

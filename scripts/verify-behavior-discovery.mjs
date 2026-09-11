@@ -152,6 +152,7 @@ const modelOnlyCandidate = modelOnlyServiceDetector.observe(
 assert.equal(modelOnlyCandidate?.state, 'agent',
   'a model-only HTTP service becomes a bounded probable candidate from kernel transport without a tool call');
 assert.equal(modelOnlyCandidate?.attribution.classification, 'probable_agent');
+assert(modelOnlyCandidate.attribution.evidence.includes('behavior:pattern=model_transport'));
 
 const semanticDetector = new BehavioralAgentDetector({
   now: () => now,
