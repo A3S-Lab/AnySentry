@@ -35,6 +35,26 @@ const processNegative = filterDecision(event(), {
   attribution: { classification: 'non_agent', source: 'process_graph' },
 });
 assert.equal(processNegative.action, 'sample');
+const behaviorCandidate = filterDecision(event('85'), {
+  state: 'agent',
+  attribution: {
+    classification: 'probable_agent',
+    source: 'behavior',
+    evidence: Array.from({ length: 30 }, (_, index) => `behavior:signal=${index}`),
+    algorithmVersion: 'behavior-window-v1',
+    score: 12,
+    threshold: 8,
+    window: '300s',
+  },
+});
+assert.equal(behaviorCandidate.action, 'keep');
+assert.equal(behaviorCandidate.source, 'behavior');
+assert.equal(behaviorCandidate.algorithmVersion, 'behavior-window-v1');
+assert.equal(behaviorCandidate.score, 12);
+assert.equal(behaviorCandidate.threshold, 8);
+assert.equal(behaviorCandidate.window, '300s');
+assert.equal(behaviorCandidate.evidence.length, 16, 'candidate evidence remains bounded in rule decisions');
+assert.equal(behaviorCandidate.evidence[0], 'behavior:signal=14');
 assert.equal(filterDecision(event('invalid'), { state: 'unknown' }), undefined);
 
 const shadowPublisher = new FilterRulePublisher({

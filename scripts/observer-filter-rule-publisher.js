@@ -101,6 +101,11 @@ function filterDecision(observerEvent, classification, options = {}) {
         ? 'non_agent'
         : 'unknown');
   const conflict = classification?.workspaceConflict === true || attribution.conflict === true;
+  const behaviorEvidence = Array.isArray(attribution.evidence)
+    ? attribution.evidence
+      .filter((value) => typeof value === 'string' && value.length <= 256)
+      .slice(-16)
+    : undefined;
   let action = 'sample';
   let authority = 'candidate';
   let reasonCode = 'identity_unknown';
@@ -154,6 +159,11 @@ function filterDecision(observerEvent, classification, options = {}) {
     action,
     reasonCode,
     source: text(attribution.source) || (classification?.state === 'infrastructure' ? 'configured_root' : 'none'),
+    ...(behaviorEvidence?.length ? { evidence: behaviorEvidence } : {}),
+    ...(text(attribution.algorithmVersion) ? { algorithmVersion: text(attribution.algorithmVersion) } : {}),
+    ...(Number.isFinite(Number(attribution.score)) ? { score: Number(attribution.score) } : {}),
+    ...(Number.isFinite(Number(attribution.threshold)) ? { threshold: Number(attribution.threshold) } : {}),
+    ...(text(attribution.window) ? { window: text(attribution.window) } : {}),
     ...(physicalWorkloadId ? { physicalWorkloadId } : {}),
     ...(agentInstanceId ? { agentInstanceId } : {}),
     ...(workloadRef ? { workloadRef } : {}),

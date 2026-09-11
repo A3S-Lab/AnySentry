@@ -68,6 +68,9 @@ const promoted = detector.observe(
 assert.equal(promoted.state, 'agent');
 assert.equal(promoted.attribution.classification, 'probable_agent');
 assert.equal(promoted.attribution.source, 'behavior');
+assert.equal(promoted.attribution.algorithmVersion, 'behavior-window-v1');
+assert.equal(promoted.attribution.threshold, 8);
+assert.equal(promoted.attribution.window, '60000ms');
 assert.equal(promoted.attribution.agentDisplayName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.podName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.containerName, 'agent');

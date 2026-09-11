@@ -568,6 +568,10 @@ class BehavioralAgentDetector {
         confidence: Math.min(0.9, 0.5 + record.score / Math.max(20, this.threshold * 2) * 0.4),
         reason: 'hint_only',
         source: 'behavior',
+        algorithmVersion: 'behavior-window-v1',
+        score: record.score,
+        threshold: this.threshold,
+        window: `${this.windowMs}ms`,
         evidence: [
           `behavior:score=${record.score}`,
           `behavior:llm=${record.llmEvents}`,
