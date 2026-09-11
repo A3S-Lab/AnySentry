@@ -214,6 +214,25 @@ for (let index = 0; index < 150; index++) {
 assert.ok(bounded.metrics().workloads <= 100);
 assert.ok(bounded.metrics().evicted > 0);
 
+const saturated = new BehavioralAgentDetector({ now: () => now, maxWorkloads: 100 });
+const activeScope = { physicalWorkloadId: 'fixture:active', processGenerationKey: 'generation-1' };
+saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }), activeScope);
+assert.equal(saturated.observe(event('LlmCall', {}), activeScope)?.state, 'agent');
+for (let index = 0; index < 99; index++) {
+  saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }, `capacity-${index}`));
+}
+assert.equal(saturated.metrics().workloads, 100);
+saturated.prune();
+assert.equal(saturated.metrics().evicted, 0, 'pruning at exact capacity does not evict live records');
+assert.equal(saturated.observe(event('FileAccess', { path: '/workspace/result' }), activeScope)?.state,
+  'agent', 'a candidate at capacity must retain its score and promotion on its next event');
+assert.equal(saturated.metrics().evicted, 0, 'a known scope needs no capacity eviction');
+saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }, 'capacity-new'));
+assert.equal(saturated.metrics().workloads, 100, 'a new scope remains bounded at capacity');
+assert.equal(saturated.metrics().evicted, 1, 'one new scope evicts exactly one inactive scope');
+assert.equal(saturated.observe(event('FileAccess', { path: '/workspace/result-2' }), activeScope)?.state,
+  'agent', 'recently observed candidate survives cold-start admission of another scope');
+
 assert.equal(isServiceDataFile({ path: '/var/lib/clickhouse/store/abc/data.bin' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/postgresql/16/main/base/1' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/mysql/orders.ibd' }), true);

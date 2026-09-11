@@ -432,8 +432,14 @@ class BehavioralAgentDetector {
     }
     const now = this.now();
     this.operations++;
-    if (this.operations % 1_024 === 0 || this.records.size >= this.maxWorkloads) this.prune(now);
+    if (this.operations % 1_024 === 0) this.prune(now);
     let record = this.records.get(key);
+    // Capacity applies to new scopes only. Visiting a known scope must not evict its evidence.
+    // Map insertion order tracks accesses, avoiding a full-table scan for each cold-start scope.
+    if (!record && this.records.size >= this.maxWorkloads) {
+      this.records.delete(this.records.keys().next().value);
+      this.stats.evicted++;
+    }
     if (!record || now - record.windowStartedAt >= this.windowMs) {
       const previousProbableUntil = record?.probableUntil ?? 0;
       record = {
@@ -461,8 +467,9 @@ class BehavioralAgentDetector {
         awaitingWorkspace: false,
         score: 0,
       };
-      this.records.set(key, record);
     }
+    this.records.delete(key);
+    this.records.set(key, record);
     record.lastSeenAt = now;
     const kind = eventKind(observerEvent);
     const payload = eventPayload(observerEvent);
@@ -599,17 +606,8 @@ class BehavioralAgentDetector {
         this.stats.expired++;
       }
     }
-    while (this.records.size >= this.maxWorkloads) {
-      let oldestKey;
-      let oldestAt = Infinity;
-      for (const [key, record] of this.records) {
-        if (record.lastSeenAt < oldestAt) {
-          oldestAt = record.lastSeenAt;
-          oldestKey = key;
-        }
-      }
-      if (!oldestKey) break;
-      this.records.delete(oldestKey);
+    while (this.records.size > this.maxWorkloads) {
+      this.records.delete(this.records.keys().next().value);
       this.stats.evicted++;
     }
   }
