@@ -22,6 +22,7 @@
 | Model-only service candidate | `verify-behavior-discovery.mjs` | passed | 同一代次窗口内两次 provider-neutral kernel `Egress` 模型路由即可进入 bounded `probable_agent`，不要求 `ToolExec` 或厂商 host，仍不创建稳定 LogicalAgent |
 | Candidate capacity and continuity | `verify-behavior-discovery.mjs` | passed | 满容量继续观测已有候选不淘汰；新 scope 按最近访问顺序淘汰一项；周期清理保留活跃记录；旧实现已复现失败 |
 | Filter-rule compiler performance | `verify-unified-filter-rule-performance.mjs` | passed | 2,000 rules，index build 2.573 ms，evaluator P95 0.034 ms，catalog P95 7.492 ms，explain P95 4.547 ms |
+| Candidate discovery hot-path performance | `perf-agent-filter.mjs` | passed | 60,000 synthetic events，246,743 events/s，latency P99 14.83 μs，RSS 增量 1.3 MB；bounded identity/process/candidate caches，无 stale-generation miss |
 | S5 capture-profile hot reload | `verify-s5-capture-profile-control.mjs` | passed | preview/ACK/grant epoch、intent hash、candidate safe downgrade、generation fence |
 | Forwarder full retention pipeline | `verify-filter-pipeline.mjs`（180 秒有界运行） | passed | Unknown、candidate、retry、413、spool、capacity、SIGTERM final snapshot/heartbeat |
 | Observer lifecycle generation | `cargo test -p a3s-observer-collector process_lifecycle` | 11 passed | PID reuse、re-exec、start ticks、cgroup mismatch、bounded generation store |
