@@ -344,7 +344,15 @@ function boundedWeight(value, fallback, max = 100) {
 }
 
 function normalizeSignalRegistry(value) {
-  const source = value && typeof value === 'object' ? value : {};
+  let source = value && typeof value === 'object' ? value : {};
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      source = parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      source = {};
+    }
+  }
   const weights = source.weights && typeof source.weights === 'object' ? source.weights : {};
   const caps = source.caps && typeof source.caps === 'object' ? source.caps : {};
   return {

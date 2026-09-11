@@ -25,6 +25,16 @@ assert.equal(tunedRegistry.version, 'behavior-window-test-v2');
 assert.equal(tunedRegistry.weights.llm, 2);
 assert.equal(tunedRegistry.weights.tool, 0);
 assert.equal(tunedRegistry.caps.llm, 4);
+assert.equal(
+  normalizeSignalRegistry(JSON.stringify({ version: 'behavior-window-json-v1', weights: { llm: 3 } })).version,
+  'behavior-window-json-v1',
+  'runtime registry may be supplied as a bounded JSON snapshot',
+);
+assert.equal(
+  normalizeSignalRegistry('{not-json').version,
+  'behavior-window-v1',
+  'invalid runtime registry falls back to the safe default',
+);
 
 let now = 1_000_000;
 const detector = new BehavioralAgentDetector({
