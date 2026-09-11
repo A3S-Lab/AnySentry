@@ -72,7 +72,7 @@ quiescent WebSocket idle、reassembly sequence-gap/eviction、Rustls moved-point
 competing pointer ambiguity 以及 WebSocket control-frame 竞争归属；这些失败保持在 WIP
 边界内，未通过调整断言隐藏，也不降低 generic HTTP、Ring reader 或 TLS attach 已通过的证据等级。
 
-目标级 `verify-canonical-goal.mjs --run-tests` 当前为 `55 pass, 2 partial, 8 blocked,
+目标级 `verify-canonical-goal.mjs --run-tests` 当前为 `58 pass, 2 partial, 5 blocked,
 9 unexecuted, 1 fail`；唯一 fail 是上述 Observer Cargo WIP，真实 host/Docker/Kubernetes
 代表对象和 credential hygiene 仍由环境门禁阻断。
 
