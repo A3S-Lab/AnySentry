@@ -1,6 +1,6 @@
 # 通用 Agent 服务发现、选择性采集与跨服务观测设计
 
-状态：设计稿，待实现与分阶段验收
+状态：已审核，分阶段实现与验收中（真实服务、canonical durable point-read、classic SSL 仍有未完成闸门）
 适用仓库：`AnySentry`、`Observer`
 当前基线：AnySentry `976d0b0`，Observer `ece8e49`
 日期：2026-09-11
