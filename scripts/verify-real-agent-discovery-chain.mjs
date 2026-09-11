@@ -11,6 +11,7 @@ const baseUrl = (
   process.env.ANYSENTRY_API_BASE ??
   `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`
 ).replace(/\/$/, '');
+const managementToken = String(process.env.ANYSENTRY_REAL_MANAGEMENT_TOKEN || '').trim();
 const image = process.env.ANYSENTRY_REAL_OBSERVER_IMAGE || 'anysentry-observer:agent-filter-test';
 const suffix = `${Date.now().toString(36)}-${process.pid}`;
 const collectorName = `anysentry-filter-chain-${suffix}`;
@@ -91,7 +92,10 @@ async function startDetachedDocker(containerName, args, options = {}) {
 async function api(path, body) {
   const response = await fetch(`${baseUrl}${path}`, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(managementToken ? { 'x-anysentry-management-token': managementToken } : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(5_000),
   });
@@ -289,6 +293,7 @@ async function startCollector(snapshotPort, nodeName) {
       'ANYSENTRY_HEARTBEAT_SECS=2',
       '-e',
       'ANYSENTRY_DOCKER_DISCOVERY=on',
+      ...(managementToken ? ['-e', `ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN=${managementToken}`] : []),
       '-e',
       'FORWARD_SCOPE=shadow',
       '-e',
