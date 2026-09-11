@@ -226,6 +226,9 @@ function isKnownInfrastructureWorkload(ref, attribution) {
 
 function isLlmEvent(kind, payload, llmHostHints = DEFAULT_LLM_HOST_HINTS) {
   if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return true;
+  // A file path or executable name can contain protocol words. Only transport observations
+  // may supply these optional model hints; otherwise ordinary file activity invents an LLM.
+  if (!['Egress', 'Connect', 'Dns', 'DnsQuery', 'Tls', 'TlsHandshake'].includes(kind)) return false;
   const route = routeText(payload);
   // These are protocol operation shapes, not provider or framework names. They also cover
   // private gateways where the peer address carries no useful vendor identity.
@@ -317,7 +320,9 @@ function qualifies(record, threshold) {
 }
 
 function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {
-  if (record.llmEvents === 0 && isKnownInfrastructureWorkload(ref, attribution)) {
+  // Inventory names are weak negative hints. A complete kernel-only decision/tool sequence
+  // must survive a deployment rename (for example an Agent which manages a database).
+  if (record.llmEvents === 0 && record.agentSequences === 0 && isKnownInfrastructureWorkload(ref, attribution)) {
     return 'known_infrastructure_workload';
   }
   const fileEvents = record.workspaceFiles + record.serviceDataFiles;

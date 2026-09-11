@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url);
 const {
   BehavioralAgentDetector,
   behaviorKey,
+  isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
 } = require('./observer-behavior-discovery');
@@ -124,6 +125,38 @@ assert.equal(
   'agent',
   'a generic model operation marker is sufficient without a provider-specific host name',
 );
+for (const kind of ['FileAccess', 'FileRead', 'FileDelete', 'ToolExec', 'ProcessExit', 'SecurityAction']) {
+  assert.equal(isLlmEvent(kind, {
+    path: '/workspace/messages/responses.json',
+    host: 'api.openai.com',
+    semanticKind: 'inference',
+  }), false, `${kind} fields cannot fabricate a model transport observation`);
+}
+const pathOnlyDetector = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+pathOnlyDetector.observe(event('ToolExec', { pid: 112, argv: ['custom-worker'] }));
+assert.equal(pathOnlyDetector.observe(event('FileAccess', {
+  pid: 112, path: '/workspace/messages/responses.json', write: true,
+})), undefined, 'model-like directory names plus one exec must not promote an Agent');
+
+for (const name of ['anonymous-service', 'redis-research-agent', 'postgres-task-runner']) {
+  const kernelOnlyDetector = new BehavioralAgentDetector({ now: () => now, llmHostHints: [] });
+  const scope = {
+    physicalWorkloadId: `docker:test:${name}`,
+    processGenerationKey: 'pgk-fixture-service-generation',
+    workloadRef: { environment: 'docker', kind: 'container', name },
+  };
+  for (const observation of [
+    event('ToolExec', { pid: 113, argv: ['opaque-action-a'] }),
+    event('Connect', { pid: 113, peer: '192.0.2.17', port: 17439 }),
+    event('ToolExec', { pid: 113, argv: ['opaque-action-b'] }),
+  ]) kernelOnlyDetector.observe(observation, scope);
+  const candidate = kernelOnlyDetector.observe(event('FileAccess', {
+    pid: 113, path: '/workspace/result.bin', write: true,
+  }), scope);
+  assert.equal(candidate?.state, 'agent', `${name}: a workload name cannot veto kernel behavior`);
+  assert(candidate.attribution.evidence.includes('behavior:llm=0'));
+  assert(candidate.attribution.evidence.includes('behavior:agent_sequences=1'));
+}
 const continued = detector.observe(
   event('ToolExec', { pid: 101, argv: ['curl', 'https://example.test'] }),
   behaviorAttribution,
