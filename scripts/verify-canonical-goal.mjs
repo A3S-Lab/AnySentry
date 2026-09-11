@@ -130,6 +130,7 @@ function parseOptions(argv) {
     jsonOut: undefined,
     apiBase: 'http://127.0.0.1:29653/security-center',
     evidenceDir: process.env.ANYSENTRY_CANONICAL_EVIDENCE_DIR || undefined,
+    apiBaseExplicit: Boolean(process.env.ANYSENTRY_API_BASE),
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -137,7 +138,10 @@ function parseOptions(argv) {
     else if (arg === '--strict') options.strict = true;
     else if (arg === '--json') options.json = true;
     else if (arg === '--json-out') options.jsonOut = argv[++index];
-    else if (arg === '--api-base') options.apiBase = argv[++index];
+    else if (arg === '--api-base') {
+      options.apiBase = argv[++index];
+      options.apiBaseExplicit = true;
+    }
     else if (arg === '--evidence-dir') options.evidenceDir = argv[++index];
     else if (arg === '--help' || arg === '-h') {
       console.log(usage());
@@ -148,6 +152,23 @@ function parseOptions(argv) {
   }
   if (!options.apiBase) throw new Error('--api-base requires a URL');
   return options;
+}
+
+async function discoverLocalApiBase(options) {
+  if (options.apiBaseExplicit) return;
+  const ports = [...new Set([
+    process.env.PORT,
+    '32653',
+    '29653',
+    '29654',
+  ].filter(Boolean))];
+  for (const port of ports) {
+    const probe = await probeHttp(`http://127.0.0.1:${port}/security-center`);
+    if (probe.status === STATUS.PASS || probe.status === STATUS.PARTIAL) {
+      options.apiBase = `http://127.0.0.1:${port}/security-center`;
+      return;
+    }
+  }
 }
 
 function trimCapture(value) {
@@ -1059,6 +1080,7 @@ function printHumanSummary(report) {
 
 async function main() {
   const options = parseOptions(process.argv.slice(2));
+  await discoverLocalApiBase(options);
   const beforeGit = snapshotGitStates();
   const [host, docker, kubernetes] = await Promise.all([
     inspectHost(options.apiBase),
