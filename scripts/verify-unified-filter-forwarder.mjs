@@ -191,6 +191,9 @@ child = spawn(process.execPath, ['scripts/observer-forward.js'], {
     FORWARD_BATCH_SIZE: '1',
     FORWARD_BATCH_FLUSH_MS: '1',
     FORWARD_SPOOL_PATH: path.join(temporary, 'spool.wal'),
+    // This verifier exercises rule projection and event admission. Keep the periodic fsync
+    // timer outside its short shutdown window; durable-spool fsync behavior is covered separately.
+    FORWARD_SPOOL_FSYNC_MS: '60000',
     FORWARD_SHUTDOWN_TIMEOUT_MS: '5000',
     A3S_OBSERVER_COLLECTOR_ID: 'unified-filter-forwarder',
     A3S_NODE_NAME: 'node-unified',
