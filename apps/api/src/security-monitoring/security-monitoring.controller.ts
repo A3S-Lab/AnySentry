@@ -8172,6 +8172,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const interactionId = f?.interactionId === undefined
       ? undefined
       : strictIdentityText(f.interactionId, 160);
+    const routeShape = f?.routeShape === undefined
+      ? undefined
+      : strictIdentityText(f.routeShape, 512);
     if (f?.agentAssetId !== undefined && !agentAssetId) {
       throw new BadRequestException('agentAssetId is invalid');
     }
@@ -8181,7 +8184,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (f?.interactionId !== undefined && !interactionId) {
       throw new BadRequestException('interactionId is invalid');
     }
-    const result = await this.agg.agentInteractions({ ...f, agentAssetId, agentInstanceId, interactionId });
+    if (f?.routeShape !== undefined && !routeShape) {
+      throw new BadRequestException('routeShape is invalid');
+    }
+    const result = await this.agg.agentInteractions({ ...f, agentAssetId, agentInstanceId, interactionId, routeShape });
     this.audit.record({
       actor: auditActor(headers),
       action: 'agent.interaction.content.read',
@@ -8192,6 +8198,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         agentAssetId,
         agentInstanceId,
         interactionId,
+        routeShape,
         resultCount: result.items.length,
         requestedLimit: f?.limit,
         classificationView: f?.classificationView,
