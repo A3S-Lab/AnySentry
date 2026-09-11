@@ -1833,6 +1833,7 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   agentInstanceId?: string;
   interactionId?: string;
   interactionType?: 'model' | 'tool' | 'remote_agent' | 'unparsed';
+  routeShape?: string;
   model?: string;
   transport?: 'http' | 'tls';
   tlsAdapterId?: string;

@@ -8055,6 +8055,7 @@ export class ClickHouseStore {
       ...(input.interactionType
         ? ["interactionType = {interactionType:String}"]
         : []),
+      ...(input.routeShape ? ["routeShape = {routeShape:String}"] : []),
       ...(input.model ? ["model = {model:String}"] : []),
       ...(input.transport ? ["transport = {transport:String}"] : []),
       ...(input.tlsAdapterId ? ["tlsAdapterId = {tlsAdapterId:String}"] : []),
@@ -8084,6 +8085,7 @@ export class ClickHouseStore {
       ...(input.interactionType
         ? { interactionType: input.interactionType }
         : {}),
+      ...(input.routeShape ? { routeShape: input.routeShape } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.transport ? { transport: input.transport } : {}),
       ...(input.tlsAdapterId ? { tlsAdapterId: input.tlsAdapterId } : {}),
