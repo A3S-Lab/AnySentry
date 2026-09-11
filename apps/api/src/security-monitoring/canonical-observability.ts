@@ -2937,7 +2937,13 @@ export interface LogicalAgentResolution {
 
 /** Resolve stable definition identity; terminal context is deliberately excluded by default. */
 export function resolveLogicalAgentDefinition(input: LogicalAgentResolutionInput): LogicalAgentResolution {
-  const family = text(input.family ?? input.product, 160) ?? 'unknown';
+  const familyRaw = text(input.family ?? input.product, 160) ?? 'unknown';
+  const family = familyRaw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/gu, '-')
+    .replace(/-+/gu, '-')
+    .replace(/^-|-$/gu, '') || 'unknown';
   const tenantId = text(input.tenantId, 240);
   const ownerId = text(input.ownerId, 240);
   const workspacePath = text(input.workspacePath, 1_024);

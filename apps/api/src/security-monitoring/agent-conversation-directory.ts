@@ -78,6 +78,22 @@ function canonicalEnvironment(
   return 'unknown';
 }
 
+function isCliAgentProduct(product: string): boolean {
+  const normalized = product.trim().toLowerCase().replace(/[\s_]+/gu, '-');
+  return (
+    normalized === 'claude'
+    || normalized === 'claude-code'
+    || normalized === 'claude-code-cli'
+    || normalized === 'codex'
+    || normalized === 'codex-cli'
+    || normalized === 'kimi'
+    || normalized === 'kimi-cli'
+    || normalized === 'kimi-code'
+    || normalized === 'pi'
+    || normalized === 'pi-agent'
+  );
+}
+
 function fallbackLogicalAgentId(
   product: string,
   workspacePath: string,
@@ -100,11 +116,13 @@ function fallbackLogicalAgentId(
   // not silently merge while still allowing later review/registration to reconcile them.
   const baseCandidate = definition.candidateId
     ?? `lac_${createHash('sha256').update(`${product}\0${workspacePath}`).digest('hex').slice(0, 24)}`;
-  // A real workspace without a registered definition is not enough evidence that two observed
-  // assets are the same LogicalAgent.  Keep synthetic compatibility fixtures grouped, but add a
-  // bounded asset discriminator for live unresolved observations so unrelated processes cannot be
-  // silently merged under one candidate.  Registration can later reconcile these candidates.
-  const candidate = !isSyntheticWorkspace(workspacePath) && agentAssetId
+  // CLI agents (Claude Code / Codex / Kimi) declare Manifest keySources that include workspace:
+  // multiple rootPid generations in the same cwd are Instances of one unresolved LogicalAgent
+  // candidate. Keep the asset discriminator for non-CLI unresolved products so unrelated host
+  // processes cannot silently merge. Registration can later reconcile these candidates.
+  const candidate = !isSyntheticWorkspace(workspacePath)
+    && agentAssetId
+    && !isCliAgentProduct(product)
     ? `lac_${createHash('sha256').update(`${baseCandidate}\0asset\0${agentAssetId}`).digest('hex').slice(0, 24)}`
     : baseCandidate;
   return {

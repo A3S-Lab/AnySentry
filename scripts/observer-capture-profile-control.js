@@ -184,6 +184,9 @@ function rootProcessFields(classification, observerEvent) {
     ...(text(attribution.rootKey) ? { rootProcessKey: text(attribution.rootKey) } : {}),
     ...(Number.isSafeInteger(rootPid) && rootPid > 0 ? { rootPid } : {}),
     ...(text(attribution.rootGeneration) ? { rootGeneration: text(attribution.rootGeneration) } : {}),
+    ...(text(attribution.rootStartTimeTicks) || text(attribution.rootStartTime)
+      ? { rootStartTimeTicks: text(attribution.rootStartTimeTicks) || text(attribution.rootStartTime) }
+      : {}),
     ...(suppliedRootExecId || currentExecId ? { rootExecId: suppliedRootExecId || currentExecId } : {}),
     ...(rootExecIdExact ? { rootExecIdExact } : {}),
   };

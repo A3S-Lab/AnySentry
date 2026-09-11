@@ -606,6 +606,51 @@ function normalizedCommand(e: T.JudgedEvent): string {
   return (attrString(e, 'argv') || e.subject).trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+function kernelExecTargetSummary(item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>): string | undefined {
+  const argv = typeof item.attributes?.argv === 'string' ? item.attributes.argv.trim() : '';
+  if (argv) return argv.slice(0, 500);
+  const subject = typeof item.subject === 'string' ? item.subject.trim() : '';
+  return subject ? subject.slice(0, 500) : undefined;
+}
+
+/** Rank kernel-inferred actions so ToolExec evidence is not buried under /proc and home-cache noise. */
+function kernelInferredActionPriority(
+  operation: T.AgentActionItem['operation'],
+  item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>,
+): number {
+  if (operation === 'kernel_exec') return 0;
+  if (operation === 'file_delete') return 1;
+  if (operation === 'file_write') return 2;
+  if (operation === 'file_read' || operation === 'file_access') {
+    const path = typeof item.attributes?.path === 'string' ? item.attributes.path : '';
+    if (/^\/(?:proc|sys|dev)\b/u.test(path)) return 6;
+    if (/\/\.(?:claude|codex|cache|nvm)\b/u.test(path)) return 5;
+    return 3;
+  }
+  if (operation === 'network_connect') {
+    const peer = String(item.attributes?.peer ?? item.subject ?? '');
+    if (/(?:^|[^\d])127\.0\.0\.\d+(?:[^\d]|$)|::1|localhost/u.test(peer)) return 7;
+    return 4;
+  }
+  return 8;
+}
+
+function isLowValueKernelInferredAction(
+  operation: T.AgentActionItem['operation'],
+  item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>,
+): boolean {
+  if (operation === 'file_read' || operation === 'file_access') {
+    const path = typeof item.attributes?.path === 'string' ? item.attributes.path : '';
+    return /^\/(?:proc|sys|dev)\b/u.test(path);
+  }
+  if (operation === 'network_connect') {
+    const peer = String(item.attributes?.peer ?? '');
+    const port = Number(item.attributes?.port ?? 0);
+    return isLoopbackPeer(peer) && (port === 53 || port === 7890 || port === 7897 || port === 29653);
+  }
+  return false;
+}
+
 function isLowValueAgentNoise(e: T.JudgedEvent): boolean {
   if (!isMonitoredAgentEvent(e)) return false;
   if (e.verdict !== 'allow' || e.riskScore > 0) return false;
@@ -4162,7 +4207,22 @@ export class AggregationService implements OnModuleDestroy {
       durable: true,
       limit: Math.min(500, Math.max(limit * 4, 80)),
     });
-    const fallbackItems = fallback.items.flatMap((item): T.AgentActionItem[] => {
+    const requestedInstance = filter.agentInstanceId?.trim();
+    type RankedAction = T.AgentActionItem & { _priority: number };
+    const fallbackItems = fallback.items.flatMap((item): RankedAction[] => {
+      if (requestedInstance) {
+        const runtimeIds = [
+          item.agentRuntimeInstanceId,
+          ...(item.agentRuntimeInstanceAliases ?? []),
+        ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+        if (runtimeIds.length > 0
+          && !runtimeIds.some((value) => agentRuntimeInstanceIdsEquivalent(value, requestedInstance))) {
+          return [];
+        }
+        // When the list item carries no runtime id, refuse to treat it as matching an explicit
+        // instance selection—otherwise asset-scoped noise floods every host/docker Agent alike.
+        if (runtimeIds.length === 0) return [];
+      }
       const accessMode = String(item.attributes.accessMode ?? 'unknown');
       const path = typeof item.attributes.path === 'string' ? item.attributes.path : undefined;
       const operation: T.AgentActionItem['operation'] | undefined = item.eventKind === 'ToolExec'
@@ -4179,6 +4239,7 @@ export class AggregationService implements OnModuleDestroy {
               ? 'network_connect'
               : undefined;
       if (!operation) return [];
+      if (isLowValueKernelInferredAction(operation, item)) return [];
       const toolName = operation === 'kernel_exec'
         ? String(item.process?.comm ?? item.subject.split(/\s+/u)[0] ?? 'command')
         : operation === 'file_read'
@@ -4190,6 +4251,9 @@ export class AggregationService implements OnModuleDestroy {
             : operation === 'file_delete'
               ? 'delete file'
               : 'network access';
+      const targetSummary = operation === 'kernel_exec'
+        ? kernelExecTargetSummary(item)
+        : (path ?? item.subject);
       return [{
         actionId: `act_${createHash('sha256').update(`kernel\0${item.eventId}`).digest('hex').slice(0, 24)}`,
         origin: 'kernel_inferred',
@@ -4201,13 +4265,19 @@ export class AggregationService implements OnModuleDestroy {
         agentRuntimeInstanceId: item.agentRuntimeInstanceId,
         toolName: toolName.slice(0, 160),
         operation,
-        targetSummary: path ?? item.subject,
+        targetSummary: typeof targetSummary === 'string' ? targetSummary.slice(0, 500) : undefined,
         startedAt: item.at,
         semanticEventIds: [],
         fallbackEventId: item.eventId,
         evidenceState: 'runtime_level',
+        _priority: kernelInferredActionPriority(operation, item),
       }];
-    }).slice(0, limit);
+    })
+      .sort((left, right) =>
+        left._priority - right._priority
+        || Date.parse(right.startedAt) - Date.parse(left.startedAt))
+      .slice(0, limit)
+      .map(({ _priority: _ignored, ...action }) => action);
     return {
       items: fallbackItems,
       total: fallbackItems.length,

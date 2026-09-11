@@ -64,6 +64,11 @@ spec:
             - { name: A3S_OBSERVER_TOOL_HTTP_ROUTES, value: "/tool/execute,/execute,/bash/execute,/mcp" }
             # Cross-agent RPC (LangGraph Design B orchestrator → worker POST /runs).
             - { name: A3S_OBSERVER_AGENT_RPC_ROUTES, value: "/runs" }
+            # BigModel Anthropic-compatible gateway used by host Claude Code
+            # (ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic → POST /api/anthropic/v1/messages).
+            # Without these exact paths, SSL classic uprobes fire but emit_tls_plaintext route-gates
+            # silently and interaction_connections stays 0.
+            - { name: A3S_OBSERVER_LLM_HTTP_ROUTES, value: "/api/anthropic/v1/messages,/api/anthropic/v1/messages/count_tokens" }
             # Test-only process name fragments so plugin_daemon OpenAI-compatible provider workers
             # and Celery HTTP Request tool workers are selected for TLS attach. Do not broaden.
             # uvicorn/python cover customer-langgraph-sim-lab Design B containers.
@@ -95,6 +100,7 @@ spec:
             # development tree so FileRead dedicated-docker scope fixes survive pod restarts
             # without republishing the Observer image.
             - { name: forwarder-scripts, mountPath: /opt/observer-capture-profile-control.js, subPath: observer-capture-profile-control.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-attribution.js, subPath: observer-agent-attribution.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-filter-rule-publisher.js, subPath: observer-filter-rule-publisher.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-filter-rules.js, subPath: observer-filter-rules.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-forward.js, subPath: observer-forward.js, readOnly: true }
