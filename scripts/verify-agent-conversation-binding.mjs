@@ -451,11 +451,11 @@ const longRecords = Array.from({ length: 80 }, (_, index) => ({
   conversationBindingVersion: 2,
   trafficRole: 'conversation',
 }));
-let exactMembershipQuery;
+const exactMembershipQueries = [];
 const exactMembershipAggregation = new AggregationService(
   {
     storedAgentInteractions: async (queryInput) => {
-      exactMembershipQuery = queryInput;
+      exactMembershipQueries.push(queryInput);
       return longRecords;
     },
   },
@@ -496,6 +496,8 @@ const longTimeline = await exactMembershipAggregation.agentConversationTimelineV
   conversationId: longConversationId,
   limit: 100,
 });
+const exactMembershipQuery = exactMembershipQueries.find((query) => Array.isArray(query.interactionIds));
+assert.ok(exactMembershipQuery, 'selected Thread must issue an exact interaction membership read');
 assert.equal(exactMembershipQuery.interactionIds.length, 80);
 assert.equal(exactMembershipQuery.fairPerAgentLimit, undefined);
 assert.equal(longTimeline.interactionIds.length, 80,
