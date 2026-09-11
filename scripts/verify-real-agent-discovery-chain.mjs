@@ -12,7 +12,7 @@ const baseUrl = (
   `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`
 ).replace(/\/$/, '');
 const managementToken = String(process.env.ANYSENTRY_REAL_MANAGEMENT_TOKEN || '').trim();
-const image = process.env.ANYSENTRY_REAL_OBSERVER_IMAGE || 'anysentry-observer:agent-filter-test';
+const image = String(process.env.ANYSENTRY_REAL_OBSERVER_IMAGE || '').trim();
 const suffix = `${Date.now().toString(36)}-${process.pid}`;
 const collectorName = `anysentry-filter-chain-${suffix}`;
 const templateName = `anysentry-template-chain-${suffix}`;
@@ -588,6 +588,12 @@ async function cleanup() {
 }
 
 try {
+  if (!managementToken) {
+    throw new Error('ANYSENTRY_REAL_MANAGEMENT_TOKEN is required; refusing to create test workloads without control-plane auth');
+  }
+  if (!image) {
+    throw new Error('ANYSENTRY_REAL_OBSERVER_IMAGE is required; refusing to use an unverified Observer image');
+  }
   console.error(`[real-discovery] API probe: ${baseUrl}/stats`);
   await api('/stats');
   // Create Docker workloads before the finite-lived Kubernetes fixture. Slow local Docker
