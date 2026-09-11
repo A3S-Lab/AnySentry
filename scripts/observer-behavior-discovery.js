@@ -337,7 +337,12 @@ function qualifies(record, threshold) {
     record.toolExecs >= 2 &&
     record.uniqueTools.size >= 2 &&
     record.workspaceFiles > 0;
-  return record.score >= threshold && (llmToolPattern || autonomousToolPattern);
+  // A service Agent can legitimately complete a run without invoking a tool. Requiring
+  // ToolExec here would leave a model-only HTTP Agent invisible forever. Two model transport
+  // observations in one generation/window are enough for a bounded probable candidate; this is
+  // deliberately weaker than confirmation and still carries the normal candidate TTL/profile.
+  const modelServicePattern = record.llmEvents >= 2 && record.networkTargets.size > 0;
+  return record.score >= threshold && (llmToolPattern || autonomousToolPattern || modelServicePattern);
 }
 
 function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {

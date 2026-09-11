@@ -131,6 +131,28 @@ const privateGatewayCandidate = privateGatewayDetector.observe(
 assert.equal(privateGatewayCandidate?.state, 'agent',
   'a private gateway is discoverable from generic model route shape without provider host hints');
 
+const modelOnlyServiceDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+const modelOnlyScope = {
+  physicalWorkloadId: 'docker:model-only-service',
+  processGenerationKey: 'model-only-generation-1',
+  workloadRef: { environment: 'docker', kind: 'container', name: 'opaque-http-service' },
+};
+modelOnlyServiceDetector.observe(
+  event('LlmInteraction', { pid: 114, host: '10.30.0.8', path: '/v1/infer' }, 'model-only-service'),
+  modelOnlyScope,
+);
+const modelOnlyCandidate = modelOnlyServiceDetector.observe(
+  event('LlmInteraction', { pid: 114, host: '10.30.0.8', path: '/v1/infer' }, 'model-only-service'),
+  modelOnlyScope,
+);
+assert.equal(modelOnlyCandidate?.state, 'agent',
+  'a model-only HTTP service becomes a bounded probable candidate without a tool call');
+assert.equal(modelOnlyCandidate?.attribution.classification, 'probable_agent');
+
 const semanticDetector = new BehavioralAgentDetector({
   now: () => now,
   threshold: 8,
