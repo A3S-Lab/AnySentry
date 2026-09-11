@@ -52,7 +52,7 @@ import { UnknownLearningRuntimeService } from './unknown-learning-runtime.servic
 import type { UnknownLearnedAction, UnknownPolicyStage } from './unknown-learning';
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
 import { ObservedAssetLifecycleService } from './observed-asset-lifecycle.read.service';
-import { parseObserverAgentInteraction } from './agent-interaction';
+import { normalizeAgentRouteShape, parseObserverAgentInteraction } from './agent-interaction';
 import { OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE } from './clickhouse-store';
 import { captureClassificationDecision } from './identity-judgment-routing';
 import { AgentConversationBindingService, trafficRoleForEvent } from './agent-conversation-binding.service';
@@ -2256,6 +2256,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     endpoint: semanticEndpoint ?? 'application://semantic-event',
     method: 'EVENT',
     path: `/${event.eventKind}`,
+    routeShape: normalizeAgentRouteShape(`/${event.eventKind}`),
     statusCode: 200,
     // OTLP/OpenInference producers normally use the standard GenAI request/response model
     // attributes rather than a flat `model` key.  Normalize those aliases here so application
