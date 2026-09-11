@@ -6,6 +6,7 @@ import { symlink, unlink } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const baseUrl = (
   process.env.ANYSENTRY_API_BASE ??
@@ -265,8 +266,8 @@ async function startTemplateContainer() {
   created.template = true;
 }
 
-async function startCollector(snapshotPort, nodeName) {
-  const containerApi = baseUrl.replace('127.0.0.1', 'host.docker.internal');
+export function collectorLaunch(snapshotPort, nodeName, credentials, controlToken, observerImage, apiBase) {
+  const containerApi = apiBase.replace('127.0.0.1', 'host.docker.internal');
   const templates = JSON.stringify([
     {
       id: 'real-host-template',
@@ -281,73 +282,56 @@ async function startCollector(snapshotPort, nodeName) {
       name: templateName,
     },
   ]);
-  await startDetachedDocker(collectorName, [
-      '--name',
-      collectorName,
-      '--privileged',
-      '--pid',
-      'host',
-      '--add-host',
-      'host.docker.internal:host-gateway',
-      '-v',
-      '/sys:/sys:ro',
-      '-v',
-      '/var/run/docker.sock:/var/run/docker.sock:ro',
-      '-e',
-      'A3S_OBSERVER_JSON=1',
-      '-e',
-      'A3S_OBSERVER_FILES=1',
-      // The fixture runs with host PID visibility. Keep its event and file lanes bounded so a
-      // shared API/ClickHouse node cannot be overwhelmed before the targeted scenarios execute.
-      'A3S_OBSERVER_JSON_QUEUE_CAPACITY=4096',
-      'A3S_OBSERVER_CRITICAL_INBOX_CAPACITY=2048',
-      'A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY=4096',
-      'A3S_OBSERVER_BULK_INBOX_CAPACITY=1024',
-      'A3S_OBSERVER_FILE_UNKNOWN_POLICY=sample',
-      'A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP=4',
-      'A3S_OBSERVER_FILE_UNKNOWN_PER_NODE=100',
-      '-e',
-      'A3S_OBSERVER_SSL=0',
-      '-e',
-      `A3S_OBSERVER_COLLECTOR_ID=${collectorId}`,
-      '-e',
-      `A3S_NODE_NAME=${nodeName}`,
-      '-e',
-      `ANYSENTRY_INGEST_URL=${containerApi}/ingest`,
-      '-e',
-      `ANYSENTRY_SOURCE_ID=${sourceCredentials.sourceId}`,
-      '-e',
-      `ANYSENTRY_INGEST_TOKEN=${sourceCredentials.token}`,
-      '-e',
-      `ANYSENTRY_IDENTITY_SNAPSHOT_URL=http://host.docker.internal:${snapshotPort}/snapshot`,
-      '-e',
-      'ANYSENTRY_IDENTITY_SNAPSHOT_SECS=1',
-      '-e',
-      'ANYSENTRY_HEARTBEAT_SECS=2',
-      '-e',
-      'ANYSENTRY_DOCKER_DISCOVERY=on',
-      '-e',
-      'FORWARD_MAX_OUTSTANDING_EVENTS=256',
-      '-e',
-      'FORWARD_MAX_OUTSTANDING_BYTES=8388608',
-      '-e',
-      'FORWARD_WAL_PENDING_MAX_EVENTS=512',
-      '-e',
-      'FORWARD_WAL_PENDING_MAX_BYTES=16777216',
-      ...(managementToken ? ['-e', `ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN=${managementToken}`] : []),
-      '-e',
-      'FORWARD_SCOPE=shadow',
-      '-e',
-      `ANYSENTRY_AGENT_TEMPLATES_JSON=${templates}`,
-      '-e',
-      'ANYSENTRY_SOURCE_TYPE=observer',
-      '-e',
-      'ANYSENTRY_SOURCE_NAME=real-agent-filter-chain',
-      '--entrypoint',
-      '/usr/local/bin/node',
-      image,
-      '/opt/observer-supervisor.js',
-    ], { timeoutMs: 120_000 });
+  // Pass values through the Docker client's environment. In particular, credentials must never
+  // appear in its argv or in the command text used by error diagnostics.
+  const environment = {
+    A3S_OBSERVER_JSON: '1',
+    A3S_OBSERVER_FILES: '1',
+    A3S_OBSERVER_JSON_QUEUE_CAPACITY: '4096',
+    A3S_OBSERVER_CRITICAL_INBOX_CAPACITY: '2048',
+    A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY: '4096',
+    A3S_OBSERVER_BULK_INBOX_CAPACITY: '1024',
+    A3S_OBSERVER_FILE_UNKNOWN_POLICY: 'sample',
+    A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP: '4',
+    A3S_OBSERVER_FILE_UNKNOWN_PER_NODE: '100',
+    A3S_OBSERVER_SSL: '0',
+    A3S_OBSERVER_COLLECTOR_ID: collectorId,
+    A3S_NODE_NAME: nodeName,
+    ANYSENTRY_INGEST_URL: `${containerApi}/ingest`,
+    ANYSENTRY_SOURCE_ID: credentials.sourceId,
+    ANYSENTRY_INGEST_TOKEN: credentials.token,
+    ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN: controlToken,
+    ANYSENTRY_IDENTITY_SNAPSHOT_URL: `http://host.docker.internal:${snapshotPort}/snapshot`,
+    ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '1',
+    ANYSENTRY_HEARTBEAT_SECS: '2',
+    ANYSENTRY_DOCKER_DISCOVERY: 'on',
+    FORWARD_MAX_OUTSTANDING_EVENTS: '256',
+    FORWARD_MAX_OUTSTANDING_BYTES: '8388608',
+    FORWARD_WAL_PENDING_MAX_EVENTS: '512',
+    FORWARD_WAL_PENDING_MAX_BYTES: '16777216',
+    FORWARD_SCOPE: 'shadow',
+    ANYSENTRY_AGENT_TEMPLATES_JSON: templates,
+    ANYSENTRY_SOURCE_TYPE: 'observer',
+    ANYSENTRY_SOURCE_NAME: 'real-agent-filter-chain',
+  };
+  return {
+    args: [
+      '--name', collectorName,
+      '--privileged', '--pid', 'host',
+      '--add-host', 'host.docker.internal:host-gateway',
+      '-v', '/sys:/sys:ro',
+      '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
+      ...Object.keys(environment).flatMap((key) => ['-e', key]),
+      '--entrypoint', '/usr/local/bin/node',
+      observerImage, '/opt/observer-supervisor.js',
+    ],
+    env: environment,
+  };
+}
+
+async function startCollector(snapshotPort, nodeName) {
+  const launch = collectorLaunch(snapshotPort, nodeName, sourceCredentials, managementToken, image, baseUrl);
+  await startDetachedDocker(collectorName, launch.args, { timeoutMs: 120_000, env: launch.env });
   created.collector = true;
   await eventually('current Observer probes and Docker discovery', async () => {
     const logs = await run('docker', ['logs', collectorName]);
@@ -623,6 +607,7 @@ async function cleanup() {
   }
 }
 
+async function main() {
 try {
   if (!managementToken) {
     throw new Error('ANYSENTRY_REAL_MANAGEMENT_TOKEN is required; refusing to create test workloads without control-plane auth');
@@ -651,4 +636,10 @@ try {
   console.log('Real Host/Docker/Kubernetes Agent discovery chain verification passed');
 } finally {
   await cleanup();
+}
+
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }
