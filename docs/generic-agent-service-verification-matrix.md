@@ -59,6 +59,12 @@
 `POST /sources` 返回 401 `management token required`，因此真实 API 证据属于“服务可达、
 管理授权未提供”，不能记为网络故障或 canonical 验收通过。
 
+当前 Docker 中的 `customer-langgraph-sim-lab` 由
+`/home/chensicheng/a3s/security/customer-langgraph-sim-lab` compose 项目管理，包含
+orchestrator、worker-agent、python-sandbox 和 tool-mocks；端口 18088、18090、18091、
+18092 均返回健康状态 200。该项目是本目标的受控 LangGraph 跨 Agent 实验链路，已核实为
+在用资源，本轮不停止或删除。
+
 当前 classic SSL WIP 的局部 interaction 测试仍为 `63 passed, 5 failed`。失败项是
 quiescent WebSocket idle、reassembly sequence-gap/eviction、Rustls moved-pointer 唯一绑定、
 competing pointer ambiguity 以及 WebSocket control-frame 竞争归属；这些失败保持在 WIP
