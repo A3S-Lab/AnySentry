@@ -54,6 +54,11 @@
 6. ClickHouse/PostgreSQL 压力下的队列、WAL、丢失计数和观测延迟；
 7. classic SSL WIP 完成后的 WebSocket/TLS 明文重组全链路。
 
+当前运行环境已确认本地 Kubernetes port-forward 的 AnySentry API 在 `127.0.0.1:32653`
+可达（`/healthz` 返回 200），但 canonical/interaction verifier 的管理写入在
+`POST /sources` 返回 401 `management token required`，因此真实 API 证据属于“服务可达、
+管理授权未提供”，不能记为网络故障或 canonical 验收通过。
+
 当前 classic SSL WIP 的局部 interaction 测试仍为 `63 passed, 5 failed`。失败项是
 quiescent WebSocket idle、reassembly sequence-gap/eviction、Rustls moved-pointer 唯一绑定、
 competing pointer ambiguity 以及 WebSocket control-frame 竞争归属；这些失败保持在 WIP
