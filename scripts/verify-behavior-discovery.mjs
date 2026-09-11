@@ -71,6 +71,40 @@ assert.equal(promoted.attribution.agentDisplayName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.podName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.containerName, 'agent');
 assert.match(promoted.attribution.evidence[0], /behavior:score=/);
+
+const privateGatewayDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+privateGatewayDetector.observe(
+  event('Egress', { pid: 110, host: '10.20.0.8', path: '/v1/chat/completions' }, 'private-gateway'),
+  behaviorAttribution,
+);
+const privateGatewayCandidate = privateGatewayDetector.observe(
+  event('ToolExec', { pid: 110, argv: ['custom-tool', 'run'] }, 'private-gateway'),
+  behaviorAttribution,
+);
+assert.equal(privateGatewayCandidate?.state, 'agent',
+  'a private gateway is discoverable from generic model route shape without provider host hints');
+
+const semanticDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+semanticDetector.observe(
+  event('Egress', { pid: 111, host: '192.0.2.10', operation: 'model_invoke' }, 'semantic-gateway'),
+  behaviorAttribution,
+);
+assert.equal(
+  semanticDetector.observe(
+    event('ToolExec', { pid: 111, argv: ['another-tool', 'run'] }, 'semantic-gateway'),
+    behaviorAttribution,
+  )?.state,
+  'agent',
+  'a generic model operation marker is sufficient without a provider-specific host name',
+);
 const continued = detector.observe(
   event('ToolExec', { pid: 101, argv: ['curl', 'https://example.test'] }),
   behaviorAttribution,

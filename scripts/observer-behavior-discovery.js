@@ -4,7 +4,10 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { eventIdentityCandidates } = require('./observer-workload-filter');
 
-const LLM_HOST_HINTS = [
+// Host names are only a compatibility hint. Candidate discovery must work when a service uses
+// an internal gateway, an IP address, or a self-hosted model endpoint. Protocol/event shape is
+// the primary signal; deployments may extend this bounded list through configuration.
+const DEFAULT_LLM_HOST_HINTS = [
   'api.openai.com',
   'anthropic.com',
   'generativelanguage.googleapis.com',
@@ -99,6 +102,28 @@ function targetText(payload) {
   ).toLowerCase();
 }
 
+function routeText(payload) {
+  return text(
+    payload.path ??
+      payload.route ??
+      payload.requestPath ??
+      payload.request_path ??
+      payload.operation ??
+      payload.operationName ??
+      payload.operation_name ??
+      payload.protocolOperation,
+  ).toLowerCase();
+}
+
+function normalizedHints(value, fallback = DEFAULT_LLM_HOST_HINTS) {
+  const configured = Array.isArray(value)
+    ? value
+    : text(value)
+      ? text(value).split(',')
+      : fallback;
+  return [...new Set(configured.map((item) => text(item).toLowerCase()).filter(Boolean))].slice(0, 64);
+}
+
 function toolText(payload) {
   const argv = Array.isArray(payload.argv) ? payload.argv.map(String) : text(payload.argv).split(/\s+/);
   return path.posix.basename(text(argv[0])).toLowerCase();
@@ -182,10 +207,22 @@ function isKnownInfrastructureWorkload(ref, attribution) {
   );
 }
 
-function isLlmEvent(kind, payload) {
+function isLlmEvent(kind, payload, llmHostHints = DEFAULT_LLM_HOST_HINTS) {
   if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return true;
+  const route = routeText(payload);
+  // These are protocol operation shapes, not provider or framework names. They also cover
+  // private gateways where the peer address carries no useful vendor identity.
+  if (/(?:chat\/completions|completions|responses|messages|text-generation|generate-content|inference|model[_-]?invoke|llm)/u.test(route)) {
+    return true;
+  }
+  const semanticKind = text(
+    payload.semanticKind ?? payload.semantic_kind ?? payload.operationType ?? payload.operation_type,
+  ).toLowerCase();
+  if (/(?:llm|language[_ -]?model|model[_ -]?(?:call|request|response|generation)|chat|completion|inference)/u.test(semanticKind)) {
+    return true;
+  }
   const target = targetText(payload);
-  return Boolean(target && LLM_HOST_HINTS.some((hint) => target.includes(hint)));
+  return Boolean(target && normalizedHints(llmHostHints).some((hint) => target.includes(hint)));
 }
 
 function normalizedPathPrefix(value) {
@@ -316,6 +353,9 @@ class BehavioralAgentDetector {
     this.serviceDataPaths = serviceDataPrefixes(
       options.serviceDataPaths ?? process.env.ANYSENTRY_BEHAVIOR_SERVICE_DATA_PATHS,
     );
+    this.llmHostHints = normalizedHints(
+      options.llmHostHints ?? process.env.ANYSENTRY_BEHAVIOR_LLM_HOST_HINTS,
+    );
     this.maxWorkloads = boundedNumber(
       options.maxWorkloads ?? process.env.ANYSENTRY_BEHAVIOR_MAX_WORKLOADS,
       20_000,
@@ -383,7 +423,7 @@ class BehavioralAgentDetector {
     record.lastSeenAt = now;
     const kind = eventKind(observerEvent);
     const payload = eventPayload(observerEvent);
-    const llm = isLlmEvent(kind, payload);
+    const llm = isLlmEvent(kind, payload, this.llmHostHints);
     const tool = kind === 'ToolExec';
     const network =
       ['Egress', 'DnsQuery', 'Dns', 'Connect'].includes(kind) &&
