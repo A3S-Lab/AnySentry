@@ -29,6 +29,7 @@ const k8sAgentMarker = `marker-k8s-agent-${suffix}`;
 const k8sSidecarMarker = `marker-k8s-sidecar-${suffix}`;
 const namespace = process.env.ANYSENTRY_REAL_K8S_NAMESPACE || 'default';
 const created = {
+  source: false,
   collector: false,
   template: false,
   unknown: false,
@@ -36,6 +37,7 @@ const created = {
   hostExecutable: false,
   hostMarker: false,
 };
+let sourceCredentials;
 let snapshotServer;
 let sidecarSnapshotAttribution;
 
@@ -89,9 +91,9 @@ async function startDetachedDocker(containerName, args, options = {}) {
   await run('docker', ['start', containerName], options);
 }
 
-async function api(path, body) {
+async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
   const response = await fetch(`${baseUrl}${path}`, {
-    method: body === undefined ? 'GET' : 'POST',
+    method,
     headers: {
       'content-type': 'application/json',
       ...(managementToken ? { 'x-anysentry-management-token': managementToken } : {}),
@@ -103,6 +105,24 @@ async function api(path, body) {
   if (!response.ok) throw new Error(`${path} returned ${response.status}: ${text}`);
   const parsed = text ? JSON.parse(text) : undefined;
   return parsed?.data ?? parsed;
+}
+
+async function createEphemeralSource() {
+  const result = await api('/sources', {
+    name: `real-agent-filter-chain-${suffix}`,
+    type: 'observer',
+    enabled: true,
+    requireToken: true,
+    collectorId,
+    environment: 'test',
+    tags: ['verification', 'ephemeral'],
+    note: 'bounded real discovery verification; disable after run',
+  });
+  if (!result?.source?.sourceId || !result?.token) {
+    throw new Error('source registration did not return sourceId and token');
+  }
+  sourceCredentials = { sourceId: result.source.sourceId, token: result.token };
+  created.source = true;
 }
 
 async function eventually(label, check, timeoutMs = 45_000) {
@@ -295,6 +315,10 @@ async function startCollector(snapshotPort, nodeName) {
       '-e',
       `ANYSENTRY_INGEST_URL=${containerApi}/ingest`,
       '-e',
+      `ANYSENTRY_SOURCE_ID=${sourceCredentials.sourceId}`,
+      '-e',
+      `ANYSENTRY_INGEST_TOKEN=${sourceCredentials.token}`,
+      '-e',
       `ANYSENTRY_IDENTITY_SNAPSHOT_URL=http://host.docker.internal:${snapshotPort}/snapshot`,
       '-e',
       'ANYSENTRY_IDENTITY_SNAPSHOT_SECS=1',
@@ -302,9 +326,13 @@ async function startCollector(snapshotPort, nodeName) {
       'ANYSENTRY_HEARTBEAT_SECS=2',
       '-e',
       'ANYSENTRY_DOCKER_DISCOVERY=on',
+      '-e',
       'FORWARD_MAX_OUTSTANDING_EVENTS=256',
+      '-e',
       'FORWARD_MAX_OUTSTANDING_BYTES=8388608',
+      '-e',
       'FORWARD_WAL_PENDING_MAX_EVENTS=512',
+      '-e',
       'FORWARD_WAL_PENDING_MAX_BYTES=16777216',
       ...(managementToken ? ['-e', `ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN=${managementToken}`] : []),
       '-e',
@@ -585,6 +613,14 @@ async function cleanup() {
   if (snapshotServer) {
     await new Promise((resolve) => snapshotServer.close(resolve));
   }
+  if (created.source && sourceCredentials?.sourceId) {
+    await api(`/sources/${encodeURIComponent(sourceCredentials.sourceId)}`, {
+      enabled: false,
+      note: 'disabled after bounded real discovery verification',
+    }, 'PUT').catch((error) => {
+      console.error(`[real-discovery] source cleanup failed: ${error.message}`);
+    });
+  }
 }
 
 try {
@@ -596,6 +632,7 @@ try {
   }
   console.error(`[real-discovery] API probe: ${baseUrl}/stats`);
   await api('/stats');
+  await createEphemeralSource();
   // Create Docker workloads before the finite-lived Kubernetes fixture. Slow local Docker
   // storage must not consume the Pod's entire test lifetime before collection starts.
   console.error(`[real-discovery] starting template workload: ${templateName}`);
