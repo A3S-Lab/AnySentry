@@ -874,6 +874,9 @@ let deferredCriticalExpired = 0;
 let drainingDeferredCritical = false;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
+let spoolCloseDeadline = 0;
+let spoolCloseTimer;
+let spoolCloseWarned = false;
 let eventDrainDeadline = 0;
 let shutdownFinalizing = false;
 let transportsClosed = false;
@@ -2895,6 +2898,35 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   deliverPendingHeartbeat(done, timeoutMs);
 }
 
+function closeSpoolWhenIdle() {
+  if (spoolCloseTimer) {
+    clearTimeout(spoolCloseTimer);
+    spoolCloseTimer = undefined;
+  }
+  try {
+    spool.close();
+    spoolCloseWarned = false;
+    return true;
+  } catch (error) {
+    const status = spool.status();
+    const pending = status.pendingOperations > 0
+      || status.pendingPutRecords > 0
+      || status.asyncSyncActive;
+    if (pending && Date.now() < spoolCloseDeadline) {
+      if (!spoolCloseWarned) {
+        console.error('[observer-forward] waiting for bounded WAL operations before close');
+        spoolCloseWarned = true;
+      }
+      spoolCloseTimer = setTimeout(closeSpoolWhenIdle, 25);
+      spoolCloseTimer.unref();
+      return false;
+    }
+    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
+    process.exitCode = 1;
+    return false;
+  }
+}
+
 function closeTransports() {
   if (transportsClosed) return;
   transportsClosed = true;
@@ -2916,12 +2948,8 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
-  try {
-    spool.close();
-  } catch (error) {
-    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
-    process.exitCode = 1;
-  }
+  spoolCloseDeadline = Math.max(Date.now() + 100, shutdownDeadline || Date.now() + SHUTDOWN_TIMEOUT_MS);
+  closeSpoolWhenIdle();
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }

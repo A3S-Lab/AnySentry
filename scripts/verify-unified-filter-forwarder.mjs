@@ -306,7 +306,7 @@ try {
   assert.equal(projectionHeaders[0]['x-anysentry-management-token'], 'unified-control-token');
   assert(forwarded.classificationSemantics, JSON.stringify(forwarded));
   assert.equal(forwarded.classificationSemantics.identityClassification, 'probable_agent');
-  assert.equal(forwarded.classificationSemantics.captureProfile, 'probable_investigation');
+  assert.equal(forwarded.classificationSemantics.captureProfile, 'agent_full');
   assert.equal(forwarded.attributes.filterF2RuleId, 'fr_guardrail_lifecycle_structure');
   assert.equal(forwarded.attributes.filterF2Action, 'priority');
   assert.equal(forwarded.attributes.filterRuleCatalogVersion, 21);
@@ -363,7 +363,7 @@ try {
   assert.equal(heartbeat.filterMetrics.unifiedIdentityVersion, 7);
   assert.equal(heartbeat.filterMetrics.unifiedCaptureVersion, 8);
   assert.equal(heartbeat.filterMetrics.unifiedForwarderVersion, 9);
-  assert.equal(heartbeat.filterMetrics.unifiedRuntimeSignatures, 6);
+  assert.equal(heartbeat.filterMetrics.unifiedRuntimeSignatures, 8);
   assert.equal(heartbeat.filterMetrics.unifiedProjectionLoadErrors, 0);
 
   const projectionCountBeforePause = projectionHeaders.length;
