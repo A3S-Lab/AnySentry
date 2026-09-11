@@ -1701,7 +1701,7 @@ export interface AgentInstanceUsageSummary extends AgentUsageSummary {
 export interface AgentInteractionRecord {
   schemaVersion: 'anysentry.agent_interaction.v1';
   interactionId: string;
-  interactionType: 'model' | 'tool' | 'unparsed';
+  interactionType: 'model' | 'tool' | 'remote_agent' | 'unparsed';
   /** True for an application/OTLP semantic projection synthesized without a transport body. */
   semanticOnly?: boolean;
   at: number;
@@ -1744,6 +1744,14 @@ export interface AgentInteractionRecord {
   parentSessionId?: string;
   canonicalParentSessionId?: string;
   sessionResolutionRevision?: number;
+  /** Cross-agent hop from `x-anysentry-hop` (orchestrator / worker). */
+  hop?: string;
+  /** Workflow node from `x-anysentry-workflow-node` (plan / work / verify). */
+  workflowNode?: string;
+  /** Per-delegation UUID from `x-anysentry-delegation-id`. */
+  delegationId?: string;
+  /** Wire `x-anysentry-agent-id` (metadata only; does not override cgroup identity). */
+  agentIdHeader?: string;
   traceId?: string;
   runId?: string;
   runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
@@ -1758,7 +1766,7 @@ export interface AgentInteractionRecord {
   providerResponseId?: string;
   providerPreviousResponseId?: string;
   trafficRole?: 'conversation' | 'bootstrap' | 'control' | 'context_replay'
-    | 'tool_backend' | 'derived_metadata' | 'retry' | 'background' | 'unclassified';
+    | 'tool_backend' | 'derived_metadata' | 'retry' | 'background' | 'delegation' | 'unclassified';
   conversationAnchors?: AgentConversationAnchor[];
   evidenceEventIds?: string[];
   conversationId?: string;
@@ -1822,7 +1830,7 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   agentAssetId?: string;
   agentInstanceId?: string;
   interactionId?: string;
-  interactionType?: 'model' | 'tool' | 'unparsed';
+  interactionType?: 'model' | 'tool' | 'remote_agent' | 'unparsed';
   model?: string;
   transport?: 'http' | 'tls';
   tlsAdapterId?: string;
@@ -2020,6 +2028,19 @@ export interface AgentConversationSummary {
   usage: AgentUsageSummary;
   instanceUsage: AgentInstanceUsageSummary[];
   coverage: AgentConversationCoverage;
+  /** Cross-agent conversation links within the same observation window. */
+  relatedConversations?: AgentRelatedConversation[];
+}
+
+export interface AgentRelatedConversation {
+  conversationId: string;
+  relation: 'delegates_to' | 'delegated_from' | 'same_run';
+  runId: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  peer?: { host?: string; port?: number; agentAssetId?: string };
+  strength: 'exact' | 'strong';
 }
 
 export interface AgentConversationList extends ClassifiedResponseMeta {
@@ -2453,13 +2474,15 @@ export interface AgentConversationTimeline extends ClassifiedResponseMeta {
   updateTime: string;
 }
 
-export type AgentConversationActor = 'user' | 'model' | 'tool';
+export type AgentConversationActor = 'user' | 'model' | 'tool' | 'agent';
 export type AgentSemanticEventKind =
   | 'user_message'
   | 'model_progress'
   | 'model_final'
   | 'tool_call'
-  | 'tool_result';
+  | 'tool_result'
+  | 'delegation_send'
+  | 'delegation_reply';
 export type AgentToolKind =
   | 'bash'
   | 'read'
@@ -2496,6 +2519,11 @@ export interface AgentSemanticEvent {
   correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
   completeness: 'complete' | 'partial' | 'missing';
   partialReasons: string[];
+  workflowNode?: string;
+  hop?: string;
+  delegationId?: string;
+  relatedConversationId?: string;
+  peer?: { host?: string; port?: number };
 }
 
 export interface AgentTimelineDiagnostic {
@@ -2585,7 +2613,7 @@ export interface AgentSemanticKernelRelation {
    * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
    * Observer KernelFact. */
   authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
-  relationVersion: 1 | 2 | 3 | 4;
+  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7;
   /** All equally strong Kernel candidates retained when ownership is ambiguous. */
   competingKernelEventIds?: string[];
   resolutionRevision: number;

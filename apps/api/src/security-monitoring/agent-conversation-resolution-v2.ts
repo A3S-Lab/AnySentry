@@ -466,6 +466,12 @@ export function trafficRoleForInteraction(
   if (interaction.interactionType === 'model' && request?.generate === false) {
     return 'bootstrap';
   }
+  // Cross-agent RPC stays in the conversation lane so timeline can project
+  // delegation_send / delegation_reply (not folded into technical-activity summaries).
+  if (interaction.interactionType === 'remote_agent'
+    || interaction.trafficRole === 'delegation') {
+    return 'conversation';
+  }
   if (interaction.trafficRole && interaction.trafficRole !== 'unclassified') {
     return interaction.trafficRole;
   }

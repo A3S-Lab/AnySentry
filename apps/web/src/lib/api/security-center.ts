@@ -1109,7 +1109,7 @@ export interface AgentInteractionTokenUsage {
 export interface AgentInteractionRecord {
   schemaVersion: "anysentry.agent_interaction.v1";
   interactionId: string;
-  interactionType: "model" | "tool" | "unparsed";
+  interactionType: "model" | "tool" | "remote_agent" | "unparsed";
   at: number;
   workspacePath: string;
   tenantId?: string;
@@ -1135,6 +1135,10 @@ export interface AgentInteractionRecord {
   sessionMode?: "resumable" | "conversation" | "per_request" | "ephemeral" | "unknown";
   sessionLifecycle?: "new" | "resume" | "fork";
   parentSessionId?: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  agentIdHeader?: string;
   logicalAgentId?: string;
   logicalAgentCandidateId?: string;
   logicalDefinitionId?: string;
@@ -1151,7 +1155,7 @@ export interface AgentInteractionRecord {
   providerResponseId?: string;
   providerPreviousResponseId?: string;
   trafficRole?: "conversation" | "bootstrap" | "control" | "context_replay"
-    | "tool_backend" | "derived_metadata" | "retry" | "background" | "unclassified";
+    | "tool_backend" | "derived_metadata" | "retry" | "background" | "delegation" | "unclassified";
   conversationAnchors?: AgentConversationAnchor[];
   evidenceEventIds?: string[];
   conversationId?: string;
@@ -1204,7 +1208,7 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   agentAssetId?: string;
   agentInstanceId?: string;
   interactionId?: string;
-  interactionType?: "model" | "tool" | "unparsed";
+  interactionType?: "model" | "tool" | "remote_agent" | "unparsed";
   model?: string;
   transport?: "http" | "tls";
   tlsAdapterId?: string;
@@ -1284,6 +1288,17 @@ export interface AgentConversationSummary {
   usage: AgentUsageSummary;
   instanceUsage: AgentInstanceUsageSummary[];
   coverage: AgentConversationCoverage;
+  relatedConversations?: AgentRelatedConversation[];
+}
+export interface AgentRelatedConversation {
+  conversationId: string;
+  relation: "delegates_to" | "delegated_from" | "same_run";
+  runId: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  peer?: { host?: string; port?: number; agentAssetId?: string };
+  strength: "exact" | "strong";
 }
 export interface AgentUsageSummary {
   modelCallCount: number;
@@ -1447,8 +1462,15 @@ export interface AgentConversationTimeline extends ClassifiedResponseMeta {
   dataSource: "clickhouse" | "hot_ring";
   updateTime: string;
 }
-export type AgentConversationActor = "user" | "model" | "tool";
-export type AgentSemanticEventKind = "user_message" | "model_progress" | "model_final" | "tool_call" | "tool_result";
+export type AgentConversationActor = "user" | "model" | "tool" | "agent";
+export type AgentSemanticEventKind =
+  | "user_message"
+  | "model_progress"
+  | "model_final"
+  | "tool_call"
+  | "tool_result"
+  | "delegation_send"
+  | "delegation_reply";
 export type AgentToolKind = "bash" | "read" | "write" | "search" | "mcp" | "skill" | "http" | "code" | "other";
 export interface AgentSemanticEvent {
   semanticEventId: string;
@@ -1475,6 +1497,11 @@ export interface AgentSemanticEvent {
   correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
   completeness: "complete" | "partial" | "missing";
   partialReasons: string[];
+  workflowNode?: string;
+  hop?: string;
+  delegationId?: string;
+  relatedConversationId?: string;
+  peer?: { host?: string; port?: number };
 }
 export interface AgentTimelineDiagnostic {
   diagnosticId: string;

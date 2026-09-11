@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowLeftRight,
   Bot,
   CheckCircle2,
   ChevronRight,
@@ -19,6 +20,7 @@ import type {
   AgentConversationSummary,
   AgentConversationTurnV2,
   AgentContextReplaySummary,
+  AgentRelatedConversation,
   AgentRunTechnicalActivitySummary,
   AgentSemanticEvent,
   ConversationInstanceSegment,
@@ -55,6 +57,12 @@ function Badge({ children, className }: { children: ReactNode; className?: strin
   );
 }
 
+function relatedChipLabel(item: AgentRelatedConversation) {
+  if (item.relation === "delegates_to") return "→ Worker 对话";
+  if (item.relation === "delegated_from") return "← 编排器工作流";
+  return "同 Run 对话";
+}
+
 function actorMeta(event: AgentSemanticEvent) {
   if (event.actor === "user") return {
     label: "用户",
@@ -70,6 +78,15 @@ function actorMeta(event: AgentSemanticEvent) {
     tone: "border-teal-400/25 bg-teal-500/[0.055] text-teal-100",
     iconTone: "border-teal-400/25 bg-teal-500/10 text-teal-200",
   };
+  if (event.actor === "agent" || event.kind === "delegation_send" || event.kind === "delegation_reply") {
+    return {
+      label: "委托",
+      detail: event.kind === "delegation_reply" ? "收到回复" : "发送委托",
+      icon: ArrowLeftRight,
+      tone: "border-amber-400/25 bg-amber-500/[0.055] text-amber-100",
+      iconTone: "border-amber-400/25 bg-amber-500/10 text-amber-200",
+    };
+  }
   return {
     label: "工具",
     detail: event.toolName ?? event.toolKind ?? "Tool",
@@ -193,6 +210,100 @@ function ToolStepCard({
   );
 }
 
+function DelegationStepCard({
+  send,
+  reply,
+  selectedEventId,
+  onSelect,
+  onJumpRelated,
+}: {
+  send?: AgentSemanticEvent;
+  reply?: AgentSemanticEvent;
+  selectedEventId?: string;
+  onSelect: (event: AgentSemanticEvent) => void;
+  onJumpRelated?: (conversationId: string) => void;
+}) {
+  const primary = send ?? reply!;
+  const selected = selectedEventId === send?.semanticEventId || selectedEventId === reply?.semanticEventId;
+  const failed = reply?.status === "failed" || send?.status === "failed";
+  const status = failed ? "失败" : reply ? "已回复" : "等待回复";
+  const peer = primary.peer;
+  const peerLabel = peer?.host
+    ? `${peer.host}${peer.port ? `:${peer.port}` : ""}`
+    : undefined;
+  const relatedId = primary.relatedConversationId ?? reply?.relatedConversationId;
+  return (
+    <div
+      data-semantic-kind="delegation"
+      className={cn(
+        "relative flex min-h-[84px] w-full gap-3 rounded border border-amber-400/25 bg-amber-500/[0.055] px-3 py-3 text-left text-amber-100",
+        selected ? "border-amber-300/55 bg-amber-400/[0.11]" : "",
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => onSelect(reply ?? send!)}
+        className="flex min-w-0 flex-1 cursor-pointer gap-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
+      >
+        <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded border border-amber-400/25 bg-amber-500/10 text-amber-200">
+          <ArrowLeftRight className="size-4" aria-hidden="true" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold">委托步骤</span>
+            {primary.workflowNode ? (
+              <Badge className="border-amber-300/20 bg-black/10 text-amber-100">{primary.workflowNode}</Badge>
+            ) : null}
+            <Badge className={failed
+              ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
+              : reply
+                ? "border-teal-400/25 bg-teal-500/10 text-teal-100"
+                : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+              {status}
+            </Badge>
+            {peerLabel ? (
+              <Badge className="border-white/10 bg-black/10 font-mono text-zinc-300">Egress {peerLabel}</Badge>
+            ) : null}
+          </span>
+          {send ? (
+            <span className="mt-1.5 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-200">
+              发送 · {send.contentPreview ?? "委托目标未形成可读摘要"}
+            </span>
+          ) : null}
+          {reply ? (
+            <span className="mt-2 block border-t border-amber-300/10 pt-2">
+              <span className="mb-1 flex items-center gap-1.5 text-[10px] font-medium text-zinc-500">
+                <TerminalSquare className="size-3" aria-hidden="true" />回复
+              </span>
+              <span className="line-clamp-4 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-300">
+                {reply.contentPreview ?? "委托回复没有可读摘要"}
+              </span>
+            </span>
+          ) : null}
+          <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-500">
+            <time>{nsDate(send?.atUnixNs ?? reply?.atUnixNs)}</time>
+            {reply ? <time>→ {nsDate(reply.atUnixNs)}</time> : null}
+            {primary.delegationId ? <span>{primary.delegationId.slice(0, 12)}</span> : null}
+          </span>
+        </span>
+      </button>
+      {relatedId && onJumpRelated ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-8 shrink-0 self-center text-[10px] text-amber-100 hover:bg-amber-500/10 hover:text-amber-50"
+          onClick={() => onJumpRelated(relatedId)}
+        >
+          跳转 Worker
+        </Button>
+      ) : (
+        <ChevronRight className="mt-2 size-4 shrink-0 self-start text-zinc-600" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
 export function ConversationSemanticTimeline({
   agent,
   conversation,
@@ -206,6 +317,7 @@ export function ConversationSemanticTimeline({
   onBack,
   onSelect,
   onSelectConversation,
+  onJumpToConversationId,
 }: {
   agent?: LogicalAgentConversationDirectoryItemV4;
   conversation?: AgentConversationSummary;
@@ -219,6 +331,7 @@ export function ConversationSemanticTimeline({
   onBack: () => void;
   onSelect: (event: AgentSemanticEvent) => void;
   onSelectConversation: (conversation: AgentConversationSummary) => void;
+  onJumpToConversationId?: (conversationId: string) => void;
 }) {
   const allEvents = useMemo(() => turns.flatMap((turn) => turn.events), [turns]);
   const callById = useMemo(() => new Map(allEvents
@@ -227,6 +340,19 @@ export function ConversationSemanticTimeline({
   const resultById = useMemo(() => new Map(allEvents
     .filter((event) => event.kind === "tool_result" && event.toolCallId)
     .map((event) => [event.toolCallId!, event])), [allEvents]);
+  const replyBySend = useMemo(() => {
+    const map = new Map<string, AgentSemanticEvent>();
+    for (const event of allEvents) {
+      if (event.kind !== "delegation_reply") continue;
+      const send = allEvents.find((candidate) =>
+        candidate.kind === "delegation_send"
+        && candidate.sourceInteractionIds[0]
+        && candidate.sourceInteractionIds[0] === event.sourceInteractionIds[0]);
+      if (send) map.set(send.semanticEventId, event);
+    }
+    return map;
+  }, [allEvents]);
+  const related = conversation?.relatedConversations ?? [];
 
   if (!conversation && loading) {
     return (
@@ -265,6 +391,17 @@ export function ConversationSemanticTimeline({
             <h2 className="truncate text-sm font-semibold text-zinc-100">{agent?.displayName ?? conversation.displayName}</h2>
             <Badge className="border-white/10 bg-white/[0.035] text-zinc-400">Thread</Badge>
             <Badge className="border-sky-400/20 bg-sky-500/[0.06] text-sky-100">{segments.length} 实例段</Badge>
+            {related.map((item) => (
+              <button
+                key={`${item.relation}:${item.conversationId}`}
+                type="button"
+                data-related-conversation={item.conversationId}
+                onClick={() => onJumpToConversationId?.(item.conversationId)}
+                className="inline-flex min-h-5 cursor-pointer items-center rounded border border-amber-400/25 bg-amber-500/[0.08] px-1.5 py-0.5 text-[10px] font-medium text-amber-100 hover:bg-amber-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
+              >
+                {relatedChipLabel(item)}
+              </button>
+            ))}
           </div>
           <p className="mt-1 truncate font-mono text-[10px] text-zinc-500" title={conversation.workspacePath}>
             {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用 · {formatTokenTotal(conversation.usage, false)} tokens · 平均 {formatDuration(conversation.usage.averageDurationMs)} · {tokenCoverageText(conversation.usage)}
@@ -346,6 +483,26 @@ export function ConversationSemanticTimeline({
                 <div className="relative space-y-2 before:absolute before:bottom-5 before:left-[17px] before:top-5 before:w-px before:bg-white/10">
                   {turn.events.map((event) => {
                     if (event.kind === "tool_result" && event.toolCallId && callById.has(event.toolCallId)) return null;
+                    if (event.kind === "delegation_reply") {
+                      const pairedSend = allEvents.find((candidate) =>
+                        candidate.kind === "delegation_send"
+                        && candidate.sourceInteractionIds[0] === event.sourceInteractionIds[0]);
+                      if (pairedSend) return null;
+                    }
+                    if (event.kind === "delegation_send" || event.kind === "delegation_reply") {
+                      return (
+                        <DelegationStepCard
+                          key={event.semanticEventId}
+                          send={event.kind === "delegation_send" ? event : undefined}
+                          reply={event.kind === "delegation_send"
+                            ? replyBySend.get(event.semanticEventId)
+                            : event}
+                          selectedEventId={selectedEventId}
+                          onSelect={onSelect}
+                          onJumpRelated={onJumpToConversationId}
+                        />
+                      );
+                    }
                     if (event.kind === "tool_call") {
                       return (
                         <ToolStepCard
@@ -360,7 +517,18 @@ export function ConversationSemanticTimeline({
                     if (event.kind === "tool_result") {
                       return <ToolStepCard key={event.semanticEventId} result={event} selectedEventId={selectedEventId} onSelect={onSelect} />;
                     }
-                    return <ActorCard key={event.semanticEventId} event={event} selected={selectedEventId === event.semanticEventId} onSelect={onSelect} />;
+                    return (
+                      <div key={event.semanticEventId} className="space-y-1">
+                        {event.workflowNode ? (
+                          <div className="pl-12">
+                            <Badge className="border-white/10 bg-white/[0.03] text-zinc-500">
+                              workflow · {event.workflowNode}
+                            </Badge>
+                          </div>
+                        ) : null}
+                        <ActorCard event={event} selected={selectedEventId === event.semanticEventId} onSelect={onSelect} />
+                      </div>
+                    );
                   })}
                   {turn.diagnostics.map((diagnostic) => (
                     <div key={diagnostic.diagnosticId} className="flex min-h-10 items-center gap-2 rounded border border-amber-400/15 bg-amber-500/[0.035] px-3 py-2 text-[11px] text-amber-100/80">

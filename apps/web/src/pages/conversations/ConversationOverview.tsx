@@ -83,6 +83,18 @@ function ThreadRow({
               {thread.agentInstanceIds.length} 段
             </span>
           ) : null}
+          {(thread.relatedConversations ?? []).slice(0, 2).map((related) => (
+            <span
+              key={`${related.relation}:${related.conversationId}`}
+              className="shrink-0 rounded border border-amber-400/25 bg-amber-500/[0.08] px-1.5 py-0.5 text-[9px] text-amber-100"
+            >
+              {related.relation === "delegates_to"
+                ? "→ Worker"
+                : related.relation === "delegated_from"
+                  ? "← 编排器"
+                  : "同 Run"}
+            </span>
+          ))}
         </span>
         <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-600">
           <span>{nsDate(thread.lastActivityAtUnixNs)}</span>

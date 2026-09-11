@@ -5,6 +5,7 @@ const http = require('node:http');
 
 const WORKLOAD_KIND_LABEL = 'anysentry.io/workload-kind';
 const WORKLOAD_ROLE_LABEL = 'anysentry.io/workload-role';
+const OBSERVATION_ROLE_LABEL = 'anysentry.io/observation-role';
 const LEGACY_OBSERVE_LABEL = 'io.anysentry.observe';
 const AGENT_ID_LABEL = 'anysentry.io/agent-id';
 const SNAPSHOT_SCHEMA = 'anysentry.workload_identity_snapshot.v1';
@@ -16,6 +17,10 @@ const WORKLOAD_ROLES = new Set([
   'ordinary_process',
   'unknown',
 ]);
+/** HTTP tool backends for LangGraph/LangChain/Dify out-of-process tools. Not Agents — they only
+ * need FULL Exec/Exit so delegated command ToolExec remains observable. */
+const HTTP_TOOL_OBSERVATION_ROLES = new Set(['http-tool', 'http_tool', 'tool-backend', 'tool_backend']);
+const HTTP_TOOL_WORKLOAD_KINDS = new Set(['tool-backend', 'tool_backend', 'http-tool', 'http_tool']);
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -70,9 +75,33 @@ function dockerHealthchecks(inspect) {
   return argv ? [{ activitySubtype: 'docker_healthcheck', argv }] : [];
 }
 
+function dockerNetworkIdentity(inspect) {
+  const networks = inspect?.NetworkSettings?.Networks && typeof inspect.NetworkSettings.Networks === 'object'
+    ? inspect.NetworkSettings.Networks
+    : {};
+  const addresses = [];
+  const aliases = [];
+  for (const network of Object.values(networks)) {
+    if (!network || typeof network !== 'object') continue;
+    const ip = text(network.IPAddress);
+    if (ip && !addresses.includes(ip)) addresses.push(ip);
+    const ipv6 = text(network.GlobalIPv6Address);
+    if (ipv6 && !addresses.includes(ipv6)) addresses.push(ipv6);
+    for (const alias of Array.isArray(network.Aliases) ? network.Aliases : []) {
+      const normalized = text(alias).toLowerCase();
+      if (normalized && !aliases.includes(normalized)) aliases.push(normalized);
+    }
+  }
+  return {
+    ...(addresses.length ? { networkAddresses: addresses } : {}),
+    ...(aliases.length ? { networkAliases: aliases } : {}),
+  };
+}
+
 function dockerRuntimeIdentity(inspect, options = {}) {
   const hostPid = Number(inspect?.State?.Pid);
-  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return {};
+  const network = dockerNetworkIdentity(inspect);
+  if (!Number.isSafeInteger(hostPid) || hostPid <= 0) return { ...network };
   const procRoot = text(options.procRoot) || '/proc';
   const cgroupRoot = text(options.cgroupRoot) || '/sys/fs/cgroup';
   try {
@@ -81,7 +110,7 @@ function dockerRuntimeIdentity(inspect, options = {}) {
       .split('\n')
       .map((line) => line.match(/^0::(.+)$/u)?.[1])
       .find(Boolean);
-    if (!unifiedPath || unifiedPath.includes('..')) return { hostPid };
+    if (!unifiedPath || unifiedPath.includes('..')) return { hostPid, ...network };
     const relative = unifiedPath.replace(/^\/+/, '');
     const cgroupPath = relative ? `${cgroupRoot}/${relative}` : cgroupRoot;
     const stat = fs.statSync(cgroupPath, { bigint: true });
@@ -95,10 +124,18 @@ function dockerRuntimeIdentity(inspect, options = {}) {
       cgroupPath: unifiedPath,
       ...(cgroupId ? { cgroupId } : {}),
       ...(rootStartTimeTicks ? { rootStartTimeTicks } : {}),
+      ...network,
     };
   } catch {
-    return { hostPid };
+    return { hostPid, ...network };
   }
+}
+
+function isHttpToolBackendLabels(labels = {}) {
+  const observationRole = text(labels[OBSERVATION_ROLE_LABEL]).toLowerCase();
+  const workloadKind = text(labels[WORKLOAD_KIND_LABEL]).toLowerCase();
+  return HTTP_TOOL_OBSERVATION_ROLES.has(observationRole)
+    || HTTP_TOOL_WORKLOAD_KINDS.has(workloadKind);
 }
 
 function dockerEntry(container, options = {}) {
@@ -106,15 +143,18 @@ function dockerEntry(container, options = {}) {
   if (!id) return undefined;
   const labels = boundedLabels(container.Labels || container.labels);
   const workloadKind = text(labels[WORKLOAD_KIND_LABEL]).toLowerCase();
+  const observationRole = text(labels[OBSERVATION_ROLE_LABEL]).toLowerCase();
   // Inventory role is an exact deployment fact. Do not normalize arbitrary values into a known
   // role, because a typo must remain visible as unresolved rather than silently changing capture.
   const declaredRole = labels[WORKLOAD_ROLE_LABEL];
   const workloadRole = WORKLOAD_ROLES.has(declaredRole) ? declaredRole : undefined;
   const selectedAgent = workloadKind === 'agent';
+  const httpToolBackend = !selectedAgent && isHttpToolBackendLabels(labels);
   const legacyInfrastructure = ['0', 'false', 'off', 'no', 'disabled']
     .includes(text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase());
   const explicitNonAgent = ['non-agent', 'non_agent', 'infrastructure'].includes(workloadKind)
-    || legacyInfrastructure;
+    || legacyInfrastructure
+    || httpToolBackend;
   const classification = selectedAgent
     ? 'confirmed_agent'
     : explicitNonAgent
@@ -131,11 +171,18 @@ function dockerEntry(container, options = {}) {
         `label:${WORKLOAD_KIND_LABEL}=agent`,
         `label:${AGENT_ID_LABEL}=${agentScopeId}`,
       ]
-    : explicitNonAgent
-      ? [legacyInfrastructure
-          ? `label:${LEGACY_OBSERVE_LABEL}=${text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase()}`
-          : `label:${WORKLOAD_KIND_LABEL}=${workloadKind}`]
-      : [`label_missing:${WORKLOAD_KIND_LABEL}`];
+    : httpToolBackend
+      ? [
+          observationRole
+            ? `label:${OBSERVATION_ROLE_LABEL}=${observationRole}`
+            : `label:${WORKLOAD_KIND_LABEL}=${workloadKind}`,
+          'http_tool_backend',
+        ]
+      : explicitNonAgent
+        ? [legacyInfrastructure
+            ? `label:${LEGACY_OBSERVE_LABEL}=${text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase()}`
+            : `label:${WORKLOAD_KIND_LABEL}=${workloadKind}`]
+        : [`label_missing:${WORKLOAD_KIND_LABEL}`];
   if (workloadRole) evidence.push(`label:${WORKLOAD_ROLE_LABEL}=${workloadRole}`);
   return {
     ids: [id, id.slice(0, 12)].filter(Boolean),
@@ -152,6 +199,8 @@ function dockerEntry(container, options = {}) {
     imageDigest: normalizedImageDigest(container.ImageID || container.imageID) || undefined,
     labels,
     ...(workloadRole ? { workloadRole } : {}),
+    ...(observationRole ? { observationRole } : {}),
+    ...(httpToolBackend ? { httpToolBackend: true } : {}),
     ...(options.runtimeById?.get(id) ?? {}),
     ...(options.inspectById?.get(id)?.length
       ? { platformHealthchecks: options.inspectById.get(id).map((probe) => ({ ...probe, argv: [...probe.argv] })) }
@@ -515,7 +564,12 @@ module.exports = {
   DockerDiscovery,
   dockerHealthchecks,
   dockerRuntimeIdentity,
+  dockerNetworkIdentity,
   dockerEntry,
   dockerSnapshot,
+  isHttpToolBackendLabels,
   normalizedImageDigest,
+  HTTP_TOOL_OBSERVATION_ROLES,
+  HTTP_TOOL_WORKLOAD_KINDS,
+  OBSERVATION_ROLE_LABEL,
 };

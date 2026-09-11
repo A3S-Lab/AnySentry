@@ -11,6 +11,11 @@ import {
 export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
 export const SEMANTIC_PROJECTION_PARSER_VERSION = 2;
 const UNRESOLVED_TOOL_GAP_GRACE_MS = 90_000;
+/** Projection markers that describe recovery, not an open capture gap. */
+const INFORMATIONAL_PARTIAL_REASONS = new Set([
+  'tool_call_reconstructed_from_request_history',
+  'semantic_items_reconciled',
+]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -123,11 +128,32 @@ function runtimeContextPart(value: unknown): boolean {
     valueText.startsWith(`<${tag}>`) && valueText.endsWith(`</${tag}>`)));
 }
 
+/** Claude Code injects this as role=user when the human returns; it is not human input. */
+function claudeResumeRecapContent(value: unknown): boolean {
+  const text = typeof value === 'string'
+    ? value.trim()
+    : Array.isArray(value)
+      ? value
+        .map((part) => {
+          const item = record(part);
+          return typeof item?.text === 'string' ? item.text : '';
+        })
+        .join('\n')
+        .trim()
+      : typeof record(value)?.text === 'string'
+        ? String(record(value)?.text).trim()
+        : '';
+  return /^The user stepped away and is coming back\./u.test(text);
+}
+
 export function humanVisibleUserContent(content: unknown): unknown {
+  if (claudeResumeRecapContent(content)) return undefined;
   if (!Array.isArray(content)) return runtimeContextPart(content) ? undefined : content;
   const visible = content.filter((part) =>
-    record(part)?.type !== 'tool_result' && !runtimeContextPart(part));
-  return visible.length ? visible : undefined;
+    record(part)?.type !== 'tool_result'
+    && !runtimeContextPart(part)
+    && !claudeResumeRecapContent(part));
+  return visible.length && !claudeResumeRecapContent(visible) ? visible : undefined;
 }
 
 /** Additive compatibility parser for persisted interactions created before Observer semantic v1. */
@@ -309,18 +335,33 @@ function preview(value: unknown, limit = 320, depth = 0): string | undefined {
       .join(' ');
   } else if (value && typeof value === 'object') {
     const item = value as Record<string, unknown>;
-    const direct = item.text
-      ?? item.input_text
-      ?? item.output_text
-      ?? item.content
-      ?? item.result
-      ?? item.output;
-    if (direct !== undefined && direct !== value) output = preview(direct, limit, depth + 1);
-    else {
-      try {
-        output = JSON.stringify(value);
-      } catch {
-        output = undefined;
+    // File tools put the path beside a body (`content` / `new_string`). Prefer the path so body
+    // markers like「待验证」are not mistaken for tool-execution status in the timeline card.
+    const filePath = [
+      item.file_path, item.filePath, item.notebook_path, item.notebookPath,
+      item.path, item.target_file, item.targetFile,
+    ].find((candidate): candidate is string => typeof candidate === 'string' && Boolean(candidate.trim()));
+    if (filePath) {
+      const body = [item.content, item.new_string, item.new_source, item.old_string]
+        .find((candidate): candidate is string => typeof candidate === 'string' && Boolean(candidate.trim()));
+      const bodyPreview = body
+        ? body.replace(/\s+/gu, ' ').trim().slice(0, Math.min(96, Math.max(24, limit - filePath.length - 3)))
+        : undefined;
+      output = bodyPreview ? `${filePath.trim()} · ${bodyPreview}` : filePath.trim();
+    } else {
+      const direct = item.text
+        ?? item.input_text
+        ?? item.output_text
+        ?? item.content
+        ?? item.result
+        ?? item.output;
+      if (direct !== undefined && direct !== value) output = preview(direct, limit, depth + 1);
+      else {
+        try {
+          output = JSON.stringify(value);
+        } catch {
+          output = undefined;
+        }
       }
     }
   } else if (value !== undefined) {
@@ -445,6 +486,56 @@ function semanticEventId(
     .slice(0, 24)}`;
 }
 
+function delegationSemanticEventId(
+  interactionId: string,
+  kind: 'delegation_send' | 'delegation_reply',
+): string {
+  return `se_${createHash('sha256')
+    .update(`${interactionId}\u0000${kind}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function parsePeerEndpoint(endpoint: string | undefined): { host?: string; port?: number } | undefined {
+  const raw = endpoint?.trim();
+  if (!raw) return undefined;
+  try {
+    const url = raw.includes('://') ? new URL(raw) : new URL(`http://${raw}`);
+    const host = url.hostname || undefined;
+    const port = url.port ? Number(url.port) : undefined;
+    if (!host && (port === undefined || !Number.isFinite(port))) return undefined;
+    return {
+      ...(host ? { host } : {}),
+      ...(port !== undefined && Number.isFinite(port) ? { port } : {}),
+    };
+  } catch {
+    const match = raw.match(/^([^:/]+)(?::(\d+))?/u);
+    if (!match?.[1]) return undefined;
+    return {
+      host: match[1],
+      ...(match[2] ? { port: Number(match[2]) } : {}),
+    };
+  }
+}
+
+function relatedConversationIdForDelegation(
+  conversation: T.AgentConversationSummary,
+  interaction: T.AgentInteractionRecord,
+): string | undefined {
+  const related = conversation.relatedConversations ?? [];
+  const byDelegation = interaction.delegationId
+    ? related.find((item) =>
+      item.relation === 'delegates_to' && item.delegationId === interaction.delegationId)
+    : undefined;
+  if (byDelegation) return byDelegation.conversationId;
+  const byRun = interaction.runId
+    ? related.find((item) =>
+      item.relation === 'delegates_to' && item.runId === interaction.runId)
+    : undefined;
+  return byRun?.conversationId
+    ?? related.find((item) => item.relation === 'delegates_to')?.conversationId;
+}
+
 function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemanticEvent): number {
   const leftAt = BigInt(left.atUnixNs);
   const rightAt = BigInt(right.atUnixNs);
@@ -455,6 +546,8 @@ function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemantic
     model_progress: 30,
     model_final: 30,
     tool_call: 40,
+    delegation_send: 35,
+    delegation_reply: 36,
   };
   return rank[left.kind] - rank[right.kind]
     || (left.sourceInteractionIds[0] === right.sourceInteractionIds[0]
@@ -546,6 +639,98 @@ export function projectSemanticConversationTimeline(
     };
     turn.endedAtUnixNs = interaction.endedAtUnixNs;
     turns.set(turnId, turn);
+    const segmentId = segmentByInteraction.get(interaction.interactionId)
+      ?? segments[0]?.segmentId
+      ?? `seg_unlinked_${interaction.interactionId}`;
+
+    if (interaction.interactionType === 'remote_agent' || interaction.trafficRole === 'delegation') {
+      const peer = parsePeerEndpoint(interaction.endpoint);
+      const relatedConversationId = relatedConversationIdForDelegation(conversation, interaction);
+      const requestStructured = record(interaction.request.structured);
+      const responseStructured = record(interaction.response.structured);
+      const sendContent = {
+        goal: text(requestStructured?.goal) ?? preview(interaction.request.structured) ?? preview(interaction.request.text),
+        ...(requestStructured?.thread_id !== undefined
+          ? { threadId: requestStructured.thread_id }
+          : {}),
+        ...(requestStructured?.todos !== undefined ? { todos: requestStructured.todos } : {}),
+        path: interaction.path,
+        method: interaction.method,
+        endpoint: interaction.endpoint,
+      };
+      const replyStatus = text(responseStructured?.status);
+      const replyContent = {
+        status: replyStatus,
+        ...(responseStructured?.result !== undefined ? { result: responseStructured.result } : {}),
+        ...(responseStructured?.thread_id !== undefined
+          ? { threadId: responseStructured.thread_id }
+          : {}),
+        ...(preview(interaction.response.structured) || preview(interaction.response.text)
+          ? {
+              summary: preview(interaction.response.structured)
+                ?? preview(interaction.response.text),
+            }
+          : {}),
+      };
+      const sendFailed = interaction.statusCode >= 400;
+      const replyFailed = sendFailed
+        || replyStatus === 'failed'
+        || replyStatus === 'error';
+      const hopFields = {
+        ...(interaction.workflowNode ? { workflowNode: interaction.workflowNode } : {}),
+        ...(interaction.hop ? { hop: interaction.hop } : {}),
+        ...(interaction.delegationId ? { delegationId: interaction.delegationId } : {}),
+        ...(relatedConversationId ? { relatedConversationId } : {}),
+        ...(peer ? { peer } : {}),
+      };
+      turn.events.push({
+        semanticEventId: delegationSemanticEventId(interaction.interactionId, 'delegation_send'),
+        conversationId: conversation.conversationId,
+        segmentId,
+        turnId,
+        actor: 'agent',
+        kind: 'delegation_send',
+        atUnixNs: interaction.startedAtUnixNs,
+        content: sendContent,
+        ...(preview(sendContent.goal) ? { contentPreview: preview(sendContent.goal) } : {}),
+        toolName: 'remote_agent.run',
+        toolKind: 'http',
+        status: sendFailed ? 'failed' : 'succeeded',
+        sourceInteractionIds: [interaction.interactionId],
+        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
+        parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
+        parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
+        correlationQuality: interaction.correlationQuality ?? 'inferred',
+        completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
+        partialReasons: [...interaction.partialReasons],
+        ...hopFields,
+      });
+      turn.events.push({
+        semanticEventId: delegationSemanticEventId(interaction.interactionId, 'delegation_reply'),
+        conversationId: conversation.conversationId,
+        segmentId,
+        turnId,
+        actor: 'agent',
+        kind: 'delegation_reply',
+        atUnixNs: interaction.endedAtUnixNs,
+        endedAtUnixNs: interaction.endedAtUnixNs,
+        content: replyContent,
+        ...(preview(replyContent) ? { contentPreview: preview(replyContent) } : {}),
+        toolName: 'remote_agent.run',
+        toolKind: 'http',
+        status: replyFailed ? 'failed' : 'succeeded',
+        sourceInteractionIds: [interaction.interactionId],
+        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
+        parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
+        parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
+        correlationQuality: interaction.correlationQuality ?? 'inferred',
+        completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
+        partialReasons: [...interaction.partialReasons],
+        ...hopFields,
+      });
+      continue;
+    }
+
     const semanticItems = semanticItemsForInteraction(interaction);
     const userItems = semanticItems.filter((item) => item.kind === 'user_message');
     const userHashes = userItems.map((item) => semanticHash(item.content));
@@ -562,9 +747,15 @@ export function projectSemanticConversationTimeline(
 
     for (const item of semanticItems) {
       if (item.kind === 'user_message' && userItems.indexOf(item) < firstNewUser) continue;
-      if (item.kind === 'user_message' && item.sourceItemId) {
-        if (observedUserItemIds.has(item.sourceItemId)) continue;
-        observedUserItemIds.add(item.sourceItemId);
+      if (item.kind === 'user_message') {
+        // Claude/Codex request histories use positional ids like `request.messages[43]`.
+        // When the transcript grows, the same index is reused for a different human turn —
+        // dedupe by index alone drops the new prompt (e.g. "重新验证…"). Bind content too.
+        const userKey = item.sourceItemId
+          ? `${item.sourceItemId}\u0000${semanticHash(item.content)}`
+          : `content:${semanticHash(item.content)}`;
+        if (observedUserItemIds.has(userKey)) continue;
+        observedUserItemIds.add(userKey);
       }
       if (item.kind === 'tool_result') {
         const resultKey = `${item.toolCallId ?? 'unlinked'}\u0000${semanticHash(item.content)}`;
@@ -612,22 +803,36 @@ export function projectSemanticConversationTimeline(
         ? pairedToolResult.isError === true ? 'failed'
           : pairedToolResult.isError === false ? 'succeeded' : 'unknown'
         : undefined;
-      const itemPartialReasons = [...item.partialReasons];
+      let itemPartialReasons = [...item.partialReasons];
       if (item.kind === 'tool_result' && resultStatus === 'unknown'
         && !itemPartialReasons.includes('tool_result_status_unobserved')) {
         itemPartialReasons.push('tool_result_status_unobserved');
       }
+      // Cross-interaction ToolResult closure / history reconstruction can leave
+      // `tool_result_pending` on the originating call after the result is already paired.
+      if (pairedResult) {
+        itemPartialReasons = itemPartialReasons.filter((reason) => reason !== 'tool_result_pending');
+      }
+      const materialPartialReasons = itemPartialReasons
+        .filter((reason) => !INFORMATIONAL_PARTIAL_REASONS.has(reason));
+      const itemCompleteness: T.AgentSemanticEvent['completeness'] = materialPartialReasons.length === 0
+        && (item.kind !== 'tool_call' || pairedResult || item.completeness === 'complete')
+        ? 'complete'
+        : item.completeness;
       const httpLink = item.kind === 'tool_call' && item.toolCallId
         ? httpToolEvidence.byToolCallId.get(item.toolCallId)
-        : undefined;
+        : item.kind === 'tool_result' && item.toolCallId
+          ? httpToolEvidence.byToolCallId.get(item.toolCallId)
+          : undefined;
       const evidenceEventIds = [...new Set([
         ...(interaction.evidenceEventIds ?? []),
         ...(httpLink?.evidenceEventIds ?? []),
       ])];
-      const sourceInteractionIds = [...new Set([
-        interaction.interactionId,
-        ...(httpLink ? [httpLink.httpInteractionId] : []),
-      ])];
+      // Prefer the HTTP tool Interaction first so the inspector raw tab opens the tool
+      // request/response bodies rather than the enclosing model turn transcript.
+      const sourceInteractionIds = httpLink
+        ? [...new Set([httpLink.httpInteractionId, interaction.interactionId])]
+        : [interaction.interactionId];
       const event: T.AgentSemanticEvent = {
         semanticEventId: semanticEventId(interaction.interactionId, item),
         conversationId: conversation.conversationId,
@@ -653,8 +858,11 @@ export function projectSemanticConversationTimeline(
         parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
         parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
         correlationQuality: interaction.correlationQuality ?? 'inferred',
-        completeness: item.completeness,
+        completeness: itemCompleteness,
         partialReasons: itemPartialReasons,
+        ...(interaction.workflowNode ? { workflowNode: interaction.workflowNode } : {}),
+        ...(interaction.hop ? { hop: interaction.hop } : {}),
+        ...(interaction.delegationId ? { delegationId: interaction.delegationId } : {}),
       };
       turn.events.push(event);
       if (item.kind === 'tool_call' && item.toolCallId) calls.set(item.toolCallId, event);
@@ -672,28 +880,40 @@ export function projectSemanticConversationTimeline(
     }
     const unresolvedToolCall = interaction.toolCalls.some((call) =>
       !resolvedToolCallIds.has(call.toolCallId));
-      const resolvedToolPending = interaction.statusCode < 400
-        && interaction.toolCalls.length > 0
-        && !unresolvedToolCall
-        && !interaction.toolCalls.some((call) => unknownToolCallIds.has(call.toolCallId))
+    const materialPartialReasons = interaction.partialReasons
+      .filter((reason) => !INFORMATIONAL_PARTIAL_REASONS.has(reason));
+    const resolvedToolPending = interaction.statusCode < 400
+      && interaction.toolCalls.length > 0
+      && !unresolvedToolCall
+      && !interaction.toolCalls.some((call) => unknownToolCallIds.has(call.toolCallId))
       && (
         interaction.conversationCompleteness === 'tool_pending'
+        || materialPartialReasons.includes('tool_result_pending')
         || interaction.partialReasons.includes('tool_result_pending')
       )
       && interaction.transportCompleteness !== 'partial'
       && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete')
-      && interaction.partialReasons.every((reason) => reason === 'tool_result_pending');
+      && materialPartialReasons.every((reason) => reason === 'tool_result_pending');
+    // History reconstruction / semantic reconcile are recovery markers. When every tool_call is
+    // already paired, do not surface them as capture_gap noise in the human timeline.
+    const onlyInformationalPartial = interaction.completeness !== 'complete'
+      && materialPartialReasons.length === 0
+      && !unresolvedToolCall
+      && interaction.statusCode < 400;
     if (
       interaction.statusCode >= 400
-      || (interaction.completeness !== 'complete' && !resolvedToolPending)
+      || (interaction.completeness !== 'complete' && !resolvedToolPending && !onlyInformationalPartial)
     ) {
+      const gapMessageReasons = materialPartialReasons.length
+        ? materialPartialReasons
+        : interaction.partialReasons;
       turn.diagnostics.push({
         diagnosticId: `diag_gap_${interaction.interactionId}`,
         type: interaction.parseState && interaction.parseState !== 'parsed' ? 'parse_gap' : 'capture_gap',
         severity: interaction.statusCode >= 400 ? 'error' : 'warning',
         message: interaction.statusCode >= 400
           ? `模型请求失败（HTTP ${interaction.statusCode}）`
-          : interaction.partialReasons.join('、') || '该次交互的采集证据不完整',
+          : gapMessageReasons.join('、') || '该次交互的采集证据不完整',
         interactionId: interaction.interactionId,
       });
     }

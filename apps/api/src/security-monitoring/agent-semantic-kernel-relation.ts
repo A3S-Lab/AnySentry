@@ -5,14 +5,21 @@ import { createEvidenceLink, type EvidenceLink } from './canonical-observability
 import { matchAgentAdapterManifest, normalizeExecArgv } from './agent-adapter-execution';
 import { agentRuntimeInstanceIdsEquivalent } from './agent-identity';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 4;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 7;
 const CLOCK_SKEW_MS = 2_000;
 /** Open-call fallback when ToolResult is still missing. Keep far shorter than a wall-clock
  *  session so late unrelated ToolExec/File/Egress cannot attach to a sticky pending ToolCall. */
 const OPEN_TOOL_WINDOW_MS = 5 * 60_000;
+/** When call and result share nearly the same stamp, the result time is not a trustworthy
+ *  filesystem upper bound (Claude often projects both from one interaction envelope). */
+const COLLAPSED_TOOL_RESULT_MS = 5_000;
+/** Grace after a collapsed ToolResult for late FileAccess — keep far shorter than the open
+ *  pending window so a Write does not absorb a later Edit/NotebookEdit effect. */
+const COLLAPSED_FILE_GRACE_MS = 30_000;
 const SHELL_TOOL_PATTERN = /(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u;
-const FILE_TOOL_PATTERN = /(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
-const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u;
+const FILE_TOOL_PATTERN = /notebook.?edit|apply.?patch|(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u;
+/** MCP and generic HTTP/search tools are network-shaped; shell HTTP backends are handled separately. */
+const NETWORK_TOOL_PATTERN = /(?:^|[\s._-])(?:search|http|fetch|network|mcp)(?:$|[\s._-])/u;
 /** Remote code-block sandboxes exec a fixed runner; semantic tools carry code/endpoint, not argv. */
 const SANDBOX_TOOL_PATTERN = /sandbox/u;
 const SANDBOX_RUNNER_PATTERN = /(?:^|[\s/])runner\.py(?:\s|$)/u;
@@ -141,18 +148,78 @@ function toolCommand(event: T.AgentSemanticEvent): string | undefined {
   return nestedString(event.content, ['cmd', 'command', 'script']);
 }
 
+const TOOL_RESOURCE_KEYS = [
+  'path',
+  'file',
+  'filePath',
+  'file_path',
+  'notebook_path',
+  'notebookPath',
+  'target_file',
+  'targetFile',
+  'resource',
+] as const;
+
 function toolResource(event: T.AgentSemanticEvent): string | undefined {
   if (typeof event.content === 'string') {
     try {
       const parsed = JSON.parse(event.content);
-      const nested = nestedString(parsed, ['path', 'file', 'filePath', 'resource']);
+      const nested = nestedString(parsed, [...TOOL_RESOURCE_KEYS]);
       if (nested) return nested;
     } catch {
       // Fall through to bounded quoted-field extraction.
     }
-    return quotedField(event.content, 'path') ?? quotedField(event.content, 'filePath');
+    return quotedField(event.content, 'path')
+      ?? quotedField(event.content, 'filePath')
+      ?? quotedField(event.content, 'file_path')
+      ?? quotedField(event.content, 'notebook_path')
+      ?? quotedField(event.content, 'notebookPath')
+      ?? quotedField(event.content, 'target_file')
+      // Claude Write/Edit results often only name the final path in prose.
+      ?? event.content.match(
+        /(?:File (?:created|updated|written) successfully at|The file)\s*:\s*(\/[^\s)]+)/u,
+      )?.[1]
+      ?? event.content.match(
+        /The file\s+(\/[^\s]+)\s+has been updated successfully/u,
+      )?.[1];
   }
-  return nestedString(event.content, ['path', 'file', 'filePath', 'resource']);
+  return nestedString(event.content, [...TOOL_RESOURCE_KEYS]);
+}
+
+/** Normalize and compare tool-declared paths against Observer FileAccess/FileDelete paths. */
+function resourcePathsMatch(expectedRaw: string, observedRaw: string): number | undefined {
+  const expected = expectedRaw.replace(/\/+/gu, '/').replace(/\/$/u, '') || expectedRaw;
+  const observed = observedRaw.replace(/\/+/gu, '/').replace(/\/$/u, '') || observedRaw;
+  if (observed === expected) return 1;
+  // Agents often pass workspace-relative paths while Observer records the absolute path.
+  if (!expected.startsWith('/') && observed.endsWith('/' + expected)) return 0.98;
+  const expectedBase = expected.split('/').pop() ?? expected;
+  const observedBase = observed.split('/').pop() ?? observed;
+  if (!expectedBase || !observedBase) return undefined;
+  // Claude/Bun atomic writes land on `/proc/self/fd/N/<basename>.tmp.<pid>.<hash>` before rename.
+  if (observedBase.startsWith(`${expectedBase}.tmp`)) return 0.92;
+  // Same runtime also opens the final basename through a directory fd:
+  // `/proc/self/fd/<dirfd>/<basename>` (often without a `.tmp.` suffix).
+  if (
+    observedBase === expectedBase
+    && /\/proc\/self\/fd\/\d+\//u.test(observed)
+  ) {
+    return 0.9;
+  }
+  return undefined;
+}
+
+/** Bun/Claude dirfd staging of the exact destination basename (not a `.tmp.` sibling). */
+function bunDirfdExactBasename(
+  observedPath: string | undefined,
+  expectedResource: string | undefined,
+): boolean {
+  if (!observedPath || !expectedResource) return false;
+  const expectedBase = expectedResource.replace(/\/+/gu, '/').split('/').pop();
+  const observedBase = observedPath.replace(/\/+/gu, '/').split('/').pop();
+  if (!expectedBase || observedBase !== expectedBase) return false;
+  if (observedBase.includes('.tmp.')) return false;
+  return /\/proc\/self\/fd\/\d+\//u.test(observedPath);
 }
 
 function toolMarker(event: T.AgentSemanticEvent): string | undefined {
@@ -235,6 +302,19 @@ function interactionEndpointPort(interaction: T.AgentInteractionRecord): number 
 function kernelEventAtMs(relation: T.AgentSemanticKernelRelation): number {
   const at = text(relation.kernelEventAt, 128);
   if (!at) return Number.NaN;
+  // Prefer millisecond/nanosecond epoch stamps when the list projection kept them. Second-bucket
+  // ClickHouse display strings (`YYYY-MM-DD HH:mm:ss`) collapse parallel HTTP tool Egress rows.
+  if (/^\d{16,}$/u.test(at)) {
+    try {
+      return Number(BigInt(at) / 1_000_000n);
+    } catch {
+      return Number.NaN;
+    }
+  }
+  if (/^\d{11,15}$/u.test(at)) {
+    const ms = Number(at);
+    return Number.isFinite(ms) ? ms : Number.NaN;
+  }
   const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/u.test(at)
     ? `${at.replace(' ', 'T')}Z`
     : at;
@@ -273,8 +353,25 @@ function preferUniqueNearestProcessLineage(
   callAtMs: number,
   relations: T.AgentSemanticKernelRelation[],
 ): T.AgentSemanticKernelRelation[] {
+  return preferUniqueNearestByLinkMethod(callAtMs, relations, 'process_lineage');
+}
+
+/** Multiple FileAccess rows for the same path (Read retries / Edit staging) should not all stay
+ * ambiguous when one is uniquely nearest to the ToolCall. */
+function preferUniqueNearestResource(
+  callAtMs: number,
+  relations: T.AgentSemanticKernelRelation[],
+): T.AgentSemanticKernelRelation[] {
+  return preferUniqueNearestByLinkMethod(callAtMs, relations, 'resource');
+}
+
+function preferUniqueNearestByLinkMethod(
+  callAtMs: number,
+  relations: T.AgentSemanticKernelRelation[],
+  linkMethod: NonNullable<T.AgentSemanticKernelRelation['linkMethod']>,
+): T.AgentSemanticKernelRelation[] {
   if (relations.length <= 1) return relations;
-  if (!relations.every((relation) => relation.linkMethod === 'process_lineage')) return relations;
+  if (!relations.every((relation) => relation.linkMethod === linkMethod)) return relations;
   if (!Number.isFinite(callAtMs)) return relations;
   const ranked = relations
     .map((relation) => {
@@ -370,6 +467,30 @@ function semanticEventAtMs(event: T.AgentSemanticEvent): number {
   return Number(BigInt(event.atUnixNs) / 1_000_000n);
 }
 
+/** Prefer the wire/HTTP tool Interaction clock for nearest-candidate arbitration. Parallel LLM
+ * tool_calls often share one issuedAt stamp; the HTTP capture times still differ. */
+function callAnchorMs(input: SemanticKernelRelationInput): number {
+  if (input.interaction.interactionType === 'tool') {
+    const started = unixNsToMs(input.interaction.startedAtUnixNs);
+    if (Number.isFinite(started)) return started;
+  }
+  return semanticEventAtMs(input.event);
+}
+
+function relationWindowEndMs(event: T.AgentSemanticEvent, result?: T.AgentSemanticEvent): number {
+  const start = semanticEventAtMs(event);
+  if (!result) return start + OPEN_TOOL_WINDOW_MS;
+  const resultAt = semanticEventAtMs(result);
+  let end = resultAt;
+  if (
+    FILE_TOOL_PATTERN.test(normalizedToolLabel(event))
+    && resultAt - start < COLLAPSED_TOOL_RESULT_MS
+  ) {
+    end = Math.max(end, start + COLLAPSED_FILE_GRACE_MS);
+  }
+  return end;
+}
+
 /** Cover every competing Tool interval so a complete batch can safely replace persisted owners. */
 export function semanticKernelRelationBatchWindow(
   inputs: SemanticKernelRelationInput[],
@@ -378,9 +499,8 @@ export function semanticKernelRelationBatchWindow(
   const bounded = inputs.length ? inputs.slice(0, 1_000) : [fallback];
   return {
     startMs: Math.max(0, Math.min(...bounded.map(({ event }) => semanticEventAtMs(event))) - CLOCK_SKEW_MS),
-    endMs: Math.max(...bounded.map(({ event, result }) => result
-      ? semanticEventAtMs(result)
-      : semanticEventAtMs(event) + OPEN_TOOL_WINDOW_MS)) + CLOCK_SKEW_MS,
+    endMs: Math.max(...bounded.map(({ event, result }) => relationWindowEndMs(event, result)))
+      + CLOCK_SKEW_MS,
   };
 }
 
@@ -505,20 +625,29 @@ function sandboxRunnerExec(candidate: T.AgentEventListItem): boolean {
   return SANDBOX_RUNNER_PATTERN.test(command);
 }
 
-/**
- * Cross-Pod HTTP sandboxes do not share process generation with the calling Agent. Require a
- * same-runtime network witness for the tool endpoint plus a uniquely nearest runner.py ToolExec
- * in-window before accepting ownership without direct runtime equivalence.
- */
-function delegatedSandboxRuntime(
+function httpToolBackendInteraction(interaction: T.AgentInteractionRecord): boolean {
+  return interaction.interactionType === 'tool'
+    || /(?:^|[\s._-])http(?:$|[\s._-])/u.test([interaction.agentProduct, interaction.wireTemplateId]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase());
+}
+
+function shellHttpTool(
+  event: T.AgentSemanticEvent,
+  interaction: T.AgentInteractionRecord,
+): boolean {
+  return SHELL_TOOL_PATTERN.test(normalizedToolLabel(event))
+    && httpToolBackendInteraction(interaction);
+}
+
+function hasToolEndpointNetworkWitness(
   input: SemanticKernelRelationInput,
-  candidate: T.AgentEventListItem,
   allCandidates: readonly T.AgentEventListItem[],
 ): boolean {
-  if (!sandboxTool(input.event) || !sandboxRunnerExec(candidate)) return false;
   const host = toolHost(input.event) ?? interactionEndpointHost(input.interaction);
   const endpointPort = interactionEndpointPort(input.interaction);
-  const hasNetworkWitness = allCandidates.some((event) => {
+  return allCandidates.some((event) => {
     if (!['Egress', 'Dns', 'Tls'].includes(event.eventKind)) return false;
     if (!sameRuntime(input.interaction, event)) return false;
     if (!withinWindow(input.event, input.result, event)) return false;
@@ -531,17 +660,67 @@ function delegatedSandboxRuntime(
       && candidatePort(event) === endpointPort;
     return hostMatches || portMatches;
   });
-  if (!hasNetworkWitness) return false;
-  const callAt = unixNsToMs(input.event.atUnixNs);
+}
+
+/**
+ * Cross-Pod / out-of-process HTTP tools (LangGraph bash/MCP backends, sandboxes) do not share
+ * process generation with the calling Agent. Require a same-runtime network witness for the tool
+ * endpoint plus a uniquely nearest matching ToolExec in-window before accepting ownership without
+ * direct runtime equivalence.
+ */
+function delegatedHttpToolRuntime(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+  allCandidates: readonly T.AgentEventListItem[],
+): boolean {
+  if (candidate.eventKind !== 'ToolExec') return false;
+  if (!httpToolBackendInteraction(input.interaction) && !sandboxTool(input.event)) return false;
+  if (!hasToolEndpointNetworkWitness(input, allCandidates)) return false;
+
+  const command = toolCommand(input.event);
+  const sandboxRunner = sandboxTool(input.event) && sandboxRunnerExec(candidate);
+  if (!sandboxRunner) {
+    if (!command) return false;
+    const expected = normalizedCommand(command, input.interaction);
+    const observedCommand = candidateCommand(candidate);
+    const observed = observedCommand ? normalizedCommand(observedCommand, input.interaction) : '';
+    if (!expected || !observed) return false;
+    if (!(expected === observed || observed.includes(expected) || expected.includes(observed))) {
+      return false;
+    }
+  }
+
+  const callAt = callAnchorMs(input);
   if (!Number.isFinite(callAt)) return false;
-  const runners = allCandidates
-    .filter((event) => sandboxRunnerExec(event) && withinWindow(input.event, input.result, event))
+  const peers = allCandidates
+    .filter((event) => {
+      if (event.eventKind !== 'ToolExec' || !withinWindow(input.event, input.result, event)) {
+        return false;
+      }
+      if (sandboxRunner) return sandboxRunnerExec(event);
+      const observedCommand = candidateCommand(event);
+      const observed = observedCommand
+        ? normalizedCommand(observedCommand, input.interaction)
+        : '';
+      const expected = normalizedCommand(command!, input.interaction);
+      return Boolean(expected && observed
+        && (expected === observed || observed.includes(expected) || expected.includes(observed)));
+    })
     .map((event) => ({ event, distance: Math.abs(candidateEventAtMs(event) - callAt) }))
     .filter((entry) => Number.isFinite(entry.distance))
     .sort((left, right) => left.distance - right.distance || left.event.eventId.localeCompare(right.event.eventId));
-  if (runners.length === 0) return false;
-  if (runners.length > 1 && runners[0]!.distance === runners[1]!.distance) return false;
-  return runners[0]!.event.eventId === candidate.eventId;
+  if (peers.length === 0) return false;
+  if (peers.length > 1 && peers[0]!.distance === peers[1]!.distance) return false;
+  return peers[0]!.event.eventId === candidate.eventId;
+}
+
+/** @deprecated Prefer delegatedHttpToolRuntime; kept as a thin alias for sandbox call sites. */
+function delegatedSandboxRuntime(
+  input: SemanticKernelRelationInput,
+  candidate: T.AgentEventListItem,
+  allCandidates: readonly T.AgentEventListItem[],
+): boolean {
+  return delegatedHttpToolRuntime(input, candidate, allCandidates);
 }
 
 function runtimeMatch(
@@ -560,18 +739,66 @@ function runtimeMatch(
   return legacyPidRuntimeMatch(interaction, candidate, index);
 }
 
+function normalizedToolLabel(event: T.AgentSemanticEvent): string {
+  return [event.toolKind, event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase() || 'other';
+}
+
 function withinWindow(
   event: T.AgentSemanticEvent,
   result: T.AgentSemanticEvent | undefined,
   candidate: T.AgentEventListItem,
 ): boolean {
   const start = unixNsToMs(event.atUnixNs);
-  const resultAt = result ? unixNsToMs(result.atUnixNs) : Number.NaN;
-  const end = Number.isFinite(resultAt) ? resultAt : start + OPEN_TOOL_WINDOW_MS;
+  const end = relationWindowEndMs(event, result);
   const at = candidateEventAtMs(candidate);
   return Number.isFinite(start) && Number.isFinite(at)
     && at >= start - CLOCK_SKEW_MS
     && at <= end + CLOCK_SKEW_MS;
+}
+
+function fileAccessModeCompatible(
+  event: T.AgentSemanticEvent,
+  candidate: T.AgentEventListItem,
+): boolean {
+  if (candidate.eventKind === 'FileDelete') {
+    return /delete|unlink|remove|(?:^|[\s._-])rm(?:$|[\s._-])/u.test(normalizedToolLabel(event));
+  }
+  if (candidate.eventKind !== 'FileAccess') return true;
+  const mode = text(candidate.attributes.accessMode, 64)?.toLowerCase();
+  if (!mode) return true;
+  const label = normalizedToolLabel(event);
+  const readShaped = /(?:^|[\s._-])read(?:$|[\s._-])/u.test(label);
+  const writeShaped = /write|edit|notebook|patch|create|append/u.test(label);
+  if (readShaped && !writeShaped) {
+    return mode.includes('read');
+  }
+  if (writeShaped) {
+    if (mode.includes('write')) return true;
+    // Small Bun writes sometimes only leave a dirfd open of the final basename as read_only.
+    // Keep this exception narrow: exact basename under `/proc/self/fd/N/`, never `.tmp.` siblings.
+    if (
+      mode.includes('read')
+      && bunDirfdExactBasename(candidatePath(candidate), toolResource(event))
+    ) {
+      return true;
+    }
+    // Edit/patch tools read the target before rewriting. When the rewrite leaves no write_only
+    // open (common for small Claude Edit), an in-window exact-path read_only open is the durable
+    // Observer footprint. Do not extend this to generic Write/create.
+    const editShaped = /notebook.?edit|apply.?patch|search.?replace|(?:^|[\s._-])edit(?:$|[\s._-])/u
+      .test(label);
+    if (editShaped && mode.includes('read')) {
+      const path = candidatePath(candidate);
+      const resource = toolResource(event);
+      const score = path && resource ? resourcePathsMatch(resource, path) : undefined;
+      return score !== undefined && score >= 0.98;
+    }
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -673,7 +900,7 @@ function potentialRelation(
   const { event, result, interaction } = input;
   const invocationId = toolInvocationId(event, interaction);
   const command = toolCommand(event);
-  const resource = toolResource(event);
+  const resource = toolResource(event) ?? (result ? toolResource(result) : undefined);
   const marker = toolMarker(event);
   const host = toolHost(event) ?? interactionEndpointHost(interaction);
   const endpointPort = interactionEndpointPort(interaction);
@@ -681,8 +908,14 @@ function potentialRelation(
     .filter((value): value is string => Boolean(value))
     .join(' ')
     .toLowerCase() || 'other';
+  // HTTP tool backends (/bash/execute, /mcp, sandbox /execute) are shell/file shaped in the
+  // LLM transcript but execute out-of-process. Admit transport Egress alongside ToolExec so a
+  // missing remote execve (common for short allowlisted binaries) still leaves kernel evidence.
+  const httpBackend = httpToolBackendInteraction(interaction);
   const acceptedKinds = SHELL_TOOL_PATTERN.test(normalizedTool)
-    ? new Set(['ToolExec'])
+    ? (httpBackend
+      ? new Set(['ToolExec', 'Egress', 'Dns', 'Tls'])
+      : new Set(['ToolExec']))
     : FILE_TOOL_PATTERN.test(normalizedTool)
       ? new Set(['FileAccess', 'FileDelete'])
       : NETWORK_TOOL_PATTERN.test(normalizedTool)
@@ -727,20 +960,26 @@ function potentialRelation(
     confidence = 0.92;
   }
   if (!linkMethod && resource && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)) {
-    const expected = resource.replace(/\/+/gu, '/').replace(/\/$/u, '') || resource;
-    const observed = candidatePath(candidate)?.replace(/\/+/gu, '/').replace(/\/$/u, '');
-    if (observed) {
-      if (observed === expected) {
-        linkMethod = 'resource';
-        confidence = 1;
-      } else if (!expected.startsWith('/') && observed.endsWith('/' + expected)) {
-        // Agents often pass workspace-relative paths while Observer records the absolute path.
-        linkMethod = 'resource';
-        confidence = 0.98;
+    const observed = candidatePath(candidate);
+    const resourceConfidence = observed ? resourcePathsMatch(resource, observed) : undefined;
+    if (resourceConfidence !== undefined && fileAccessModeCompatible(event, candidate)) {
+      linkMethod = 'resource';
+      confidence = resourceConfidence;
+      const mode = text(candidate.attributes.accessMode, 64)?.toLowerCase() ?? '';
+      // Read-before-write footprints must not outrank a real write_only / tmp open for the same tool.
+      if (
+        /write|edit|notebook|patch|create|append/u.test(normalizedToolLabel(event))
+        && mode.includes('read')
+        && !mode.includes('write')
+      ) {
+        confidence = Math.min(confidence, 0.85);
       }
     }
   }
-  if (!linkMethod && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
+  // Shell HTTP tools: transport Egress is supporting evidence only. Prefer command ToolExec when
+  // present; demote host/port network matches to the fallback tier below.
+  const shellHttp = shellHttpTool(event, interaction);
+  if (!linkMethod && !shellHttp && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
     const observed = candidateHost(candidate);
     const hostMatches = Boolean(observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed)));
     // A logical endpoint with an explicit port must not claim a same-host connection on a
@@ -759,8 +998,20 @@ function potentialRelation(
     // Kubernetes/service-mesh Egress observes a resolved ClusterIP while HTTP preserves the
     // logical service name. Exact endpoint port plus Runtime and unique-candidate arbitration is
     // the strongest transport fact available without depending on cluster DNS configuration.
+    // For shell HTTP tools this remains a fallback (see batch content/fallback split).
     linkMethod = 'network_endpoint';
-    confidence = 0.95;
+    confidence = shellHttp ? 0.9 : 0.95;
+  }
+  if (!linkMethod && shellHttp && host && ['Egress', 'Dns', 'Tls'].includes(candidate.eventKind)) {
+    const observed = candidateHost(candidate);
+    const hostMatches = Boolean(observed && (observed === host || observed.endsWith('.' + host) || host.endsWith('.' + observed)));
+    const portMatches = endpointPort === undefined
+      || candidate.eventKind !== 'Egress'
+      || candidatePort(candidate) === endpointPort;
+    if (hostMatches && portMatches) {
+      linkMethod = 'network';
+      confidence = 0.9;
+    }
   }
   if (!linkMethod && command && shellBootstrapCandidate(input, candidate)) {
     // Some Agent shells receive the actual command over stdin after an exec-time environment
@@ -779,7 +1030,7 @@ function potentialRelation(
   if (!linkMethod) return undefined;
 
   let runtimeLink = runtimeMatch(interaction, candidate, index);
-  if (!runtimeLink && delegatedSandboxRuntime(input, candidate, allCandidates)) {
+  if (!runtimeLink && delegatedHttpToolRuntime(input, candidate, allCandidates)) {
     runtimeLink = 'delegated_runtime';
   }
   if (!runtimeLink) return undefined;
@@ -830,7 +1081,10 @@ function potentialRelation(
     toolInvocationId: invocationId,
     kernelEventId: candidate.eventId,
     ...(candidate.kernelFactId ? { kernelFactId: candidate.kernelFactId } : {}),
-    kernelEventAt: candidate.at,
+    kernelEventAt: candidate.eventAtUnixNs
+      ?? (typeof candidate.at === 'number' && Number.isFinite(candidate.at)
+        ? String(candidate.at)
+        : candidate.at),
     kernelEventKind: candidate.eventKind,
     ...(candidate.decisionRevision !== undefined
       ? { kernelEventDecisionRevision: candidate.decisionRevision }
@@ -1009,10 +1263,15 @@ export function buildSemanticKernelRelationBatch(
     const potential = candidates
       .map((candidate) => potentialRelation(input, candidate, index, resolutionRevision, candidates))
       .filter((relation): relation is T.AgentSemanticKernelRelation => Boolean(relation));
-    const contentRelations = potential.filter((relation) =>
-      !['shell_bootstrap', 'network_endpoint', 'process_lineage'].includes(relation.linkMethod ?? ''));
-    const boundedFallbacks = potential.filter((relation) =>
-      ['shell_bootstrap', 'network_endpoint', 'process_lineage'].includes(relation.linkMethod ?? ''));
+    // Shell HTTP tools treat transport Egress as fallback so command ToolExec owns the primary
+    // edge when both exist. MCP/search HTTP tools keep network matches as content.
+    const shellHttp = shellHttpTool(input.event, input.interaction);
+    const transportFallbackMethod = (relation: T.AgentSemanticKernelRelation) =>
+      ['shell_bootstrap', 'network_endpoint', 'process_lineage'].includes(relation.linkMethod ?? '')
+      || (shellHttp && (relation.linkMethod === 'network'
+        || ['Egress', 'Dns', 'Tls'].includes(relation.kernelEventKind ?? '')));
+    const contentRelations = potential.filter((relation) => !transportFallbackMethod(relation));
+    const boundedFallbacks = potential.filter((relation) => transportFallbackMethod(relation));
     const strongestContentConfidence = contentRelations.reduce(
       (highest, relation) => Math.max(highest, relation.confidence),
       0,
@@ -1027,12 +1286,12 @@ export function buildSemanticKernelRelationBatch(
       relation.confidence === strongestFallbackConfidence);
     const relations = contentRelations.length > 0
       // One semantic Tool action has one primary Kernel owner. A complete command match outranks
-      // descendant subcommands; equal-strength candidates are retained and marked ambiguous in
-      // the result projection rather than being silently replaced by a no-kernel row.
-      ? strongestContent
+      // descendant subcommands; equal-strength resource/file rows keep the uniquely nearest
+      // candidate. Other equal-strength content still stays ambiguous rather than silent.
+      ? preferUniqueNearestResource(callAnchorMs(input), strongestContent)
       : preferUniqueNearestProcessLineage(
-        semanticEventAtMs(input.event),
-        preferUniqueNearestNetworkEndpoint(semanticEventAtMs(input.event), strongestFallbacks),
+        callAnchorMs(input),
+        preferUniqueNearestNetworkEndpoint(callAnchorMs(input), strongestFallbacks),
       );
     potentialBySemantic.set(semanticId, relations);
     for (const relation of relations) {
@@ -1040,6 +1299,88 @@ export function buildSemanticKernelRelationBatch(
       const owners = ownersByKernel.get(relation.kernelEventId) ?? new Set<string>();
       owners.add(semanticId);
       ownersByKernel.set(relation.kernelEventId, owners);
+    }
+  }
+
+  // Write vs NotebookEdit can both path-match the same `*.tmp.*` FileAccess when Claude collapses
+  // ToolResult stamps. Give exclusive ownership to the uniquely nearest ToolCall.
+  for (const [kernelEventId, owners] of [...ownersByKernel.entries()]) {
+    if (owners.size <= 1) continue;
+    const ownerIds = [...owners];
+    const resourceOwners = ownerIds.filter((semanticId) =>
+      (potentialBySemantic.get(semanticId) ?? []).some((relation) =>
+        relation.kernelEventId === kernelEventId && relation.linkMethod === 'resource'));
+    if (resourceOwners.length <= 1 || resourceOwners.length !== ownerIds.length) continue;
+    const ranked = resourceOwners
+      .map((semanticId) => {
+        const input = boundedInputs.find((item) => item.event.semanticEventId === semanticId);
+        const relation = (potentialBySemantic.get(semanticId) ?? [])
+          .find((item) => item.kernelEventId === kernelEventId);
+        const callAt = input ? semanticEventAtMs(input.event) : Number.NaN;
+        const kernAt = relation ? kernelEventAtMs(relation) : Number.NaN;
+        return {
+          semanticId,
+          distance: Number.isFinite(callAt) && Number.isFinite(kernAt)
+            ? Math.abs(callAt - kernAt)
+            : Number.POSITIVE_INFINITY,
+        };
+      })
+      .sort((left, right) => left.distance - right.distance
+        || left.semanticId.localeCompare(right.semanticId));
+    const best = ranked[0];
+    const second = ranked[1];
+    if (!best || best.distance === Number.POSITIVE_INFINITY) continue;
+    if (second && second.distance === best.distance) continue;
+    ownersByKernel.set(kernelEventId, new Set([best.semanticId]));
+    for (const semanticId of resourceOwners) {
+      if (semanticId === best.semanticId) continue;
+      potentialBySemantic.set(
+        semanticId,
+        (potentialBySemantic.get(semanticId) ?? [])
+          .filter((relation) => relation.kernelEventId !== kernelEventId),
+      );
+    }
+  }
+
+  // Parallel HTTP tool backends (e.g. three /bash/execute calls) often share one ClusterIP:port.
+  // Give each Egress to the uniquely nearest HTTP Interaction clock so they do not all stay
+  // ambiguous after network_endpoint / network nearest-candidate selection.
+  for (const [kernelEventId, owners] of [...ownersByKernel.entries()]) {
+    if (owners.size <= 1) continue;
+    const ownerIds = [...owners];
+    const networkOwners = ownerIds.filter((semanticId) =>
+      (potentialBySemantic.get(semanticId) ?? []).some((relation) =>
+        relation.kernelEventId === kernelEventId
+        && (relation.linkMethod === 'network_endpoint' || relation.linkMethod === 'network')));
+    if (networkOwners.length <= 1 || networkOwners.length !== ownerIds.length) continue;
+    const ranked = networkOwners
+      .map((semanticId) => {
+        const input = boundedInputs.find((item) => item.event.semanticEventId === semanticId);
+        const relation = (potentialBySemantic.get(semanticId) ?? [])
+          .find((item) => item.kernelEventId === kernelEventId);
+        const callAt = input ? callAnchorMs(input) : Number.NaN;
+        const kernAt = relation ? kernelEventAtMs(relation) : Number.NaN;
+        return {
+          semanticId,
+          distance: Number.isFinite(callAt) && Number.isFinite(kernAt)
+            ? Math.abs(callAt - kernAt)
+            : Number.POSITIVE_INFINITY,
+        };
+      })
+      .sort((left, right) => left.distance - right.distance
+        || left.semanticId.localeCompare(right.semanticId));
+    const best = ranked[0];
+    const second = ranked[1];
+    if (!best || best.distance === Number.POSITIVE_INFINITY) continue;
+    if (second && second.distance === best.distance) continue;
+    ownersByKernel.set(kernelEventId, new Set([best.semanticId]));
+    for (const semanticId of networkOwners) {
+      if (semanticId === best.semanticId) continue;
+      potentialBySemantic.set(
+        semanticId,
+        (potentialBySemantic.get(semanticId) ?? [])
+          .filter((relation) => relation.kernelEventId !== kernelEventId),
+      );
     }
   }
 

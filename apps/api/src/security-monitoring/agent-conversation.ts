@@ -52,6 +52,8 @@ function displayProduct(value: string | undefined): string | undefined {
       return 'Claude Code';
     case 'langchain':
       return 'LangChain';
+    case 'langgraph':
+      return 'LangGraph';
     default:
       return product || undefined;
   }
@@ -133,7 +135,20 @@ function rootIdentity(record: T.AgentInteractionRecord): string {
     process?.pidNamespace ?? '',
     process?.startTimeTicks ?? '',
     process?.pid ?? '',
+    hopConversationFence(record),
   ].join('\u0000');
+}
+
+function hopConversationFence(record: T.AgentInteractionRecord): string {
+  // Keep orchestrator / worker LogicalAgent conversations independent even when they share
+  // runId/sessionId correlation headers across a Design-B delegation hop.
+  const hop = record.hop?.trim().toLowerCase();
+  if (hop === 'orchestrator' || hop === 'worker') return `\u0000hop:${hop}`;
+  const header = record.agentIdHeader?.trim().toLowerCase() ?? '';
+  if (header.includes('orchestrator') || header.includes('worker')) {
+    return `\u0000agent-id:${header}`;
+  }
+  return '';
 }
 
 function explicitConversation(
@@ -147,9 +162,10 @@ function explicitConversation(
 } | undefined {
   const logicalScopeKey = conversationLogicalScopeKeyV2(record);
   const deploymentScopeKey = conversationDeploymentScopeKey(record);
-  const scopeKey = deploymentScopeKey
+  const hopFence = hopConversationFence(record);
+  const scopeKey = `${deploymentScopeKey
     ? `${logicalScopeKey}|deployment:${deploymentScopeKey}`
-    : logicalScopeKey;
+    : logicalScopeKey}${hopFence}`;
   const perRequestBoundary = record.sessionMode === 'per_request'
     || record.sessionIdentityQuality === 'ephemeral'
     || record.sessionIdSource === 'per_request'
@@ -172,7 +188,9 @@ function explicitConversation(
   if (record.conversationId
     && (record.conversationIdSource !== 'inferred' || record.conversationBindingVersion)) {
     return {
-      conversationId: record.conversationId,
+      conversationId: hopFence
+        ? stableId('cv', `bound\0${record.conversationId}${hopFence}`)
+        : record.conversationId,
       source: record.conversationIdSource ?? 'inferred',
       scopeKey,
     };
@@ -200,12 +218,21 @@ function explicitConversation(
   }
   const providerChain = providerChains.get(record.interactionId);
   if (providerChain) {
-    return { conversationId: providerChain, source: 'provider', scopeKey };
+    return {
+      conversationId: hopFence
+        ? stableId('cv', `provider-chain\0${providerChain}${hopFence}`)
+        : providerChain,
+      source: 'provider',
+      scopeKey,
+    };
   }
   const session = conversationRuntimeSession(record);
   if (session) {
     return {
-      conversationId: stableId('cv', `runtime\u0000${record.agentAssetId}\u0000${session}`),
+      conversationId: stableId(
+        'cv',
+        `runtime\u0000${record.agentAssetId}\u0000${session}${hopFence}`,
+      ),
       source: 'runtime',
       scopeKey,
     };
@@ -288,6 +315,20 @@ function deduplicateToolEvidence(
     for (const call of record.toolCalls) {
       const richness = canonicalSemanticJson(call.arguments).length
         + (normalized(call.name) === 'unknown' ? 0 : call.name.length);
+      // Wire/HTTP tool captures must keep their toolCallId anchors. Collapsing them into the
+      // model Interaction removes the only row linkHttpToolCaptureEvidence can attach, so the
+      // inspector loses raw tool request/response bodies and plaintext evidenceEventIds.
+      if (record.interactionType === 'tool') {
+        retainedCalls.push(call);
+        if (!calls.has(call.toolCallId)) {
+          calls.set(call.toolCallId, {
+            recordIndex,
+            itemIndex: retainedCalls.length - 1,
+            richness,
+          });
+        }
+        continue;
+      }
       const prior = calls.get(call.toolCallId);
       if (!prior) {
         calls.set(call.toolCallId, {
@@ -307,6 +348,10 @@ function deduplicateToolEvidence(
 
     const retainedResults: T.AgentInteractionToolResult[] = [];
     for (const result of record.toolResults) {
+      if (record.interactionType === 'tool') {
+        retainedResults.push(result);
+        continue;
+      }
       const key = `${result.toolCallId}\u0000${semanticValueHash({
         content: result.content,
         isError: result.isError,
@@ -345,7 +390,7 @@ function isProperPrefix(left: string[], right: string[]): boolean {
 }
 
 function inferredThreadScope(record: T.AgentInteractionRecord): string {
-  return conversationLogicalScopeKeyV2(record);
+  return `${conversationLogicalScopeKeyV2(record)}${hopConversationFence(record)}`;
 }
 
 function clusterContinuesPriorThread(
@@ -530,7 +575,15 @@ function messagePreview(message: T.AgentInteractionMessage | undefined): string 
         '',
       ).trim()
     : raw;
-  return jsonPreview(withoutRuntimeContext || raw);
+  const preview = withoutRuntimeContext || raw;
+  // Keep Agent→LLM cards on real human turns; Claude resume recaps are role=user but not human.
+  if (
+    message.role.toLowerCase() === 'user'
+    && /^The user stepped away and is coming back\./u.test(preview.trim())
+  ) {
+    return undefined;
+  }
+  return jsonPreview(preview);
 }
 
 function requestPreview(
@@ -546,10 +599,24 @@ function requestPreview(
     && JSON.stringify(messages[firstNew]) === JSON.stringify(prior[firstNew])
   ) firstNew += 1;
   const delta = messages.slice(firstNew);
-  const preferred = [...delta].reverse().find((message) =>
-    ['user', 'developer', 'system'].includes(message.role.toLowerCase()))
+  // Claude often appends a trailing system `<total_tokens>…` (and similar) after the human turn.
+  // Prefer the new user/developer message over the latest system/tool so the Agent→LLM card shows
+  // what the human actually said, not the runtime counter.
+  const preferred = [...delta].reverse().find((message) => {
+    if (message.role.toLowerCase() !== 'user') return false;
+    return Boolean(messagePreview(message));
+  })
+    ?? [...delta].reverse().find((message) => message.role.toLowerCase() === 'developer')
+    ?? [...delta].reverse().find((message) => {
+      if (message.role.toLowerCase() !== 'system') return false;
+      const text = messagePreview(message) ?? '';
+      return text.length > 0 && !/^<(?:total_tokens|system-reminder|environment_context)\b/iu.test(text);
+    })
     ?? [...delta].reverse().find((message) => message.role.toLowerCase() === 'tool');
-  const fallback = [...messages].reverse().find((message) => message.role.toLowerCase() === 'user');
+  const fallback = [...messages].reverse().find((message) => {
+    if (message.role.toLowerCase() !== 'user') return false;
+    return Boolean(messagePreview(message));
+  });
   return messagePreview(preferred ?? fallback)
     ?? jsonPreview(record.request.structured)
     ?? jsonPreview(record.request.body);
@@ -902,7 +969,7 @@ function summaryForConversation(
       .filter((value): value is string => Boolean(value)))].slice(0, 256),
     agentInstanceIds: instanceIds,
     agentProduct,
-    displayName: asset?.displayName ?? agentProduct,
+    displayName: displayProduct(asset?.displayName) ?? asset?.displayName ?? agentProduct,
     environment: interactionEnvironment(first, asset),
     classification: first.currentEffectiveClassification,
     workspacePath: first.workspacePath,
@@ -1154,6 +1221,8 @@ export function projectAgentConversations(
     }
   }
 
+  attachRelatedConversations(summaries, interactionsByConversation);
+
   const visible = summaries
     .filter((summary) => summaryMatches(summary, query))
     .sort((left, right) => {
@@ -1165,6 +1234,170 @@ export function projectAgentConversations(
     });
 
   return { summaries: visible, interactionsByConversation, sourceInteractionsByConversation };
+}
+
+function parseEndpointPeer(endpoint: string | undefined): { host?: string; port?: number } | undefined {
+  const raw = endpoint?.trim();
+  if (!raw) return undefined;
+  try {
+    const url = raw.includes('://') ? new URL(raw) : new URL(`http://${raw}`);
+    const host = url.hostname || undefined;
+    const port = url.port ? Number(url.port) : undefined;
+    if (!host && port === undefined) return undefined;
+    return {
+      ...(host ? { host } : {}),
+      ...(port !== undefined && Number.isFinite(port) ? { port } : {}),
+    };
+  } catch {
+    const match = raw.match(/^([^:/]+)(?::(\d+))?/u);
+    if (!match) return undefined;
+    return {
+      host: match[1],
+      ...(match[2] ? { port: Number(match[2]) } : {}),
+    };
+  }
+}
+
+function conversationHopRole(
+  records: readonly T.AgentInteractionRecord[],
+): 'orchestrator' | 'worker' | 'unknown' {
+  if (records.some((item) => item.interactionType === 'remote_agent' || item.trafficRole === 'delegation')) {
+    return 'orchestrator';
+  }
+  if (records.some((item) => normalized(item.hop) === 'worker')) return 'worker';
+  if (records.some((item) => normalized(item.hop) === 'orchestrator')) return 'orchestrator';
+  if (records.some((item) => Boolean(item.parentSessionId || item.delegationId))) return 'worker';
+  return 'unknown';
+}
+
+function attachRelatedConversations(
+  summaries: T.AgentConversationSummary[],
+  interactionsByConversation: Map<string, T.AgentInteractionRecord[]>,
+): void {
+  type RunMember = {
+    conversationId: string;
+    agentAssetId: string;
+    role: 'orchestrator' | 'worker' | 'unknown';
+    runId: string;
+    delegationId?: string;
+    parentSessionId?: string;
+    hop?: string;
+    workflowNode?: string;
+    peer?: { host?: string; port?: number };
+  };
+  const byRun = new Map<string, RunMember[]>();
+  for (const summary of summaries) {
+    if (!summary.hasContent) continue;
+    const records = interactionsByConversation.get(summary.conversationId) ?? [];
+    const role = conversationHopRole(records);
+    const runIds = [...new Set(records
+      .map((item) => item.runId?.trim())
+      .filter((value): value is string => Boolean(value)))];
+    for (const runId of runIds) {
+      const scoped = records.filter((item) => item.runId === runId);
+      const delegationId = scoped.find((item) => item.delegationId)?.delegationId;
+      const parentSessionId = scoped.find((item) => item.parentSessionId)?.parentSessionId;
+      const hop = scoped.find((item) => item.hop)?.hop;
+      const workflowNode = scoped.find((item) => item.workflowNode)?.workflowNode;
+      const remote = scoped.find((item) =>
+        item.interactionType === 'remote_agent' || item.trafficRole === 'delegation');
+      const peer = parseEndpointPeer(remote?.endpoint);
+      const members = byRun.get(runId) ?? [];
+      members.push({
+        conversationId: summary.conversationId,
+        agentAssetId: summary.agentAssetId,
+        role,
+        runId,
+        ...(delegationId ? { delegationId } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
+        ...(hop ? { hop } : {}),
+        ...(workflowNode ? { workflowNode } : {}),
+        ...(peer ? { peer } : {}),
+      });
+      byRun.set(runId, members);
+    }
+  }
+
+  const relatedByConversation = new Map<string, T.AgentRelatedConversation[]>();
+  for (const members of byRun.values()) {
+    for (let i = 0; i < members.length; i += 1) {
+      for (let j = i + 1; j < members.length; j += 1) {
+        const left = members[i]!;
+        const right = members[j]!;
+        if (left.conversationId === right.conversationId) continue;
+        // Prefer distinct assets; when Docker cgroup attribution collapses to one host-root
+        // asset, still link cross-hop peers distinguished by hop / agentIdHeader roles.
+        const distinctPeer = left.agentAssetId !== right.agentAssetId
+          || (left.role !== 'unknown' && right.role !== 'unknown' && left.role !== right.role)
+          || (Boolean(left.hop) && Boolean(right.hop) && left.hop !== right.hop);
+        if (!distinctPeer) continue;
+        const exact = Boolean(
+          (left.delegationId && left.delegationId === right.delegationId)
+          || (left.parentSessionId && (
+            left.parentSessionId === right.parentSessionId
+            || right.role === 'worker'
+          )),
+        );
+        const strength: T.AgentRelatedConversation['strength'] = exact ? 'exact' : 'strong';
+        const link = (
+          from: RunMember,
+          to: RunMember,
+          relation: T.AgentRelatedConversation['relation'],
+        ): T.AgentRelatedConversation => ({
+          conversationId: to.conversationId,
+          relation,
+          runId: from.runId,
+          ...(from.hop ?? to.hop ? { hop: from.hop ?? to.hop } : {}),
+          ...(from.workflowNode ?? to.workflowNode
+            ? { workflowNode: from.workflowNode ?? to.workflowNode }
+            : {}),
+          ...(from.delegationId ?? to.delegationId
+            ? { delegationId: from.delegationId ?? to.delegationId }
+            : {}),
+          peer: {
+            ...(from.peer ?? to.peer ?? {}),
+            agentAssetId: to.agentAssetId,
+          },
+          strength,
+        });
+        let leftRelation: T.AgentRelatedConversation['relation'] = 'same_run';
+        let rightRelation: T.AgentRelatedConversation['relation'] = 'same_run';
+        if (left.role === 'orchestrator' && right.role !== 'orchestrator') {
+          leftRelation = 'delegates_to';
+          rightRelation = 'delegated_from';
+        } else if (right.role === 'orchestrator' && left.role !== 'orchestrator') {
+          leftRelation = 'delegated_from';
+          rightRelation = 'delegates_to';
+        } else if (left.role === 'worker' && right.role !== 'worker') {
+          leftRelation = 'delegated_from';
+          rightRelation = 'delegates_to';
+        } else if (right.role === 'worker' && left.role !== 'worker') {
+          leftRelation = 'delegates_to';
+          rightRelation = 'delegated_from';
+        }
+        const leftLinks = relatedByConversation.get(left.conversationId) ?? [];
+        leftLinks.push(link(left, right, leftRelation));
+        relatedByConversation.set(left.conversationId, leftLinks);
+        const rightLinks = relatedByConversation.get(right.conversationId) ?? [];
+        rightLinks.push(link(right, left, rightRelation));
+        relatedByConversation.set(right.conversationId, rightLinks);
+      }
+    }
+  }
+
+  for (const summary of summaries) {
+    const related = relatedByConversation.get(summary.conversationId);
+    if (!related?.length) continue;
+    const deduped = new Map<string, T.AgentRelatedConversation>();
+    for (const item of related) {
+      const key = `${item.relation}\u0000${item.conversationId}\u0000${item.runId}`;
+      const previous = deduped.get(key);
+      if (!previous || (previous.strength !== 'exact' && item.strength === 'exact')) {
+        deduped.set(key, item);
+      }
+    }
+    summary.relatedConversations = [...deduped.values()].slice(0, 32);
+  }
 }
 
 function eventId(kind: T.AgentConversationEventKind, interactionId: string, suffix = ''): string {

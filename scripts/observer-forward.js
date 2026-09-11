@@ -580,6 +580,34 @@ const dockerDiscovery = new DockerDiscovery({
   hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
   bootId: attributor.bootId,
 });
+/** TTL for HTTP tool-backend Exec/Exit promotion. Short enough to expire after idle backends, long
+ * enough to cover LangGraph multi-tool turns that spawn allowlisted binaries. */
+const HTTP_TOOL_BACKEND_CAPTURE_TTL_MS = Math.max(
+  30_000,
+  Number(process.env.ANYSENTRY_HTTP_TOOL_BACKEND_CAPTURE_TTL_MS) || 300_000,
+);
+/** Cgroups currently promoted for out-of-process HTTP tool Exec/Exit retention. */
+const httpToolBackendCgroups = new Set();
+const httpToolBackendCgroupExpiry = new Map();
+
+function rememberHttpToolBackendCgroup(cgroupId, ttlMs = HTTP_TOOL_BACKEND_CAPTURE_TTL_MS) {
+  const id = text(cgroupId);
+  if (!id) return;
+  httpToolBackendCgroups.add(id);
+  httpToolBackendCgroupExpiry.set(id, Date.now() + Math.max(1_000, Number(ttlMs) || HTTP_TOOL_BACKEND_CAPTURE_TTL_MS));
+}
+
+function isHttpToolBackendLifecycleCgroup(cgroupId) {
+  const id = text(cgroupId);
+  if (!id || !httpToolBackendCgroups.has(id)) return false;
+  const expiresAt = httpToolBackendCgroupExpiry.get(id) || 0;
+  if (expiresAt <= Date.now()) {
+    httpToolBackendCgroups.delete(id);
+    httpToolBackendCgroupExpiry.delete(id);
+    return false;
+  }
+  return true;
+}
 const behaviorDetector = new BehavioralAgentDetector();
 const unifiedFilterPolicy = new UnifiedFilterPolicyRegistry();
 const infrastructureResolver = new InfrastructureRootResolver();
@@ -619,6 +647,103 @@ const tlsAgentCgroupPublisher = new TlsAgentCgroupPublisher({ file: TLS_AGENT_CG
 // together with host/SSH runtime snapshots. A host CLI is not present in Docker inventory, but it
 // still has a stable process-root/cgroup identity for the lifetime of the session.
 let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
+
+function endpointHostToken(endpoint) {
+  const raw = text(endpoint).toLowerCase();
+  if (!raw) return '';
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//u.test(raw) ? raw : `http://${raw}`;
+    return text(new URL(withScheme).hostname).toLowerCase();
+  } catch {
+    return text(raw.split('/')[0]?.split(':')[0]).toLowerCase();
+  }
+}
+
+function dockerEntryMatchesToolEndpoint(entry, endpoint) {
+  const host = endpointHostToken(endpoint);
+  if (!host || !entry || entry.classification === 'confirmed_agent') return false;
+  const names = [
+    text(entry.containerName).toLowerCase(),
+    ...(Array.isArray(entry.networkAliases) ? entry.networkAliases : []).map((value) => text(value).toLowerCase()),
+  ].filter(Boolean);
+  if (names.some((name) => name === host || name.endsWith(`-${host}`) || name.endsWith(`_${host}`)
+    || name.includes(`/${host}`) || host === name.split('.').shift())) {
+    return true;
+  }
+  const addresses = Array.isArray(entry.networkAddresses) ? entry.networkAddresses : [];
+  return addresses.includes(host);
+}
+
+function resolveDockerToolBackendEntry(endpoint, snapshot = latestDockerIdentitySnapshot) {
+  const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+  const labeled = entries.filter((entry) => entry?.httpToolBackend === true
+    && dockerEntryMatchesToolEndpoint(entry, endpoint));
+  if (labeled.length === 1) return labeled[0];
+  if (labeled.length > 1) return undefined;
+  const matches = entries.filter((entry) => dockerEntryMatchesToolEndpoint(entry, endpoint));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * Promote FULL Exec/Exit for Docker HTTP tool backends via rootPid capture promotion.
+ * Keeps the cgroup as non-agent infrastructure so conversations are not attributed to the
+ * tool server; descendants inherit agent_admitted and escape bounded AGGREGATE remapping.
+ */
+function promoteHttpToolBackendCapture(entry, reasonCode = 'http_tool_backend_lifecycle') {
+  if (CAPTURE_PROFILE_MODE === 'legacy') return false;
+  const cgroupId = text(entry?.cgroupId);
+  const rootPid = Number(entry?.hostPid);
+  const physicalWorkloadId = text(entry?.physicalWorkloadId);
+  if (!cgroupId || !Number.isSafeInteger(rootPid) || rootPid <= 0 || !physicalWorkloadId) return false;
+  const now = Date.now();
+  const promoted = Boolean(filterRulePublisher.observeDecision({
+    cgroupId,
+    scopeType: 'cgroup',
+    scopeKey: `cgroup:${cgroupId}`,
+    action: 'keep',
+    policyAction: 'keep',
+    authority: 'candidate',
+    classification: 'non_agent',
+    // Agent-family profile: every process in the tool-backend cgroup gets FULL Exec/Exit under
+    // bounded lifecycle without depending on per-PID promotion inheritance across epoch churn.
+    // Classification stays non_agent so conversations are not attributed to the tool server.
+    captureProfile: 'probable_investigation',
+    reasonCode,
+    promotionReason: reasonCode,
+    physicalWorkloadId,
+    rootPid,
+    rootProcessKey: `http-tool-backend:${physicalWorkloadId}`,
+    rootStartTimeTicks: text(entry.rootStartTimeTicks) || undefined,
+    expiresAt: new Date(now + HTTP_TOOL_BACKEND_CAPTURE_TTL_MS).toISOString(),
+    ttlMs: HTTP_TOOL_BACKEND_CAPTURE_TTL_MS,
+  }));
+  if (promoted) rememberHttpToolBackendCgroup(cgroupId, HTTP_TOOL_BACKEND_CAPTURE_TTL_MS);
+  return promoted;
+}
+
+function publishLabeledHttpToolBackendCapture(snapshot = latestDockerIdentitySnapshot) {
+  const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+  let promoted = 0;
+  for (const entry of entries) {
+    if (entry?.httpToolBackend !== true) continue;
+    if (promoteHttpToolBackendCapture(entry, 'http_tool_backend_label')) promoted += 1;
+  }
+  if (promoted > 0 && CAPTURE_PROFILE_MODE !== 'legacy') filterRulePublisher.flush();
+  return promoted;
+}
+
+function promoteHttpToolBackendFromToolInteraction(observerEvent) {
+  const interaction = observerEvent?.event?.LlmInteraction;
+  if (!interaction || typeof interaction !== 'object') return false;
+  const interactionType = text(interaction.interactionType || interaction.interaction_type).toLowerCase();
+  if (interactionType !== 'tool') return false;
+  const endpoint = text(interaction.endpoint || interaction.url || interaction.host);
+  const entry = resolveDockerToolBackendEntry(endpoint);
+  if (!entry) return false;
+  const promoted = promoteHttpToolBackendCapture(entry, 'http_tool_backend_agent_callee');
+  if (promoted && CAPTURE_PROFILE_MODE !== 'legacy') filterRulePublisher.flush();
+  return promoted;
+}
 let lastTlsScopeFingerprint = '';
 let tlsScopeProjectionVersion = 0;
 let lastCaptureProfileReportError = '';
@@ -3873,6 +3998,12 @@ function handleLine(raw, fromDeferred = false) {
     classification,
     resolvedCaptureDecision,
   );
+  // LangGraph/LangChain HTTP tool callees execute out-of-process. Promote FULL Exec/Exit on the
+  // Docker peer that serves the tool endpoint so command ToolExec survives bounded infrastructure
+  // AGGREGATE remapping — without classifying the backend as an Agent.
+  if (kind === 'LlmInteraction' && classification.state === 'agent') {
+    promoteHttpToolBackendFromToolInteraction(o);
+  }
   // Runtime lifecycle is rooted in ProcessKey, but placement/confirmation can come from Docker,
   // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
   // its process-instance ID with a workload-level ID.
@@ -3909,7 +4040,14 @@ function handleLine(raw, fromDeferred = false) {
     && semanticDecision?.action === 'suppress'
     && PROTECTED_LIFECYCLE_SUPPRESSION_RULES.has(semanticDecision.ruleId)
   );
-  const alwaysKeep = alwaysKeepEventKind(kind) && !trustedLifecycleSuppression;
+  // LangGraph/LangChain HTTP tool backends are non-Agent infrastructure, but their delegated
+  // command ToolExec is the primary kernel evidence for shell tools. Bypass trusted lifecycle
+  // suppress for cgroups we explicitly promoted as http-tool backends.
+  const httpToolLifecycle = (kind === 'ToolExec' || kind === 'ProcessExit')
+    && isHttpToolBackendLifecycleCgroup(
+      text(o?.process?.cgroupId) || text(o?.process?.cgroup_id) || text(decision?.cgroupId),
+    );
+  const alwaysKeep = (alwaysKeepEventKind(kind) && !trustedLifecycleSuppression) || httpToolLifecycle;
   if (!alwaysKeep && classification.state === 'unknown' && !RETAIN_UNKNOWN) {
     // Unknown events are useful during discovery, but an unbounded host-wide unknown stream can
     // overwhelm the forwarder/WAL before attribution catches up. The setting is deliberately
@@ -4087,6 +4225,7 @@ async function start() {
     // the local projection idempotent when neither side's admission facts changed.
     lastTlsScopeFingerprint = '';
     publishTlsAgentRuntimeScope();
+    publishLabeledHttpToolBackendCapture(snapshot);
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
   });
   if (closing) return;

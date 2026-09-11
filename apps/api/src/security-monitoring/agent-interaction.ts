@@ -56,7 +56,7 @@ const MESSAGE_ORIGINS = new Set<NonNullable<T.AgentInteractionMessage['messageOr
 ]);
 const TRAFFIC_ROLES = new Set<NonNullable<T.AgentInteractionRecord['trafficRole']>>([
   'conversation', 'bootstrap', 'control', 'context_replay', 'tool_backend',
-  'derived_metadata', 'retry', 'background', 'unclassified',
+  'derived_metadata', 'retry', 'background', 'delegation', 'unclassified',
 ]);
 const ANCHOR_KINDS = new Set<T.AgentConversationAnchorKind>([
   'provider_conversation', 'response_id', 'previous_response_id', 'continuity_key',
@@ -1084,7 +1084,9 @@ export function parseObserverAgentInteraction(
     interactionId,
     interactionType: input.interactionType === 'tool'
       ? 'tool'
-      : input.interactionType === 'unparsed' ? 'unparsed' : 'model',
+      : input.interactionType === 'remote_agent'
+        ? 'remote_agent'
+        : input.interactionType === 'unparsed' ? 'unparsed' : 'model',
     at: unixNsToMs(startedAtUnixNs),
     workspacePath: meta.workspacePath,
     ...(tenantId ? { tenantId } : {}),
@@ -1148,6 +1150,10 @@ export function parseObserverAgentInteraction(
       ? { canonicalParentSessionId: sessionResolution.canonicalParentSessionId }
       : {}),
     ...(sessionResolution.parentSessionId ? { parentSessionId: sessionResolution.parentSessionId } : string(input.parentSessionId, 512) ? { parentSessionId: string(input.parentSessionId, 512) } : {}),
+    ...(string(input.hop, 120) ? { hop: string(input.hop, 120) } : {}),
+    ...(string(input.workflowNode, 120) ? { workflowNode: string(input.workflowNode, 120) } : {}),
+    ...(string(input.delegationId, 512) ? { delegationId: string(input.delegationId, 512) } : {}),
+    ...(string(input.agentIdHeader, 240) ? { agentIdHeader: string(input.agentIdHeader, 240) } : {}),
     ...(invocationId ? { invocationId } : {}),
     ...(providerConversationId ? { providerConversationId } : {}),
     ...(providerResponseId ? { providerResponseId } : {}),

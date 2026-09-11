@@ -630,6 +630,12 @@ export default function ConversationTrackingPage() {
                 onBack={clearSelectionOnMobile}
                 onSelect={selectEvent}
                 onSelectConversation={selectConversation}
+                onJumpToConversationId={(conversationId) => {
+                  const found = directory?.items
+                    .flatMap((item) => item.userThreads)
+                    .find((thread) => thread.conversationId === conversationId);
+                  if (found) selectConversation(found);
+                }}
               />
             ) : (
               <ConversationOverview

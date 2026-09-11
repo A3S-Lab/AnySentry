@@ -2922,7 +2922,9 @@ export class AggregationService implements OnModuleDestroy {
           .map((event) => {
             const owner = event.sourceInteractionIds
               .map((interactionId) => records.find((item) => item.interactionId === interactionId))
-              .find((item): item is T.AgentInteractionRecord => Boolean(item));
+              .filter((item): item is T.AgentInteractionRecord => Boolean(item))
+              .sort((left, right) =>
+                Number(right.interactionType === 'tool') - Number(left.interactionType === 'tool'))[0];
             if (!owner) return undefined;
             const result = semanticResultForCall(event, events);
             return { event, result, interaction: owner };
@@ -2943,7 +2945,8 @@ export class AggregationService implements OnModuleDestroy {
     const instanceIds = [...new Set(relationInputs
       .map((input) => input.interaction.agentInstanceId)
       .filter((value): value is string => Boolean(value)))];
-    const relationCategories = relationInputs.map(({ event }) => semanticKernelEventCategory(event));
+    const relationCategories = relationInputs.map(({ event, interaction: owner }) =>
+      owner.interactionType === 'tool' ? undefined : semanticKernelEventCategory(event));
     const relationEventCategory = relationCategories[0]
       && relationCategories.every((category) => category === relationCategories[0])
       ? relationCategories[0]
@@ -3410,9 +3413,25 @@ export class AggregationService implements OnModuleDestroy {
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);
     });
-    const boundInteractions = this.conversationBindings
+    let boundInteractions = this.conversationBindings
       ? await this.conversationBindings.applyPersistedBindings(interactions.items)
       : interactions.items;
+    // Membership-scoped reads are exact for the selected Thread, but cross-hop relatedConversations
+    // need peer Interactions from the same run/session window. Expand with a fair history read.
+    if (exactMembershipIds?.length) {
+      const peerWindow = await this.readAgentInteractions(interactionQuery, {
+        fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
+        totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+      });
+      const peerBound = this.conversationBindings
+        ? await this.conversationBindings.applyPersistedBindings(peerWindow.items)
+        : peerWindow.items;
+      const byId = new Map(boundInteractions.map((item) => [item.interactionId, item]));
+      for (const item of peerBound) {
+        if (!byId.has(item.interactionId)) byId.set(item.interactionId, item);
+      }
+      boundInteractions = [...byId.values()];
+    }
     const routeAlias = requestedConversationId
       ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
       : undefined;
@@ -3661,9 +3680,13 @@ export class AggregationService implements OnModuleDestroy {
       : selected;
     if (!call || call.kind !== 'tool_call') return undefined;
     const result = semanticResultForCall(call, events);
-    const interaction = call.sourceInteractionIds
+    const interactionCandidates = call.sourceInteractionIds
       .map((interactionId) => records.find((record) => record.interactionId === interactionId))
-      .find((record): record is T.AgentInteractionRecord => Boolean(record));
+      .filter((record): record is T.AgentInteractionRecord => Boolean(record));
+    // Prefer the wire/HTTP tool Interaction when present so kernel correlation uses the tool
+    // endpoint (Egress) instead of the model provider host.
+    const interaction = interactionCandidates.find((record) => record.interactionType === 'tool')
+      ?? interactionCandidates[0];
     if (!interaction) return undefined;
     // Read the append-only canonical side lane by its semantic evidence reference before relying
     // on the legacy PostgreSQL relation projection.  This keeps a valid ToolCall→Kernel link
@@ -3773,7 +3796,9 @@ export class AggregationService implements OnModuleDestroy {
       .map((event) => {
         const owner = event.sourceInteractionIds
           .map((interactionId) => records.find((record) => record.interactionId === interactionId))
-          .find((record): record is T.AgentInteractionRecord => Boolean(record));
+          .filter((record): record is T.AgentInteractionRecord => Boolean(record))
+          .sort((left, right) =>
+            Number(right.interactionType === 'tool') - Number(left.interactionType === 'tool'))[0];
         if (!owner) return undefined;
         const eventResult = semanticResultForCall(event, events);
         const eventAt = Number(BigInt(event.atUnixNs) / 1_000_000n);
@@ -3791,7 +3816,9 @@ export class AggregationService implements OnModuleDestroy {
       relationInputs,
       { event: call, result, interaction },
     );
-    const relationEventCategory = semanticKernelEventCategory(call);
+    const relationEventCategory = interaction.interactionType === 'tool'
+      ? undefined
+      : semanticKernelEventCategory(call);
     let kernel = await this.storedAgentEvents({
       timeType: 'custom',
       startTime: new Date(relationWindow.startMs).toISOString(),

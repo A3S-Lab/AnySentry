@@ -1249,6 +1249,20 @@ class AgentAttributor {
     if (sameCachedProcess) this.stats.cacheHits++;
     else this.stats.cacheMisses++;
 
+    if (toolExec) {
+      const execIdExact = text(payload.execIdExact) || text(payload.exec_id_exact);
+      if (execIdExact) {
+        const root = this.activeRootByPid(pid, current.hostId, current.bootId)
+          || (sameCachedProcess ? this.rootForRecord(cached, false) : undefined);
+        if (root && root.pid === pid && root.runtimeState === 'running') {
+          root.execIdExact = execIdExact;
+          if (text(payload.execId) || text(payload.exec_id)) {
+            root.execId = text(payload.execId) || text(payload.exec_id);
+          }
+        }
+      }
+    }
+
     const existing = sameCachedProcess ? cached : undefined;
     // A stable cached binding is the hot path. ToolExec still evaluates the executable first so a
     // nested Agent (for example Pi launched by Codex) can establish its own root instance.
@@ -1731,6 +1745,8 @@ class AgentAttributor {
         rootStartTime: root.startTime,
         rootStartTimeTicks: root.startTime,
         rootGeneration: root.generation,
+        ...(text(root.execIdExact) ? { rootExecIdExact: text(root.execIdExact) } : {}),
+        ...(text(root.execId) ? { rootExecId: text(root.execId) } : {}),
         confidence: source === 'process_graph' ? 0.9 : 0.85,
         reason,
         source,
@@ -1770,6 +1786,8 @@ class AgentAttributor {
         rootStartTime: root.startTime,
         rootStartTimeTicks: root.startTime,
         rootGeneration: record.rootGeneration,
+        ...(text(root.execIdExact) ? { rootExecIdExact: text(root.execIdExact) } : {}),
+        ...(text(root.execId) ? { rootExecId: text(root.execId) } : {}),
         confidence: 0.9,
         reason: 'process_lineage',
         source: 'process_graph',

@@ -438,6 +438,92 @@ assert.equal(sandboxDelegatedRelations[0].lineageMethod, 'delegated_runtime');
 assert.equal(sandboxDelegatedRelations[0].kernelEventId, sandboxRunnerExecEvent.eventId);
 assert.equal(sandboxDelegatedRelations[0].kernelEventKind, 'ToolExec');
 
+// LangGraph Design B: run_bash HTTP → remote echo ToolExec must outrank transport Egress.
+const bashHttpInteraction = {
+  ...interaction,
+  interactionId: 'mi_bash_http_tool',
+  interactionType: 'tool',
+  endpoint: 'tool-mocks:18092/bash/execute',
+  startedAtUnixNs: String(BigInt(callAt) * 1_000_000n),
+};
+const bashHttpCall = {
+  ...toolCall,
+  semanticEventId: 'se_bash_http_call',
+  toolCallId: 'call_bash_echo',
+  toolName: 'run_bash',
+  toolKind: 'bash',
+  content: { command: 'echo "Hello from worker"' },
+  sourceInteractionIds: [bashHttpInteraction.interactionId],
+};
+const bashHttpResult = {
+  ...bashHttpCall,
+  semanticEventId: 'se_bash_http_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 80) * 1_000_000n),
+};
+const bashHttpEgress = {
+  ...kernelEvent,
+  eventId: 'evt_bash_http_egress',
+  eventKind: 'Egress',
+  subject: 'egress → 172.29.0.2:18092',
+  attributes: { peer: '172.29.0.2', port: 18092 },
+  at: new Date(callAt + 10).toISOString(),
+};
+const bashHttpExec = {
+  ...kernelEvent,
+  eventId: 'evt_bash_http_echo_exec',
+  eventKind: 'ToolExec',
+  subject: 'echo Hello from worker',
+  agentRuntimeInstanceId: 'docker:tool-mocks:echo',
+  agentRuntimeInstanceAliases: [],
+  attributes: { argv: 'echo "Hello from worker"' },
+  at: new Date(callAt + 25).toISOString(),
+  attribution: {
+    processGenerationKey: 'pgk_echo_child',
+    parentProcessGenerationKey: 'pgk_tool_mocks_parent',
+    parentLinkAuthority: 'forwarder_process_graph',
+  },
+};
+const bashHttpRelations = buildSemanticKernelRelations(
+  bashHttpCall,
+  bashHttpResult,
+  bashHttpInteraction,
+  [bashHttpEgress, bashHttpExec],
+  21,
+  false,
+);
+assert.equal(bashHttpRelations[0].kernelEventKind, 'ToolExec',
+  'shell HTTP tools must prefer delegated command ToolExec over transport Egress');
+assert.equal(bashHttpRelations[0].linkMethod, 'command');
+assert.equal(bashHttpRelations[0].lineageMethod, 'delegated_runtime');
+assert.equal(bashHttpRelations[0].kernelEventId, bashHttpExec.eventId);
+
+const mcpHttpCall = {
+  ...bashHttpCall,
+  semanticEventId: 'se_mcp_http_call',
+  toolCallId: 'call_mcp_weather',
+  toolName: 'call_mcp_tool',
+  toolKind: 'mcp',
+  content: { name: 'get_weather', arguments: { city: 'Beijing' } },
+};
+const mcpHttpResult = {
+  ...mcpHttpCall,
+  semanticEventId: 'se_mcp_http_result',
+  kind: 'tool_result',
+  atUnixNs: String(BigInt(callAt + 90) * 1_000_000n),
+};
+const mcpHttpRelations = buildSemanticKernelRelations(
+  mcpHttpCall,
+  mcpHttpResult,
+  bashHttpInteraction,
+  [bashHttpEgress],
+  22,
+  false,
+);
+assert.equal(mcpHttpRelations[0].kernelEventKind, 'Egress',
+  'MCP HTTP tools correctly use network_effect when no local exec exists');
+assert.equal(mcpHttpRelations[0].linkMethod, 'network_endpoint');
+
 const resolvedServiceEgress = {
   ...sandboxEgress,
   eventId: 'evt_sandbox_cluster_ip_egress',

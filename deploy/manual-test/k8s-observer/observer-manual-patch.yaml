@@ -62,6 +62,8 @@ spec:
             # /bash/execute + /mcp: customer-langgraph-sim-lab Design B tool-mocks.
             # Observer wire template recognizes command+timeout_ms (bash) and mcp-jsonrpc.
             - { name: A3S_OBSERVER_TOOL_HTTP_ROUTES, value: "/tool/execute,/execute,/bash/execute,/mcp" }
+            # Cross-agent RPC (LangGraph Design B orchestrator → worker POST /runs).
+            - { name: A3S_OBSERVER_AGENT_RPC_ROUTES, value: "/runs" }
             # Test-only process name fragments so plugin_daemon OpenAI-compatible provider workers
             # and Celery HTTP Request tool workers are selected for TLS attach. Do not broaden.
             # uvicorn/python cover customer-langgraph-sim-lab Design B containers.
