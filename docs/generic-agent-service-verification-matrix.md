@@ -33,6 +33,12 @@
 
 ## 真实验收闸门
 
+最近一次只读 health 观察：API `healthz/livez` 返回 200，ClickHouse ready，PostgreSQL 未就绪；
+hot ring 为 `4991/5000`，protected 为 `4528`，post-commit projection 为 0 in-flight、0
+pending、0 failed、0 dropped，canonical raw/kernel/semantic/evidence lane 的 dropped 均为 0。
+由于 hot ring 已处于约 99.8% 高水位，当前只保留只读和低事件量验证，暂缓会扩大事件量的真实
+Agent E2E；健康检查通过不等价于容量闸门通过。
+
 `verify-real-agent-discovery-chain.mjs` 在创建任何 source、Pod、Docker workload 或 Collector 前执行连续容量检查：
 
 - AnySentry API 默认不超过 `600 MiB`；
