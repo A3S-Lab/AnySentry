@@ -80,6 +80,14 @@ function run(command, args, options = {}) {
   });
 }
 
+async function startDetachedDocker(containerName, args, options = {}) {
+  // `docker run -d` can keep the client attached while the daemon prepares a privileged
+  // host-PID container. Separating create/start makes that boundary observable and keeps
+  // cleanup deterministic when startup fails.
+  await run('docker', ['create', ...args], options);
+  await run('docker', ['start', containerName], options);
+}
+
 async function api(path, body) {
   const response = await fetch(`${baseUrl}${path}`, {
     method: body === undefined ? 'GET' : 'POST',
@@ -208,11 +216,7 @@ async function createSnapshotServer(pod) {
 }
 
 async function startUnknownContainer() {
-  await run(
-    'docker',
-    [
-      'run',
-      '-d',
+  await startDetachedDocker(unknownName, [
       '--name',
       unknownName,
       '--entrypoint',
@@ -220,18 +224,12 @@ async function startUnknownContainer() {
       image,
       '-e',
       'setInterval(() => {}, 1000)',
-    ],
-    { timeoutMs: 120_000 },
-  );
+    ], { timeoutMs: 120_000 });
   created.unknown = true;
 }
 
 async function startTemplateContainer() {
-  await run(
-    'docker',
-    [
-      'run',
-      '-d',
+  await startDetachedDocker(templateName, [
       '--name',
       templateName,
       '--entrypoint',
@@ -239,9 +237,7 @@ async function startTemplateContainer() {
       image,
       '-e',
       'setInterval(() => {}, 1000)',
-    ],
-    { timeoutMs: 120_000 },
-  );
+    ], { timeoutMs: 120_000 });
   created.template = true;
 }
 
@@ -261,11 +257,7 @@ async function startCollector(snapshotPort, nodeName) {
       name: templateName,
     },
   ]);
-  await run(
-    'docker',
-    [
-      'run',
-      '-d',
+  await startDetachedDocker(collectorName, [
       '--name',
       collectorName,
       '--privileged',
@@ -309,9 +301,7 @@ async function startCollector(snapshotPort, nodeName) {
       '/usr/local/bin/node',
       image,
       '/opt/observer-supervisor.js',
-    ],
-    { timeoutMs: 120_000 },
-  );
+    ], { timeoutMs: 120_000 });
   created.collector = true;
   await eventually('current Observer probes and Docker discovery', async () => {
     const logs = await run('docker', ['logs', collectorName]);
