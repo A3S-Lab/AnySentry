@@ -16,8 +16,30 @@ const { agentAssetIdForIdentityKey } = require(
   '../apps/api/dist/security-monitoring/agent-identity.js',
 );
 
-const baseUrl = (process.env.ANYSENTRY_API_BASE
-  ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/u, '');
+async function discoverApiBase() {
+  if (process.env.ANYSENTRY_API_BASE) {
+    return process.env.ANYSENTRY_API_BASE.replace(/\/$/u, '');
+  }
+  const ports = [...new Set([
+    process.env.PORT,
+    '32653',
+    '29653',
+    '29654',
+  ].filter(Boolean))];
+  for (const port of ports) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (response.ok) return `http://127.0.0.1:${port}/security-center`;
+    } catch {
+      // A local port probe is best effort; the request below retains the normal failure detail.
+    }
+  }
+  return 'http://127.0.0.1:29653/security-center';
+}
+
+const baseUrl = await discoverApiBase();
 const runId = safeProbeId('interaction');
 const createdSourceIds = new Set();
 let sourceCleanupFinished = false;
