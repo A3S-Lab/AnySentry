@@ -8102,7 +8102,7 @@ export class ClickHouseStore {
       result_overflow_mode: "break" as const,
     };
     try {
-      let rows: Array<{ payload?: string }>;
+      let rows: Array<{ payload?: string; routeShape?: string }>;
       if (fairPerAgentLimit) {
         // Keep large request/response payloads out of the LIMIT BY sort. Resolve a bounded set of
         // lightweight IDs first, then fetch only those payloads in a second query.
@@ -8133,7 +8133,7 @@ export class ClickHouseStore {
         if (interactionIds.length === 0) return [];
         const payloadResult = await this.client.query({
           query: `
-            SELECT interactionId, argMax(payload, revision) AS payload
+            SELECT interactionId, argMax(payload, revision) AS payload, argMax(routeShape, revision) AS routeShape
             FROM ${AGENT_INTERACTION_TABLE}
             WHERE interactionId IN {interactionIds:Array(String)}
             GROUP BY interactionId
@@ -8146,7 +8146,7 @@ export class ClickHouseStore {
       } else {
         const result = await this.client.query({
           query: `
-            SELECT interactionId, argMax(payload, revision) AS payload, max(at) AS latestAt
+            SELECT interactionId, argMax(payload, revision) AS payload, argMax(routeShape, revision) AS routeShape, max(at) AS latestAt
             FROM ${AGENT_INTERACTION_TABLE}
             WHERE ${conditions.join(" AND ")}
             GROUP BY interactionId
@@ -8163,7 +8163,7 @@ export class ClickHouseStore {
           if (!row.payload) return [];
           const parsed = JSON.parse(row.payload) as AgentInteractionRecord;
           return parsed.schemaVersion === "anysentry.agent_interaction.v1"
-            ? [parsed]
+            ? [{ ...parsed, ...(parsed.routeShape || !row.routeShape ? {} : { routeShape: row.routeShape }) }]
             : [];
         } catch {
           return [];
