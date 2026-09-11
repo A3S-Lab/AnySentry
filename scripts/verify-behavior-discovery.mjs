@@ -142,15 +142,15 @@ const modelOnlyScope = {
   workloadRef: { environment: 'docker', kind: 'container', name: 'opaque-http-service' },
 };
 modelOnlyServiceDetector.observe(
-  event('LlmInteraction', { pid: 114, host: '10.30.0.8', path: '/v1/infer' }, 'model-only-service'),
+  event('Egress', { pid: 114, host: '10.30.0.8', path: '/v1/responses' }, 'model-only-service'),
   modelOnlyScope,
 );
 const modelOnlyCandidate = modelOnlyServiceDetector.observe(
-  event('LlmInteraction', { pid: 114, host: '10.30.0.8', path: '/v1/infer' }, 'model-only-service'),
+  event('Egress', { pid: 114, host: '10.30.0.8', path: '/v1/responses' }, 'model-only-service'),
   modelOnlyScope,
 );
 assert.equal(modelOnlyCandidate?.state, 'agent',
-  'a model-only HTTP service becomes a bounded probable candidate without a tool call');
+  'a model-only HTTP service becomes a bounded probable candidate from kernel transport without a tool call');
 assert.equal(modelOnlyCandidate?.attribution.classification, 'probable_agent');
 
 const semanticDetector = new BehavioralAgentDetector({
