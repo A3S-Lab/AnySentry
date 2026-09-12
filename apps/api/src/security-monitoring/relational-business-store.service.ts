@@ -932,6 +932,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       bounded,
       (record) => `${record.observationId}\0${record.revision}`,
     )) return false;
+    if (batchHasConflictingRecords(
+      bounded,
+      (record) => `${record.idempotencyKey}\0${record.revision}`,
+    )) return false;
     const boundedJson = boundedJsonRows(bounded, RAW_OBSERVATION_LIMIT, CANONICAL_WRITE_MAX_BYTES);
     if (!boundedJson) return false;
     if (!(await this.initialize()) || !this.pool) return false;
@@ -945,8 +949,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            SELECT 1
              FROM anysentry_raw_observations_v1 existing
              JOIN incoming
-               ON existing.observation_id = incoming.record->>'observationId'
-              AND existing.revision = (incoming.record->>'revision')::bigint
+               ON existing.revision = (incoming.record->>'revision')::bigint
+              AND (existing.observation_id = incoming.record->>'observationId'
+                OR existing.idempotency_key = incoming.record->>'idempotencyKey')
             WHERE existing.payload_sha256 <> incoming.record->'payload'->>'sha256'
                OR existing.record <> incoming.record
          ) AS conflict`,
