@@ -3434,7 +3434,11 @@ export class AggregationService implements OnModuleDestroy {
             inventoryTimer.unref();
           }),
         ]);
-    const fairHistoryRead = !exactMembershipIds && (resolveConversationId || (
+    // Canonical raw projections must report the bounded durable result as-is. The dashboard's
+    // fair-per-agent quota is a presentation safeguard for the ordinary Agent view; applying it
+    // to the raw lane marks a small, complete canonical Session read as `scan_limit` merely because
+    // the fairness adapter was used. Keep the total interaction cap in both lanes.
+    const fairHistoryRead = filter.scope !== 'raw' && !exactMembershipIds && (resolveConversationId || (
       !filter.agentAssetId
       && !filter.agentInstanceId
       && !filter.model
