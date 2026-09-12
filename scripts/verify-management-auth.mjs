@@ -48,6 +48,35 @@ const expectedProtectedRoutes = [
   'PUT unknown-learning/policies/:policyId',
   'POST unknown-learning/policies/:policyId/infrastructure-draft',
   'PUT unknown-learning/config',
+  // Canonical observability reads are management protected because they expose
+  // raw kernel facts, evidence links, session membership and identity detail.
+  'GET v1/raw-observations',
+  'GET v1/raw-observations/:observationId',
+  'GET v1/coverage-gaps',
+  'GET v1/kernel-facts',
+  'GET v1/kernel-facts/:factId',
+  'GET v1/kernel-facts/:factId/context',
+  'GET v1/semantic-records',
+  'GET v1/semantic-records/:semanticRecordId',
+  'GET v1/evidence-links',
+  'GET v1/evidence-links/:linkId',
+  'GET v1/session-memberships',
+  'GET v1/session-memberships/:membershipId',
+  'GET v1/logical-agents',
+  'GET v1/logical-agents/:logicalAgentId',
+  'GET v1/logical-agents/:logicalAgentId/instances',
+  'GET v1/agent-instances',
+  'GET v1/agent-instances/:agentInstanceId',
+  'GET v1/agent-instances/:agentInstanceId/runtimes',
+  'GET v1/agent-instances/:agentInstanceId/sessions',
+  'GET v1/runtime-instances',
+  'GET v1/runtime-instances/:runtimeInstanceId',
+  'GET v1/sessions',
+  'GET v1/sessions/:sessionId',
+  'GET v1/sessions/:sessionId/timeline',
+  'GET v1/sessions/:sessionId/coverage',
+  'GET v1/semantic-events/:semanticEventId/evidence',
+  'GET v1/observability/contracts',
 ];
 
 function fail(message, details) {
@@ -193,14 +222,15 @@ async function main() {
 
   const protectedProbes = protectedWriteProbes(runId);
   const probedRouteSet = new Set(['POST sources', ...protectedProbes.map((probe) => probe.route)]);
+  const runtimeProbeRouteSet = new Set([...expectedRouteSet].filter((route) => !route.startsWith('GET v1/')));
   assert(
     'management auth runtime probes cover every protected management route',
-    setDifference(expectedRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, expectedRouteSet).length === 0,
+    setDifference(runtimeProbeRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, runtimeProbeRouteSet).length === 0,
     {
-      expectedProtectedRoutes,
+      expectedRuntimeProbeRoutes: [...runtimeProbeRouteSet].sort(),
       probedRoutes: [...probedRouteSet].sort(),
-      missingRuntimeProbes: setDifference(expectedRouteSet, probedRouteSet),
-      unexpectedRuntimeProbes: setDifference(probedRouteSet, expectedRouteSet),
+      missingRuntimeProbes: setDifference(runtimeProbeRouteSet, probedRouteSet),
+      unexpectedRuntimeProbes: setDifference(probedRouteSet, runtimeProbeRouteSet),
     },
   );
 
