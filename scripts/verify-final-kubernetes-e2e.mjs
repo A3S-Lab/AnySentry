@@ -276,6 +276,9 @@ function baseResources(nodeName, includePi = false) {
           // in the isolated E2E namespace; production policy remains independently bounded by
           // F1/F2 snapshots and per-workload budgets.
           env: [env('A3S_OBSERVER_JSON', '1'), env('A3S_OBSERVER_FILES', '1'),
+            // FileRead is a high-volume opt-in. The isolated fixture enables it explicitly so
+            // the read ToolEvidence link is exercised without widening the default deployment.
+            env('A3S_OBSERVER_FILE_READ', '1'),
             env('A3S_OBSERVER_FILE_ACCESS', '1'), env('A3S_OBSERVER_FILE_DELETE', '0'), env('A3S_OBSERVER_SSL', '0'),
             env('A3S_OBSERVER_CONNECT', '0'), env('A3S_OBSERVER_TLS', '0'), env('A3S_OBSERVER_DNS', '0'),
             env('A3S_OBSERVER_LLM', '0'),
