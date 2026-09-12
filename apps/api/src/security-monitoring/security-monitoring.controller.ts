@@ -11270,11 +11270,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
   @Get('v1/session-memberships')
   @RequireManagementAuth()
-  async canonicalSessionMemberships(@Query('limit') limit?: string) {
+  async canonicalSessionMemberships(@Query('limit') limit?: string, @Query('interactionId') interactionId?: string) {
     const bounded = boundedCanonicalStoreLimit(limit);
+    const interaction = interactionId === undefined ? undefined : strictIdentityText(interactionId, 240);
+    if (interactionId !== undefined && !interaction) throw new BadRequestException('interactionId is invalid');
     const result = await this.boundedCanonicalList(
-      this.canonicalObservability.listDurableSessionMemberships(bounded),
-      () => this.canonicalObservability.sessionMemberships.list(bounded),
+      this.canonicalObservability.listDurableSessionMemberships(bounded, interaction),
+      () => this.canonicalObservability.sessionMemberships.list(Math.min(10_000, interaction ? bounded * 8 : bounded))
+        .filter((membership) => !interaction || membership.interactionId === interaction),
     );
     const reasons = result.degraded ? ['canonical_session_membership_projection_unavailable'] : [];
     const dataSource = result.degraded ? 'memory_hot_ring' : 'canonical_session_membership_store';

@@ -76,7 +76,7 @@ export interface CanonicalRawObservationSink {
     limit?: number;
   }): Promise<EvidenceLink[]>;
   saveSessionMemberships?(memberships: readonly SessionMembership[]): Promise<boolean>;
-  loadSessionMemberships?(input?: { membershipIds?: readonly string[]; resolutionRevision?: number; limit?: number }): Promise<SessionMembership[]>;
+  loadSessionMemberships?(input?: { membershipIds?: readonly string[]; interactionIds?: readonly string[]; resolutionRevision?: number; limit?: number; strictRead?: boolean }): Promise<SessionMembership[]>;
 }
 
 export interface CanonicalEvidenceLinkReadResult {
@@ -1083,11 +1083,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     };
   }
 
-  async listDurableSessionMemberships(limit = 1_000): Promise<SessionMembership[]> {
+  async listDurableSessionMemberships(limit = 1_000, interactionId?: string): Promise<SessionMembership[]> {
     const requested = Number(limit);
     const bounded = Number.isFinite(requested) ? Math.max(1, Math.min(10_000, Math.trunc(requested))) : 1_000;
     const durable = this.sink?.loadSessionMemberships
-      ? (await this.sink.loadSessionMemberships({ limit: bounded }).catch(() => []))
+      ? (await this.sink.loadSessionMemberships({
+          limit: bounded,
+          ...(interactionId ? { interactionIds: [interactionId] } : {}),
+        }).catch(() => []))
           .flatMap((candidate) => {
             const safe = safeDurableSessionMembership(candidate);
             return safe ? [safe] : [];
@@ -1095,7 +1098,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       : [];
     return this.mergeDurableFirst(
       durable,
-      this.sessionMemberships.list(bounded),
+      this.sessionMemberships.list(Math.min(10_000, bounded * (interactionId ? 8 : 1)))
+        .filter((membership) => !interactionId || membership.interactionId === interactionId),
       (membership) => `${membership.membershipId}\0${membership.resolutionRevision}`,
     )
       .sort((left, right) => left.validFromUnixNs === right.validFromUnixNs
@@ -1108,22 +1112,31 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   async getDurableSessionMembership(membershipId: string, resolutionRevision?: number): Promise<SessionMembership | undefined> {
     const id = boundedText(membershipId, 240);
     if (!id) return undefined;
-    const durable = this.sink?.loadSessionMemberships
-      ? (await this.sink.loadSessionMemberships({
-          membershipIds: [id],
-          ...(resolutionRevision === undefined ? {} : { resolutionRevision }),
-          limit: resolutionRevision === undefined ? 128 : 1,
-        }).catch(() => []))
-          .flatMap((candidate) => {
-            const safe = safeDurableSessionMembership(candidate);
-            return safe ? [safe] : [];
-          })
-      : [];
-    const candidates = [...durable, ...(this.sessionMemberships.get(id, resolutionRevision) ? [this.sessionMemberships.get(id, resolutionRevision)!] : [])]
-      .filter((item) => resolutionRevision === undefined || item.resolutionRevision === resolutionRevision);
-    return candidates.sort((left, right) => right.resolutionRevision - left.resolutionRevision)[0]
-      ? structuredClone(candidates.sort((left, right) => right.resolutionRevision - left.resolutionRevision)[0])
-      : undefined;
+    // Point reads are the canonical durability boundary. Do not silently merge the hot ring into
+    // a successful durable result: the controller must be able to mark a late or unavailable
+    // PostgreSQL projection as partial while still returning the bounded hot fallback.
+    if (!this.sink?.loadSessionMemberships) {
+      throw new Error('canonical SessionMembership projection temporarily unavailable');
+    }
+    const durable = (await this.sink.loadSessionMemberships({
+      membershipIds: [id],
+      ...(resolutionRevision === undefined ? {} : { resolutionRevision }),
+      limit: resolutionRevision === undefined ? 128 : 1,
+      strictRead: true,
+    }))
+      .flatMap((candidate) => {
+        const safe = safeDurableSessionMembership(candidate);
+        return safe ? [safe] : [];
+      })
+      .filter((item) => resolutionRevision === undefined || item.resolutionRevision === resolutionRevision)
+      .sort((left, right) => right.resolutionRevision - left.resolutionRevision);
+    const hot = this.sessionMemberships.get(id, resolutionRevision);
+    const latestDurable = durable[0];
+    if (!latestDurable) return undefined;
+    // A newer hot revision means the durable point is stale. Returning it as complete would
+    // make a canonical reader hide an append-only resolution update.
+    if (resolutionRevision === undefined && hot && hot.resolutionRevision > latestDurable.resolutionRevision) return undefined;
+    return structuredClone(latestDurable);
   }
 
   sessionMembershipStats(): ReturnType<SessionMembershipStore['stats']> {

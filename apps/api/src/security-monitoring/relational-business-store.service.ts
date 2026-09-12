@@ -1341,18 +1341,35 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async loadSessionMemberships(input: { membershipIds?: readonly string[]; resolutionRevision?: number; limit?: number } = {}): Promise<SessionMembership[]> {
-    if (!(await this.initialize()) || !this.pool) return [];
+  async loadSessionMemberships(input: { membershipIds?: readonly string[]; interactionIds?: readonly string[]; resolutionRevision?: number; limit?: number; strictRead?: boolean } = {}): Promise<SessionMembership[]> {
+    const strictRead = input.strictRead === true;
+    if (!(await this.initialize()) || !this.pool) {
+      if (strictRead) throw new Error('canonical SessionMembership store is unavailable');
+      return [];
+    }
     const requested = Number(input.limit ?? 1_000);
     const limit = Number.isFinite(requested)
       ? Math.max(1, Math.min(SESSION_MEMBERSHIP_LIMIT, Math.trunc(requested))) : 1_000;
     try {
       const ids = [...new Set((input.membershipIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SESSION_MEMBERSHIP_LIMIT);
+      const interactionIds = [...new Set((input.interactionIds ?? []).map((value) => String(value).trim()).filter(Boolean))].slice(0, SESSION_MEMBERSHIP_LIMIT);
       const requestedRevision = input.resolutionRevision !== undefined
         && Number.isSafeInteger(input.resolutionRevision) && input.resolutionRevision > 0
         ? input.resolutionRevision : undefined;
       const result = await this.pool.query<{ record: SessionMembership | string }>(
-        ids.length && requestedRevision !== undefined
+        interactionIds.length && requestedRevision !== undefined
+          ? `SELECT record
+               FROM anysentry_session_memberships_v1
+              WHERE record->>'interactionId' = ANY($1::text[]) AND resolution_revision = $2
+              ORDER BY valid_from DESC, membership_id
+              LIMIT $3`
+          : interactionIds.length
+            ? `SELECT record
+                 FROM anysentry_session_memberships_v1
+                WHERE record->>'interactionId' = ANY($1::text[])
+                ORDER BY valid_from DESC, membership_id, resolution_revision DESC
+                LIMIT $2`
+            : ids.length && requestedRevision !== undefined
           ? `SELECT record
                FROM anysentry_session_memberships_v1
               WHERE membership_id = ANY($1::text[]) AND resolution_revision = $2
@@ -1374,7 +1391,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
                    FROM anysentry_session_memberships_v1
                   ORDER BY valid_from DESC, membership_id, resolution_revision DESC
                   LIMIT $1`,
-        ids.length && requestedRevision !== undefined
+        interactionIds.length && requestedRevision !== undefined
+          ? [interactionIds, requestedRevision, limit]
+          : interactionIds.length ? [interactionIds, limit]
+            : ids.length && requestedRevision !== undefined
           ? [ids, requestedRevision, limit]
           : ids.length ? [ids, limit]
             : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
@@ -1387,6 +1407,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         });
     } catch (error) {
       this.markUnavailable('load canonical SessionMemberships', error);
+      if (strictRead) throw error;
       return [];
     }
   }

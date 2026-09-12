@@ -454,7 +454,8 @@ try {
   assert.equal(snapshot.payload?.applied, true, snapshot.payload?.reason ?? 'runtime snapshot not applied');
 
   const runtimeIds = [firstObserved.agentInstanceId, resumedObserved.agentInstanceId, forkedObserved.agentInstanceId];
-  const [instanceResults, sessionsResult, membershipsResult] = await Promise.all([
+  const lifecycleInteractionIds = [interactionId(first), interactionId(resumed), interactionId(forked)];
+  const [instanceResults, sessionsResult, membershipResults] = await Promise.all([
     Promise.all(runtimeIds.map((id) => request(
       `/v1/agent-instances/${encodeURIComponent(id)}?includeCoverage=true`,
     ))),
@@ -462,18 +463,19 @@ try {
       request(`/v1/sessions/${encodeURIComponent(firstObserved.canonicalSessionId)}?includeCoverage=true`),
       request(`/v1/sessions/${encodeURIComponent(forkedObserved.canonicalSessionId)}?includeCoverage=true`),
     ]),
-    request('/v1/session-memberships?limit=20&includeCoverage=true'),
+    ...lifecycleInteractionIds.map((id) => request(
+      `/v1/session-memberships?limit=4&includeCoverage=true&interactionId=${encodeURIComponent(id)}`,
+    )),
   ]);
   assert(instanceResults.every((result) => result.response.status === 200));
   assert(sessionsResult.every((result) => result.response.status === 200));
-  assert.equal(membershipsResult.response.status, 200);
+  assert(membershipResults.every((result) => result.response.status === 200));
   assert(instanceResults.every((result, index) =>
     result.payload?.item?.runtimeInstanceIds?.includes(runtimeIds[index])));
   assert(sessionsResult.every((result, index) =>
     result.payload?.item?.sessionId === [firstObserved.canonicalSessionId, forkedObserved.canonicalSessionId][index]));
-  const memberships = membershipsResult.payload?.items ?? [];
-  const lifecycleIds = new Set([interactionId(first), interactionId(resumed), interactionId(forked)]);
-  const lifecycleMemberships = memberships.filter((item) => lifecycleIds.has(item.interactionId));
+  const lifecycleMemberships = membershipResults.flatMap((result) => result.payload?.items ?? []);
+  const lifecycleIds = new Set(lifecycleInteractionIds);
 
   const [exactSessionResult, exactForkResult] = sessionsResult;
   const sessionProjection = {
@@ -495,10 +497,10 @@ try {
         pointReadCount: membershipPointResults.length,
       }
     : {
-        status: membershipsResult.payload?.coverage?.status ?? 'unknown',
-        dataSource: membershipsResult.payload?.dataSource ?? 'unknown',
+        status: membershipResults.every((result) => result.payload?.coverage?.status === 'complete') ? 'complete' : 'partial',
+        dataSource: membershipResults[0]?.payload?.dataSource ?? 'unknown',
         reasons: [
-          ...(membershipsResult.payload?.coverage?.reasons ?? []),
+          ...membershipResults.flatMap((result) => result.payload?.coverage?.reasons ?? []),
           ...(lifecycleMemberships.length !== lifecycleIds.size ? ['lifecycle_membership_not_in_bounded_list'] : []),
           ...membershipPointResults.flatMap((result) => result.payload?.coverage?.reasons ?? []),
         ].filter((reason, index, reasons) => reasons.indexOf(reason) === index),
