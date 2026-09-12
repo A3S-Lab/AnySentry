@@ -585,6 +585,10 @@ class WorkloadIdentityCache {
         rootGeneration: 1,
         hostId,
         bootId,
+        // Capture-profile materialization is keyed by the kernel cgroup ID. Keep the
+        // process-resolved value beside the stable workload identity; omitting it makes
+        // a confirmed Kubernetes Agent visible in inventory but impossible to admit at F1.
+        ...(text(resolvedProcess?.cgroupId) ? { cgroupId: text(resolvedProcess.cgroupId) } : {}),
         ...(text(resolvedProcess?.comm) ? { comm: text(resolvedProcess.comm) } : {}),
         ...(text(resolvedProcess?.exe) ? { exe: text(resolvedProcess.exe) } : {}),
         ...(text(resolvedProcess?.cwd) ? { workspacePath: text(resolvedProcess.cwd) } : {}),
