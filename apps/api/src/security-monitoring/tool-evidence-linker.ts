@@ -101,7 +101,11 @@ interface EvidenceCandidate {
 const MAX_TOOL_CLAIMS = 1_000;
 const MAX_KERNEL_EVIDENCE = 10_000;
 const MAX_LINKS_PER_TOOL = 256;
-const LINK_CLOCK_SKEW_MS = 2_000;
+// Observer compatibility lines can arrive after the adapter batch that describes the same
+// operation. Exact process-generation plus resource/command equality remains mandatory, so a
+// bounded ingest skew is safe while preventing delayed kernel delivery from becoming a coverage
+// gap. Producer-timestamped events still use this same finite bound.
+const LINK_CLOCK_SKEW_MS = 15_000;
 const OPEN_TOOL_WINDOW_MS = 5 * 60_000;
 
 function text(value: unknown, limit = 1_024): string | undefined {
