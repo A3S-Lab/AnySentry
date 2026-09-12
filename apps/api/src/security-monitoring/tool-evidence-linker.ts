@@ -101,11 +101,11 @@ interface EvidenceCandidate {
 const MAX_TOOL_CLAIMS = 1_000;
 const MAX_KERNEL_EVIDENCE = 10_000;
 const MAX_LINKS_PER_TOOL = 256;
-// Observer compatibility lines can arrive after the adapter batch that describes the same
-// operation. Exact process-generation plus resource/command equality remains mandatory, so a
-// bounded ingest skew is safe while preventing delayed kernel delivery from becoming a coverage
-// gap. Producer-timestamped events still use this same finite bound.
-const LINK_CLOCK_SKEW_MS = 30_000;
+// Producer-timestamped events retain a tight clock bound. Compatibility Observer lines are
+// receive-timestamped and can arrive after the adapter batch; they get a larger bounded allowance
+// while exact process-generation plus resource/command equality remains mandatory.
+const LINK_CLOCK_SKEW_MS = 2_000;
+const COMPATIBILITY_INGEST_SKEW_MS = 30_000;
 const OPEN_TOOL_WINDOW_MS = 5 * 60_000;
 
 function text(value: unknown, limit = 1_024): string | undefined {
@@ -267,9 +267,13 @@ function toolKey(event: JudgedEvent, invocationId: string, toolCallId: string): 
   return [tenant, environment, event.workspacePath, source, event.agentId, invocationId, toolCallId].join('\0');
 }
 
-function withinToolWindow(claim: ToolClaim, at: number): boolean {
-  const lower = (claim.startedAt ?? claim.endedAt ?? at) - LINK_CLOCK_SKEW_MS;
-  const upper = (claim.endedAt ?? ((claim.startedAt ?? at) + OPEN_TOOL_WINDOW_MS)) + LINK_CLOCK_SKEW_MS;
+function withinToolWindow(claim: ToolClaim, event: JudgedEvent): boolean {
+  const skew = event.eventTimeQuality === 'api_received'
+    ? COMPATIBILITY_INGEST_SKEW_MS
+    : LINK_CLOCK_SKEW_MS;
+  const at = event.at;
+  const lower = (claim.startedAt ?? claim.endedAt ?? at) - skew;
+  const upper = (claim.endedAt ?? ((claim.startedAt ?? at) + OPEN_TOOL_WINDOW_MS)) + skew;
   return at >= lower && at <= upper;
 }
 
@@ -324,7 +328,7 @@ function resourceOperationCompatible(claim: ToolClaim, candidate: EvidenceCandid
 }
 
 function matchMethod(claim: ToolClaim, candidate: EvidenceCandidate): ToolEvidenceLinkMethod | undefined {
-  if (!withinToolWindow(claim, candidate.event.at)) return undefined;
+  if (!withinToolWindow(claim, candidate.event)) return undefined;
   if (
     claim.resourceHash &&
     candidate.resourceHash === claim.resourceHash &&
