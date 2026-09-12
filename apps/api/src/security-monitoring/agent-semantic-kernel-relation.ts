@@ -915,7 +915,11 @@ function potentialRelation(
   const acceptedKinds = SHELL_TOOL_PATTERN.test(normalizedTool)
     ? (httpBackend
       ? new Set(['ToolExec', 'Egress', 'Dns', 'Tls'])
-      : new Set(['ToolExec']))
+      // A local shell tool can perform file work in a child process. Keep the process
+      // generation check in candidate arbitration, but admit same-runtime FileAccess facts so
+      // bash writes do not degrade to semantic-only merely because the shell is not the Agent
+      // root process itself.
+      : new Set(['ToolExec', 'FileAccess', 'FileDelete']))
     : FILE_TOOL_PATTERN.test(normalizedTool)
       ? new Set(['FileAccess', 'FileDelete'])
       : NETWORK_TOOL_PATTERN.test(normalizedTool)
