@@ -1025,6 +1025,19 @@ function potentialRelation(
     linkMethod = 'shell_bootstrap';
     confidence = 0.95;
   }
+  if (
+    !linkMethod
+    && !httpBackend
+    && SHELL_TOOL_PATTERN.test(normalizedTool)
+    && ['FileAccess', 'FileDelete'].includes(candidate.eventKind)
+    && runtimeMatch(interaction, candidate, index)
+  ) {
+    // A local shell may perform the file operation in a child process while the adapter only
+    // exposes command metadata (without a resource path). Same-runtime and bounded call/result
+    // arbitration still constrain this fallback; HTTP-backed shells remain network-only above.
+    linkMethod = 'process_lineage';
+    confidence = 0.82;
+  }
   if (!linkMethod && processLineageCandidate(input, candidate)) {
     // Undeclared / custom tools: no HTTP route and no cmd/path/url argument to match. Attribute
     // the unique same-runtime ToolExec that is a direct Agent-root child in the call→result window.
