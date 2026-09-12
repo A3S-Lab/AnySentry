@@ -113,6 +113,18 @@ function containerIdFromCgroup(value) {
     || cgroup.match(/(?:^|\/)([a-f0-9]{64})(?:\.scope)?(?:$|\/)/i)?.[1];
 }
 
+// Kubernetes exposes Pod UIDs with dashes while systemd/containerd cgroup paths may
+// encode the same UID with dashes, underscores, or a `pod` prefix. Keep the physical
+// workload join product-neutral: normalize only UUID-like hexadecimal identities and
+// compare their compact form, without falling back to process names.
+function workloadIdentityTokens(value) {
+  const raw = text(value)?.replace(/^pod(?=[a-f0-9])/i, '');
+  if (!raw) return [];
+  const compact = raw.replace(/[-_]/gu, '').toLowerCase();
+  if (!/^[a-f0-9]{12,64}$/u.test(compact)) return [];
+  return [...new Set([raw.toLowerCase(), compact])];
+}
+
 function cgroupIdFromCgroup(value) {
   const relative = text(value)
     .split(/\r?\n/u)
@@ -452,8 +464,9 @@ class AgentAttributor {
     const ids = [...new Set([
       ...(Array.isArray(entry.ids) ? entry.ids : []),
       physicalWorkloadId.split(':').at(-1),
-    ].map((value) => text(value).replace(/^[a-z0-9._-]+:\/\//i, '').toLowerCase())
-      .filter((value) => /^[a-f0-9]{12,64}$/.test(value)))];
+    ].flatMap((value) => workloadIdentityTokens(
+      text(value).replace(/^[a-z0-9._-]+:\/\//i, ''),
+    )))];
     if (!physicalWorkloadId || ids.length === 0) return undefined;
 
     const cachedKey = this.workloadRuntimeProcesses.get(physicalWorkloadId);
@@ -469,7 +482,8 @@ class AgentAttributor {
 
     const matchesContainer = (info) => {
       const cgroup = text(info?.cgroup).toLowerCase();
-      return Boolean(cgroup && ids.some((id) => cgroup.includes(id)));
+      const normalizedCgroup = cgroup.replace(/[-_]/gu, '');
+      return Boolean(cgroup && ids.some((id) => cgroup.includes(id) || normalizedCgroup.includes(id.replace(/[-_]/gu, ''))));
     };
     const candidates = new Map();
     for (const info of this.procs.values()) {
@@ -1992,6 +2006,7 @@ module.exports = {
   findGitWorkspace,
   isEphemeralWorkspacePath,
   containerIdFromCgroup,
+  workloadIdentityTokens,
   readProcInfo,
   listProcPids,
   processKey,
