@@ -2,6 +2,22 @@
 
 本文记录 `fix/langgraph-cross-agent-hop` 阶段性实现的可重复验证证据。矩阵只记录已经执行的本地结果、受控环境闸门和仍待取得的真实证据；真实运行中的凭据、事件正文和中间产物不进入仓库。
 
+## 2026-09-12 本地受控运行补充
+
+在清理旧 AnySentry 镜像、ReplicaSet 和临时数据后，使用当前镜像 digest
+`sha256:6be4202534c53916e3c5430e15f846da57e9fd703b5215a4917c8b244d423a05`，并通过本地管理鉴权运行了
+`customer-langgraph-sim-lab/scripts/verify-observer.sh`。Design B 编排器、独立 worker、sandbox 和 tool-mock
+保持为既有受控实验服务，未停止或删除。
+
+结果：健康检查通过；一次 `/runs` 返回 `completed`；AnySentry 在 5 秒轮询窗口内收到 5 条 interaction，路径包含
+`/runs`、`/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，产品归因为 `langgraph`；conversation-directory
+返回父编排器和 worker 两个 LangGraph 线程；两个 timeline 均返回完整 turn 和语义事件，父侧包含
+`delegation_send`/`delegation_reply`，worker 侧包含 `tool_call`/`tool_result`。
+
+本次还修正了受控验证脚本对 `timeline-v3` canonical 响应的兼容性：事件位于 `turn.events`，旧 fixture 才使用
+`turn.items`；脚本现在兼容两种响应形状，避免把已经持久化的事件误判为空。该修复只影响测试脚本，不改变产品
+事件模型。仍未据此宣称 KernelFact 与 Tool evidence 已完成唯一双向 canonical 关联。
+
 ## 已通过的本地验证
 
 | 能力 | 验证入口 | 结果 | 证据范围 |
