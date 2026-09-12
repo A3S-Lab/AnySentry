@@ -939,8 +939,16 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     const boundedJson = boundedJsonRows(bounded, RAW_OBSERVATION_LIMIT, CANONICAL_WRITE_MAX_BYTES);
     if (!boundedJson) return false;
     if (!(await this.initialize()) || !this.pool) return false;
+    const client = await this.pool.connect();
     try {
-      const conflict = await this.pool.query<{ conflict: boolean }>(
+      await client.query('BEGIN');
+      // Serialize canonical raw batches across pool connections. The preflight and insert
+      // must share one transaction, otherwise two concurrent retries can both pass the
+      // preflight and race on the idempotency unique index.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended('anysentry.raw_observations.v1', 0))`,
+      );
+      const conflict = await client.query<{ conflict: boolean }>(
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
@@ -957,8 +965,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          ) AS conflict`,
         [boundedJson],
       );
-      if (conflict.rows?.[0]?.conflict === true) return false;
-      await this.pool.query(
+      if (conflict.rows?.[0]?.conflict === true) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+      await client.query(
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
@@ -985,10 +996,14 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          ON CONFLICT (observation_id, revision) DO NOTHING`,
         [boundedJson],
       );
+      await client.query('COMMIT');
       return true;
     } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
       this.markUnavailable('save canonical raw observations', error);
       return false;
+    } finally {
+      client.release();
     }
   }
 
