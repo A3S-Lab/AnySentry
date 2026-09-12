@@ -4160,6 +4160,9 @@ function universalEventLine(kind: string, input: T.UniversalIngestEvent, default
         ...(cleanString(suppliedProcess?.bootId ?? eventAttr(input, 'bootId') ?? eventAttr(input, 'boot_id'), 240) ? { bootId: cleanString(suppliedProcess?.bootId ?? eventAttr(input, 'bootId') ?? eventAttr(input, 'boot_id'), 240) } : {}),
         ...(cleanString(suppliedProcess?.startTimeTicks ?? eventAttr(input, 'startTimeTicks') ?? eventAttr(input, 'start_time_ticks'), 64) ? { startTimeTicks: cleanString(suppliedProcess?.startTimeTicks ?? eventAttr(input, 'startTimeTicks') ?? eventAttr(input, 'start_time_ticks'), 64) } : {}),
         ...(cleanString(suppliedProcess?.startTimeNs ?? eventAttr(input, 'startTimeNs') ?? eventAttr(input, 'start_time_ns'), 64) ? { startTimeNs: cleanString(suppliedProcess?.startTimeNs ?? eventAttr(input, 'startTimeNs') ?? eventAttr(input, 'start_time_ns'), 64) } : {}),
+        ...(cleanString(suppliedProcess?.pidNamespace ?? eventAttr(input, 'pidNamespace') ?? eventAttr(input, 'pid_namespace'), 128) ? { pidNamespace: cleanString(suppliedProcess?.pidNamespace ?? eventAttr(input, 'pidNamespace') ?? eventAttr(input, 'pid_namespace'), 128) } : {}),
+        ...(finiteNumber(suppliedProcess?.namespacePid ?? eventAttr(input, 'namespacePid') ?? eventAttr(input, 'namespace_pid')) !== undefined ? { namespacePid: finiteNumber(suppliedProcess?.namespacePid ?? eventAttr(input, 'namespacePid') ?? eventAttr(input, 'namespace_pid')) } : {}),
+        ...(finiteNumber(suppliedProcess?.namespacePpid ?? eventAttr(input, 'namespacePpid') ?? eventAttr(input, 'namespace_ppid')) !== undefined ? { namespacePpid: finiteNumber(suppliedProcess?.namespacePpid ?? eventAttr(input, 'namespacePpid') ?? eventAttr(input, 'namespace_ppid')) } : {}),
       }
     : undefined;
   const eventAt = eventTime(input);
