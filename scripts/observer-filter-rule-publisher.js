@@ -1287,6 +1287,15 @@ class FilterRulePublisher {
     this.flush();
   }
 
+  agentCaptureForCgroup(cgroupId) {
+    const normalized = normalizedCgroupId(cgroupId);
+    if (!normalized) return undefined;
+    const entry = this.entries.get(`cgroup:${normalized}`);
+    if (!entry || entry.action !== 'keep') return undefined;
+    if (!['confirmed_agent', 'probable_agent'].includes(text(entry.classification))) return undefined;
+    return entry;
+  }
+
   metrics() {
     this.refreshSafety();
     return {

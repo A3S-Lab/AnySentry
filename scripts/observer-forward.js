@@ -4082,7 +4082,17 @@ function handleLine(raw, fromDeferred = false) {
     && isHttpToolBackendLifecycleCgroup(
       text(o?.process?.cgroupId) || text(o?.process?.cgroup_id) || text(decision?.cgroupId),
     );
-  const alwaysKeep = (alwaysKeepEventKind(kind) && !trustedLifecycleSuppression) || httpToolLifecycle;
+  const agentCaptureEntry = (kind === 'FileAccess' || kind === 'FileDelete')
+    && filterRulePublisher.agentCaptureForCgroup(
+      text(o?.process?.cgroupId) || text(o?.process?.cgroup_id),
+    );
+  // A child shell may not yet have a complete process-generation attribution even though its
+  // cgroup is already an explicitly confirmed/probable Agent capture scope. Preserve its file
+  // fact for downstream generation-safe arbitration; this is cgroup-bound and never a host-wide
+  // Unknown retention bypass.
+  const alwaysKeep = (alwaysKeepEventKind(kind) && !trustedLifecycleSuppression)
+    || httpToolLifecycle
+    || Boolean(agentCaptureEntry);
   if (!alwaysKeep && classification.state === 'unknown' && !RETAIN_UNKNOWN) {
     // Unknown events are useful during discovery, but an unbounded host-wide unknown stream can
     // overwhelm the forwarder/WAL before attribution catches up. The setting is deliberately
