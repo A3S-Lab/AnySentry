@@ -3508,7 +3508,13 @@ export class AggregationService implements OnModuleDestroy {
     const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 80));
     const items = projection.summaries.slice(0, limit);
-    const partial = interactions.coverage.partial || inventory.coverage.partial;
+    // Canonical raw Session reads are established by durable semantic interactions plus
+    // SessionMembership. Inventory is an auxiliary identity directory and may be incomplete while
+    // the selected interaction/session rows are already durable; propagating that unrelated gap
+    // downgraded exact Session point-reads to hot_ring_only. Keep inventory coverage visible to
+    // inventory callers, but do not let it mask a complete raw conversation projection.
+    const inventoryRequired = filter.scope !== 'raw' || items.length === 0;
+    const partial = interactions.coverage.partial || (inventoryRequired && inventory.coverage.partial);
     return {
       items,
       total: projection.summaries.length,
@@ -3519,7 +3525,7 @@ export class AggregationService implements OnModuleDestroy {
         ...interactions.coverage,
         partial,
         partialReason: interactions.coverage.partialReason
-          ?? inventory.coverage.partialReason,
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
       },
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
