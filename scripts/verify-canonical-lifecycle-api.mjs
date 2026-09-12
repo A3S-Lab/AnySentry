@@ -455,7 +455,7 @@ try {
 
   const runtimeIds = [firstObserved.agentInstanceId, resumedObserved.agentInstanceId, forkedObserved.agentInstanceId];
   const lifecycleInteractionIds = [interactionId(first), interactionId(resumed), interactionId(forked)];
-  const [instanceResults, sessionsResult, membershipResults] = await Promise.all([
+  const [instanceResults, sessionsResult, ...membershipResults] = await Promise.all([
     Promise.all(runtimeIds.map((id) => request(
       `/v1/agent-instances/${encodeURIComponent(id)}?includeCoverage=true`,
     ))),
