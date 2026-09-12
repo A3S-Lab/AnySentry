@@ -332,4 +332,43 @@ assert.equal(mergeAttributionClassifications(undefined, undefined, undefined), u
   );
 }
 
+// Re-evaluating identity rules must keep the original workload authority across each merge.
+// Selective capture consumes this placement after classification, so test the module seam.
+{
+  const workload = {
+    state: 'agent',
+    attribution: {
+      classification: 'confirmed_agent', source: 'kubernetes', confidence: 1,
+      agentScopeId: 'service-definition', agentInstanceId: 'pod/container',
+      physicalWorkloadId: 'k8s:cluster:pod:container',
+      workloadRef: { environment: 'kubernetes', kind: 'container' },
+    },
+  };
+  const overlay = {
+    state: 'agent',
+    attribution: {
+      classification: 'confirmed_agent', source: 'self_register', confidence: 1,
+      agentScopeId: 'service-definition', agentInstanceId: 'pod/container',
+    },
+  };
+  let classification = mergeAttributionClassifications(undefined, workload);
+  for (let pass = 0; pass < 3; pass++) {
+    classification = mergeAttributionClassifications(classification, workload, overlay);
+    assert.equal(classification.attribution.physicalWorkloadId, workload.attribution.physicalWorkloadId);
+    assert.deepEqual(classification.attribution.workloadRef, workload.attribution.workloadRef);
+  }
+  const { compileCaptureDecision } = require('./observer-capture-profile-control.js');
+  const decision = compileCaptureDecision(
+    { process: { cgroupId: '1234' }, event: { FileAccess: {} } },
+    classification,
+    { classification: 'confirmed_agent', authority: 'authoritative', action: 'keep',
+      cgroupId: '1234', captureProfile: 'agent_full', ruleId: 'capture-agent',
+      physicalWorkloadId: classification.attribution.physicalWorkloadId,
+      agentInstanceId: classification.attribution.agentInstanceId,
+      workloadRef: classification.attribution.workloadRef },
+    { captureProfileMode: 'enforce', activationMode: 'enforce' },
+  );
+  assert.equal(decision.desiredProbeActions.file_read, 'full');
+}
+
 console.log('Observer attribution field-merge verification passed.');

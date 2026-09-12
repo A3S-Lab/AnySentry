@@ -3976,7 +3976,9 @@ function handleLine(raw, fromDeferred = false) {
     ) {
       trustedNonAgentRuleId = candidate.ruleId;
     }
-    catalogClassification = mergeAttributionClassifications(catalogClassification, candidate)
+    // The workload slot owns placement fields. A rule conclusion is an identity overlay;
+    // replacing this slot with the overlay drops the cgroup's verified container boundary.
+    catalogClassification = mergeAttributionClassifications(catalogClassification, workloadClassification, candidate)
       ?? catalogClassification;
   }
   if (
@@ -4002,6 +4004,7 @@ function handleLine(raw, fromDeferred = false) {
   const classification = infrastructureEvaluation?.classification
     ? mergeAttributionClassifications(
         identityClassification,
+        workloadClassification,
         infrastructureEvaluation.classification,
       ) ?? identityClassification
     : identityClassification;
