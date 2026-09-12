@@ -584,7 +584,18 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     line: string,
     context: CanonicalObservationCommitContext = {},
   ): Promise<CanonicalObservationCommitResult> {
-    const sourceType = context.sourceType;
+    // Compatibility Observer lines can omit producer timestamps. Resolve a receive-time anchor
+    // once at the ingest boundary so their durable rows remain searchable and eligible for the
+    // same bounded kernel↔tool time-window linker as fully timestamped events.
+    const ingestNow = nowUnixNs();
+    const resolvedContext: CanonicalObservationCommitContext = {
+      ...context,
+      eventAtUnixNs: context.eventAtUnixNs && /^\d{9,41}$/u.test(context.eventAtUnixNs)
+        ? context.eventAtUnixNs : ingestNow,
+      receivedAtUnixNs: context.receivedAtUnixNs && /^\d{9,41}$/u.test(context.receivedAtUnixNs)
+        ? context.receivedAtUnixNs : ingestNow,
+    };
+    const sourceType = resolvedContext.sourceType;
     const acceptProducerGaps = sourceType === 'kernel'
       || sourceType === 'uprobe'
       || sourceType === 'socket_payload'
@@ -592,7 +603,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     for (const gap of acceptProducerGaps ? observerEnvelopeGaps(line) : []) {
       const stage = boundedText(gap.stage, 64) ?? 'ingest';
       const reason = boundedText(gap.reason, 160) ?? 'unclassified';
-      const scope = boundedText(gap.scope, 240) ?? context.sourceId ?? context.collectorId ?? 'observer';
+      const scope = boundedText(gap.scope, 240) ?? resolvedContext.sourceId ?? resolvedContext.collectorId ?? 'observer';
       this.recordGap(stage as CoverageGap['stage'], reason, scope, {
         observerGapId: boundedText(gap.gapId, 240) ?? 'unknown',
       }, boundedText(gap.lastSeenAtUnixNs, 48) ?? boundedText(gap.firstSeenAtUnixNs, 48) ?? nowUnixNs());
@@ -604,19 +615,19 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         // The envelope may be supplied by an untrusted bridge. Rebind transport authority and
         // idempotency to the server-resolved Source context before committing; otherwise a caller
         // could label an API/OTel line as `kernel` and mint an attested KernelFact.
-        const reboundSourceType = context.sourceType ?? checked.value.source.sourceType;
+        const reboundSourceType = resolvedContext.sourceType ?? checked.value.source.sourceType;
         // A validated envelope from a generic API/OTel bridge is still producer-controlled. Only
         // an Observer/Forwarder source may carry its own immutable observation identity; generic
         // ingress receives a server-derived hash-only observation below.
         if (!['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(reboundSourceType)) {
           return this.commit(rawObservationFromLine(line, {
-            ...context,
+            ...resolvedContext,
             sourceType: reboundSourceType,
           }));
         }
-        const sourceId = boundedText(context.sourceId, 240) ?? checked.value.source.sourceId;
-        const collectorId = boundedText(context.collectorId, 240) ?? checked.value.source.collectorId;
-        const sourceSequence = boundedText(context.sourceSequence, 120) ?? checked.value.source.sourceSequence;
+        const sourceId = boundedText(resolvedContext.sourceId, 240) ?? checked.value.source.sourceId;
+        const collectorId = boundedText(resolvedContext.collectorId, 240) ?? checked.value.source.collectorId;
+        const sourceSequence = boundedText(resolvedContext.sourceSequence, 120) ?? checked.value.source.sourceSequence;
         const rebound: RawObservation = {
           ...checked.value,
           source: {
@@ -626,31 +637,29 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
             sourceType: reboundSourceType,
             ...(sourceSequence ? { sourceSequence } : {}),
           },
-          ...(context.eventAtUnixNs && /^\d{9,41}$/u.test(context.eventAtUnixNs)
-            ? { eventAtUnixNs: context.eventAtUnixNs } : {}),
-          ...(context.receivedAtUnixNs && /^\d{9,41}$/u.test(context.receivedAtUnixNs)
-            ? { receivedAtUnixNs: context.receivedAtUnixNs } : {}),
+          ...(resolvedContext.eventAtUnixNs ? { eventAtUnixNs: resolvedContext.eventAtUnixNs } : {}),
+          ...(resolvedContext.receivedAtUnixNs ? { receivedAtUnixNs: resolvedContext.receivedAtUnixNs } : {}),
           sourceRefs: (() => {
             const trustedRefs = ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(reboundSourceType)
               ? mergeServerSourceRefs(
                   checked.value.observationId,
-                  context.sourceRefs,
-                  context.compatibilitySourceRefs,
+                  resolvedContext.sourceRefs,
+                  resolvedContext.compatibilitySourceRefs,
                 )
               : [checked.value.observationId];
             return [...new Set([...trustedRefs, ...checked.value.sourceRefs])].slice(0, 128);
           })(),
-          idempotencyKey: context.idempotencyKey ?? checked.value.idempotencyKey,
+          idempotencyKey: resolvedContext.idempotencyKey ?? checked.value.idempotencyKey,
         };
         return this.commit(rebound);
       }
       // A malformed producer extension must not prevent the compatibility raw fact from being
       // retained. Record the gap and continue with the line hash below.
-      this.recordGap('raw_commit', 'parser_failed', context.sourceId ?? context.collectorId ?? 'observer', {
+      this.recordGap('raw_commit', 'parser_failed', resolvedContext.sourceId ?? resolvedContext.collectorId ?? 'observer', {
         validation: checked.reason,
       });
     }
-    const observation = rawObservationFromLine(line, context);
+    const observation = rawObservationFromLine(line, resolvedContext);
     return this.commit(observation);
   }
 
