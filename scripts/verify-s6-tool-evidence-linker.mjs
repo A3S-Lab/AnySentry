@@ -144,6 +144,8 @@ const semanticEvents = [
   } }),
   ...toolPair({ toolCallId: 'bash-1', toolName: 'bash', start: base + 300, end: base + 500, attributes: {
     'anysentry.tool.command_hash': sha256(bashCommand),
+    'anysentry.tool.resource_kind': 'file',
+    'anysentry.tool.resource_path': writePath,
   } }),
   ...toolPair({ toolCallId: 'custom-1', toolName: 'remote_inventory', start: base + 600, end: base + 650 }),
 ];
@@ -169,6 +171,14 @@ const kernelEvents = [
     },
     // Persistence may redact or truncate this preview; the attested digest above remains usable.
     rawPreview: JSON.stringify({ event: { ToolExec: { argv: ['/bin/bash', '-c', 'redacted'] } } }),
+  }),
+  kernelEvent({
+    eventId: 'kernel-bash-file',
+    at: base + 400,
+    eventKind: 'FileAccess',
+    eventCategory: 'file',
+    process: { ...piProcess, pid: 4_201, ppid: piProcess.pid, startTimeTicks: '9002' },
+    attributes: { path: writePath, accessMode: 'write_only', write: true },
   }),
   // A direct child with the same PPID and command after parent PID reuse is not the same lineage.
   kernelEvent({
