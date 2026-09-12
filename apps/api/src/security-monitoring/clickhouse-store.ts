@@ -1937,7 +1937,24 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
   } catch {
     attributes = {};
   }
-  const at = num(r.at);
+  const storedEventAtUnixNs = str(r.eventAtUnixNs);
+  const storedReceivedAtUnixNs = str(r.receivedAtUnixNs);
+  // Older Observer rows may have an empty `at` column even though the canonical envelope
+  // retained eventAt/receivedAt. Keep them usable for bounded evidence linking instead of
+  // silently making every Kernel candidate fail the time-window predicate.
+  const envelopeAt = (value: string): number => {
+    if (!/^\d+$/u.test(value)) return 0;
+    try {
+      return Number(BigInt(value) / 1_000_000n);
+    } catch {
+      return 0;
+    }
+  };
+  const at = num(r.at)
+    || envelopeAt(storedEventAtUnixNs)
+    || envelopeAt(storedReceivedAtUnixNs)
+    || num(r.receivedAt)
+    || num(r.ingestedAt);
   const agentId = str(r.agentId);
   const sessionId = str(r.sessionId);
   const rawSessionIdentityQuality = str(
@@ -2086,8 +2103,8 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     eventId: str(r.eventId) || `evt_${at}_${agentId}_${eventKind}`,
     sourceEventId: str(r.sourceEventId) || undefined,
     at,
-    eventAtUnixNs: str(r.eventAtUnixNs) || undefined,
-    receivedAtUnixNs: str(r.receivedAtUnixNs) || undefined,
+    eventAtUnixNs: storedEventAtUnixNs || undefined,
+    receivedAtUnixNs: storedReceivedAtUnixNs || undefined,
     receivedAt: num(r.receivedAt) || undefined,
     eventTimeQuality: (str(r.eventTimeQuality) ||
       "api_received") as JudgedEvent["eventTimeQuality"],
