@@ -222,7 +222,9 @@ await tool('write-' + invocationId, 'write', {
 // shell is intentionally allowed to degrade to semantic-only when those strong facts disappear.
 const command = 'printf bash-evidence >> /workspace/bash-output.txt; sleep 2';
 await tool('bash-' + invocationId, 'bash', {
-  'anysentry.tool.resource_kind': 'command', 'anysentry.tool.command_hash': sha256(command),
+  'anysentry.tool.resource_kind': 'file',
+  'anysentry.tool.resource_path': workspace + '/bash-output.txt',
+  'anysentry.tool.command_hash': sha256(command),
   'anysentry.tool.command_executable': 'printf',
 }, () => {
   const result = spawnSync('/bin/bash', ['-c', command], { cwd: workspace });
