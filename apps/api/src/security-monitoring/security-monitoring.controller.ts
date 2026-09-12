@@ -6809,6 +6809,14 @@ function universalFromOtelAttrs(
   const processBootId = attrText(combined, 'host.boot_id', 'bootId', 'boot.id');
   const processStartTicks = attrText(combined, 'process.start_time_ticks', 'startTimeTicks', 'process.start_time');
   const processStartNs = attrText(combined, 'process.start_time_unix_nano', 'startTimeNs');
+  // Adapter spans commonly run inside a container and report both the host PID field
+  // (which may be a namespace PID) and the namespace coordinates. Preserve those
+  // coordinates so the linker can compare them with Observer facts when host PID
+  // translation is unavailable. Dropping them silently turns an otherwise exact
+  // process generation into a false semantic-only result.
+  const processPidNamespace = attrText(combined, 'process.pid_namespace', 'pidNamespace', 'process.pid.namespace');
+  const processNamespacePid = attrNumber(combined, 'process.namespace_pid', 'namespacePid', 'process.pid_namespace_pid');
+  const processNamespacePpid = attrNumber(combined, 'process.namespace_ppid', 'namespacePpid', 'process.ppid_namespace');
   const processCwd = attrText(combined, 'process.working_directory', 'cwd');
   const processComm = attrText(combined, 'process.executable.name', 'process.command_name', 'comm');
   const processCgroup = attrText(combined, 'container.id', 'process.cgroup', 'cgroup');
@@ -6820,6 +6828,9 @@ function universalFromOtelAttrs(
         ...(processBootId ? { bootId: processBootId } : {}),
         ...(processStartTicks ? { startTimeTicks: processStartTicks } : {}),
         ...(processStartNs ? { startTimeNs: processStartNs } : {}),
+        ...(processPidNamespace ? { pidNamespace: processPidNamespace } : {}),
+        ...(processNamespacePid !== undefined ? { namespacePid: processNamespacePid } : {}),
+        ...(processNamespacePpid !== undefined ? { namespacePpid: processNamespacePpid } : {}),
         ...(processCwd ? { cwd: processCwd } : {}),
         ...(processComm ? { comm: processComm } : {}),
         ...(processCgroup ? { cgroup: processCgroup } : {}),
