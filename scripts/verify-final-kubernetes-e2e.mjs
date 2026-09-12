@@ -625,6 +625,13 @@ try {
       timeType: 'last_30d', invocationId, workspacePath, limit: 1_000,
     });
     const indexed = Object.fromEntries((result.items ?? []).map((item) => [item.toolName, item]));
+    const evidenceSignature = (result.items ?? [])
+      .map((item) => `${item.toolName}:${item.status}:${item.reason}:${item.kernelEvidence?.length ?? 0}`)
+      .sort().join('|');
+    if (result.items?.length === 4 && evidenceSignature !== globalThis.__lastE2eEvidenceSignature) {
+      globalThis.__lastE2eEvidenceSignature = evidenceSignature;
+      console.error(`E2E ToolEvidence snapshot ${evidenceSignature}`);
+    }
     return result.items?.length === 4
       && indexed.read?.status === 'linked'
       && indexed.write?.status === 'linked'
