@@ -371,7 +371,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     1,
     1_000,
   );
+  private readonly asyncRawBatchMaxBytes = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_MAX_BYTES',
+    32 * 1024 * 1024,
+    64 * 1024,
+    256 * 1024 * 1024,
+  );
   private asyncRawBatchQueue: Array<{ observation: RawObservation; onFailure: () => void }> = [];
+  private asyncRawBatchQueueBytes = 0;
   private asyncRawBatchTimer?: ReturnType<typeof setTimeout>;
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
@@ -455,12 +462,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   ): boolean {
     if (!this.sink || this.closed) return false;
     const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
-    if (this.asyncRawBatchQueue.length >= capacity) {
+    const observationBytes = Buffer.byteLength(JSON.stringify(observation));
+    if (this.asyncRawBatchQueue.length >= capacity
+      || this.asyncRawBatchQueueBytes + observationBytes > this.asyncRawBatchMaxBytes) {
       this.asyncPersistenceDropped += 1;
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
     this.asyncRawBatchQueue.push({ observation, onFailure });
+    this.asyncRawBatchQueueBytes += observationBytes;
     this.asyncPersistenceScheduled += 1;
     if (this.asyncRawBatchQueue.length >= this.asyncRawBatchMaxRows) {
       void this.flushRawObservationBatch();
@@ -486,6 +496,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       return;
     }
     const batch = this.asyncRawBatchQueue.splice(0, this.asyncRawBatchMaxRows);
+    this.asyncRawBatchQueueBytes = Math.max(
+      0,
+      this.asyncRawBatchQueueBytes - batch.reduce(
+        (sum, item) => sum + Buffer.byteLength(JSON.stringify(item.observation)),
+        0,
+      ),
+    );
     this.asyncPersistenceInFlight += 1;
     const task = Promise.resolve()
       .then(() => this.sink?.saveRawObservations?.(batch.map(({ observation }) => observation)) ?? false)
@@ -1273,6 +1290,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncPersistenceCompleted: number;
     asyncPersistenceFailed: number;
     asyncPersistenceDropped: number;
+    asyncRawBatchQueueRows: number;
+    asyncRawBatchQueueBytes: number;
+    asyncRawBatchMaxRows: number;
+    asyncRawBatchMaxBytes: number;
   } {
     return {
       entries: this.gaps.size,
@@ -1295,6 +1316,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncPersistenceCompleted: this.asyncPersistenceCompleted,
       asyncPersistenceFailed: this.asyncPersistenceFailed,
       asyncPersistenceDropped: this.asyncPersistenceDropped,
+      asyncRawBatchQueueRows: this.asyncRawBatchQueue.length,
+      asyncRawBatchQueueBytes: this.asyncRawBatchQueueBytes,
+      asyncRawBatchMaxRows: this.asyncRawBatchMaxRows,
+      asyncRawBatchMaxBytes: this.asyncRawBatchMaxBytes,
     };
   }
 
@@ -1541,6 +1566,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       try { item.onFailure(); } catch { /* coverage is best effort */ }
     }
     this.asyncRawBatchQueue = [];
+    this.asyncRawBatchQueueBytes = 0;
     this.closed = true;
     this.raw.close();
     this.kernel.close();
