@@ -232,3 +232,14 @@ Observer DaemonSet 已恢复 Ready rollout。
 - interaction 查询最终返回父 orchestrator 与 worker 的 6 条记录。父侧运行实例为 `host-root:...:4077834:6976435`，canonical Session=`sess_f618de6ee7aa6e151a87c218`；worker 侧运行实例为 `host-root:...:4078576:6977190`，canonical Session=`sess_b33430d0e9ccf7d587971560`。两者共享 run/trace，但不再因为 `/app`、Source 或 provider run 相同而合并到同一个 Session。
 - 父侧 interaction 包含模型调用、sandbox 调用和模型返回；worker 侧包含 delegation 入口及自身模型调用。worker delegation 保留父 run 关联，满足父视图保留子 Agent 入口、子视图保留内部细节的归属方向。
 - `/v1/sessions/sess_f618de6ee7aa6e151a87c218` 与 `/v1/sessions/sess_b33430d0e9ccf7d587971560` 均可点查，但 coverage 为 `asset_only / semantic_projection_expired_or_missing`，`interactionIds` 已存在而 `completeInteractions=0`。因此 Session 边界修复通过，canonical semantic durable projection 仍未通过最终验收。
+### 2026-09-15 durable semantic coverage reconciliation
+
+The restarted customer B deployment produced distinct canonical Sessions for the parent
+orchestrator (`sess_f618de6ee7aa6e151a87c218`) and worker (`sess_b33430d0e9ccf7d587971560`).
+The durable semantic-record endpoint returned 12 records for the parent and 10 for the worker;
+complete and `tool_result_pending` partial records were both present and carried the expected
+canonical Session IDs and interaction references. The Session point endpoint nevertheless reported
+`asset_only / semantic_projection_expired_or_missing`, because it only used the expired timeline
+projection for coverage. Commit `9510935` adds a bounded durable-record reconciliation to the
+Session projection. The source builds successfully with `pnpm --filter @anysentry/api build`; the
+new behavior still needs an image rebuild and a fresh A/B runtime check.
