@@ -98,6 +98,7 @@ class DurableSpool {
     this.lazyRecords = 0;
     this.lazyReads = 0;
     this.lazyReadErrors = 0;
+    this.recoveredTailBytes = 0;
     this.residentBodies = 0;
     // Recovered records keep only bounded metadata until replay needs their body. Count explicit
     // releases so a heartbeat can prove that materialized replay payloads were returned to the
@@ -218,7 +219,10 @@ class DurableSpool {
       return operation.record.body;
     } catch (error) {
       this.lazyReadErrors += 1;
-      throw new Error(`Observer spool record ${record.id} could not be read: ${error.message}`);
+      // JSON.parse errors can include captured request text, including credentials. Keep only
+      // structural diagnostics in the log; the WAL is the restricted-access evidence source.
+      const reason = error instanceof SyntaxError ? 'invalid JSON at recorded WAL offset' : error.message;
+      throw new Error(`Observer spool record ${record.id} could not be read: ${reason}`);
     }
   }
 
@@ -257,7 +261,8 @@ class DurableSpool {
       try {
         this.applyLoadedOperation(JSON.parse(line), offset, lineBytes);
       } catch (error) {
-        throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
+        const reason = error instanceof SyntaxError ? 'invalid JSON' : error.message;
+        throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${reason}`);
       }
     };
     try {
@@ -281,10 +286,20 @@ class DurableSpool {
       if (pending) {
         // A process or host crash can leave only the final, non-newline-terminated append torn.
         // A complete final operation is still applied; malformed trailing bytes are ignored.
+        let operation;
         try {
-          this.applyLoadedOperation(JSON.parse(pending), pendingOffset, Buffer.byteLength(pending));
-        } catch {
-          // Safe replay boundary: every preceding newline-terminated operation was validated.
+          operation = JSON.parse(pending);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+          // Remove only a torn final append, before opening the writer. Merely ignoring it in
+          // memory would join the next PUT onto the torn bytes and poison every later restart.
+          this.recoveredTailBytes = Buffer.byteLength(pending);
+          fs.truncateSync(this.filePath, pendingOffset);
+        }
+        if (operation !== undefined) {
+          this.applyLoadedOperation(operation, pendingOffset, Buffer.byteLength(pending));
+          // A complete JSON operation without its newline is also a possible crash boundary.
+          fs.appendFileSync(this.filePath, '\n');
         }
       }
     } finally {
@@ -727,6 +742,7 @@ class DurableSpool {
       lazyRecords: this.lazyRecords,
       lazyReads: this.lazyReads,
       lazyReadErrors: this.lazyReadErrors,
+      recoveredTailBytes: this.recoveredTailBytes,
       lazyBodyReleases: this.lazyBodyReleases,
       residentBodies: this.residentBodies,
     };

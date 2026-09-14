@@ -405,6 +405,32 @@ try {
   assert.equal(await ackResult, 1);
   assert.equal(asyncSpool.status().pendingOperations, 0);
   asyncSpool.close();
+  // Recovery must repair the physical append boundary, not just ignore a torn tail once.
+  for (const completeTail of [false, true]) {
+    const recoveryPath = path.join(temporary, `tail-${completeTail}.wal`);
+    const initial = JSON.stringify({ op: 'put', record: records[0] });
+    const tail = completeTail
+      ? JSON.stringify({ op: 'put', record: records[1] })
+      : '{"op":"put","record":{"body":"private-tail-marker';
+    writeFileSync(recoveryPath, `${initial}\n${tail}`, { mode: 0o600 });
+    const recovered = new DurableSpool({ filePath: recoveryPath });
+    assert.equal(recovered.status().recoveredTailBytes, completeTail ? 0 : Buffer.byteLength(tail));
+    recovered.put({ id: 'after-recovery', body: { line: '你好 🌍' } });
+    recovered.close();
+    const reopened = new DurableSpool({ filePath: recoveryPath });
+    const byId = new Map(reopened.available(new Set(), 10).map((r) => [r.id, r.body]));
+    assert.equal(byId.get('after-recovery').line, '你好 🌍');
+    assert.deepEqual(byId.get(records[0].id), records[0].body);
+    assert.equal(byId.has(records[1].id), completeTail);
+    reopened.close();
+  }
+  const malformedPath = path.join(temporary, 'malformed.wal');
+  writeFileSync(malformedPath, 'private-payload-marker\n', { mode: 0o600 });
+  assert.throws(() => new DurableSpool({ filePath: malformedPath }), (error) => {
+    assert.match(error.message, /corrupt at line 1: invalid JSON/u);
+    assert.doesNotMatch(error.message, /private-payload-marker/u);
+    return true;
+  });
   console.log('Observer spool replay rescue verification passed');
 } finally {
   await new Promise((resolve) => server.close(resolve));

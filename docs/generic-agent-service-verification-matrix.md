@@ -256,13 +256,27 @@ and `1 + 1 = 2`. AnySentry recorded six interactions in canonical Session
 
 Design B was then rebuilt after Design A cleanup. The orchestrator, worker and sandbox health checks
 passed; `/runs` returned `completed`, the worker returned `remote_ok`, and the correlation payload
-contained a worker hop and sandbox execution. AnySentry recorded six interactions in canonical Session
-`sess_982d3b0f4adcca5cf5819eb6`, including model, sandbox and gateway traffic. The Session point
-query returned `coverage.status=partial`, with `completeInteractions=3` and
-`partialInteractions=3`, and no `semantic_projection_expired_or_missing` reason. The partial state
-is retained because the run contains pending/less-complete semantic records; it is not promoted to
-complete by the durable reconciliation.
+contained a worker hop and sandbox execution. **Correction:** the six records in Session
+`sess_982d3b0f4adcca5cf5819eb6` carry run `f9f00e85-e394-49ba-a65b-efae58b0370b`,
+whereas this B invocation returned `09b9cc79-f800-481b-860a-538ebcd4e3d1`. They cannot be used
+as evidence for this B run. Queries of the latest 500 interactions did not find this B run;
+that result alone does not distinguish missing capture, delayed ingestion or pagination.
+The historical Session point query returned partial (3 complete, 3 partial), but proves only
+that historical coverage reconciliation executed. Fresh B Session alignment remains unverified.
 
 The customer A/B containers, networks and dangling images were removed after verification; the
 pre-existing local registry was retained. Observer logs showed bounded reassembly and dynamic PID
-allowlist admission; classic SSL static-signature warnings remain the separately protected WIP boundary.
+allowlist admission; static-signature warnings do not on their own identify the affected workload
+or prove that the warning is caused by the protected classic SSL WIP.
+
+### 2026-09-15 WAL 清理纠正与恢复边界
+
+运行中截断 WAL 使 Forwarder 内存中的延迟读取偏移失效，产生 JSON 读取错误；随后日志中的
+解析异常还可能携带事件正文。这是清理动作引入的问题，不能作为正常负载下吞吐不足的证明。
+恢复改为通过 DaemonSet 正常滚动切换到新的 `spool-recovery-20260915.wal`，不再截断运行文件。
+WAL 的磁盘大小包含 PUT/ACK 历史，只有结合存活记录数、ACK 和队列指标才能判断积压。
+
+局部修复：启动恢复时移除未完成的最后一行，完整但缺少换行的末尾记录补齐换行，避免下一次
+追加污染第二次重启；中间行损坏仍拒绝加载。JSON 解析错误只记录结构信息，不输出正文片段。
+`node scripts/verify-forwarder-spool-replay.mjs` 通过，包括两次重启、UTF-8 新记录保留和错误脱敏。
+该新增代码尚未重新构建到 Observer 镜像，不能据此声明已部署修复。
