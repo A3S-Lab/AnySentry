@@ -615,10 +615,17 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       // hash-only payload descriptor. Preserve the envelope identity and event kind while
       // repairing only that missing descriptor from the original line. This keeps the raw
       // commit fence useful for semantic projection without accepting arbitrary producer data.
-      if (!checked.ok && checked.reason.includes('payload')) {
+      if (!checked.ok && (checked.reason.includes('payload') || checked.reason.includes('sourceRefs'))) {
         const fallback = rawObservationFromLine(line, resolvedContext);
         const repaired = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
-          ? { ...(candidate as Record<string, unknown>), payload: fallback.payload }
+          ? {
+              ...fallback,
+              ...(candidate as Record<string, unknown>),
+              payload: fallback.payload,
+              sourceRefs: fallback.sourceRefs,
+              derivedFrom: fallback.derivedFrom,
+              idempotencyKey: fallback.idempotencyKey,
+            }
           : candidate;
         checked = validateRawObservation(repaired);
       }
