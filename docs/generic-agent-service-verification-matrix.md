@@ -441,3 +441,19 @@ confirming the next bottleneck is per-observation transaction/WAL work rather th
 The async batch canary after this change drained its raw queue (`asyncRawBatchQueueRows=0`) but still
 accumulated admission and CoverageGap pressure under the full host event rate, so async mode remains
 reverted for the stable runtime.
+
+### 2026-09-15 raw unique-key conflict handling and redeploy
+
+Commit `973483a` changes the raw-observation insert to `ON CONFLICT DO NOTHING`. The table has two
+ independent unique keys, `(observation_id, revision)` and `(idempotency_key, revision)`; targeting
+ only the first key caused the old image to emit duplicate-key warnings when a retry collided on
+ the second key. The existing post-insert payload comparison remains the rejection path for a
+ conflicting record, so this change handles either retry key without accepting a different payload.
+
+The API image `127.0.0.1:5000/anysentry:raw-unique-973483a` was built from `973483a`, pushed to the
+local registry with digest
+`sha256:398e22b0c14333e89cbc6f00fcb778c2c678d15bfabf062574aa3235ed4e0bd2`, and rolled out as the
+only ready API replica. The previous `raw-no-advisory-966ff06` pod was allowed to terminate; the
+PostgreSQL, ClickHouse, Redis and Observer infrastructure remained running. During the first two
+minutes after readiness, the new API log contained no duplicate-key or raw-save warnings. This is
+an initial runtime regression check, not yet a sustained load or canonical point-read acceptance.
