@@ -180,6 +180,24 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private pool?: Pool;
   private initializePromise?: Promise<boolean>;
   private ready = false;
+  private readonly rawBatchMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_RAW_BATCH_ROWS,
+    256,
+    2_000,
+  );
+  private readonly rawBatchMaxBytes = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_RAW_BATCH_MAX_BYTES,
+    8 * 1024 * 1024,
+    64 * 1024 * 1024,
+  );
+  private readonly rawBatchWindowMs = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_RAW_BATCH_WINDOW_MS,
+    10,
+    1_000,
+  );
+  private rawBatchQueue: Array<{ rows: readonly RawObservation[]; resolve: (value: boolean) => void }> = [];
+  private rawBatchTimer?: ReturnType<typeof setTimeout>;
+  private rawBatchFlushInFlight?: Promise<void>;
   private evidenceLinksReadFailureAt = 0;
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
@@ -209,6 +227,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.rawBatchTimer) clearTimeout(this.rawBatchTimer);
+    this.rawBatchTimer = undefined;
+    await this.flushRawBatchQueue();
     const pool = this.pool;
     this.pool = undefined;
     this.ready = false;
@@ -947,6 +968,48 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
    * unique constraint and surfaced as `false` to the hot-store caller.
    */
   async saveRawObservations(observations: readonly RawObservation[]): Promise<boolean> {
+    if (observations.length === 0) return true;
+    return new Promise<boolean>((resolve) => {
+      this.rawBatchQueue.push({ rows: observations, resolve });
+      if (this.rawBatchQueue.reduce((sum, item) => sum + item.rows.length, 0) >= this.rawBatchMaxRows) {
+        void this.flushRawBatchQueue();
+      } else if (!this.rawBatchTimer) {
+        this.rawBatchTimer = setTimeout(() => {
+          this.rawBatchTimer = undefined;
+          void this.flushRawBatchQueue();
+        }, this.rawBatchWindowMs);
+        this.rawBatchTimer.unref?.();
+      }
+    });
+  }
+
+  private async flushRawBatchQueue(): Promise<void> {
+    if (this.rawBatchFlushInFlight || this.rawBatchQueue.length === 0) return;
+    const entries: Array<{ rows: readonly RawObservation[]; resolve: (value: boolean) => void }> = [];
+    let rows = 0;
+    let bytes = 2;
+    while (this.rawBatchQueue.length > 0) {
+      const next = this.rawBatchQueue[0];
+      const nextBytes = Buffer.byteLength(JSON.stringify(next.rows));
+      if (entries.length > 0 && (rows + next.rows.length > this.rawBatchMaxRows
+        || bytes + nextBytes > this.rawBatchMaxBytes)) break;
+      this.rawBatchQueue.shift();
+      entries.push(next);
+      rows += next.rows.length;
+      bytes += nextBytes;
+    }
+    const combined = entries.flatMap((entry) => entry.rows);
+    this.rawBatchFlushInFlight = this.saveRawObservationsNow(combined)
+      .then((result) => { for (const entry of entries) entry.resolve(result); })
+      .catch(() => { for (const entry of entries) entry.resolve(false); })
+      .finally(() => {
+        this.rawBatchFlushInFlight = undefined;
+        if (this.rawBatchQueue.length > 0) void this.flushRawBatchQueue();
+      });
+    await this.rawBatchFlushInFlight;
+  }
+
+  private async saveRawObservationsNow(observations: readonly RawObservation[]): Promise<boolean> {
     if (observations.length === 0) return true;
     if (observations.length > RAW_OBSERVATION_LIMIT) return false;
     const bounded = observations.slice(0, RAW_OBSERVATION_LIMIT);
