@@ -18,8 +18,6 @@ import type {
 } from './unknown-learning';
 import type { JudgedEvent } from './types';
 import type { UnknownInfrastructureRecommendationEvidence } from './infrastructure-rule.types';
-import { BehaviorCandidateRegistry } from './behavior-candidate-registry.service';
-import type { BehaviorAgentScore } from './behavior-agent-scorer';
 
 function envEnabled(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
@@ -107,10 +105,7 @@ export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDest
   private lastPersistedAt?: number;
   private persistenceErrors = 0;
 
-  constructor(
-    private readonly judge: SentryJudgeService,
-    private readonly behaviorCandidates: BehaviorCandidateRegistry,
-  ) {}
+  constructor(private readonly judge: SentryJudgeService) {}
 
   async onModuleInit(): Promise<void> {
     if (!this.configuredEnabled) return;
@@ -202,10 +197,6 @@ export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDest
       this.schedulePersist();
     }
     return result;
-  }
-
-  behaviorScore(scopeKey: string): BehaviorAgentScore | undefined {
-    return this.behaviorCandidates.get(scopeKey);
   }
 
   listClusters(limit = 200): UnknownCluster[] {
