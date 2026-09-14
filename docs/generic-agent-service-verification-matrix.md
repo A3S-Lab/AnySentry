@@ -211,3 +211,10 @@ Observer DaemonSet 已恢复 Ready rollout。
 - raw commit 字段诊断从 `payload` 收敛到 `sourceRefs`，随后在 envelope repair 后不再出现在最新 coverage-gap 前十项；这证明服务端接收时间、来源类型、payload hash、sourceRefs、derivedFrom 和幂等键已具备兼容补齐路径。
 - 当前查询结果：该 B run 的 `agents/interactions` 返回 `items=0`、`completeness=exact_as_observed`、`partial=false`；因此 semantic interaction projection 与 canonical Session 尚未验收通过。Observer 日志同时显示 HTTP 交互重组 `completed_interactions=1`，说明剩余缺口位于 Forwarder/semantic 投影或其关联键，而非客户服务未运行。
 - 资源清理：Design B compose、network、containers 已停止并删除；本地 AnySentry 旧测试镜像 tag 已清理，仅保留当前部署镜像。Observer WAL 仍约 252 MiB，未在 Collector 运行期间强制截断，避免把活动链路误判为已清空。
+
+## 2026-09-15 interaction query backpressure fix
+
+- 从 Observer WAL 中解析到 Design B 的真实事件：`/v1/chat/completions` 和 `worker-agent:18091/runs` 均为 `parseState=parsed`，共享同一 `traceId/runId/sessionId`；Design A 的 `/runs` 外层 HTTP 仍有 `wire_template_unparsed`，但内层模型调用具备完整关联三元组。
+- API coverage gap 明确记录了 `agent_interaction` 与 `semantic_record` 的 `ANYSENTRY_OBSERVER_PROJECTION_TIMEOUT`。原因是 ClickHouse/关系投影慢时，读取接口先等待 durable interaction 查询，未及时合并已进入进程 hot ring 的记录。
+- AnySentry `b11f3ea` 为 durable interaction 查询增加 2 秒有界等待；超时后返回 hot ring 内容并把 coverage 标为 `partial/hot_ring_only`，不再把数据库慢误报为 `items=0/exact`。构建部署 digest：`sha256:139a8762a994efb3e19552849d2d952e62f91310c2314fcb4489aa2b682c8d81`。
+- 本轮低负载 A 调用业务返回 `completed/pass`，但调用后立即查询仍为 `items=0/exact_as_observed`；最新 coverage gap 尚未出现对应 projection timeout，说明该请求的 Observer/WAL 到 API 投递仍可能受历史 WAL backlog 延迟影响，semantic projection 尚不能验收为完成。
