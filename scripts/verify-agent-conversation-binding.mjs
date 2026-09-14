@@ -534,6 +534,10 @@ const relationalSource = readFileSync(
   new URL('../apps/api/src/security-monitoring/relational-business-store.service.ts', import.meta.url),
   'utf8',
 );
+assert.match(relationalSource, /Canonical Session IDs are a separate namespace/u,
+  'durable membership loader must have a canonical Session point-read path');
+assert.match(relationalSource, /FROM anysentry_session_memberships_v1 AS candidate[\s\S]*candidate\.session_id = \$1/u,
+  'canonical Session point-read must query SessionMembership by session_id');
 const v1Start = relationalSource.indexOf('async saveAgentConversationResolution(');
 const v2Start = relationalSource.indexOf('async saveAgentConversationResolutionV2(');
 const v2End = relationalSource.indexOf('async loadAgentSemanticKernelRelations(', v2Start);
