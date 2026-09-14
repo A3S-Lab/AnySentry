@@ -36,12 +36,6 @@ async function bootstrap() {
     limit: process.env.ANYSENTRY_WORKSPACE_SCAN_BODY_LIMIT || '32mb',
   }));
   app.use(json({ type: ['application/json', 'application/*+json'] }));
-  app.useGlobalInterceptors(
-    new PlatformMetricsInterceptor(app.get(PlatformMetricsService)),
-    new ApiResponseInterceptor(app.get(Reflector)),
-  );
-  const port = Number(process.env.PORT ?? 29653);
-  await app.listen(port, '0.0.0.0');
   // Body-parser failures happen before a controller can see an Observer batch. Keep a bounded,
   // redacted diagnostic seam so a client timeout/request abort can be matched to Forwarder WAL
   // growth without ever logging the request body or authorization headers.
@@ -86,6 +80,12 @@ async function bootstrap() {
       error: 'request_aborted',
     });
   });
+  app.useGlobalInterceptors(
+    new PlatformMetricsInterceptor(app.get(PlatformMetricsService)),
+    new ApiResponseInterceptor(app.get(Reflector)),
+  );
+  const port = Number(process.env.PORT ?? 29653);
+  await app.listen(port, '0.0.0.0');
   // eslint-disable-next-line no-console
   console.log(`AnySentry api listening on http://0.0.0.0:${port}`);
 }
