@@ -34,6 +34,15 @@ thread。服务清理后继续对同一 run 做只读点查，最终得到 8 条
 时自动清理两个 compose 项目的容器、volume 和网络；仍可用 `KEEP_LAB_SERVICES=1` 显式保留服务。该脚本改动位于
 customer lab 外部目录，不作为 AnySentry 产品代码提交。
 
+第二次复跑验证了另一个边界：应用健康检查通过不代表 Observer 已完成新进程的 probe attach。一次无启动等待的
+调用发生在 attach 窗口之前，未形成该 run 的完整 interaction；脚本已增加默认 20 秒的
+`OBSERVER_STARTUP_SETTLE_SECONDS`，用于受控实验等待冷启动发现。该等待是测试闸门，不是把缺失证据标记为成功。
+
+本轮 AnySentry health/collector point-read 还观察到 Forwarder 处于真实容量压力：`spoolRecords=158665`、
+`spoolActiveRecords=11471`、`spoolParkedRecords=147194`、`spoolAtCapacity=true`、`queueDropped=525`，delivery
+状态为 degraded；同时 Collector Ring `ringDropped=0`。这一区分证明 Ring 无丢失不能推出 F2/F3 投递无丢失，后续
+真实 E2E 必须先清理开发机可丢弃的旧 spool 并恢复 delivery health，再进行稳定性验收。
+
 ## 已通过的本地验证
 
 | 能力 | 验证入口 | 结果 | 证据范围 |
