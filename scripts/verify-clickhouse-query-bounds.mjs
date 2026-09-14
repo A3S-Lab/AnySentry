@@ -32,6 +32,7 @@ function fakeClient() {
     maxActive: 0,
     calls: [],
     failNext: false,
+    responses: [],
   };
   return {
     state,
@@ -51,7 +52,7 @@ function fakeClient() {
           async json() {
             try {
               await delay(2);
-              return [];
+              return state.responses.shift() ?? [];
             } finally {
               if (!consumed) {
                 consumed = true;
@@ -118,6 +119,32 @@ assert.equal(exactMembershipCall.query_params.interactionIds.length, 5_000);
 assert.equal(exactMembershipCall.query_params.limit, 5_000);
 assert.equal(exactMembershipCall.clickhouse_settings.max_result_rows, '5000');
 assert.equal(fake.state.active, 0);
+fake.state.calls.length = 0;
+
+// Correlation selectors must not turn into a fair-per-agent sample or inflate the requested limit.
+// Resolve only small IDs first and hydrate precisely those IDs, including beyond the 256-per-agent
+// directory budget. An empty selector result must never trigger a broad payload read.
+for (const key of ['sessionId', 'runId', 'traceId']) {
+  fake.state.responses.push([{ interactionId: 'mi_correlated' }], [{ payload: JSON.stringify({
+    schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_correlated', [key]: 'correlation-test',
+  }) }]);
+  const records = await store.queryAgentInteractions({
+    startMs: 100, endMs: 200, [key]: 'correlation-test', limit: 500,
+  });
+  assert.equal(records.length, 1);
+  assert.equal(fake.state.calls.length, 2);
+  const [index, payload] = fake.state.calls;
+  assert.doesNotMatch(index.query, /argMax\(payload/u);
+  assert.doesNotMatch(index.query, /LIMIT .* BY latestAgentAssetId/u);
+  assert.equal(index.query_params[key], 'correlation-test');
+  assert.equal(index.query_params.limit, 500);
+  assert.deepEqual(payload.query_params.interactionIds, ['mi_correlated']);
+  assert.match(payload.query, /WHERE interactionId IN/u);
+  fake.state.calls.length = 0;
+}
+assert.deepEqual(await store.queryAgentInteractions({ startMs: 100, endMs: 200, runId: 'absent', limit: 10 }), []);
+assert.equal(fake.state.calls.length, 1);
+assert.doesNotMatch(fake.state.calls[0].query, /argMax\(payload/u);
 fake.state.calls.length = 0;
 
 assert.equal(

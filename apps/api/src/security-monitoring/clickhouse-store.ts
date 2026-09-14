@@ -154,9 +154,9 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
   collectorId LowCardinality(String) DEFAULT '',
   agentAssetId String,
   agentInstanceId String DEFAULT '',
-  sessionId String DEFAULT '',
-  runId String DEFAULT '',
-  traceId String DEFAULT '',
+  sessionId String DEFAULT if(empty(JSONExtractString(payload, 'sessionId')), JSONExtractString(payload, 'canonicalSessionId'), JSONExtractString(payload, 'sessionId')),
+  runId String DEFAULT JSONExtractString(payload, 'runId'),
+  traceId String DEFAULT JSONExtractString(payload, 'traceId'),
   agentProduct LowCardinality(String) DEFAULT '',
   classification LowCardinality(String),
   interactionType LowCardinality(String) DEFAULT 'model',
@@ -1194,6 +1194,14 @@ async function runClickHouseBootstrap(
         ADD COLUMN IF NOT EXISTS wireTemplateId LowCardinality(String) DEFAULT '' AFTER transportProtocol,
         ADD COLUMN IF NOT EXISTS parseState LowCardinality(String) DEFAULT '' AFTER wireTemplateId,
         ADD COLUMN IF NOT EXISTS routeShape LowCardinality(String) DEFAULT '' AFTER endpoint`,
+    });
+    // Older parts have no stored correlation columns. Derive missing values from their payloads
+    // until rewritten; an empty default would silently make durable history disappear in point reads.
+    await schema.command({
+      query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
+        MODIFY COLUMN sessionId String DEFAULT if(empty(JSONExtractString(payload, 'sessionId')), JSONExtractString(payload, 'canonicalSessionId'), JSONExtractString(payload, 'sessionId')),
+        MODIFY COLUMN runId String DEFAULT JSONExtractString(payload, 'runId'),
+        MODIFY COLUMN traceId String DEFAULT JSONExtractString(payload, 'traceId')`,
     });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
     // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
@@ -8060,9 +8068,9 @@ export class ClickHouseStore {
     const exactMembershipRead = interactionIds.length > 0;
     const correlationPointRead = Boolean(input.sessionId || input.runId || input.traceId);
     const fairPerAgentLimit =
-      exactMembershipRead || (!correlationPointRead && input.fairPerAgentLimit === undefined)
+      exactMembershipRead || input.fairPerAgentLimit === undefined
         ? undefined
-        : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit ?? input.limit ?? 100)));
+        : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
     const limit = exactMembershipRead
       ? Math.max(1, Math.min(5_000, input.limit ?? interactionIds.length))
       : fairPerAgentLimit
@@ -8077,8 +8085,8 @@ export class ClickHouseStore {
         ? ["agentInstanceId = {agentInstanceId:String}"]
         : []),
       // Correlation anchors have dedicated scalar columns so point reads do not parse large
-      // interaction payloads across the whole MergeTree. Older rows remain discoverable through
-      // the bounded hot ring until they naturally age out or are rewritten.
+      // interaction payloads across the whole MergeTree for newly written rows. Column defaults
+      // retain correlation lookup for older parts whose scalar columns have not been stored yet.
       ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
       ...(input.runId ? ["runId = {runId:String}"] : []),
       ...(input.traceId ? ["traceId = {traceId:String}"] : []),
@@ -8139,7 +8147,7 @@ export class ClickHouseStore {
     };
     try {
       let rows: Array<{ payload?: string; routeShape?: string }>;
-      if (fairPerAgentLimit) {
+      if (fairPerAgentLimit || correlationPointRead) {
         // Keep large request/response payloads out of the LIMIT BY sort. Resolve a bounded set of
         // lightweight IDs first, then fetch only those payloads in a second query.
         const indexResult = await this.client.query({
@@ -8154,7 +8162,7 @@ export class ClickHouseStore {
               GROUP BY interactionId
             )
             ORDER BY latestAt DESC, interactionId DESC
-            LIMIT {fairPerAgentLimit:UInt32} BY latestAgentAssetId
+            ${fairPerAgentLimit ? 'LIMIT {fairPerAgentLimit:UInt32} BY latestAgentAssetId' : ''}
             LIMIT {limit:UInt32}`,
           query_params: queryParams,
           clickhouse_settings: settings,
