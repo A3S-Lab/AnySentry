@@ -487,9 +487,8 @@ async function triggerScenarios() {
   await run('docker', [
     'exec',
     unknownName,
-    '/bin/echo',
-    ingestUnknownMarker,
-    unknownMarker,
+    'node', '-e', 'setTimeout(() => {}, 5000)',
+    ingestUnknownMarker, unknownMarker,
   ]);
 
   await run('kubectl', [
