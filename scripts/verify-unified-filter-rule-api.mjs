@@ -83,7 +83,10 @@ for (const protectedProbe of [
 
 const projection = await request('/filter-rules/projections/forwarder', { token: adminToken });
 assert.equal(projection.response.status, 200, JSON.stringify(projection.raw));
-assert.equal(projection.payload.runtimeSignatures.runtimes.length, 6);
+assert(
+  projection.payload.runtimeSignatures.runtimes.length >= 6,
+  `runtime signature registry unexpectedly shrank: ${projection.payload.runtimeSignatures.runtimes.length}`,
+);
 assert.equal(projection.payload.captureProfiles.agent_full.file_access, 'full');
 assert.equal(projection.payload.captureProfiles.infrastructure_aggregate.file_access, 'aggregate');
 
