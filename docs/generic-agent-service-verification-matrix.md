@@ -158,3 +158,17 @@ competing pointer ambiguity 以及 WebSocket control-frame 竞争归属；这些
 
 本轮实验结束后应执行 Design B compose down（`--remove-orphans --volumes`），避免测试服务和
 临时网络继续占用开发机资源；保留日志目录作为未入库现场证据，不提交 `.runtime` 或凭据。
+
+### 2026-09-15 冷启动关联候选修复
+
+Forwarder `1cba15b` 增加了通用的协议级候选信号：当 `LlmInteraction` 同时携带非空
+`run_id` 与 `trace_id/session_id` 时，即使进程分类尚未完成，也进入 `probable_agent` 候选
+路径，原因写为 `correlation_header` / `correlated_llm_interaction_candidate`。该规则不读取
+工具名、厂商域名、固定端口或框架版本，不直接创建 LogicalAgent；明确的基础设施和
+non-agent 结论仍优先。`verify-behavior-discovery.mjs` 与 `verify-filter-pipeline.mjs` 均通过。
+
+重启正式 Observer 后再次执行一次低负载 Design B：业务请求 completed/verify pass，
+但 canonical run 点查仍为 0 条且 `exact_as_observed/partial=false`。因此修复已进入部署脚本，
+但真实闭环仍未验收；下一步需要取得该 workload 的实际 Forwarder classification 和
+`LlmInteraction` 原始字段，确认是传播头未进入重组事件，还是更高优先级的 workload/infrastructure
+规则覆盖了候选信号。
