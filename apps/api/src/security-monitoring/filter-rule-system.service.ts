@@ -143,6 +143,8 @@ function infrastructureOperation(operation: InfrastructureRuleOperationRecord) {
 
 @Injectable()
 export class FilterRuleSystemService {
+  private readonly explainCache = new Map<string, { expiresAt: number; result: FilterRuleExplainResult }>();
+
   constructor(
     private readonly catalog: FilterRuleCatalogService,
     private readonly infrastructure: InfrastructureRuleService,
@@ -366,6 +368,11 @@ export class FilterRuleSystemService {
     if (Boolean(eventId) === Boolean(assetId)) {
       throw new FilterRuleSystemError('invalid_request', 'provide exactly one eventId or assetId');
     }
+    if (assetId) {
+      const cached = this.explainCache.get(assetId);
+      if (cached && cached.expiresAt > Date.now()) return structuredClone(cached.result);
+      if (cached) this.explainCache.delete(assetId);
+    }
     let context: FilterRuleEvaluationContext;
     let subject: FilterRuleExplainResult['subject'];
     let facts: FilterRuleExplainResult['context']['facts'];
@@ -394,7 +401,16 @@ export class FilterRuleSystemService {
         subject = { type: 'asset', id: detail.asset.subjectAssetId, label: detail.asset.displayName };
       }
     }
-    return this.explainContext(subject, context, facts);
+    const result = this.explainContext(subject, context, facts);
+    if (assetId) {
+      this.explainCache.set(assetId, { expiresAt: Date.now() + 750, result });
+      while (this.explainCache.size > 64) {
+        const oldest = this.explainCache.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.explainCache.delete(oldest);
+      }
+    }
+    return result;
   }
 
   example(exampleId: string): FilterRuleExplainResult {
