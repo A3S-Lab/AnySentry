@@ -1452,16 +1452,38 @@ export function validateRawObservation(input: unknown): RawObservationValidation
   const sourceRefs = boundedRefs(value.sourceRefs);
   const derivedFrom = value.derivedFrom === undefined ? [] : boundedRefs(value.derivedFrom);
   const idempotencyKey = text(value.idempotencyKey, 512);
-  if (!observationId || revision === undefined || !eventAtUnixNs || !receivedAtUnixNs
-    || !source || !sourceTypeValue || !payload || !sourceRefs || sourceRefs.length === 0
-    || !derivedFrom || !idempotencyKey) {
-    return { ok: false, reason: 'raw observation has missing or invalid required fields' };
+  const missing: string[] = [];
+  if (!observationId) missing.push('observationId');
+  if (revision === undefined) missing.push('revision');
+  if (!eventAtUnixNs) missing.push('eventAtUnixNs');
+  if (!receivedAtUnixNs) missing.push('receivedAtUnixNs');
+  if (!source) missing.push('source');
+  if (!sourceTypeValue) missing.push('source.sourceType');
+  if (!payload) missing.push('payload');
+  if (!sourceRefs || sourceRefs.length === 0) missing.push('sourceRefs');
+  if (!derivedFrom) missing.push('derivedFrom');
+  if (!idempotencyKey) missing.push('idempotencyKey');
+  if (missing.length) {
+    return {
+      ok: false,
+      reason: `raw observation has missing or invalid required fields: ${missing.join(',')}`,
+    };
   }
-  if (!sourceRefs.includes(observationId)) {
+  const requiredObservationId = observationId as string;
+  const requiredRevision = revision as number;
+  const requiredEventAtUnixNs = eventAtUnixNs as string;
+  const requiredReceivedAtUnixNs = receivedAtUnixNs as string;
+  const requiredSource = source as Record<string, unknown>;
+  const requiredSourceType = sourceTypeValue as RawObservationSourceType;
+  const requiredPayload = payload as RawObservationPayload;
+  const requiredSourceRefs = sourceRefs as string[];
+  const requiredDerivedFrom = derivedFrom as string[];
+  const requiredIdempotencyKey = idempotencyKey as string;
+  if (!requiredSourceRefs.includes(requiredObservationId)) {
     return { ok: false, reason: 'sourceRefs must include observationId', field: 'sourceRefs' };
   }
   try {
-    if (BigInt(receivedAtUnixNs) < BigInt(eventAtUnixNs)) {
+    if (BigInt(requiredReceivedAtUnixNs) < BigInt(requiredEventAtUnixNs)) {
       return { ok: false, reason: 'receivedAtUnixNs must not precede eventAtUnixNs' };
     }
   } catch {
@@ -1469,22 +1491,22 @@ export function validateRawObservation(input: unknown): RawObservationValidation
   }
   const normalized: RawObservation = {
     schemaVersion: CANONICAL_SCHEMA_VERSIONS.rawObservation,
-    observationId,
-    revision,
-    eventAtUnixNs,
-    receivedAtUnixNs,
+    observationId: requiredObservationId,
+    revision: requiredRevision,
+    eventAtUnixNs: requiredEventAtUnixNs,
+    receivedAtUnixNs: requiredReceivedAtUnixNs,
     source: {
-      ...(text(source.sourceDomain, 240) ? { sourceDomain: text(source.sourceDomain, 240) } : {}),
-      ...(text(source.sourceId, 240) ? { sourceId: text(source.sourceId, 240) } : {}),
-      ...(text(source.collectorId, 240) ? { collectorId: text(source.collectorId, 240) } : {}),
-      sourceType: sourceTypeValue,
-      ...(text(source.probeId, 240) ? { probeId: text(source.probeId, 240) } : {}),
-      ...(text(source.sourceSequence, 120) ? { sourceSequence: text(source.sourceSequence, 120) } : {}),
+      ...(text(requiredSource.sourceDomain, 240) ? { sourceDomain: text(requiredSource.sourceDomain, 240) } : {}),
+      ...(text(requiredSource.sourceId, 240) ? { sourceId: text(requiredSource.sourceId, 240) } : {}),
+      ...(text(requiredSource.collectorId, 240) ? { collectorId: text(requiredSource.collectorId, 240) } : {}),
+      sourceType: requiredSourceType,
+      ...(text(requiredSource.probeId, 240) ? { probeId: text(requiredSource.probeId, 240) } : {}),
+      ...(text(requiredSource.sourceSequence, 120) ? { sourceSequence: text(requiredSource.sourceSequence, 120) } : {}),
     },
-    payload,
-    sourceRefs,
-    derivedFrom,
-    idempotencyKey,
+    payload: requiredPayload,
+    sourceRefs: requiredSourceRefs,
+    derivedFrom: requiredDerivedFrom,
+    idempotencyKey: requiredIdempotencyKey,
   };
   const runtime = normalizeRuntimeContext(value.runtime);
   if (value.runtime !== undefined && !runtime) return { ok: false, reason: 'runtime context is invalid', field: 'runtime' };
