@@ -12191,6 +12191,18 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         limit: 5_000,
       });
       const projection = projectAgentConversations(selected.items, [], { scope: 'raw', includeBackground: true });
+      // The compatibility projector may derive a per-request `cv_…` key for ephemeral records.
+      // For an exact canonical Session, preserve the immutable Interaction conversation alias so
+      // the Session resource and its timeline deep link resolve to the same records.
+      for (const summary of projection.summaries) {
+        const records = projection.interactionsByConversation.get(summary.conversationId) ?? [];
+        const alias = records.find((record) => record.conversationId)?.conversationId;
+        if (alias && alias !== summary.conversationId) {
+          projection.interactionsByConversation.delete(summary.conversationId);
+          projection.interactionsByConversation.set(alias, records);
+          summary.conversationId = alias;
+        }
+      }
       conversations = {
         items: projection.summaries,
         total: projection.summaries.length,
