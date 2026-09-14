@@ -12167,6 +12167,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       snapshotAsOf: query.snapshotAsOf,
       scope: 'raw',
       classificationView: query.classificationView,
+      // The canonical Session endpoint carries sessionId while the semantic projector resolves
+      // exact membership through conversationId. Pass the identity through so a deep link uses
+      // the narrow interaction-ID path instead of scanning the historical interaction table.
+      ...(query.sessionId ? { conversationId: query.sessionId } : {}),
       agentAssetId: query.agentAssetId,
       agentInstanceId: query.agentInstanceId,
       product: query.product,
