@@ -2073,6 +2073,12 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     attributes: event.attributes,
   })).digest('hex');
   const payloadRef = `sha256:${payloadDigest}`;
+  const producerRunId = cleanString(
+    event.attributes?.['anysentry.run.id']
+      ?? event.attributes?.runId
+      ?? event.attributes?.['run.id'],
+    512,
+  );
   const contentMarker = {
     schemaVersion: 'anysentry.semantic_reference.v1',
     payloadRef,
@@ -2223,6 +2229,7 @@ function canonicalInteractionForSemanticEvent(event: T.JudgedEvent): T.AgentInte
     sessionResolutionRevision: event.sessionResolutionRevision,
     traceId: event.traceId,
     runId: event.runId,
+    ...(producerRunId ? { producerRunId } : {}),
     runIdSource: event.runIdSource,
     sessionId: event.sessionId,
     sessionKey: event.sessionKey,

@@ -156,6 +156,7 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
   agentInstanceId String DEFAULT '',
   sessionId String DEFAULT if(empty(JSONExtractString(payload, 'sessionId')), JSONExtractString(payload, 'canonicalSessionId'), JSONExtractString(payload, 'sessionId')),
   runId String DEFAULT JSONExtractString(payload, 'runId'),
+  producerRunId String DEFAULT JSONExtractString(payload, 'producerRunId'),
   traceId String DEFAULT JSONExtractString(payload, 'traceId'),
   agentProduct LowCardinality(String) DEFAULT '',
   classification LowCardinality(String),
@@ -1188,6 +1189,7 @@ async function runClickHouseBootstrap(
         ADD COLUMN IF NOT EXISTS interactionType LowCardinality(String) DEFAULT 'model' AFTER classification,
         ADD COLUMN IF NOT EXISTS sessionId String DEFAULT '' AFTER agentInstanceId,
         ADD COLUMN IF NOT EXISTS runId String DEFAULT '' AFTER sessionId,
+        ADD COLUMN IF NOT EXISTS producerRunId String DEFAULT '' AFTER runId,
         ADD COLUMN IF NOT EXISTS traceId String DEFAULT '' AFTER runId,
         ADD COLUMN IF NOT EXISTS tlsAdapterId LowCardinality(String) DEFAULT '' AFTER protocol,
         ADD COLUMN IF NOT EXISTS transportProtocol LowCardinality(String) DEFAULT '' AFTER tlsAdapterId,
@@ -1201,6 +1203,7 @@ async function runClickHouseBootstrap(
       query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
         MODIFY COLUMN sessionId String DEFAULT if(empty(JSONExtractString(payload, 'sessionId')), JSONExtractString(payload, 'canonicalSessionId'), JSONExtractString(payload, 'sessionId')),
         MODIFY COLUMN runId String DEFAULT JSONExtractString(payload, 'runId'),
+        MODIFY COLUMN producerRunId String DEFAULT JSONExtractString(payload, 'producerRunId'),
         MODIFY COLUMN traceId String DEFAULT JSONExtractString(payload, 'traceId')`,
     });
     // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
@@ -8007,6 +8010,7 @@ export class ClickHouseStore {
             agentInstanceId: record.agentInstanceId ?? "",
             sessionId: record.sessionId ?? record.canonicalSessionId ?? "",
             runId: record.runId ?? "",
+            producerRunId: record.producerRunId ?? "",
             traceId: record.traceId ?? "",
             agentProduct: record.agentProduct ?? "",
             classification: record.currentEffectiveClassification,
@@ -8088,7 +8092,7 @@ export class ClickHouseStore {
       // interaction payloads across the whole MergeTree for newly written rows. Column defaults
       // retain correlation lookup for older parts whose scalar columns have not been stored yet.
       ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
-      ...(input.runId ? ["runId = {runId:String}"] : []),
+      ...(input.runId ? ["(runId = {runId:String} OR producerRunId = {runId:String})"] : []),
       ...(input.traceId ? ["traceId = {traceId:String}"] : []),
       ...(input.interactionId
         ? ["interactionId = {interactionId:String}"]

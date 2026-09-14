@@ -830,6 +830,8 @@ export interface EventMeta {
   spanId?: string;
   parentSpanId?: string;
   runId?: string;
+  /** Producer-supplied run anchor retained alongside the canonical run identity. */
+  producerRunId?: string;
   turnId?: string;
   /** Distinguishes an Adapter-provided Run from the compatibility event-local fallback. */
   runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
@@ -1754,6 +1756,8 @@ export interface AgentInteractionRecord {
   agentIdHeader?: string;
   traceId?: string;
   runId?: string;
+  /** Producer-supplied run anchor retained alongside the canonical run identity. */
+  producerRunId?: string;
   runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   sessionId?: string;
   /** Canonical scope-qualified Session key; native IDs remain compatibility aliases. */
