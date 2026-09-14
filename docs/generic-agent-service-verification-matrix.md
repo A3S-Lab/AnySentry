@@ -341,3 +341,20 @@ The active Observer heartbeat was accepted after restart (`collectorId=pjnl26107
 The clean baseline eliminated old parked records and restored zero collector drops, but the host still produced more events than the API could drain: after a short window the new WAL had about 2,169 active records and the health channel again reported `spool_backlog_over_slo`. With `FORWARD_BATCH_MAX_BYTES=131072` and `FORWARD_MAX_INFLIGHT=2`, transport errors disappeared in the sample, but delivery remained capacity-bound (141 events accepted in the sampled window while the queue grew). This is evidence for a remaining API/ingest throughput or host-noise capacity problem; it is not evidence to enable global full capture. The runtime tuning was left explicit in the DaemonSet for the controlled baseline and must be revisited before a high-rate endurance claim.
 
 Commit `20483c2` improves forwarder diagnostics by preserving redacted HTTP/status or socket failure reasons for control requests and logging heartbeat delivery failures with only the collector ID.
+
+### 2026-09-15 ingest capacity experiment: API replicas and forwarder concurrency
+
+The clean Observer baseline was measured with `FORWARD_BATCH_MAX_BYTES=131072` and
+`FORWARD_MAX_INFLIGHT=2`. The capture channel remained healthy with zero Ring/output drops, but
+bounded delivery accumulated records and reached `queueDropped=1555` while the API acknowledged only
+about 420 events in the sampled window. Scaling AnySentry API from one to two replicas did not remove
+backlog growth; the API batch path still performs per-event source resolution, canonical observation
+commit, ClickHouse persistence and projection preparation.
+
+A second controlled window raised only `FORWARD_MAX_INFLIGHT` to 4 while keeping the 131 KB batch cap.
+During the first sample, `queueDropped` fell to zero and active spool records fell from roughly 12,979
+to 3,770 while 950 events were acknowledged. A later sample showed the queue rising again to about
+10,571 active records and a `control_runtime_snapshot_failed` warning, so this is an improved but not
+stable capacity setting. The extra API replica was removed after the experiment to avoid idle resource
+consumption. The runtime DaemonSet remains at the bounded 131 KB / concurrency 4 canary values for the
+next controlled test; no claim of lossless endurance is made.
