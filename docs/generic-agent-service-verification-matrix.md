@@ -172,3 +172,17 @@ non-agent 结论仍优先。`verify-behavior-discovery.mjs` 与 `verify-filter-p
 但真实闭环仍未验收；下一步需要取得该 workload 的实际 Forwarder classification 和
 `LlmInteraction` 原始字段，确认是传播头未进入重组事件，还是更高优先级的 workload/infrastructure
 规则覆盖了候选信号。
+
+### 2026-09-15 API 镜像更新与诊断字段复测
+
+AnySentry API 以提交 `e1adf79` 构建并部署到开发 Kubernetes，运行镜像 digest：
+`127.0.0.1:5000/anysentry@sha256:c278900fa475825cbc080660f16c49b4cfe19fffe5822a166dc312f8b11d72a5`。
+旧 API Pod 已由 Deployment rollout 替换，新 Pod imageID 与该 digest 一致。
+
+一次低负载 Design B 调用返回 completed/verify pass，`run_id=3e3c6fc5-e54f-4fd3-9139-8018e7404e12`，
+`trace_id=8d3a7e36d560b9543e5202cf8d72741e`。新 API health 已能保留 Forwarder 诊断字段：
+`correlatedLlmCandidates=6`、`correlatedLlmRejectedInfrastructure=0`、
+`llmWithoutCorrelationTuple=10`。这证明本次事件中确有 6 个带传播 tuple 的 LLM 候选进入 Forwarder，
+且未被 infrastructure 规则拒绝；但按该 run/trace 查询 `events/list` 和 `agents/interactions` 仍均为 0，
+coverage 为 `exact_as_observed/partial=false`。故当前故障点已从 Forwarder 候选判定进一步收敛到
+F2/F3 canonical ingest 或 interaction projection，而不是冷启动识别或 API 字段隐藏。
