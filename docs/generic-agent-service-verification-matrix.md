@@ -256,13 +256,18 @@ and `1 + 1 = 2`. AnySentry recorded six interactions in canonical Session
 
 Design B was then rebuilt after Design A cleanup. The orchestrator, worker and sandbox health checks
 passed; `/runs` returned `completed`, the worker returned `remote_ok`, and the correlation payload
-contained a worker hop and sandbox execution. **Correction:** the six records in Session
-`sess_982d3b0f4adcca5cf5819eb6` carry run `f9f00e85-e394-49ba-a65b-efae58b0370b`,
-whereas this B invocation returned `09b9cc79-f800-481b-860a-538ebcd4e3d1`. They cannot be used
-as evidence for this B run. Queries of the latest 500 interactions did not find this B run;
-that result alone does not distinguish missing capture, delayed ingestion or pagination.
-The historical Session point query returned partial (3 complete, 3 partial), but proves only
-that historical coverage reconciliation executed. Fresh B Session alignment remains unverified.
+contained a worker hop and sandbox execution. The first query window contained six records from the
+ earlier B run under `f9f00e85-e394-49ba-a65b-efae58b0370b`, which was initially mistaken for the
+ current invocation. A later bounded query found the expected six records for run
+ `09b9cc79-f800-481b-860a-538ebcd4e3d1`: three parent interactions in
+ `sess_e496ae12c1a26873307b9963`, and three worker interactions in
+ `sess_e9a98ad109a439c94f15d231`. Both Session point queries returned `partial` without
+ `semantic_projection_expired_or_missing`, proving delayed eventual ingestion and parent/worker
+ Session separation for that invocation.
+
+A subsequent fresh B run `5157aabe-94c2-4da5-b925-b760592f1a8c` returned `completed/remote_ok`,
+ but was absent from the bounded interaction result at check time; it remains a delivery-latency
+ observation and is not counted as a successful canonical run.
 
 The customer A/B containers, networks and dangling images were removed after verification; the
 pre-existing local registry was retained. Observer logs showed bounded reassembly and dynamic PID
