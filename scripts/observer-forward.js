@@ -818,6 +818,9 @@ function emptyAttributionCounts() {
     protectedQueueDropped: 0,
     queueDroppedByClass: Object.create(null),
     unknownReasons: Object.create(null),
+    correlatedLlmCandidates: 0,
+    correlatedLlmRejectedInfrastructure: 0,
+    llmWithoutCorrelationTuple: 0,
   };
 }
 
@@ -2645,6 +2648,9 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         probableAgent: classifications.probableAgent,
         unknown: classifications.unknown,
         unknownReasonCounts: classifications.unknownReasons,
+        correlatedLlmCandidates: classifications.correlatedLlmCandidates,
+        correlatedLlmRejectedInfrastructure: classifications.correlatedLlmRejectedInfrastructure,
+        llmWithoutCorrelationTuple: classifications.llmWithoutCorrelationTuple,
         nonAgent: classifications.nonAgent,
         filteredNonAgent: classifications.filteredNonAgent,
         wouldFilterNonAgent: classifications.wouldFilterNonAgent,
@@ -4041,6 +4047,18 @@ function handleLine(raw, fromDeferred = false) {
         infrastructureEvaluation.classification,
       ) ?? identityClassification
     : identityClassification;
+  if (kind === 'LlmInteraction') {
+    if (hasCorrelatedLlmInteraction(o)) {
+      if (classification.state === 'infrastructure'
+        || classification.attribution?.classification === 'non_agent') {
+        attributionCounts.correlatedLlmRejectedInfrastructure++;
+      } else {
+        attributionCounts.correlatedLlmCandidates++;
+      }
+    } else {
+      attributionCounts.llmWithoutCorrelationTuple++;
+    }
+  }
   // Correlation headers on a decoded LLM interaction are a bounded discovery signal.  A
   // previously unknown workload must be allowed into the candidate/full-evidence path so the
   // API can join its first run; requiring a pre-existing process rule here creates a cold-start
