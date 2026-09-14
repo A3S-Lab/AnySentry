@@ -1064,6 +1064,23 @@ export function parseObserverAgentInteraction(
     ?? (sessionNamespaceHint
       ? `scope_${createHash('sha256').update(sessionNamespaceHint).digest('hex')}`
       : undefined);
+  // An authenticated HTTP workflow and a delegated worker may reuse the same provider run
+  // identifier while representing different observable services. When no registered logical
+  // definition gives us a stable service boundary, keep those views separate by the exact
+  // process workload generation. This is generation-safe (restart creates a new boundary) and
+  // does not collapse unrelated containers that happen to share `/app` or a source id.
+  const runtimeWorkloadScope = !logical.definition.logicalAgentId
+    && !logical.definition.definitionId
+    && runtimeInstanceId
+    ? `runtime:${runtimeInstanceId}`
+    : undefined;
+  const resolvedSessionNamespaceHint = runtimeWorkloadScope
+    ? [sessionNamespaceHint, runtimeWorkloadScope].filter(Boolean).join('\0')
+    : sessionNamespaceHint;
+  const resolvedSessionNamespaceKey = secureSessionScope
+    ?? (resolvedSessionNamespaceHint
+      ? `scope_${createHash('sha256').update(resolvedSessionNamespaceHint).digest('hex')}`
+      : undefined);
   const sessionResolution = resolveSessionIdentity({
     providerSessionId: providerConversationId,
     sessionId,
@@ -1076,7 +1093,7 @@ export function parseObserverAgentInteraction(
     fork: input.fork === true,
     parentSessionId: string(input.parentSessionId, 512),
     scopeKey: secureSessionScope,
-    namespaceHint: sessionNamespaceHint,
+    namespaceHint: resolvedSessionNamespaceHint,
   });
   const runtimeOnlySession = explicitlyNonProviderSession
     || runtimeOnlySessionId(sessionId, runtimeSessionId, meta);
@@ -1141,7 +1158,7 @@ export function parseObserverAgentInteraction(
     ...(runIdSource ? { runIdSource } : {}),
     ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
     canonicalSessionId: sessionResolution.canonicalSessionId,
-    ...(sessionNamespaceKey ? { sessionNamespaceKey } : {}),
+    ...(resolvedSessionNamespaceKey ? { sessionNamespaceKey: resolvedSessionNamespaceKey } : {}),
     ...(sessionResolution.canonicalSessionKey ? { sessionKey: sessionResolution.canonicalSessionKey } : {}),
     ...(sessionResolution.providerSessionIdHash ? { providerSessionIdHash: sessionResolution.providerSessionIdHash } : {}),
     sessionIdentityQuality,
