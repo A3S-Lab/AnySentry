@@ -424,3 +424,20 @@ row count, in-flight batch count, and time window. Queue diagnostics now expose 
 configured limits through `canonicalObservability.gaps`; the shutdown path clears the byte accounting
 while recording every pending item as a coverage/drop outcome. The deterministic raw batching test
 continues to pass after this change.
+
+### 2026-09-15 PostgreSQL raw-write advisory-lock removal
+
+Commit `966ff06` removes the global `pg_advisory_xact_lock('anysentry.raw_observations.v1')`
+from `saveRawObservations`. The unique `(observation_id, revision)` and idempotency keys still
+serialize conflicting inserts; conflict detection now runs after the insert inside the same
+transaction and rolls back the current batch when an existing payload differs. This keeps identical
+retries idempotent without serializing every unrelated raw batch.
+
+Runtime evidence before the change showed one PostgreSQL session waiting on
+`wait_event=advisory` while another held the same raw-observation lock. After deploying the change,
+`advisory_waiters=0`; remaining database waits were `WALWrite`/`WalSync`. Synchronous canonical
+writes still showed per-batch `canonicalObservationMs` in the sub-second-to-several-second range,
+confirming the next bottleneck is per-observation transaction/WAL work rather than the global lock.
+The async batch canary after this change drained its raw queue (`asyncRawBatchQueueRows=0`) but still
+accumulated admission and CoverageGap pressure under the full host event rate, so async mode remains
+reverted for the stable runtime.
