@@ -42,6 +42,50 @@ async function bootstrap() {
   );
   const port = Number(process.env.PORT ?? 29653);
   await app.listen(port, '0.0.0.0');
+  // Body-parser failures happen before a controller can see an Observer batch. Keep a bounded,
+  // redacted diagnostic seam so a client timeout/request abort can be matched to Forwarder WAL
+  // growth without ever logging the request body or authorization headers.
+  app.use((error: {
+    type?: string;
+    code?: string;
+    message?: string;
+  }, req: {
+    method?: string;
+    originalUrl?: string;
+    url?: string;
+    headers?: Record<string, string | string[] | undefined>;
+  }, res: {
+    headersSent?: boolean;
+    status: (code: number) => { json: (body: unknown) => void };
+  }, next: (error?: unknown) => void) => {
+    const aborted = error?.type === 'request.aborted'
+      || error?.code === 'ECONNABORTED'
+      || error?.message === 'request aborted';
+    if (!aborted) {
+      next(error);
+      return;
+    }
+    const headers = req.headers ?? {};
+    const contentLength = headers['content-length'];
+    const sourceId = headers['x-anysentry-source-id'];
+    const batchId = headers['x-anysentry-batch-id'];
+    // eslint-disable-next-line no-console
+    console.warn('[AnySentry] observer ingest request aborted', {
+      method: req.method,
+      path: req.originalUrl ?? req.url,
+      contentLength: Array.isArray(contentLength) ? contentLength[0] : contentLength,
+      sourceId: Array.isArray(sourceId) ? sourceId[0] : sourceId,
+      batchId: Array.isArray(batchId) ? batchId[0] : batchId,
+      errorType: error.type,
+      errorCode: error.code,
+    });
+    if (res.headersSent) return;
+    res.status(400).json({
+      code: 400,
+      message: 'observer ingest request aborted before batch processing',
+      error: 'request_aborted',
+    });
+  });
   // eslint-disable-next-line no-console
   console.log(`AnySentry api listening on http://0.0.0.0:${port}`);
 }
