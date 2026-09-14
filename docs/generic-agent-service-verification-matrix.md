@@ -203,3 +203,11 @@ Observer DaemonSet 已恢复 Ready rollout。
 
 尚待一次新镜像下的 customer A/B 受控请求验证 raw commit gap 是否消失，以及 interaction point-read
 是否恢复；在该验证前不宣称 canonical Session/Run 已通过。
+
+## 2026-09-14/15 B 方案重启后 canonical raw 复测
+
+- customer-langgraph-sim-lab Design B 在重启后的本机重新启动，orchestrator `:18090`、worker `:18091`、sandbox `:18088` 均健康；受控 POST `用 Python 计算 3+3 并打印结果` 返回 `status=completed`、`verify_status=pass`，产生独立 `run_id`/`trace_id`。
+- AnySentry 当前部署 digest：`sha256:8ca3eb119fba6ebbff04a4da308b0f30ca4dc8399d822a2197ba87f11da6edb0`，对应本地提交 `e09a794`。旧 Pod 已进入 terminating，新 Pod `1/1 Running`，滚动更新完成。
+- raw commit 字段诊断从 `payload` 收敛到 `sourceRefs`，随后在 envelope repair 后不再出现在最新 coverage-gap 前十项；这证明服务端接收时间、来源类型、payload hash、sourceRefs、derivedFrom 和幂等键已具备兼容补齐路径。
+- 当前查询结果：该 B run 的 `agents/interactions` 返回 `items=0`、`completeness=exact_as_observed`、`partial=false`；因此 semantic interaction projection 与 canonical Session 尚未验收通过。Observer 日志同时显示 HTTP 交互重组 `completed_interactions=1`，说明剩余缺口位于 Forwarder/semantic 投影或其关联键，而非客户服务未运行。
+- 资源清理：Design B compose、network、containers 已停止并删除；本地 AnySentry 旧测试镜像 tag 已清理，仅保留当前部署镜像。Observer WAL 仍约 252 MiB，未在 Collector 运行期间强制截断，避免把活动链路误判为已清空。
