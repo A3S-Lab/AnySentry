@@ -358,3 +358,23 @@ to 3,770 while 950 events were acknowledged. A later sample showed the queue ris
 stable capacity setting. The extra API replica was removed after the experiment to avoid idle resource
 consumption. The runtime DaemonSet remains at the bounded 131 KB / concurrency 4 canary values for the
 next controlled test; no claim of lossless endurance is made.
+
+### 2026-09-15 ingest phase timing and bounded async persistence experiment
+
+Commit `0b5b9a5` adds an opt-in `ANYSENTRY_INGEST_DIAGNOSTICS=1` timing record for Observer
+batches. The record contains only event counts and phase durations: preparation, durable fence,
+projection, source resolution, canonical observation, Judge preparation and total time.
+
+A deployed sample with synchronous canonical persistence showed the actual bottleneck: a 29-event
+batch took about 7.5 seconds, of which `canonicalObservationMs` was about 7.4 seconds; source
+resolution was about 2 ms, Judge preparation about 17 ms, the ClickHouse durable fence about 50 ms,
+and projection about 10 ms. This rules out source matching, Judge classification and ClickHouse
+batch commit as the primary cause of the earlier prepare latency.
+
+The existing bounded async canonical side lane was enabled temporarily with
+`ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT=64`. Batch latency fell to roughly 0.15–0.45 seconds
+and canonical observation time to roughly 9–17 ms. However, the health contract reported
+`asyncPersistenceDropped=36820` and `persistenceDropped=54917` while the active in-flight limit was
+reached. The experiment therefore proves the latency benefit but fails the no-unexpected-loss gate;
+async persistence was reverted to `off` after the sample. A follow-up implementation must coalesce
+raw observations into bounded batches before enabling this path as a product default.
