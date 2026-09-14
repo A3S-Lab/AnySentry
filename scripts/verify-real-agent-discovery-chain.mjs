@@ -546,7 +546,7 @@ async function matchingEvents() {
       event.attribution?.classification === 'confirmed_agent',
   );
   return {
-    total: result.total,
+    total: host.total + docker.total + unknown.total + k8sAgent.total,
     host: host.event,
     docker: docker.event,
     unknown: unknown.event,
