@@ -3580,6 +3580,10 @@ export interface CollectorFilterMetrics {
   forwarded: number;
   confirmedAgent: number;
   probableAgent: number;
+  /** Forwarder diagnostics for protocol-level cold-start Agent discovery. */
+  correlatedLlmCandidates?: number;
+  correlatedLlmRejectedInfrastructure?: number;
+  llmWithoutCorrelationTuple?: number;
   unknown: number;
   /** Closed, low-cardinality S3 reason counts for this Forwarder delta window. */
   unknownReasonCounts?: Partial<Record<UnknownReason, number>>;

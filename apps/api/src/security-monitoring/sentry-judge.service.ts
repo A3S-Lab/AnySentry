@@ -2600,6 +2600,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       forwarded: clamp(rawFilter.forwarded),
       confirmedAgent: clamp(rawFilter.confirmedAgent),
       probableAgent: clamp(rawFilter.probableAgent),
+      ...(rawFilter.correlatedLlmCandidates !== undefined
+        ? { correlatedLlmCandidates: clamp(rawFilter.correlatedLlmCandidates) } : {}),
+      ...(rawFilter.correlatedLlmRejectedInfrastructure !== undefined
+        ? { correlatedLlmRejectedInfrastructure: clamp(rawFilter.correlatedLlmRejectedInfrastructure) } : {}),
+      ...(rawFilter.llmWithoutCorrelationTuple !== undefined
+        ? { llmWithoutCorrelationTuple: clamp(rawFilter.llmWithoutCorrelationTuple) } : {}),
       unknown: clamp(rawFilter.unknown),
       ...(Object.keys(unknownReasonCounts).length ? { unknownReasonCounts } : {}),
       nonAgent: clamp(rawFilter.nonAgent),
