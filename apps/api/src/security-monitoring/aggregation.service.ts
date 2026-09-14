@@ -3471,7 +3471,10 @@ export class AggregationService implements OnModuleDestroy {
       : interactions.items;
     // Membership-scoped reads are exact for the selected Thread, but cross-hop relatedConversations
     // need peer Interactions from the same run/session window. Expand with a fair history read.
-    if (exactMembershipIds?.length) {
+    if (exactMembershipIds?.length && filter.scope !== 'raw') {
+      // Raw canonical Session reads already have an exact membership ID set. Expanding them with
+      // a fair historical peer scan defeats point-read semantics and can trigger a wide ClickHouse
+      // merge sort under load. Peer expansion is only needed by the dashboard cross-hop view.
       const peerWindow = await this.readAgentInteractions(interactionQuery, {
         fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
         totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
