@@ -950,6 +950,11 @@ async function boundedRelationRead<T>(
   });
 }
 
+// ClickHouse is a secondary durable projection for interactions. A slow read must not hide
+// records already admitted to the bounded hot ring; callers can return a truthful partial view
+// and retry instead of blocking the API request until the database recovers.
+const AGENT_INTERACTION_QUERY_TIMEOUT_MS = 2_000;
+
 function normalizeSimulationDecision(decision: SimulatedDecision | null): T.PolicySimulationDecision {
   if (!decision) return { verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed' };
   let verdict = decision.verdict as T.Verdict;
@@ -3139,7 +3144,11 @@ export class AggregationService implements OnModuleDestroy {
     // An empty membership selection is still an exact query, never a request for all history.
     const persisted = exactMembershipRead && exactInteractionIds.size === 0
       ? (options.membershipDurable === true ? [] : null)
-      : await this.judge.storedAgentInteractions(query);
+      : (await boundedRelationRead(
+          this.judge.storedAgentInteractions(query),
+          null,
+          AGENT_INTERACTION_QUERY_TIMEOUT_MS,
+        )).value;
     const merged = new Map<string, T.AgentInteractionRecord>();
     for (const item of persisted ?? []) merged.set(item.interactionId, item);
     for (const { record } of this.interactionHot.values()) {
