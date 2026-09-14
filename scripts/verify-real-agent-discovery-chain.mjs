@@ -490,16 +490,18 @@ async function triggerScenarios() {
 }
 
 async function matchingEvents() {
-  const find = async (marker, predicate) => {
-    const result = await api('/events/list', {
-      timeType: 'last_1h',
-      collectorId,
-      includeBenign: true,
-      eventKind: 'ToolExec',
-      scope: 'raw',
-      q: marker,
-      limit: 10,
-    });
+  // Fetch one bounded collector-scoped page and filter markers locally. A separate q query for
+  // every marker expands the durable search scan budget (up to thousands of wide rows) and can
+  // starve the API under a host-wide privileged Collector smoke test.
+  const result = await api('/events/list', {
+    timeType: 'last_1h',
+    collectorId,
+    includeBenign: true,
+    eventKind: 'ToolExec',
+    scope: 'raw',
+    limit: 100,
+  });
+  const find = (marker, predicate) => {
     const candidates = result.items?.filter(
       (candidate) => JSON.stringify(candidate).includes(marker),
     ) ?? [];
@@ -514,17 +516,15 @@ async function matchingEvents() {
       })),
     };
   };
-  const [host, docker, unknown, k8sAgent] = await Promise.all([
-    find(hostMarker, (event) => event.attribution?.source === 'self_register'),
-    find(dockerMarker, (event) => event.attribution?.source === 'self_register'),
-    find(unknownMarker, (event) => event.attribution?.source === 'behavior'),
-    find(
-      k8sAgentMarker,
-      (event) =>
-        event.attribution?.source === 'kubernetes' &&
-        event.attribution?.classification === 'confirmed_agent',
-    ),
-  ]);
+  const host = find(hostMarker, (event) => event.attribution?.source === 'self_register');
+  const docker = find(dockerMarker, (event) => event.attribution?.source === 'self_register');
+  const unknown = find(unknownMarker, (event) => event.attribution?.source === 'behavior');
+  const k8sAgent = find(
+    k8sAgentMarker,
+    (event) =>
+      event.attribution?.source === 'kubernetes' &&
+      event.attribution?.classification === 'confirmed_agent',
+  );
   return {
     total: host.total + docker.total + unknown.total + k8sAgent.total,
     host: host.event,
