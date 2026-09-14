@@ -397,3 +397,22 @@ writes. The canary therefore improves F2 delivery but does not satisfy the canon
 The async canary was reverted to synchronous persistence after measurement. Further work must reduce
 PostgreSQL transaction/advisory-lock cost or introduce a durable, lossless raw sink queue before
 making async batch persistence a default.
+
+### 2026-09-15 bounded raw-observation batch coalescing
+
+Commit `bc372d4` introduces a bounded raw canonical side-lane batcher. It coalesces up to
+`ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS` observations over
+`ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_WINDOW_MS`, uses the existing `saveRawObservations([...])`
+transaction/idempotency fence, and records a CoverageGap for every batch member when the sink fails.
+Queue capacity is bounded by the configured in-flight batch limit and batch row limit; shutdown drains
+pending entries into explicit dropped/gap accounting instead of acknowledging them silently.
+
+A clean-WAL runtime canary (`async persistence on`, 64 in-flight batches, 512 rows, 50 ms window)
+reduced Observer batch latency to roughly 30–320 ms and kept the Collector delivery channel healthy
+with queue/spool at zero and no Observer drops. The same 90-second window still reported raw-side
+persistence pressure: 9,428 async observations scheduled, 8,939 completed, 96 failed, and 5,240
+async admissions dropped; the separate CoverageGap persistence lane also reported 15,496 dropped
+writes. The canary therefore improves F2 delivery but does not satisfy the canonical no-gap gate.
+The async canary was reverted to synchronous persistence after measurement. Further work must reduce
+PostgreSQL transaction/advisory-lock cost or introduce a durable, lossless raw sink queue before
+making async batch persistence a default.
