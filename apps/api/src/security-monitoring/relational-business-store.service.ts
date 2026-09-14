@@ -1055,7 +1055,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            (record->'payload'->>'capturedBytes')::bigint,
            record
          FROM incoming
-         ON CONFLICT (observation_id, revision) DO NOTHING`,
+         -- Both observation_id/revision and idempotency_key/revision are unique.
+         -- Leave the conflict target unspecified so either idempotent key can
+         -- turn a retry into a no-op; the query below still rejects payload
+         -- mismatches instead of silently accepting a conflicting record.
+         ON CONFLICT DO NOTHING`,
         [boundedJson],
       );
       const conflict = await client.query<{ conflict: boolean }>(
