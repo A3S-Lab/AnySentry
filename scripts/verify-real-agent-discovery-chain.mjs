@@ -480,6 +480,13 @@ async function triggerScenarios() {
   await run('docker', [
     'exec',
     unknownName,
+    '/bin/sh',
+    '-c',
+    `printf '%s' ${unknownMarker} >/tmp/${unknownMarker}; sleep 2`,
+  ]);
+  await run('docker', [
+    'exec',
+    unknownName,
     '/bin/echo',
     ingestUnknownMarker,
     unknownMarker,
