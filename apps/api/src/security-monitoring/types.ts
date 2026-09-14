@@ -1983,6 +1983,8 @@ export interface AgentConversationBindingRecord {
 }
 
 export interface AgentConversationQuery extends SecurityTimeFilter {
+  /** Internal exact-member projection hint; never broadens an ordinary dashboard read. */
+  includeBackground?: boolean;
   agentAssetId?: string;
   agentInstanceId?: string;
   conversationId?: string;

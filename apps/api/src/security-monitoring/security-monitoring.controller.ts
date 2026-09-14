@@ -12190,7 +12190,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         interactionIds: memberships.map((membership) => membership.interactionId).filter((id): id is string => Boolean(id)),
         limit: 5_000,
       });
-      const projection = projectAgentConversations(selected.items, [], { scope: 'raw' });
+      const projection = projectAgentConversations(selected.items, [], { scope: 'raw', includeBackground: true });
       conversations = {
         items: projection.summaries,
         total: projection.summaries.length,

@@ -1076,9 +1076,8 @@ export function projectAgentConversations(
     evidence.push(record);
     evidenceByAsset.set(record.agentAssetId, evidence);
     return false;
-  }).filter((record) => ['conversation', 'context_replay'].includes(
-    trafficRoleForInteraction(record),
-  ));
+  }).filter((record) => query.includeBackground
+    || ['conversation', 'context_replay'].includes(trafficRoleForInteraction(record)));
   const grouped = new Map<string, {
     source: 'provider' | 'runtime' | 'inferred';
     records: T.AgentInteractionRecord[];
