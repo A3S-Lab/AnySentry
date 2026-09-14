@@ -464,19 +464,27 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     this.asyncPersistenceScheduled += 1;
     if (this.asyncRawBatchQueue.length >= this.asyncRawBatchMaxRows) {
       void this.flushRawObservationBatch();
-    } else if (!this.asyncRawBatchTimer) {
-      this.asyncRawBatchTimer = setTimeout(() => {
-        this.asyncRawBatchTimer = undefined;
-        void this.flushRawObservationBatch();
-      }, this.asyncRawBatchWindowMs);
-      this.asyncRawBatchTimer.unref?.();
-    }
+    } else this.scheduleRawObservationFlush();
     return true;
+  }
+
+  private scheduleRawObservationFlush(): void {
+    if (this.asyncRawBatchTimer || this.closed) return;
+    this.asyncRawBatchTimer = setTimeout(() => {
+      this.asyncRawBatchTimer = undefined;
+      void this.flushRawObservationBatch();
+    }, this.asyncRawBatchWindowMs);
+    this.asyncRawBatchTimer.unref?.();
   }
 
   private async flushRawObservationBatch(): Promise<void> {
     if (this.asyncRawBatchQueue.length === 0 || this.closed) return;
-    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) return;
+    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+      // Derived writes share the task limit. Their completion does not flush this queue, so
+      // retain a timer even when no new observation arrives after capacity becomes available.
+      this.scheduleRawObservationFlush();
+      return;
+    }
     const batch = this.asyncRawBatchQueue.splice(0, this.asyncRawBatchMaxRows);
     this.asyncPersistenceInFlight += 1;
     const task = Promise.resolve()
