@@ -154,6 +154,9 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
   collectorId LowCardinality(String) DEFAULT '',
   agentAssetId String,
   agentInstanceId String DEFAULT '',
+  sessionId String DEFAULT '',
+  runId String DEFAULT '',
+  traceId String DEFAULT '',
   agentProduct LowCardinality(String) DEFAULT '',
   classification LowCardinality(String),
   interactionType LowCardinality(String) DEFAULT 'model',
@@ -1183,6 +1186,9 @@ async function runClickHouseBootstrap(
     await schema.command({
       query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
         ADD COLUMN IF NOT EXISTS interactionType LowCardinality(String) DEFAULT 'model' AFTER classification,
+        ADD COLUMN IF NOT EXISTS sessionId String DEFAULT '' AFTER agentInstanceId,
+        ADD COLUMN IF NOT EXISTS runId String DEFAULT '' AFTER sessionId,
+        ADD COLUMN IF NOT EXISTS traceId String DEFAULT '' AFTER runId,
         ADD COLUMN IF NOT EXISTS tlsAdapterId LowCardinality(String) DEFAULT '' AFTER protocol,
         ADD COLUMN IF NOT EXISTS transportProtocol LowCardinality(String) DEFAULT '' AFTER tlsAdapterId,
         ADD COLUMN IF NOT EXISTS wireTemplateId LowCardinality(String) DEFAULT '' AFTER transportProtocol,
@@ -7991,6 +7997,9 @@ export class ClickHouseStore {
             collectorId: record.collectorId ?? "",
             agentAssetId: record.agentAssetId,
             agentInstanceId: record.agentInstanceId ?? "",
+            sessionId: record.sessionId ?? record.canonicalSessionId ?? "",
+            runId: record.runId ?? "",
+            traceId: record.traceId ?? "",
             agentProduct: record.agentProduct ?? "",
             classification: record.currentEffectiveClassification,
             interactionType: record.interactionType,
@@ -8066,12 +8075,12 @@ export class ClickHouseStore {
       ...(input.agentInstanceId
         ? ["agentInstanceId = {agentInstanceId:String}"]
         : []),
-      // Correlation anchors are part of the versioned interaction payload.  Keep these
-      // point reads compatible with older ClickHouse tables that do not have dedicated
-      // columns yet; querying a missing column would force an incorrect hot-ring fallback.
-      ...(input.sessionId ? [`JSONExtractString(${AGENT_INTERACTION_TABLE}.payload, 'sessionId') = {sessionId:String}`] : []),
-      ...(input.runId ? [`JSONExtractString(${AGENT_INTERACTION_TABLE}.payload, 'runId') = {runId:String}`] : []),
-      ...(input.traceId ? [`JSONExtractString(${AGENT_INTERACTION_TABLE}.payload, 'traceId') = {traceId:String}`] : []),
+      // Correlation anchors have dedicated scalar columns so point reads do not parse large
+      // interaction payloads across the whole MergeTree. Older rows remain discoverable through
+      // the bounded hot ring until they naturally age out or are rewritten.
+      ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
+      ...(input.runId ? ["runId = {runId:String}"] : []),
+      ...(input.traceId ? ["traceId = {traceId:String}"] : []),
       ...(input.interactionId
         ? ["interactionId = {interactionId:String}"]
         : []),
