@@ -7646,6 +7646,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       compatibilityEventId,
       meta.rawObservationId,
     ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    // A collector payload can be structurally valid while omitting its event clock (for example
+    // during a cold-start socket reassembly).  Do not lose the immutable observation at the raw
+    // commit fence in that case: use the API receive clock, mark the quality explicitly, and let
+    // semantic/session resolution retain the coverage boundary.  This is bounded to the
+    // Observer raw lane; it never fabricates provider or application timestamps.
+    const rawEventAtUnixNs = trustedMeta.eventAtUnixNs
+      ?? trustedMeta.receivedAtUnixNs
+      ?? String(BigInt(Date.now()) * 1_000_000n);
+    const rawReceivedAtUnixNs = trustedMeta.receivedAtUnixNs
+      ?? rawEventAtUnixNs;
+    const rawTimeFallback = trustedMeta.eventAtUnixNs === undefined;
     const committed = await this.canonicalObservability.commitObserverLine(line, {
       sourceId: context.sourceId ?? sourceResolution.source?.sourceId,
       collectorId: context.collectorId ?? sourceResolution.source?.collectorId,
@@ -7653,8 +7664,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       sourceSequence: context.sourceEventId,
       sourceRefs: compatibilitySourceRefs,
       eventKind: observerLineEventKind(line) ?? trustedMeta.eventKind,
-      eventAtUnixNs: trustedMeta.eventAtUnixNs,
-      receivedAtUnixNs: trustedMeta.receivedAtUnixNs,
+      eventAtUnixNs: rawEventAtUnixNs,
+      receivedAtUnixNs: rawReceivedAtUnixNs,
       observationId: trustedMeta.rawObservationId,
       revision: trustedMeta.rawObservationRevision,
       processGenerationKey: trustedProcess ? processGenerationKey : undefined,
@@ -7677,7 +7688,19 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         },
       };
     }
-    const attached = this.canonicalObservability.attachMeta(trustedMeta, committed.observation);
+    const attached = this.canonicalObservability.attachMeta(
+      rawTimeFallback
+        ? {
+            ...trustedMeta,
+            eventTimeQuality: 'api_received',
+            attributes: {
+              ...(trustedMeta.attributes ?? {}),
+              'anysentry.event_time_fallback': 'api_received',
+            },
+          }
+        : trustedMeta,
+      committed.observation,
+    );
     // `attachMeta` is an additive public projection and therefore returns a fresh object.  Carry
     // the server-only capability across that clone; otherwise the Judge would silently downgrade
     // an already-authorized application/adapter claim after the canonical raw commit.
