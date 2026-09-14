@@ -8058,10 +8058,11 @@ export class ClickHouseStore {
       ),
     ].slice(0, 5_000);
     const exactMembershipRead = interactionIds.length > 0;
+    const correlationPointRead = Boolean(input.sessionId || input.runId || input.traceId);
     const fairPerAgentLimit =
-      exactMembershipRead || input.fairPerAgentLimit === undefined
+      exactMembershipRead || (!correlationPointRead && input.fairPerAgentLimit === undefined)
         ? undefined
-        : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit)));
+        : Math.max(1, Math.min(256, Math.trunc(input.fairPerAgentLimit ?? input.limit ?? 100)));
     const limit = exactMembershipRead
       ? Math.max(1, Math.min(5_000, input.limit ?? interactionIds.length))
       : fairPerAgentLimit
