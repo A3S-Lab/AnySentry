@@ -588,6 +588,7 @@ try {
   });
 
   const observerSource = await createSource({ name: `Observer ${collectorId}`, type: 'observer', collectorId,
+    tags: ['managed-observer'],
     correlationClaims: { enabled: true, authority: 'observer_runtime', bindings: { collectorIds: [collectorId] } } });
   const adapterSource = await createSource({ name: `Adapter ${runSuffix}`, type: 'custom', workspacePath,
     correlationClaims: { enabled: true, authority: 'agent_adapter', bindings: {
