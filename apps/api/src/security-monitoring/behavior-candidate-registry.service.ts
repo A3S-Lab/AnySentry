@@ -12,8 +12,11 @@ export class BehaviorCandidateRegistry {
   });
 
   observe(event: JudgedEvent): BehaviorAgentScore | undefined {
-    if (event.classificationSemantics?.identityClassification !== 'unknown' &&
-        event.attribution?.classification !== 'unknown') return undefined;
+    const semantic = event.classificationSemantics?.identityClassification;
+    const attributed = event.attribution?.classification;
+    // Cold-start events often have no identity envelope yet. Treat an absent classification as
+    // unknown; only an explicit confirmed/probable/non-agent fact fences behavior discovery.
+    if ((semantic && semantic !== 'unknown') || (attributed && attributed !== 'unknown')) return undefined;
     return this.scorer.observe(event);
   }
 
