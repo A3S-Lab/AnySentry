@@ -3979,14 +3979,7 @@ function handleLine(raw, fromDeferred = false) {
   const processClassification = attributor.classify(o);
   const workloadClassification = workloadCache.classify(o);
   const activity = classifyEventActivity(o, processClassification, workloadClassification);
-  // A workload snapshot often carries the stable container/pod name and image while the raw
-  // kernel event only carries a cgroup id. Evaluate templates against both views so a generic
-  // deployment/image template can classify the first event without requiring a tool-specific
-  // argv signature or waiting for a later lineage enrichment.
-  const templateClassification = mergeAttributionClassifications(
-    templateRegistry.classifyEvent(o),
-    templateRegistry.classifyEntry(workloadClassification?.attribution?.workloadRef),
-  );
+  const templateClassification = templateRegistry.classifyEvent(o);
   const baseClassification = mergeAttributionClassifications(
     processClassification,
     workloadClassification,
