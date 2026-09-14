@@ -3174,7 +3174,7 @@ export class AggregationService implements OnModuleDestroy {
         && (!exactMembershipRead || exactInteractionIds.has(item.interactionId))
         && (!filter.interactionId || item.interactionId === filter.interactionId)
         && (!filter.sessionId || item.sessionId === filter.sessionId || item.canonicalSessionId === filter.sessionId)
-        && (!filter.runId || item.runId === filter.runId)
+        && (!filter.runId || item.runId === filter.runId || item.producerRunId === filter.runId)
         && (!filter.traceId || item.traceId === filter.traceId)
         && (!filter.interactionType || item.interactionType === filter.interactionType)
         && (!filter.routeShape || item.routeShape === filter.routeShape)
