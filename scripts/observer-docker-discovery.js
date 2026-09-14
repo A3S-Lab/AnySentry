@@ -283,9 +283,13 @@ class DockerDiscovery {
     this.streamFactory = options.streamFactory;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.timeoutMs = boundedNumber(options.timeoutMs, 5_000, 250, 120_000);
+    // Container start/stop events are normally delivered through the Docker event stream. Keep
+    // a short bounded reconciliation interval as a recovery path: after a daemon or Observer
+    // restart the event stream can be established after a container has already started, and a
+    // one-minute default leaves the TLS admission scope stale for the whole first interaction.
     this.refreshMs = boundedNumber(
       options.refreshMs ?? Number(process.env.ANYSENTRY_DOCKER_REFRESH_SECS) * 1000,
-      60_000,
+      10_000,
       1_000,
       3_600_000,
     );
