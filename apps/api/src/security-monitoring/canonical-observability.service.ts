@@ -610,7 +610,18 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     }
     const candidate = observerEnvelopeCandidate(line);
     if (candidate !== undefined) {
-      const checked = validateRawObservation(candidate);
+      let checked = validateRawObservation(candidate);
+      // Some older Observer bridges emitted the immutable envelope before adding the
+      // hash-only payload descriptor. Preserve the envelope identity and event kind while
+      // repairing only that missing descriptor from the original line. This keeps the raw
+      // commit fence useful for semantic projection without accepting arbitrary producer data.
+      if (!checked.ok && checked.reason.includes('payload')) {
+        const fallback = rawObservationFromLine(line, resolvedContext);
+        const repaired = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+          ? { ...(candidate as Record<string, unknown>), payload: fallback.payload }
+          : candidate;
+        checked = validateRawObservation(repaired);
+      }
       if (checked.ok) {
         // The envelope may be supplied by an untrusted bridge. Rebind transport authority and
         // idempotency to the server-resolved Source context before committing; otherwise a caller
