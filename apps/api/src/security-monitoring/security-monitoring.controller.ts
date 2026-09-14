@@ -10,6 +10,7 @@ import {
   enrichAgentConversationDirectoryV2,
   projectAgentConversationDirectory,
 } from './agent-conversation-directory';
+import { projectAgentConversations } from './agent-conversation';
 import { projectSemanticConversationTimeline } from './agent-semantic-timeline';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
@@ -12179,7 +12180,29 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     query: CanonicalEntityQuery,
     headers: HeaderBag,
   ): Promise<CanonicalSessionProjection> {
-    const conversations = await this.agg.agentConversations({
+    const memberships = query.sessionId
+      ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
+      : await this.canonicalObservability.listDurableSessionMemberships(512);
+    let conversations: T.AgentConversationList;
+    if (memberships.length > 0 && query.sessionId) {
+      const selected = await this.agg.agentInteractions({
+        scope: 'raw',
+        interactionIds: memberships.map((membership) => membership.interactionId).filter((id): id is string => Boolean(id)),
+        limit: 5_000,
+      });
+      const projection = projectAgentConversations(selected.items, [], { scope: 'raw' });
+      conversations = {
+        items: projection.summaries,
+        total: projection.summaries.length,
+        totalMode: 'exact',
+        coverage: selected.coverage,
+        dataSource: selected.dataSource,
+        classificationView: query.classificationView ?? 'current_effective',
+        reviewRevision: 0,
+        updateTime: new Date().toISOString(),
+      };
+    } else {
+      conversations = await this.agg.agentConversations({
       timeType: query.timeType,
       startTime: query.startTime,
       endTime: query.endTime,
@@ -12199,7 +12222,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       // reconciliation; asking ClickHouse for 500 wide summaries first can trigger a global sort
       // and exceed the node memory limit under ordinary history volume.
       limit: CANONICAL_SEMANTIC_SESSION_SCAN_MAX,
-    });
+      });
     // Exact Session reads should remain point-oriented. Loading the entire membership lane before
     // reconciling one conversation makes a small deep link pay for a large PostgreSQL/WAL scan.
     // Resolve the bounded interaction ID set first and fetch only those membership rows; broad
@@ -12207,6 +12230,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const memberships = query.sessionId
       ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
       : await this.canonicalObservability.listDurableSessionMemberships(512);
+    }
     const membershipBySession = new Map<string, T.SessionMembership[]>();
     for (const membership of memberships) {
       const values = membershipBySession.get(membership.sessionId) ?? [];

@@ -1833,6 +1833,8 @@ export interface AgentInteractionRecord {
 }
 
 export interface AgentInteractionQuery extends SecurityTimeFilter {
+  /** Immutable member IDs for bounded canonical Session reads. */
+  interactionIds?: readonly string[];
   /** Exact application correlation anchors for canonical point reads. */
   sessionId?: string;
   runId?: string;

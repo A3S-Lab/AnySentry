@@ -554,6 +554,7 @@ for (const durable of [true, false]) {
 const { SecurityMonitoringController } = require('../apps/api/dist/security-monitoring/security-monitoring.controller.js');
 const controller = Object.create(SecurityMonitoringController.prototype);
 controller.agg = canonicalRead.agg;
+controller.agg.agentInteractions = async () => ({ items: canonicalRecords, coverage: { partial: false }, dataSource: 'clickhouse' });
 controller.canonicalCurrentRevision = () => 1;
 controller.canonicalRevisionCoverage = (_query, _revision, coverage) => coverage;
 controller.canonicalObservability = { listDurableSessionMemberships: async () =>
@@ -566,7 +567,7 @@ const sessionQuery = { sessionId: canonicalSession, limit: 20, offset: 0 };
 const sessionProjection = await controller.computeCanonicalSessionResources(sessionQuery, {});
 assert.deepEqual(sessionProjection.items[0].interactionIds.sort(), canonicalSelection.interactionIds);
 assert.ok(sessionProjection.items[0].turnCount > 0, 'Session resource must retain semantic content');
-controller.agg = { agentConversations: async () => ({
+controller.agg = { agentInteractions: async () => ({
   items: [], coverage: { partial: true, partialReason: 'storage_unavailable' }, dataSource: 'hot_ring',
 }) };
 const missingProjection = await controller.computeCanonicalSessionResources(sessionQuery, {});

@@ -3064,7 +3064,9 @@ export class AggregationService implements OnModuleDestroy {
   }
 
   async agentInteractions(filter: T.AgentInteractionQuery): Promise<T.AgentInteractionList> {
-    return this.readAgentInteractions(filter);
+    return this.readAgentInteractions(filter, filter.interactionIds
+      ? { interactionIds: filter.interactionIds, membershipDurable: true, totalLimit: filter.interactionIds.length }
+      : {});
   }
 
   /**
