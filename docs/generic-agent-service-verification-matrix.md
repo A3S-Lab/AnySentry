@@ -307,3 +307,13 @@ and lower concurrency did not reduce the source/backlog rate. No new WAL JSON re
 This experiment is runtime-only and is not a product default change. The evidence points away from
 simple batch size/concurrency tuning; the next diagnostic must expose Forwarder ACK/retry counters
 and the API request-abort boundary.
+
+### 2026-09-15 request-abort diagnostic deployment
+
+Commit `50f763f` adds a post-route Express error handler for body-parser aborts. It records only
+method, path, content length, source ID, batch ID and error type/code; request bodies, bearer tokens
+and arbitrary headers are excluded. The API image was rebuilt and deployed as
+`127.0.0.1:5000/anysentry:abort-diagnostics-50f763f` with digest
+`sha256:7fc061861b0316082a858f73d74afb7fb070976c077202db905bf86f96100b4e`; the old ReplicaSet
+terminated and the new Pod became ready. A fresh abort sample is still required before claiming
+that the diagnostic closes the WAL loss boundary.
