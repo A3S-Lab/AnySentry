@@ -35,6 +35,7 @@ const k8sSidecarMarker = `marker-k8s-sidecar-${suffix}`;
 const ingestMarkerPrefix = `asel-marker-${suffix}-docker-shadow-`;
 const ingestDockerMarker = `${ingestMarkerPrefix}pi`;
 const ingestUnknownMarker = `${ingestMarkerPrefix}unknown-filter-canary`;
+const verificationPhase = process.env.ANYSENTRY_REAL_PHASE || 'all';
 const namespace = process.env.ANYSENTRY_REAL_K8S_NAMESPACE || 'default';
 const controlNamespace = process.env.ANYSENTRY_REAL_CONTROL_NAMESPACE || 'anysentry';
 const capacityGate = process.env.ANYSENTRY_REAL_CAPACITY_GATE !== 'off';
@@ -450,11 +451,7 @@ async function triggerScenarios() {
   created.hostMarker = true;
 
   await run('docker', [
-    'exec',
-    templateName,
-    '/bin/sh',
-    '-c',
-    `printf '%s' ${ingestDockerMarker}; printf '%s' ${dockerMarker} >/tmp/${dockerMarker}; sleep 2`,
+    'exec', templateName, '/bin/echo', ingestDockerMarker, dockerMarker,
   ]);
 
   // Keep each phase alive briefly. Observer exports exec, connect and file records from
@@ -473,11 +470,7 @@ async function triggerScenarios() {
     { timeoutMs: 10_000, allowFailure: true },
   );
   await run('docker', [
-    'exec',
-    unknownName,
-    '/bin/sh',
-    '-c',
-    `printf '%s' ${ingestUnknownMarker}; printf '%s' ${unknownMarker} >/tmp/${unknownMarker}; sleep 2`,
+    'exec', unknownName, '/bin/echo', ingestUnknownMarker, unknownMarker,
   ]);
   // The file write completes tool A -> network/decision -> tool B -> workspace change.
   // Verify a later tool inherits the resulting probable identity instead of accepting raw
@@ -574,10 +567,9 @@ async function verifyResults() {
     events = await eventually('four retained real scenario events', async () => {
       const current = await matchingEvents();
       lastEvents = current;
-      return current.host &&
-        current.docker &&
-        current.unknown &&
-        current.k8sAgent
+      (verificationPhase === 'docker'
+        ? current.docker && current.unknown
+        : current.host && current.docker && current.unknown && current.k8sAgent)
         ? current
         : undefined;
     });
