@@ -12425,6 +12425,55 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         resolutionRevision: membership.resolutionRevision,
       });
     }
+    // Session coverage must not depend exclusively on the time-windowed ClickHouse timeline.
+    // The canonical semantic lane is durable and can remain available after that projection has
+    // expired. Reconcile a bounded record set by immutable Session/Interaction identifiers so a
+    // deep link reports the real semantic coverage instead of degrading to asset_only.
+    if (resourcesByKey.size > 0) {
+      try {
+        const durableRecords = await withCanonicalProjectionTimeout(
+          this.canonicalObservability.listDurableSemanticRecords(
+            query.sessionId ? 2_048 : Math.min(2_048, resourcesByKey.size * 64),
+          ),
+          CANONICAL_SEMANTIC_EVIDENCE_TIMEOUT_MS,
+        );
+        for (const resource of resourcesByKey.values()) {
+          const interactionIds = new Set(resource.interactionIds);
+          const records = durableRecords.filter((record) =>
+            (record.canonicalSessionId === resource.sessionId
+              || record.sessionId === resource.sessionId
+              || record.canonicalSessionId === resource.canonicalSessionId
+              || record.sessionId === resource.canonicalSessionId
+              || record.sourceRefs.some((ref) => interactionIds.has(ref)))
+            && (!query.sessionId || record.canonicalSessionId === query.sessionId
+              || record.sessionId === query.sessionId
+              || record.sourceRefs.some((ref) => interactionIds.has(ref))),
+          );
+          if (records.length === 0) continue;
+          const completeInteractions = new Set(
+            records.filter((record) => record.completeness === 'complete')
+              .flatMap((record) => record.sourceRefs.filter((ref) => interactionIds.has(ref))),
+          ).size;
+          const partialInteractions = new Set(
+            records.filter((record) => record.completeness !== 'complete')
+              .flatMap((record) => record.sourceRefs.filter((ref) => interactionIds.has(ref))),
+          ).size;
+          const hasPartial = records.some((record) => record.completeness !== 'complete');
+          resource.coverage = {
+            status: hasPartial || completeInteractions < interactionIds.size ? 'partial' : 'complete',
+            reasons: hasPartial || completeInteractions < interactionIds.size
+              ? [...new Set(resource.coverage.reasons.filter((reason) => reason !== 'semantic_projection_expired_or_missing'))]
+              : [],
+            completeInteractions,
+            partialInteractions,
+          };
+        }
+      } catch (error) {
+        if (!isCanonicalProjectionDegradation(error)) throw error;
+        // Keep the existing explicit projection gap; durable storage was unavailable within the
+        // bounded read budget and must not be represented as complete.
+      }
+    }
     const resources = [...resourcesByKey.values()].filter((resource) => canonicalScopeMatches({
       logicalAgentId: resource.logicalAgentId,
       logicalAgentCandidateId: resource.logicalAgentCandidateId,
