@@ -18,6 +18,22 @@
 `turn.items`；脚本现在兼容两种响应形状，避免把已经持久化的事件误判为空。该修复只影响测试脚本，不改变产品
 事件模型。仍未据此宣称 KernelFact 与 Tool evidence 已完成唯一双向 canonical 关联。
 
+## 2026-09-14 Design B 延迟投影复核
+
+重启开发机后重新构建并启动 customer lab 的 Design B，实际 `/runs` 返回 `completed`，orchestrator、worker 和
+sandbox 的健康检查均通过。Observer 日志确认已附加到三个 customer PID，并出现完整 HTTP interaction reassembly；
+Collector 窗口的 `output_dropped`、三个优先级队列 dropped、sequence gap 和 body-limit drop 均为 0。
+
+严格验收脚本在前 120 秒内点查到 `coverage.partial=false` 但当前 run 为 0 条 interaction，因此正确拒绝使用历史
+thread。服务清理后继续对同一 run 做只读点查，最终得到 8 条当前 run interaction，包含 `/runs`、`/execute` 和 6 条
+`/v1/chat/completions`；全部 `captureSource=tcp_plaintext`、`transportCompleteness=complete`、
+`wireCompleteness=complete`，其中部分语义项为合法的 `tool_pending`。该证据表明本次主要偏差是 F3 canonical
+投影/查询可见性延迟，不能把 120 秒内的 0 条直接解释成 Collector 丢失。
+
+同时将 `customer-langgraph-sim-lab/scripts/verify-observer.sh` 的 canonical 等待窗口改为默认 600 秒，并加入失败
+时自动清理两个 compose 项目的容器、volume 和网络；仍可用 `KEEP_LAB_SERVICES=1` 显式保留服务。该脚本改动位于
+customer lab 外部目录，不作为 AnySentry 产品代码提交。
+
 ## 已通过的本地验证
 
 | 能力 | 验证入口 | 结果 | 证据范围 |
