@@ -298,3 +298,12 @@ WAL 的磁盘大小包含 PUT/ACK 历史，只有结合存活记录数、ACK 和
 追加污染第二次重启；中间行损坏仍拒绝加载。JSON 解析错误只记录结构信息，不输出正文片段。
 `node scripts/verify-forwarder-spool-replay.mjs` 通过，包括两次重启、UTF-8 新记录保留和错误脱敏。
 该新增代码尚未重新构建到 Observer 镜像，不能据此声明已部署修复。
+### 2026-09-15 batch pressure experiment
+
+The live Observer DaemonSet was temporarily tested with `FORWARD_BATCH_MAX_BYTES=131072` and
+`FORWARD_MAX_INFLIGHT=2`, then restored to its prior configuration. The recovery WAL grew from
+approximately 109.3 MB to 112.9 MB in 20 seconds during the constrained run, so smaller batches
+and lower concurrency did not reduce the source/backlog rate. No new WAL JSON read errors appeared.
+This experiment is runtime-only and is not a product default change. The evidence points away from
+simple batch size/concurrency tuning; the next diagnostic must expose Forwarder ACK/retry counters
+and the API request-abort boundary.
