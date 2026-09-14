@@ -399,7 +399,7 @@ async function startCollector(snapshotPort, nodeName) {
   });
   await eventually('Docker and Kubernetes identity snapshots', async () => {
     const health = await api('/collectors/health', {
-      timeType: 'last_30d',
+      timeType: 'last_1h',
       collectorId,
       limit: 5,
     });
@@ -492,13 +492,13 @@ async function triggerScenarios() {
 async function matchingEvents() {
   const find = async (marker, predicate) => {
     const result = await api('/events/list', {
-      timeType: 'last_30d',
+      timeType: 'last_1h',
       collectorId,
       includeBenign: true,
       eventKind: 'ToolExec',
       scope: 'raw',
       q: marker,
-      limit: 20,
+      limit: 10,
     });
     const candidates = result.items?.filter(
       (candidate) => JSON.stringify(candidate).includes(marker),
