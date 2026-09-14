@@ -526,6 +526,12 @@ assert.match(membershipSql, /WITH RECURSIVE thread_ids/u);
 assert.match(membershipSql, /newer\.resolution_revision > candidate\.resolution_revision/u);
 assert.match(membershipSql, /NOT EXISTS[\s\S]*current\.interaction_id = binding\.interaction_id/u);
 assert.deepEqual(membershipParams, [longConversationId, 5_001]);
+assert.deepEqual(
+  await relationalStore.loadAgentConversationInteractionIds(`sess_${'a'.repeat(24)}`, 12),
+  { interactionIds: ['mi_sql_member'], truncated: false },
+);
+assert.match(membershipSql, /FROM anysentry_session_memberships_v1 AS candidate/u);
+assert.deepEqual(membershipParams, [`sess_${'a'.repeat(24)}`, 13]);
 
 // V2 memberships/anchors are historical decisions. Keep a source-level guard alongside the
 // executable SQL mock so a future migration cannot reintroduce an in-place DO UPDATE that erases
