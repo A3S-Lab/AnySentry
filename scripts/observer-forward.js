@@ -1141,16 +1141,19 @@ function postJson(url, bodyObj, timeoutMs, done) {
     (res) => {
       response = res;
       res.resume();
-      res.on('end', () => finish((res.statusCode || 500) >= 400));
-      res.on('aborted', () => finish(true));
-      res.on('error', () => finish(true));
+      res.on('end', () => {
+        const statusCode = res.statusCode || 500;
+        finish(statusCode >= 400, statusCode >= 400 ? `http_${statusCode}` : undefined);
+      });
+      res.on('aborted', () => finish(true, 'response_aborted'));
+      res.on('error', (error) => finish(true, error?.code || 'response_error'));
       res.on('close', () => {
-        if (!res.complete) finish(true);
+        if (!res.complete) finish(true, 'response_incomplete');
       });
     },
   );
   activeControlRequests.add(state);
-  req.on('error', () => finish(true));
+  req.on('error', (error) => finish(true, error?.code || 'request_error'));
   absoluteTimer = setTimeout(() => {
     absoluteTimer = undefined;
     timeoutAbortImmediate = setImmediate(() => {
@@ -2530,6 +2533,7 @@ function deliverPendingHeartbeat(done, timeoutMs) {
       // heartbeat transport failure is control evidence, not an event-output loss.
       attributionCounts.heartbeatDeliveryFailures++;
       errorCount++;
+      console.error(`[observer-forward] heartbeat delivery failed: reason=${reason || 'unknown'} collector=${COLLECTOR_ID || 'unset'}`);
     }
     done(Boolean(failed));
   });
