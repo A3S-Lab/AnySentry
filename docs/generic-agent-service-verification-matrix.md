@@ -325,3 +325,19 @@ route handling. A controlled partial request then produced the expected redacted
 `batchId=abort-test-74e1bc5`, `errorType=request.aborted`, `errorCode=ECONNABORTED`. No request body
 or authorization value was logged. The diagnostic seam is now verified; it does not by itself prove
 that ordinary Forwarder batches are accepted or that WAL growth has stopped.
+
+### 2026-09-15 customer LangGraph restart and clean A/B verification
+
+After the host restart, the customer simulation was rebuilt from `/home/chensicheng/a3s/security/customer-langgraph-sim-lab/README.md`. Design A was verified through the existing Kubernetes service (`design=A`, `node_agent_mode=ephemeral_subgraph`): `POST /runs` completed with sandbox exit code 0, stdout `2`, and a run/session correlation tuple (`trace_id=e8276db6fd6ab597be4a87450923baad`, `run_id=session_id=556de716-ea49-42fa-9f7b-022382a028f3`).
+
+Design B was rebuilt with `docker compose -f docker-compose.design-b.yml up -d --build` and verified through both orchestrator and worker health endpoints (`node_agent_mode=remote_http`). Its POST run completed with sandbox exit code 0, stdout `2`, four spans in the local correlation payload, and explicit `parent_session_id` plus `delegation_id` (`trace_id=5dbb405197833520d310f11c02a9c9b0`, `run_id=session_id=cf9bddac-2be4-4ab5-9819-260185d296d4`). The response reported `telemetry_export.enabled=false` because the local simulation has no OTLP/source credential wiring; this is a coverage limitation, not a failed workflow run.
+
+The Docker Design B stack was stopped with `docker compose ... down --remove-orphans`, and the old Kubernetes simulation deployments were scaled to zero after the checks. No simulation container was left running. The customer run artifacts were kept only in temporary `/tmp` files and are not part of the repository.
+
+### 2026-09-15 fresh WAL baseline and delivery capacity
+
+The active Observer heartbeat was accepted after restart (`collectorId=pjnl261070032`), proving the source credential and heartbeat route. Before cleanup, delivery was degraded by `spool_backlog_over_slo` with about 57,550 records and 45,489 parked records. Because this is the development host and historical loss is explicitly allowed, the stale recovery/stable WAL files were truncated while the Observer was stopped, then the DaemonSet was restarted.
+
+The clean baseline eliminated old parked records and restored zero collector drops, but the host still produced more events than the API could drain: after a short window the new WAL had about 2,169 active records and the health channel again reported `spool_backlog_over_slo`. With `FORWARD_BATCH_MAX_BYTES=131072` and `FORWARD_MAX_INFLIGHT=2`, transport errors disappeared in the sample, but delivery remained capacity-bound (141 events accepted in the sampled window while the queue grew). This is evidence for a remaining API/ingest throughput or host-noise capacity problem; it is not evidence to enable global full capture. The runtime tuning was left explicit in the DaemonSet for the controlled baseline and must be revisited before a high-rate endurance claim.
+
+Commit `20483c2` improves forwarder diagnostics by preserving redacted HTTP/status or socket failure reasons for control requests and logging heartbeat delivery failures with only the collector ID.
