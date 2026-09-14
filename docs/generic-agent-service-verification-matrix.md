@@ -266,8 +266,21 @@ contained a worker hop and sandbox execution. The first query window contained s
  Session separation for that invocation.
 
 A subsequent fresh B run `5157aabe-94c2-4da5-b925-b760592f1a8c` returned `completed/remote_ok`,
- but was absent from the bounded interaction result at check time; it remains a delivery-latency
- observation and is not counted as a successful canonical run.
+but was absent from the bounded interaction result at check time; it remains a delivery-latency
+observation and is not counted as a successful canonical run.
+
+### 2026-09-15 B 延迟交付与 WAL 采样
+
+又一次 B 调用 `5157aabe-94c2-4da5-b925-b760592f1a8c` 返回 `completed/remote_ok`，但 20 秒后
+的 500 条交互查询仍未出现该 run；这次调用不计入成功证据。同期查询能够看到前一个
+`09b9cc79-f800-481b-860a-538ebcd4e3d1` 的 6 条记录，说明查询路径不是完全失效，而是存在
+事件交付延迟或容量丢失窗口。
+
+五次、每次间隔 5 秒的运行采样中，当前 recovery WAL 从约 66.9 MB 增长到 71.0 MB；日志未
+出现新的 WAL JSON 读取错误，但 API 日志出现 `request aborted`。Observer 仍报告大量连接重组
+状态，其中部分 HTTP/2 和 WebSocket 状态未完成。当前只能确认持续积压，尚不能把原因归为
+单一的 eBPF、Forwarder 或 ClickHouse 故障；需要补齐 Forwarder ACK/重试指标和 ingest 批次
+响应记录后再调整并发或过滤策略。
 
 The customer A/B containers, networks and dangling images were removed after verification; the
 pre-existing local registry was retained. Observer logs showed bounded reassembly and dynamic PID
