@@ -837,7 +837,8 @@ try {
   const piFiles = await optionalPiFiles();
   if (!piFiles.enabled) {
     await applyObject(list([piDeployment(nodeName)]));
-    await kube(['-n', namespace, 'rollout', 'status', 'deployment/pi-agent', `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
+    await kube(['-n', namespace, 'wait', '--for=condition=available', 'deployment/pi-agent',
+      `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
     console.log(`SKIP real Pi turn: ${piFiles.reason}`);
   } else {
     await applySecret('e2e-pi-runtime', { 'models.json': piFiles.models, 'api-key': piFiles.key });
