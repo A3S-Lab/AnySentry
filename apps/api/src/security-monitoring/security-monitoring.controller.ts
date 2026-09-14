@@ -12865,6 +12865,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           snapshotAsOf: query.snapshotAsOf,
           scope: 'raw',
           classificationView: query.classificationView,
+        includeBackground: true,
           limit: 500,
         }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
         const matched = interactionList.items.find((item) =>
@@ -12883,6 +12884,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             snapshotAsOf: query.snapshotAsOf,
             scope: 'raw',
             classificationView: query.classificationView,
+        includeBackground: true,
             agentInstanceId: session.agentInstanceIds[0],
             limit: 500,
           });
@@ -12894,6 +12896,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               snapshotAsOf: query.snapshotAsOf,
               scope: 'raw',
               classificationView: query.classificationView,
+        includeBackground: true,
               limit: 500,
             });
           }
@@ -12955,6 +12958,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           snapshotAsOf: query.snapshotAsOf,
           scope: 'raw',
           classificationView: query.classificationView,
+        includeBackground: true,
           conversationId: sessionId,
           limit: query.limit,
         }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
@@ -12989,6 +12993,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         snapshotAsOf: query.snapshotAsOf,
         scope: 'raw',
         classificationView: query.classificationView,
+        includeBackground: true,
         conversationId,
         limit: query.limit,
       }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
@@ -13020,6 +13025,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             snapshotAsOf: query.snapshotAsOf,
             scope: 'raw',
             classificationView: query.classificationView,
+        includeBackground: true,
             interactionId: session.interactionIds[0],
             limit: 2,
           }), 1_000);
@@ -13036,6 +13042,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               snapshotAsOf: query.snapshotAsOf,
               scope: 'raw',
               classificationView: query.classificationView,
+        includeBackground: true,
               conversationId,
               limit: query.limit,
             }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
