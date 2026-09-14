@@ -317,3 +317,11 @@ and arbitrary headers are excluded. The API image was rebuilt and deployed as
 `sha256:7fc061861b0316082a858f73d74afb7fb070976c077202db905bf86f96100b4e`; the old ReplicaSet
 terminated and the new Pod became ready. A fresh abort sample is still required before claiming
 that the diagnostic closes the WAL loss boundary.
+
+The first deployment placed the error middleware after `listen` and did not intercept the parser
+exception. Commit `74e1bc5` moves it immediately after the JSON body-parser middleware and before
+route handling. A controlled partial request then produced the expected redacted log on the new Pod:
+`path=/security-center/ingest/batch`, `contentLength=16000000`, `sourceId=diagnostic-test`,
+`batchId=abort-test-74e1bc5`, `errorType=request.aborted`, `errorCode=ECONNABORTED`. No request body
+or authorization value was logged. The diagnostic seam is now verified; it does not by itself prove
+that ordinary Forwarder batches are accepted or that WAL growth has stopped.
