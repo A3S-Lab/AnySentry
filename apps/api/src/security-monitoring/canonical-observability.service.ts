@@ -359,6 +359,20 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncPersistenceFailed = 0;
   private asyncPersistenceDropped = 0;
   private readonly asyncPersistenceTasks = new Set<Promise<void>>();
+  private readonly asyncRawBatchMaxRows = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS',
+    128,
+    1,
+    512,
+  );
+  private readonly asyncRawBatchWindowMs = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_WINDOW_MS',
+    25,
+    1,
+    1_000,
+  );
+  private asyncRawBatchQueue: Array<{ observation: RawObservation; onFailure: () => void }> = [];
+  private asyncRawBatchTimer?: ReturnType<typeof setTimeout>;
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
@@ -428,6 +442,67 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       });
     this.asyncPersistenceTasks.add(task);
     return true;
+  }
+
+  /**
+   * Coalesce raw observations before entering the relational side lane.  The raw hot store has
+   * already accepted each immutable observation, so this queue only controls durable delivery;
+   * failures remain explicit CoverageGaps and never become an implicit ACK.
+   */
+  private enqueueRawObservation(
+    observation: RawObservation,
+    onFailure: () => void,
+  ): boolean {
+    if (!this.sink || this.closed) return false;
+    const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
+    if (this.asyncRawBatchQueue.length >= capacity) {
+      this.asyncPersistenceDropped += 1;
+      try { onFailure(); } catch { /* coverage is best effort */ }
+      return false;
+    }
+    this.asyncRawBatchQueue.push({ observation, onFailure });
+    this.asyncPersistenceScheduled += 1;
+    if (this.asyncRawBatchQueue.length >= this.asyncRawBatchMaxRows) {
+      void this.flushRawObservationBatch();
+    } else if (!this.asyncRawBatchTimer) {
+      this.asyncRawBatchTimer = setTimeout(() => {
+        this.asyncRawBatchTimer = undefined;
+        void this.flushRawObservationBatch();
+      }, this.asyncRawBatchWindowMs);
+      this.asyncRawBatchTimer.unref?.();
+    }
+    return true;
+  }
+
+  private async flushRawObservationBatch(): Promise<void> {
+    if (this.asyncRawBatchQueue.length === 0 || this.closed) return;
+    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) return;
+    const batch = this.asyncRawBatchQueue.splice(0, this.asyncRawBatchMaxRows);
+    this.asyncPersistenceInFlight += 1;
+    const task = Promise.resolve()
+      .then(() => this.sink?.saveRawObservations?.(batch.map(({ observation }) => observation)) ?? false)
+      .then((durable) => {
+        if (durable) {
+          this.asyncPersistenceCompleted += batch.length;
+          return;
+        }
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) {
+          try { item.onFailure(); } catch { /* coverage is best effort */ }
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) {
+          try { item.onFailure(); } catch { /* coverage is best effort */ }
+        }
+      })
+      .finally(() => {
+        this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+        if (this.asyncRawBatchQueue.length > 0) void this.flushRawObservationBatch();
+      });
+    this.asyncPersistenceTasks.add(task);
   }
 
   registryCatalog(): {
@@ -507,10 +582,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         sideLaneGap = this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
       };
       if (this.asyncPersistence) {
-        const admitted = await this.writeCanonicalSideLane(
-          () => this.sink!.saveRawObservations!([sanitized]),
-          failure,
-        );
+        const admitted = this.enqueueRawObservation(sanitized, failure);
         // In async mode a task admitted to the bounded side lane is intentionally hot-only from
         // the request's perspective; its eventual durable result is reflected by metrics/gaps.
         if (!admitted) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
@@ -1454,6 +1526,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
 
   close(): void {
     if (this.closed) return;
+    if (this.asyncRawBatchTimer) clearTimeout(this.asyncRawBatchTimer);
+    this.asyncRawBatchTimer = undefined;
+    for (const item of this.asyncRawBatchQueue) {
+      this.asyncPersistenceDropped += 1;
+      try { item.onFailure(); } catch { /* coverage is best effort */ }
+    }
+    this.asyncRawBatchQueue = [];
     this.closed = true;
     this.raw.close();
     this.kernel.close();
