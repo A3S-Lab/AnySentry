@@ -534,7 +534,11 @@ async function matchingEvents() {
     ) ?? [];
     return {
       total: result.total,
-      event: candidates.find(predicate),
+      // Durable API revisions can return the same marker with an earlier pre-promotion
+      // classification before the later behavioral revision. Prefer the predicate match, then
+      // the strongest retained candidate from the same marker set.
+      event: candidates.find(predicate) || candidates.find((candidate) =>
+        candidate.attribution?.classification === 'probable_agent'),
       observed: candidates.slice(0, 5).map((candidate) => ({
         eventId: candidate.eventId,
         subject: candidate.subject,
