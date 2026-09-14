@@ -3180,6 +3180,15 @@ function finishBatch(batch, outcome, retryDelivery) {
     );
   }
   if (rejectedItems.length) {
+    const rejectedKinds = [...new Set(rejectedItems.map((item) => {
+      try {
+        const parsed = JSON.parse(item.body);
+        return parsed?.eventKind || parsed?.observerEvent?.eventKind || 'unknown';
+      } catch {
+        return 'malformed';
+      }
+    }))];
+    console.error(`[observer-forward] rejected event details count=${rejectedItems.length} kinds=${rejectedKinds.join(',') || 'unknown'} reason=${outcome.reason || 'permanent ingest rejection'}`);
     spool.deadLetter(
       rejectedItems
         .filter((item) => item.spoolId)
