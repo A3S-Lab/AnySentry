@@ -416,3 +416,11 @@ writes. The canary therefore improves F2 delivery but does not satisfy the canon
 The async canary was reverted to synchronous persistence after measurement. Further work must reduce
 PostgreSQL transaction/advisory-lock cost or introduce a durable, lossless raw sink queue before
 making async batch persistence a default.
+
+### 2026-09-15 raw batch queue byte bound
+
+Commit `11eff9e` adds an explicit byte bound to the asynchronous raw batch queue in addition to
+row count, in-flight batch count, and time window. Queue diagnostics now expose rows, bytes, and
+configured limits through `canonicalObservability.gaps`; the shutdown path clears the byte accounting
+while recording every pending item as a coverage/drop outcome. The deterministic raw batching test
+continues to pass after this change.
