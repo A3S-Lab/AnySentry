@@ -7,6 +7,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const baseUrl = (
   process.env.ANYSENTRY_API_BASE ??
@@ -15,6 +18,7 @@ const baseUrl = (
 const managementToken = String(process.env.ANYSENTRY_REAL_MANAGEMENT_TOKEN || '').trim();
 const image = String(process.env.ANYSENTRY_REAL_OBSERVER_IMAGE || '').trim();
 const suffix = `${Date.now().toString(36)}-${process.pid}`;
+const testStartedAt = new Date(Date.now() - 5_000).toISOString();
 const collectorName = `anysentry-filter-chain-${suffix}`;
 const templateName = `anysentry-template-chain-${suffix}`;
 const unknownName = `anysentry-unknown-chain-${suffix}`;
@@ -147,7 +151,7 @@ async function eventually(label, check, timeoutMs = 45_000) {
       last = error;
       firstError ||= error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
   const format = (value) => value instanceof Error ? value.message : JSON.stringify(value);
   throw new Error(
@@ -259,6 +263,7 @@ async function createSnapshotServer(pod) {
   service.readyNamespaces.add(namespace);
   service.rebuild();
   const snapshot = service.snapshot(pod.spec.nodeName);
+  const baseProjection = await api('/filter-rules/projections/forwarder');
   const agentEntry = snapshot.entries.find((entry) => entry.containerName === 'agent');
   const sidecarEntry = snapshot.entries.find((entry) => entry.containerName === 'metrics');
   assert.equal(agentEntry?.classification, 'confirmed_agent');
@@ -281,6 +286,11 @@ async function createSnapshotServer(pod) {
     },
   };
   snapshotServer = http.createServer((request, response) => {
+    if (request.url?.startsWith('/filter-projection')) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(discoveryProjection(baseProjection)));
+      return;
+    }
     if (request.url?.startsWith('/snapshot')) {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify(snapshot));
@@ -322,22 +332,39 @@ async function startTemplateContainer() {
   created.template = true;
 }
 
-export function collectorLaunch(snapshotPort, nodeName, credentials, controlToken, observerImage, apiBase) {
-  const containerApi = apiBase.replace('127.0.0.1', 'host.docker.internal');
-  const templates = JSON.stringify([
+function discoveryTemplates() {
+  return [
     {
       id: 'real-host-template',
       agentId: 'real-host-template-agent',
       deployment: 'host',
-      name: hostExecutableName,
+      match: { command: `${hostExecutablePath}*` },
     },
     {
       id: 'real-docker-template',
       agentId: 'real-docker-template-agent',
       deployment: 'docker',
-      name: templateName,
+      match: { container: templateName },
     },
-  ]);
+  ];
+}
+
+// The API projection owns runtime templates after hot load. Keep test-only bindings in the
+// temporary control-plane fixture, not in an env bootstrap that the first refresh replaces.
+// All capture and retention rules remain those served by the real API.
+export function discoveryProjection(base, now = Date.now()) {
+  const { filterRuleDigest } = require('../apps/api/dist/security-monitoring/filter-rule-builtins.js');
+  const { projectionIntentDigest } = require('./observer-unified-filter-policy.js');
+  const { contentHash: _hash, ...projection } = structuredClone(base);
+  projection.generatedAt = new Date(now).toISOString();
+  projection.expiresAt = new Date(now + 120_000).toISOString();
+  projection.agentTemplates.templates.push(...discoveryTemplates());
+  projection.intentHash = projectionIntentDigest(projection);
+  return { ...projection, contentHash: filterRuleDigest(projection) };
+}
+
+export function collectorLaunch(snapshotPort, nodeName, credentials, controlToken, observerImage, apiBase) {
+  const containerApi = apiBase.replace('127.0.0.1', 'host.docker.internal');
   // Pass values through the Docker client's environment. In particular, credentials must never
   // appear in its argv or in the command text used by error diagnostics.
   const environment = {
@@ -359,6 +386,7 @@ export function collectorLaunch(snapshotPort, nodeName, credentials, controlToke
     ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN: controlToken,
     ANYSENTRY_IDENTITY_SNAPSHOT_URL: `http://host.docker.internal:${snapshotPort}/snapshot`,
     ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '1',
+    ANYSENTRY_FILTER_RULE_PROJECTION_URL: `http://host.docker.internal:${snapshotPort}/filter-projection`,
     ANYSENTRY_HEARTBEAT_SECS: '2',
     ANYSENTRY_DOCKER_DISCOVERY: 'on',
     FORWARD_MAX_OUTSTANDING_EVENTS: '256',
@@ -366,7 +394,6 @@ export function collectorLaunch(snapshotPort, nodeName, credentials, controlToke
     FORWARD_WAL_PENDING_MAX_EVENTS: '512',
     FORWARD_WAL_PENDING_MAX_BYTES: '16777216',
     FORWARD_SCOPE: 'shadow',
-    ANYSENTRY_AGENT_TEMPLATES_JSON: templates,
     ANYSENTRY_SOURCE_TYPE: 'observer',
     ANYSENTRY_SOURCE_NAME: 'real-agent-filter-chain',
   };
@@ -405,6 +432,7 @@ async function startCollector(snapshotPort, nodeName) {
     });
     const metrics = health.items?.[0]?.filterMetrics;
     return metrics?.dockerReady &&
+      metrics.templateLoaded >= 2 &&
       metrics.identitySnapshotReady
       ? metrics
       : undefined;
@@ -414,7 +442,7 @@ async function startCollector(snapshotPort, nodeName) {
 async function triggerScenarios() {
   await symlink('/bin/sh', hostExecutablePath);
   created.hostExecutable = true;
-  await run(hostExecutablePath, ['-c', `printf '%s' ${hostMarker} >${hostMarkerPath}`]);
+  await run(hostExecutablePath, ['-c', `printf '%s' ${hostMarker} >${hostMarkerPath}; sleep 2`]);
   created.hostMarker = true;
 
   await run('docker', [
@@ -490,18 +518,11 @@ async function triggerScenarios() {
 }
 
 async function matchingEvents() {
-  // Fetch one bounded collector-scoped page and filter markers locally. A separate q query for
-  // every marker expands the durable search scan budget (up to thousands of wide rows) and can
-  // starve the API under a host-wide privileged Collector smoke test.
-  const result = await api('/events/list', {
-    timeType: 'last_1h',
-    collectorId,
-    includeBenign: true,
-    eventKind: 'ToolExec',
-    scope: 'raw',
-    limit: 100,
-  });
-  const find = (marker, predicate) => {
+  const find = async (marker, predicate) => {
+    const result = await api('/events/list', {
+      timeType: 'custom', startTime: testStartedAt, endTime: new Date().toISOString(),
+      collectorId, includeBenign: true, eventKind: 'ToolExec', scope: 'raw', q: marker, limit: 10,
+    });
     const candidates = result.items?.filter(
       (candidate) => JSON.stringify(candidate).includes(marker),
     ) ?? [];
@@ -516,17 +537,17 @@ async function matchingEvents() {
       })),
     };
   };
-  const host = find(hostMarker, (event) => event.attribution?.source === 'self_register');
-  const docker = find(dockerMarker, (event) => event.attribution?.source === 'self_register');
-  const unknown = find(unknownMarker, (event) => event.attribution?.source === 'behavior');
-  const k8sAgent = find(
-    k8sAgentMarker,
-    (event) =>
-      event.attribution?.source === 'kubernetes' &&
+  const host = await find(hostMarker, (event) => event.attribution?.source === 'self_register');
+  const docker = await find(dockerMarker, (event) => event.attribution?.source === 'self_register');
+  const unknown = await find(unknownMarker, (event) => event.attribution?.source === 'behavior');
+  const k8sAgent = await find(
+      k8sAgentMarker,
+      (event) =>
+        event.attribution?.source === 'self_register' &&
       event.attribution?.classification === 'confirmed_agent',
   );
   return {
-    total: host.total + docker.total + unknown.total + k8sAgent.total,
+    total: result.total,
     host: host.event,
     docker: docker.event,
     unknown: unknown.event,
