@@ -453,7 +453,7 @@ async function triggerScenarios() {
   created.hostMarker = true;
 
   await run('docker', [
-    'exec', templateName, '/bin/echo', ingestDockerMarker, dockerMarker,
+    'exec', templateName, 'node', '-e', 'setTimeout(() => {}, 5000)', ingestDockerMarker, dockerMarker,
   ]);
 
   // Keep each phase alive briefly. Observer exports exec, connect and file records from
@@ -472,7 +472,7 @@ async function triggerScenarios() {
     { timeoutMs: 10_000, allowFailure: true },
   );
   await run('docker', [
-    'exec', unknownName, '/bin/echo', ingestUnknownMarker, unknownMarker,
+    'exec', unknownName, 'node', '-e', 'setTimeout(() => {}, 5000)', ingestUnknownMarker, unknownMarker,
   ]);
   // The file write completes tool A -> network/decision -> tool B -> workspace change.
   // Verify a later tool inherits the resulting probable identity instead of accepting raw
