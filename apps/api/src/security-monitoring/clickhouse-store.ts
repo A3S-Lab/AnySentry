@@ -8066,6 +8066,9 @@ export class ClickHouseStore {
       ...(input.agentInstanceId
         ? ["agentInstanceId = {agentInstanceId:String}"]
         : []),
+      ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
+      ...(input.runId ? ["runId = {runId:String}"] : []),
+      ...(input.traceId ? ["traceId = {traceId:String}"] : []),
       ...(input.interactionId
         ? ["interactionId = {interactionId:String}"]
         : []),
@@ -8098,6 +8101,9 @@ export class ClickHouseStore {
       ...(input.agentInstanceId
         ? { agentInstanceId: input.agentInstanceId }
         : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.runId ? { runId: input.runId } : {}),
+      ...(input.traceId ? { traceId: input.traceId } : {}),
       ...(input.interactionId ? { interactionId: input.interactionId } : {}),
       ...(input.interactionType
         ? { interactionType: input.interactionType }

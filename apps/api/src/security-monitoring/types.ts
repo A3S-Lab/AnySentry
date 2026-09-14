@@ -1829,6 +1829,10 @@ export interface AgentInteractionRecord {
 }
 
 export interface AgentInteractionQuery extends SecurityTimeFilter {
+  /** Exact application correlation anchors for canonical point reads. */
+  sessionId?: string;
+  runId?: string;
+  traceId?: string;
   agentAssetId?: string;
   agentInstanceId?: string;
   interactionId?: string;
