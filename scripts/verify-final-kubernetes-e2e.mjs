@@ -682,7 +682,13 @@ try {
   // depend on a node's pod-termination/pipe-drain timing and could discard evidence that had not
   // reached the API yet.
   await kube(['-n', namespace, 'scale', 'deployment/observer', '--replicas=0']);
-  await kube(['-n', namespace, 'rollout', 'status', 'deployment/observer', `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
+  await waitUntil('Observer scale-down', async () => {
+    const result = await kube(['-n', namespace, 'get', 'deployment/observer',
+      '-o', 'jsonpath={.spec.replicas}:{.status.replicas}:{.status.readyReplicas}'],
+      { silent: true, timeout: 10_000 });
+    const [desired, current, ready] = String(result.stdout ?? '').split(':').map((value) => Number(value || 0));
+    return desired === 0 && current === 0 && ready === 0;
+  }, Math.min(timeoutMs, 60_000), 1_000);
   const byTool = Object.fromEntries(evidence.items.map((item) => [item.toolName, item]));
   assert.equal(byTool.read?.status, 'linked');
   assert.equal(byTool.write?.status, 'linked');
