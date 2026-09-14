@@ -6770,6 +6770,11 @@ function otlpDefaults(resourceAttrs: Record<string, T.EventAttributeValue>, body
     workspacePath: body.workspacePath ?? workspacePath,
     agentId: body.agentId ?? service,
     sessionId: body.sessionId ?? body.conversationId ?? body.threadId ?? otlpExplicitSessionId(resourceAttrs),
+    // OTLP adapters commonly put the per-invocation anchor at the envelope level.
+    // Propagate it to every normalized span so canonical queries by runId remain stable
+    // even when the adapter does not duplicate `run.id` on each span.
+    runId: body.runId ?? body.invocationId,
+    invocationId: body.invocationId,
     userId: body.userId ?? attrText(resourceAttrs, 'enduser.id', 'user.id', 'user.name'),
     collectorId: body.collectorId ?? attrText(resourceAttrs, 'anysentry.collector.id', 'collector.id', 'host.name'),
     sourceName: body.sourceName ?? attrText(resourceAttrs, 'service.name'),
