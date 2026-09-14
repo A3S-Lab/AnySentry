@@ -130,3 +130,31 @@ competing pointer ambiguity 以及 WebSocket control-frame 竞争归属；这些
 - Unknown、CandidateAgent、KernelFact 和 coverage gap 必须保留；缺少明文解析不能被解释成没有内核证据。
 - classic SSL WIP 的已知失败不通过修改测试断言隐藏，也不作为 generic HTTP 已完成的证据。
 - 任何真实运行报告必须同时附带镜像 digest、规则 epoch、进程代次、队列/WAL 指标和 canonical 点查结果。
+
+### 2026-09-15 customer-langgraph-sim-lab 重启后 A/B 复测
+
+为验证重启后的干净开发环境，先停止并删除旧的 customer compose 容器/卷，清理
+`/var/lib/anysentry-forwarder/spool-stable-20260907.wal`（约 809 MB，开发机临时 WAL），再恢复
+`a3s-observer` DaemonSet；Observer 新 Pod 为 Ready，Ring/LLM 计数持续增长，Ring dropped 为 0。
+该清理未触碰 PostgreSQL、ClickHouse、镜像仓库或 classic SSL WIP。
+
+- Design A：`docker compose.yml` 真实启动成功，`GET /healthz` 返回 `design=A`；`POST /runs`
+  返回 completed/verify pass，`run_id=session_id=be775a3c-3596-4a27-9ae2-36e15bec5056`，
+  `trace_id=278e58013a037d7a63c9fc9f876aa231`，业务侧包含 plan/work/verify、sandbox 输入输出和
+  11 条 dialogue。以该 run/trace 做 canonical durable point-read 时返回
+  `coverage.completeness=exact_as_observed, partial=false`，但 0 条 interaction。
+- Design B：`docker compose.design-b.yml` 真实启动成功，编排器和 worker 均返回健康；
+  `POST /runs` 返回 completed/verify pass，`run_id=38274771-1308-425f-9e86-460f43d605bd`，
+  `trace_id=22fa9f2ad7f396f14d56c2e2f68b9ecd`，业务侧返回 16 条 dialogue。以该 run/trace
+  做 canonical durable point-read，轮询后仍为 0 条 interaction，coverage 同样为
+  `exact_as_observed/partial=false`。
+- 这两次结果不是“继续等待即可”：API 已报告 exact snapshot；Observer health 在同一窗口内
+  报告 LLM/Ring 有事件且 ringDropped=0，但 interaction reassembly 日志对应的是其他进程流，
+  未形成本次 customer run 的闭合 semantic projection。当前结论是：A/B 应用生命周期和业务
+  canonical run 产生正常，跨进程 kernel/plaintext→run 归属与 projection 仍未通过真实验收。
+- 该结果保留了 Unknown/Candidate/coverage 缺口，没有通过全量放开采集掩盖问题。下一步应在
+  Observer 事件中核对传播头（`x-anysentry-run-id`、`traceparent`）是否被重组并写入
+  `LlmInteraction`，同时核对 Docker workload 的进程代次与候选规则是否在首次调用前完成反馈。
+
+本轮实验结束后应执行 Design B compose down（`--remove-orphans --volumes`），避免测试服务和
+临时网络继续占用开发机资源；保留日志目录作为未入库现场证据，不提交 `.runtime` 或凭据。
