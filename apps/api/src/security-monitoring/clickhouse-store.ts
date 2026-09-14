@@ -8066,9 +8066,12 @@ export class ClickHouseStore {
       ...(input.agentInstanceId
         ? ["agentInstanceId = {agentInstanceId:String}"]
         : []),
-      ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
-      ...(input.runId ? ["runId = {runId:String}"] : []),
-      ...(input.traceId ? ["traceId = {traceId:String}"] : []),
+      // Correlation anchors are part of the versioned interaction payload.  Keep these
+      // point reads compatible with older ClickHouse tables that do not have dedicated
+      // columns yet; querying a missing column would force an incorrect hot-ring fallback.
+      ...(input.sessionId ? ["JSONExtractString(payload, 'sessionId') = {sessionId:String}"] : []),
+      ...(input.runId ? ["JSONExtractString(payload, 'runId') = {runId:String}"] : []),
+      ...(input.traceId ? ["JSONExtractString(payload, 'traceId') = {traceId:String}"] : []),
       ...(input.interactionId
         ? ["interactionId = {interactionId:String}"]
         : []),
