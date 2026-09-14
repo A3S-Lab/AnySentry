@@ -218,3 +218,10 @@ Observer DaemonSet 已恢复 Ready rollout。
 - API coverage gap 明确记录了 `agent_interaction` 与 `semantic_record` 的 `ANYSENTRY_OBSERVER_PROJECTION_TIMEOUT`。原因是 ClickHouse/关系投影慢时，读取接口先等待 durable interaction 查询，未及时合并已进入进程 hot ring 的记录。
 - AnySentry `b11f3ea` 为 durable interaction 查询增加 2 秒有界等待；超时后返回 hot ring 内容并把 coverage 标为 `partial/hot_ring_only`，不再把数据库慢误报为 `items=0/exact`。构建部署 digest：`sha256:139a8762a994efb3e19552849d2d952e62f91310c2314fcb4489aa2b682c8d81`。
 - 本轮低负载 A 调用业务返回 `completed/pass`，但调用后立即查询仍为 `items=0/exact_as_observed`；最新 coverage gap 尚未出现对应 projection timeout，说明该请求的 Observer/WAL 到 API 投递仍可能受历史 WAL backlog 延迟影响，semantic projection 尚不能验收为完成。
+
+## 2026-09-15 clean-WAL replay boundary
+
+- 为隔离历史积压，开发机暂停 Observer forwarder PID 后将 `/var/lib/anysentry-forwarder/spool-stable-20260907.wal` 清为 0，再恢复进程；B 受控调用 `run_id=a92360c1-5760-47e5-b1cc-c2ee87dd83df`、`trace_id=4890edb1f07eb3d1e20fcaa5fa030d99` 返回 `completed/pass`。
+- 调用后 WAL 很快重新增长到约 65 MiB，说明宿主上的持续内核活动速率高于当前 Forwarder/API 投递速度；coverage-gaps 未出现该 run 的新 projection 错误，但 interaction 查询仍为 0。这个结果不能证明 semantic projection 成功，也不能继续通过扩大采集来掩盖 backlog。
+- 运行时还发现 Deployment 的 hostPath overlay `scripts/.local-bin/aggregation.service.js` 比当前源码旧，已在开发机仅同步必要的 `runId/traceId` 过滤和 2 秒 durable read 超时；该中间 overlay 未纳入 Git。源码修复 `b11f3ea` 仍是正式可审查变更。
+- A/B 容器已全部停止并删除；当前仅保留 AnySentry、Observer 和本地 registry。Observer classic SSL WIP 未改动。
