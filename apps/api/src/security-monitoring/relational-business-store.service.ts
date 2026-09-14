@@ -964,33 +964,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      // Serialize canonical raw batches across pool connections. The preflight and insert
-      // must share one transaction, otherwise two concurrent retries can both pass the
-      // preflight and race on the idempotency unique index.
-      await client.query(
-        `SELECT pg_advisory_xact_lock(hashtextextended('anysentry.raw_observations.v1', 0))`,
-      );
-      const conflict = await client.query<{ conflict: boolean }>(
-        `WITH incoming AS (
-           SELECT item AS record
-             FROM jsonb_array_elements($1::jsonb) AS source(item)
-         )
-         SELECT EXISTS (
-           SELECT 1
-             FROM anysentry_raw_observations_v1 existing
-             JOIN incoming
-               ON existing.revision = (incoming.record->>'revision')::bigint
-              AND (existing.observation_id = incoming.record->>'observationId'
-                OR existing.idempotency_key = incoming.record->>'idempotencyKey')
-            WHERE existing.payload_sha256 <> incoming.record->'payload'->>'sha256'
-               OR existing.record <> incoming.record
-         ) AS conflict`,
-        [boundedJson],
-      );
-      if (conflict.rows?.[0]?.conflict === true) {
-        await client.query('ROLLBACK');
-        return false;
-      }
+      // The unique keys serialize conflicting inserts at the index without a global advisory
+      // lock. Insert first, then inspect the committed row for an idempotency payload conflict;
+      // concurrent identical retries become no-ops while a conflicting retry rolls back this
+      // transaction. This preserves the old conflict contract without serializing every batch.
       await client.query(
         `WITH incoming AS (
            SELECT item AS record
@@ -1018,6 +995,27 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          ON CONFLICT (observation_id, revision) DO NOTHING`,
         [boundedJson],
       );
+      const conflict = await client.query<{ conflict: boolean }>(
+        `WITH incoming AS (
+           SELECT item AS record
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         SELECT EXISTS (
+           SELECT 1
+             FROM anysentry_raw_observations_v1 existing
+             JOIN incoming
+               ON existing.revision = (incoming.record->>'revision')::bigint
+              AND (existing.observation_id = incoming.record->>'observationId'
+                OR existing.idempotency_key = incoming.record->>'idempotencyKey')
+           WHERE existing.payload_sha256 <> incoming.record->'payload'->>'sha256'
+              OR existing.record <> incoming.record
+         ) AS conflict`,
+        [boundedJson],
+      );
+      if (conflict.rows?.[0]?.conflict === true) {
+        await client.query('ROLLBACK');
+        return false;
+      }
       await client.query('COMMIT');
       return true;
     } catch (error) {
