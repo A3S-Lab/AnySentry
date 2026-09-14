@@ -12177,7 +12177,19 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       // and exceed the node memory limit under ordinary history volume.
       limit: CANONICAL_SEMANTIC_SESSION_SCAN_MAX,
     });
-    const memberships = await this.canonicalObservability.listDurableSessionMemberships(10_000);
+    // Exact Session reads should remain point-oriented. Loading the entire membership lane before
+    // reconciling one conversation makes a small deep link pay for a large PostgreSQL/WAL scan.
+    // Resolve the bounded interaction ID set first and fetch only those membership rows; broad
+    // membership listing remains reserved for the directory path.
+    const selectedMemberships = query.sessionId && this.conversationBindings
+      ? await this.conversationBindings.interactionIdsForConversation(query.sessionId, 512)
+      : undefined;
+    const membershipIds = selectedMemberships?.interactionIds ?? [];
+    const memberships = membershipIds.length > 0
+      ? (await Promise.all(membershipIds.map((interactionId) =>
+          this.canonicalObservability.listDurableSessionMemberships(16, interactionId))))
+        .flat()
+      : await this.canonicalObservability.listDurableSessionMemberships(512);
     const membershipBySession = new Map<string, T.SessionMembership[]>();
     for (const membership of memberships) {
       const values = membershipBySession.get(membership.sessionId) ?? [];
