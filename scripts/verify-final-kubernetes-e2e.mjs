@@ -607,7 +607,8 @@ try {
   const observerOnly = baseResources(nodeName, false);
   observerOnly.items = observerOnly.items.filter((item) => item.metadata?.name === 'observer');
   await applyObject(observerOnly);
-  await kube(['-n', namespace, 'rollout', 'status', 'deployment/observer', `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
+  await kube(['-n', namespace, 'wait', '--for=condition=available', 'deployment/observer',
+    `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
 
   const collector = await waitUntil('Collector accounting', async () => {
     const health = await api('/collectors/health', 'POST', { timeType: 'last_30d', collectorId, limit: 5 });
