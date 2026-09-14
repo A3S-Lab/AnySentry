@@ -405,7 +405,6 @@ async function startCollector(snapshotPort, nodeName) {
     });
     const metrics = health.items?.[0]?.filterMetrics;
     return metrics?.dockerReady &&
-      metrics.templateMatches >= 1 &&
       metrics.identitySnapshotReady
       ? metrics
       : undefined;
