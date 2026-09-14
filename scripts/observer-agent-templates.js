@@ -138,7 +138,14 @@ function eventFacts(observerEvent) {
     deployment,
     namespace: text(workload.namespace),
     pod: text(workload.replica_id) || text(identity.agent),
-    container: text(workload.provider_unit_id) || text(identity.session),
+    // Producers use both snake_case wire fields and the normalized camelCase form. Keep the
+    // template facts tolerant of either shape so a generic workload template can match before
+    // attribution has been materialized, without depending on a vendor tool name.
+    container:
+      text(workload.containerName) ||
+      text(workload.container_name) ||
+      text(workload.provider_unit_id) ||
+      text(identity.session),
     image: text(workload.image),
     owner: text(workload.owner),
     systemdUnit,
@@ -151,6 +158,8 @@ function eventFacts(observerEvent) {
       workload.workload_id,
       workload.deployment_id,
       workload.replica_id,
+      workload.containerName,
+      workload.container_name,
       workload.provider_unit_id,
       processInfo.comm,
       processInfo.exe ? path.posix.basename(text(processInfo.exe)) : '',
