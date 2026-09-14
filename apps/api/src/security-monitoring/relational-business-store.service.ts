@@ -719,6 +719,28 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     if (!normalizedConversationId || !(await this.initialize()) || !this.pool) return null;
     const boundedLimit = Math.max(1, Math.min(10_000, Math.trunc(limit)));
     try {
+      // Canonical Session IDs are a separate namespace from compatibility Thread IDs. Read
+      // their members directly, including after restart when no route alias is in memory.
+      if (/^sess_[a-f0-9]{24}$/u.test(normalizedConversationId)) {
+        const result = await this.pool.query<{ interaction_id: string }>(
+          `SELECT candidate.record->>'interactionId' AS interaction_id
+             FROM anysentry_session_memberships_v1 AS candidate
+            WHERE candidate.session_id = $1
+              AND NULLIF(candidate.record->>'interactionId', '') IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM anysentry_session_memberships_v1 AS newer
+                 WHERE newer.session_id = candidate.session_id
+                   AND newer.record->>'interactionId' = candidate.record->>'interactionId'
+                   AND newer.resolution_revision > candidate.resolution_revision
+              )
+            GROUP BY candidate.record->>'interactionId'
+            ORDER BY MIN(candidate.valid_from), interaction_id
+            LIMIT $2`,
+          [normalizedConversationId, boundedLimit + 1],
+        );
+        const interactionIds = result.rows.map((row) => row.interaction_id);
+        return { interactionIds: interactionIds.slice(0, boundedLimit), truncated: interactionIds.length > boundedLimit };
+      }
       const result = await this.pool.query<{ interaction_id: string }>(
         `WITH RECURSIVE thread_ids(conversation_id) AS (
            SELECT $1::text
