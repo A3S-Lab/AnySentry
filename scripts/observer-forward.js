@@ -1154,6 +1154,7 @@ function invalidBatchAck(batchLength, reason) {
     retryItems: [],
     acceptedItems: [],
     rejectedItems: [],
+    rejectionDetails: [],
     pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batchLength),
     reason,
   };
@@ -1222,6 +1223,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
   let rejectedItems = 0;
   const acceptedBatchItems = [];
   const rejectedBatchItems = [];
+  const rejectionDetails = [];
   const retryItems = [];
   let sawRetryable = false;
   for (let index = 0; index < items.length; index++) {
@@ -1259,6 +1261,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
       rejectedItems++;
       batch[index].rejectReasonCode = typeof item.reasonCode === 'string' ? item.reasonCode : '';
       batch[index].rejectReason = typeof item.reason === 'string' ? item.reason.slice(0, 300) : '';
+      rejectionDetails.push({ index, reasonCode: batch[index].rejectReasonCode, reason: batch[index].rejectReason });
       rejectedBatchItems.push(batch[index]);
     } else {
       return invalidBatchAck(batchLength, 'batch endpoint returned an invalid rejected disposition');
@@ -1288,6 +1291,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
     errors: rejectedEvents > 0 ? 1 : 0,
     acceptedItems: acceptedBatchItems,
     rejectedItems: rejectedBatchItems,
+    rejectionDetails,
     retryItems,
     retryAfterMs: ack.retryAfterMs,
     pipelineCounts: [
@@ -3191,8 +3195,8 @@ function finishBatch(batch, outcome, retryDelivery) {
         return 'malformed';
       }
     }))];
-    const rejectionReasons = [...new Set(rejectedItems.map((item) =>
-      `${item.rejectReasonCode || 'unknown'}:${item.rejectReason || outcome.reason || 'permanent ingest rejection'}`))];
+    const rejectionReasons = (outcome.rejectionDetails ?? []).map((item) =>
+      `${item.index}:${item.reasonCode || 'unknown'}:${item.reason || outcome.reason || 'permanent ingest rejection'}`);
     console.error(`[observer-forward] rejected event details count=${rejectedItems.length} kinds=${rejectedKinds.join(',') || 'unknown'} reasons=${rejectionReasons.join('|')}`);
     spool.deadLetter(
       rejectedItems
