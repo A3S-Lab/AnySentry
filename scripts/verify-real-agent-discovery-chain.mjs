@@ -573,7 +573,7 @@ async function verifyResults() {
   try {
     // Authoritative non-Agent events are intentionally rejected before ClickHouse ingestion.
     // Verify the four retained identities here and the Kubernetes sidecar via snapshot/counters.
-    events = await eventually('four retained real scenario events', async () => {
+    events = await eventually(`${verificationPhase} retained scenario events`, async () => {
       const current = await matchingEvents();
       lastEvents = current;
       (verificationPhase === 'docker'
@@ -593,26 +593,37 @@ async function verifyResults() {
     })}`;
     throw error;
   }
+  if (verificationPhase === 'docker') {
+    assert.equal(events.docker.attribution?.classification, 'confirmed_agent');
+    assert.equal(events.docker.attribution?.agentScopeId, 'real-docker-template-agent');
+    assert.equal(events.docker.attribution?.source, 'self_register');
+    assert.equal(events.unknown.attribution?.classification, 'probable_agent');
+    assert.equal(events.unknown.attribution?.source, 'behavior');
+  }
   console.log(JSON.stringify({
     observedAttribution: {
-      host: events.host.attribution,
-      docker: events.docker.attribution,
-      unknown: events.unknown.attribution,
-      k8sAgent: events.k8sAgent.attribution,
+      host: events.host?.attribution,
+      docker: events.docker?.attribution,
+      unknown: events.unknown?.attribution,
+      k8sAgent: events.k8sAgent?.attribution,
       k8sSidecar: sidecarSnapshotAttribution,
     },
   }, null, 2));
-  assert.equal(events.host.attribution?.classification, 'confirmed_agent');
-  assert.equal(events.host.attribution?.agentScopeId, 'real-host-template-agent');
-  assert.equal(events.host.attribution?.source, 'self_register');
-  assert.equal(events.docker.attribution?.classification, 'confirmed_agent');
-  assert.equal(events.docker.attribution?.agentScopeId, 'real-docker-template-agent');
-  assert.equal(events.docker.attribution?.source, 'self_register');
-  assert.equal(events.unknown.attribution?.classification, 'probable_agent');
-  assert.equal(events.unknown.attribution?.source, 'behavior');
-  assert.equal(events.k8sAgent.attribution?.classification, 'confirmed_agent');
-  assert.equal(events.k8sAgent.attribution?.agentScopeId, 'real-k8s-agent');
-  assert.equal(events.k8sAgent.attribution?.source, 'kubernetes');
+  if (verificationPhase !== 'docker') assert.equal(events.host.attribution?.classification, 'confirmed_agent');
+  if (verificationPhase !== 'docker') {
+    assert.equal(events.host.attribution?.agentScopeId, 'real-host-template-agent');
+    assert.equal(events.host.attribution?.source, 'self_register');
+  }
+  if (verificationPhase !== 'docker') {
+    assert.equal(events.docker.attribution?.classification, 'confirmed_agent');
+    assert.equal(events.docker.attribution?.agentScopeId, 'real-docker-template-agent');
+    assert.equal(events.docker.attribution?.source, 'self_register');
+    assert.equal(events.unknown.attribution?.classification, 'probable_agent');
+    assert.equal(events.unknown.attribution?.source, 'behavior');
+    assert.equal(events.k8sAgent.attribution?.classification, 'confirmed_agent');
+    assert.equal(events.k8sAgent.attribution?.agentScopeId, 'real-k8s-agent');
+    assert.equal(events.k8sAgent.attribution?.source, 'kubernetes');
+  }
   assert.equal(sidecarSnapshotAttribution?.classification, 'non_agent');
   assert.equal(sidecarSnapshotAttribution?.monitored, false);
 
@@ -625,19 +636,21 @@ async function verifyResults() {
     const item = health.items?.[0];
     return item?.filterMetrics?.dockerReady &&
       item.filterMetrics.behaviorCandidates >= 1 &&
-      item.filterMetrics.identityCgroupHits > 0 &&
-      item.filterMetrics.nonAgent > 0 &&
-      item.filterMetrics.wouldFilterNonAgent > 0
+      (verificationPhase === 'docker' || (
+        item.filterMetrics.identityCgroupHits > 0 &&
+        item.filterMetrics.nonAgent > 0 &&
+        item.filterMetrics.wouldFilterNonAgent > 0
+      ))
       ? item
       : undefined;
   });
   console.log(JSON.stringify({
     collectorId,
     events: {
-      hostTemplate: events.host.attribution,
-      dockerTemplate: events.docker.attribution,
-      unknownBehavior: events.unknown.attribution,
-      kubernetesAgent: events.k8sAgent.attribution,
+      hostTemplate: events.host?.attribution,
+      dockerTemplate: events.docker?.attribution,
+      unknownBehavior: events.unknown?.attribution,
+      kubernetesAgent: events.k8sAgent?.attribution,
       kubernetesSidecar: sidecarSnapshotAttribution,
     },
     filterMetrics: heartbeat.filterMetrics,
