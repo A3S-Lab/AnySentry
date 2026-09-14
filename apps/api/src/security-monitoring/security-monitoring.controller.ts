@@ -11997,6 +11997,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const result = await this.canonicalSessionResources(query, headers);
     const requestedSessionId = query.sessionId;
     if (!requestedSessionId
+      || /^sess_[a-f0-9]{24}$/u.test(requestedSessionId)
       || result.items.some((item) => [item.sessionId, item.canonicalSessionId, item.conversationId].includes(requestedSessionId))) {
       return result;
     }
@@ -12306,11 +12307,21 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
     // Memberships are the canonical session lane even when a semantic projection has expired.
     for (const membership of memberships) {
-      if ([...resourcesByKey.values()].some((resource) => [
+      const existing = [...resourcesByKey.values()].find((resource) => [
         resource.sessionId,
         resource.canonicalSessionId,
         resource.conversationId,
-      ].includes(membership.sessionId))) continue;
+      ].includes(membership.sessionId));
+      if (existing) {
+        if (membership.interactionId && !existing.interactionIds.includes(membership.interactionId)) {
+          existing.interactionIds.push(membership.interactionId);
+        }
+        if (membership.segmentId && !existing.segmentIds.includes(membership.segmentId)) existing.segmentIds.push(membership.segmentId);
+        if (membership.agentInstanceId && !existing.agentInstanceIds.includes(membership.agentInstanceId)) existing.agentInstanceIds.push(membership.agentInstanceId);
+        existing.sourceRefs = [...new Set([...existing.sourceRefs, ...membership.sourceRefs])].slice(0, 128);
+        existing.resolutionRevision = Math.max(existing.resolutionRevision, membership.resolutionRevision);
+        continue;
+      }
       resourcesByKey.set(membership.sessionId, {
         schemaVersion: 'anysentry.session.v1',
         sessionId: membership.sessionId,

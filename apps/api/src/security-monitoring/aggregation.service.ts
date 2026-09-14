@@ -3113,7 +3113,7 @@ export class AggregationService implements OnModuleDestroy {
     const exactInteractionIds = new Set((options.interactionIds ?? [])
       .map((value) => value.trim())
       .filter(Boolean));
-    const exactMembershipRead = exactInteractionIds.size > 0;
+    const exactMembershipRead = options.interactionIds !== undefined;
     const requestedAsset = filter.agentAssetId?.trim();
     const agentAssetId = requestedAsset
       ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
@@ -3134,7 +3134,10 @@ export class AggregationService implements OnModuleDestroy {
         : {}),
       ...(options.totalLimit ? { limit: options.totalLimit } : {}),
     };
-    const persisted = await this.judge.storedAgentInteractions(query);
+    // An empty membership selection is still an exact query, never a request for all history.
+    const persisted = exactMembershipRead && exactInteractionIds.size === 0
+      ? (options.membershipDurable === true ? [] : null)
+      : await this.judge.storedAgentInteractions(query);
     const merged = new Map<string, T.AgentInteractionRecord>();
     for (const item of persisted ?? []) merged.set(item.interactionId, item);
     for (const { record } of this.interactionHot.values()) {
@@ -3376,6 +3379,8 @@ export class AggregationService implements OnModuleDestroy {
     // produce a different ID. Once a conversationId is present, keep those values as post-
     // projection consistency filters instead of changing the record set used to resolve the ID.
     const requestedConversationId = filter.conversationId?.trim();
+    const canonicalSessionRead = Boolean(requestedConversationId
+      && /^sess_[a-f0-9]{24}$/u.test(requestedConversationId));
     const persistedAlias = requestedConversationId
       ? await this.conversationBindings?.resolveRouteAlias(requestedConversationId)
       : undefined;
@@ -3389,9 +3394,9 @@ export class AggregationService implements OnModuleDestroy {
           5_000,
         )
       : undefined;
-    const exactMembershipIds = membershipSelection?.interactionIds.length
-      ? membershipSelection.interactionIds
-      : undefined;
+    const exactMembershipIds = canonicalSessionRead
+      ? membershipSelection?.interactionIds ?? []
+      : membershipSelection?.interactionIds.length ? membershipSelection.interactionIds : undefined;
     // Canonical/deep-link reads may explicitly request the raw compatibility lane so that an
     // unknown/candidate physical asset can still be resolved and shown with a CoverageGap. The
     // ordinary Agent dashboard keeps its historical `agent` scope and therefore does not widen
@@ -3452,9 +3457,9 @@ export class AggregationService implements OnModuleDestroy {
     const interactionReadOptions = exactMembershipIds
       ? {
           interactionIds: exactMembershipIds,
-          membershipTruncated: membershipSelection!.truncated,
-          membershipDurable: membershipSelection!.durable,
-          membershipStoreUnavailable: membershipSelection!.storeUnavailable === true,
+          membershipTruncated: membershipSelection?.truncated,
+          membershipDurable: membershipSelection?.durable ?? false,
+          membershipStoreUnavailable: membershipSelection?.storeUnavailable === true,
           totalLimit: exactMembershipIds.length,
         }
       : fairHistoryRead
@@ -3474,7 +3479,7 @@ export class AggregationService implements OnModuleDestroy {
       : interactions.items;
     // Membership-scoped reads are exact for the selected Thread, but cross-hop relatedConversations
     // need peer Interactions from the same run/session window. Expand with a fair history read.
-    if (exactMembershipIds?.length && filter.scope !== 'raw') {
+    if (exactMembershipIds?.length && filter.scope !== 'raw' && !canonicalSessionRead) {
       // Raw canonical Session reads already have an exact membership ID set. Expanding them with
       // a fair historical peer scan defeats point-read semantics and can trigger a wide ClickHouse
       // merge sort under load. Peer expansion is only needed by the dashboard cross-hop view.
@@ -3494,13 +3499,24 @@ export class AggregationService implements OnModuleDestroy {
     const routeAlias = requestedConversationId
       ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
       : undefined;
-    const canonicalConversationId = routeAlias?.targetType === 'conversation'
+    let canonicalConversationId = routeAlias?.targetType === 'conversation'
       ? routeAlias.canonicalConversationId
       : initialConversationId;
     const projection = projectAgentConversations(boundInteractions, inventory.items, {
       ...filter,
-      ...(canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
+      ...(canonicalSessionRead ? { conversationId: undefined }
+        : canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
     });
+    if (canonicalSessionRead) {
+      // Session and compatibility conversation IDs use different namespaces. Resolve the display
+      // alias from the selected immutable members, not from a shared runtime or a history scan.
+      projection.summaries = projection.summaries.filter((summary) =>
+        projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
+          (record.canonicalSessionId ?? record.sessionId) === requestedConversationId));
+      if (projection.summaries.length === 1) {
+        canonicalConversationId = projection.summaries[0].conversationId;
+      }
+    }
     // Read APIs are pure projections. Durable Thread/Segment/Relation state is updated by the
     // bounded post-ingest materializer; polling this page must never create PostgreSQL WAL churn.
     return {

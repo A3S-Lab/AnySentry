@@ -506,6 +506,74 @@ assert.equal(longTimeline.coverage.partial, false);
 assert.equal(longTimeline.coverage.partialReason, undefined,
   'partial inventory decoration must not downgrade exact selected-Thread content');
 
+// A canonical Session is not a compatibility conversation ID. Its selected records must retain
+// their messages across a cold read, and missing membership must never trigger a history scan.
+const canonicalSession = `sess_${'c'.repeat(24)}`;
+const canonicalRecords = longRecords.slice(0, 2).map((record) => ({
+  ...record, sessionId: canonicalSession, canonicalSessionId: canonicalSession,
+}));
+function canonicalAggregation(selection, records = canonicalRecords) {
+  const reads = [];
+  const agg = new AggregationService({ storedAgentInteractions: async (q) => {
+    assert.ok(Array.isArray(q.interactionIds), 'canonical Session reads must stay membership-scoped');
+    reads.push(q);
+    return records;
+  } }, { identitySnapshotVersion: () => 0, canonicalAgentAssetId: (v) => v }, {}, {}, {}, undefined, {
+    resolveRouteAlias: async () => undefined,
+    interactionIdsForConversation: async (id) => {
+      assert.equal(id, canonicalSession);
+      return selection;
+    },
+    applyPersistedBindings: async (items) => items,
+    routeAlias: () => undefined,
+    segmentsForConversation: () => [],
+  });
+  agg.agentInventory = exactMembershipAggregation.agentInventory;
+  return { agg, reads };
+}
+const canonicalSelection = {
+  interactionIds: canonicalRecords.map((record) => record.interactionId),
+  durable: true, truncated: false,
+};
+const canonicalQuery = { ...fixedProjectionQuery, scope: 'raw', conversationId: canonicalSession };
+const canonicalRead = canonicalAggregation(canonicalSelection);
+const canonicalTimeline = await canonicalRead.agg.agentConversationTimelineV2(canonicalQuery);
+assert.deepEqual(canonicalTimeline.interactionIds.sort(), canonicalSelection.interactionIds);
+assert.equal(canonicalTimeline.thread.sessionId, canonicalSession);
+assert.ok(canonicalTimeline.turns.length > 0, 'canonical ID lookup must retain the semantic timeline');
+assert.equal(canonicalTimeline.coverage.partial, false);
+assert.equal(canonicalRead.reads.length, 1, 'no additional broad peer read for canonical content');
+for (const durable of [true, false]) {
+  const missing = canonicalAggregation({ interactionIds: [], durable, truncated: false, storeUnavailable: !durable });
+  const result = await missing.agg.agentConversationTimelineV2(canonicalQuery);
+  assert.equal(missing.reads.length, 0, 'empty membership must not fetch unrelated history');
+  assert.equal(result.turns.length, 0);
+  assert.ok(durable || result.coverage.partial, 'store outage must remain partial');
+}
+
+const { SecurityMonitoringController } = require('../apps/api/dist/security-monitoring/security-monitoring.controller.js');
+const controller = Object.create(SecurityMonitoringController.prototype);
+controller.agg = canonicalRead.agg;
+controller.canonicalCurrentRevision = () => 1;
+controller.canonicalRevisionCoverage = (_query, _revision, coverage) => coverage;
+controller.canonicalObservability = { listDurableSessionMemberships: async () =>
+  canonicalRecords.map((record, i) => ({
+    membershipId: `sm_test_${i}`, sessionId: canonicalSession, sessionKey: canonicalSession,
+    interactionId: record.interactionId, resolutionRevision: 1, sourceRefs: [record.interactionId],
+  })),
+};
+const sessionQuery = { sessionId: canonicalSession, limit: 20, offset: 0 };
+const sessionProjection = await controller.computeCanonicalSessionResources(sessionQuery, {});
+assert.deepEqual(sessionProjection.items[0].interactionIds.sort(), canonicalSelection.interactionIds);
+assert.ok(sessionProjection.items[0].turnCount > 0, 'Session resource must retain semantic content');
+controller.agg = { agentConversations: async () => ({
+  items: [], coverage: { partial: true, partialReason: 'storage_unavailable' }, dataSource: 'hot_ring',
+}) };
+const missingProjection = await controller.computeCanonicalSessionResources(sessionQuery, {});
+assert.deepEqual(missingProjection.items[0].interactionIds.sort(), canonicalSelection.interactionIds,
+  'a missing semantic projection must still expose every canonical member');
+assert.equal(missingProjection.items[0].coverage.status, 'asset_only');
+
 // Keep the SQL contract executable without requiring PostgreSQL in the local verifier.
 let membershipSql;
 let membershipParams;
