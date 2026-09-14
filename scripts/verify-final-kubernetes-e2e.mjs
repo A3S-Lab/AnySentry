@@ -620,7 +620,9 @@ try {
 
   await applyObject(list([customAgentDeployment(nodeName)]));
   await kube(['-n', namespace, 'rollout', 'status', 'deployment/custom-agent', `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
-  const evidence = await waitUntil('custom ToolEvidence', async () => {
+  let evidence;
+  try {
+    evidence = await waitUntil('custom ToolEvidence', async () => {
     const result = await api('/events/tool-evidence', 'POST', {
       timeType: 'last_30d', invocationId, workspacePath, limit: 1_000,
     });
@@ -638,7 +640,33 @@ try {
       && indexed.bash?.status === 'linked'
       ? result
       : undefined;
-  }, timeoutMs, 1_000);
+    }, timeoutMs, 1_000);
+  } catch (error) {
+    // Preserve bounded, non-secret evidence before the finally block removes the namespace.
+    // This makes a failed run actionable without retaining a test workload indefinitely.
+    const [apiLogs, observerLogs, rawEvents] = await Promise.all([
+      kube(['-n', namespace, 'logs', 'deployment/anysentry', '--tail=200'], { silent: true, timeout: 15_000 })
+        .then((value) => value.stdout ?? '', () => ''),
+      kube(['-n', namespace, 'logs', 'deployment/observer', '--tail=200'], { silent: true, timeout: 15_000 })
+        .then((value) => value.stdout ?? '', () => ''),
+      api('/events/list', 'POST', { timeType: 'last_30d', scope: 'raw', workspacePath,
+        invocationId, includeUnknown: true, limit: 500 }).catch(() => undefined),
+    ]);
+    console.error(JSON.stringify({
+      toolEvidenceFailure: error instanceof Error ? error.message : String(error),
+      rawEventSummary: (rawEvents?.items ?? []).map((item) => ({
+        eventId: item.eventId, eventKind: item.eventKind, at: item.at,
+        pid: item.process?.pid, ppid: item.process?.ppid,
+        namespacePid: item.process?.namespacePid, namespacePpid: item.process?.namespacePpid,
+        pidNamespace: item.process?.pidNamespace, startTimeTicks: item.process?.startTimeTicks,
+        rootPid: item.attribution?.rootPid, rootStartTime: item.attribution?.rootStartTime,
+        toolName: item.attributes?.['gen_ai.tool.name'], commandHash: item.attributes?.['anysentry.kernel.command_hash'],
+      })),
+      apiLogs: apiLogs.slice(-20_000),
+      observerLogs: observerLogs.slice(-20_000),
+    }, null, 2));
+    throw error;
+  }
   // Freeze only after the API has acknowledged all strong links. Scaling first made correctness
   // depend on a node's pod-termination/pipe-drain timing and could discard evidence that had not
   // reached the API yet.
