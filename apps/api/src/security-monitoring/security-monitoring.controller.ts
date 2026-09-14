@@ -14576,6 +14576,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     @Body() body: ObserverBatchIngestBody = {},
     @Headers() headers: HeaderBag,
   ): Promise<T.ObserverBatchIngestResult> {
+    const ingestStartedAt = performance.now();
+    const ingestDiagnostics = process.env.ANYSENTRY_INGEST_DIAGNOSTICS === '1';
+    let prepareCompletedAt = ingestStartedAt;
+    let durableFenceCompletedAt = ingestStartedAt;
+    let projectionCompletedAt = ingestStartedAt;
+    let sourceResolutionMs = 0;
+    let canonicalObservationMs = 0;
+    let judgePreparationMs = 0;
     const events = Array.isArray(body.events) ? body.events : [];
     if (body.durableReplay !== undefined && typeof body.durableReplay !== 'boolean') {
       throw new BadRequestException('observer durableReplay must be a boolean');
@@ -14668,6 +14676,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       const collectorId = canonicalCollectorId(collectorIdInput);
       const requestSourceId = sourceId ?? headerValue(headers, 'x-anysentry-source-id');
       const requestToken = token ?? headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+      const sourceResolutionStartedAt = performance.now();
       const sourceResolution = this.sources.resolve({
         sourceId: requestSourceId,
         token: requestToken,
@@ -14676,6 +14685,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         sourceName,
         type: sourceType,
       });
+      sourceResolutionMs += performance.now() - sourceResolutionStartedAt;
       if (!sourceResolution.accepted) {
         const reason = sourceResolution.reason ?? 'source rejected';
         immediate.set(index, {
@@ -14815,12 +14825,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       // RawObservation is the append-only provenance fence.  Commit it after source
       // authentication but before semantic/Judge preparation; a later parser or storage failure
       // must leave the raw fact and an explicit gap rather than silently deleting the observation.
+      const canonicalObservationStartedAt = performance.now();
       meta = await this.commitCanonicalObservation(line, meta, sourceResolution, {
         sourceId: requestSourceId,
         collectorId,
         sourceType: sourceType ?? sourceResolution.source?.type,
         sourceEventId,
       });
+      canonicalObservationMs += performance.now() - canonicalObservationStartedAt;
       meta = bindCanonicalSessionFromMeta(
         meta,
         sourceResolution.authenticated
@@ -14828,7 +14840,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
             || hasAuthorizedSemanticClaim(meta, sourceResolution, 'agent_adapter')
             || hasAuthorizedSemanticClaim(meta, sourceResolution, 'application')),
       );
+      const judgePreparationStartedAt = performance.now();
       const prepared = this.judge.prepareAcceptWithDisposition(line, meta, collectorEventAt ?? Date.now());
+      judgePreparationMs += performance.now() - judgePreparationStartedAt;
       let interaction: T.AgentInteractionRecord | undefined;
       try {
         interaction = parseObserverAgentInteraction(line, meta);
@@ -14866,6 +14880,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       if (prepared.disposition === 'retained') retained.push(context);
       else if (prepared.disposition === 'structural_consumed') structural.push(context);
     }
+    prepareCompletedAt = performance.now();
 
     // Exact Forwarder retries retain one batchId and payload digest. Source resolution above must
     // still run on every request, but a previously terminal ACK is the authoritative idempotency
@@ -15075,6 +15090,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         await this.judge.commitPreparedBatch(retainedPrepared);
       }
     }
+    durableFenceCompletedAt = performance.now();
     // The binding pass above is side-effect free. Publish only facts/events that crossed their
     // ClickHouse durability fence; a failed block therefore cannot create a ghost Asset/Runtime.
     for (const context of structural) {
@@ -15387,6 +15403,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         }
       }
     }
+    projectionCompletedAt = performance.now();
 
     if (deliveryRetryFrom >= 0) {
       for (let index = deliveryRetryFrom; index < events.length; index += 1) {
@@ -15435,6 +15452,22 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       && legacyIndexes.size === 0
     ) {
       rememberObserverBatchResult(batchCacheKey, payload.safeDigest, result);
+    }
+    if (ingestDiagnostics) {
+      console.info('[AnySentry] observer ingest batch timing', {
+        eventCount: events.length,
+        acceptedEvents,
+        retainedEvents,
+        structuralEvents,
+        retryableEvents,
+        prepareMs: Math.round(prepareCompletedAt - ingestStartedAt),
+        durableFenceMs: Math.round(durableFenceCompletedAt - prepareCompletedAt),
+        projectionMs: Math.round(projectionCompletedAt - durableFenceCompletedAt),
+        sourceResolutionMs: Math.round(sourceResolutionMs),
+        canonicalObservationMs: Math.round(canonicalObservationMs),
+        judgePreparationMs: Math.round(judgePreparationMs),
+        totalMs: Math.round(performance.now() - ingestStartedAt),
+      });
     }
     return result;
   }
