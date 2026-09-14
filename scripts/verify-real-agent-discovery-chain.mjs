@@ -481,6 +481,7 @@ async function triggerScenarios() {
     'exec',
     unknownName,
     '/bin/echo',
+    ingestUnknownMarker,
     unknownMarker,
   ]);
 
