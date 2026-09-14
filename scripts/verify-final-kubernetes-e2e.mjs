@@ -621,7 +621,8 @@ try {
   assert.equal(typeof collector.pipelineAccounting.latest?.producerInstanceId, 'string');
 
   await applyObject(list([customAgentDeployment(nodeName)]));
-  await kube(['-n', namespace, 'rollout', 'status', 'deployment/custom-agent', `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
+  await kube(['-n', namespace, 'wait', '--for=condition=available', 'deployment/custom-agent',
+    `--timeout=${Math.ceil(timeoutMs / 1000)}s`]);
   let evidence;
   try {
     evidence = await waitUntil('custom ToolEvidence', async () => {
