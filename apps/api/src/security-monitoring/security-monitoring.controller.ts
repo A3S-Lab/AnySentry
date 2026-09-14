@@ -12178,33 +12178,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     query: CanonicalEntityQuery,
     headers: HeaderBag,
   ): Promise<CanonicalSessionProjection> {
-    // A canonical Session deep link is already keyed by durable membership. Do not pay for the
-    // compatibility conversation scan when the point-read has members; that scan is payload-heavy
-    // and was the source of heap pressure during ClickHouse/WAL stalls.
-    const memberships = query.sessionId
-      ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
-      : await this.canonicalObservability.listDurableSessionMemberships(512);
-    const conversations: T.AgentConversationList = memberships.length > 0 && query.sessionId
-      ? {
-          items: [],
-          total: 0,
-          totalMode: 'exact',
-          coverage: {
-            requestedFrom: query.startTime ?? '',
-            requestedTo: query.endTime ?? '',
-            snapshotAsOf: query.snapshotAsOf ?? '',
-            asOf: new Date().toISOString(),
-            completeness: 'exact_as_observed',
-            partial: false,
-            source: 'clickhouse',
-            totalMode: 'exact',
-          },
-          dataSource: 'clickhouse',
-          classificationView: query.classificationView ?? 'current_effective',
-          reviewRevision: 0,
-          updateTime: new Date().toISOString(),
-        }
-      : await this.agg.agentConversations({
+    const conversations = await this.agg.agentConversations({
       timeType: query.timeType,
       startTime: query.startTime,
       endTime: query.endTime,
@@ -12225,6 +12199,13 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       // and exceed the node memory limit under ordinary history volume.
       limit: CANONICAL_SEMANTIC_SESSION_SCAN_MAX,
     });
+    // Exact Session reads should remain point-oriented. Loading the entire membership lane before
+    // reconciling one conversation makes a small deep link pay for a large PostgreSQL/WAL scan.
+    // Resolve the bounded interaction ID set first and fetch only those membership rows; broad
+    // membership listing remains reserved for the directory path.
+    const memberships = query.sessionId
+      ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
+      : await this.canonicalObservability.listDurableSessionMemberships(512);
     const membershipBySession = new Map<string, T.SessionMembership[]>();
     for (const membership of memberships) {
       const values = membershipBySession.get(membership.sessionId) ?? [];
