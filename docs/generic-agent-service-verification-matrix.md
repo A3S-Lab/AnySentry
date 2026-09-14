@@ -225,3 +225,10 @@ Observer DaemonSet 已恢复 Ready rollout。
 - 调用后 WAL 很快重新增长到约 65 MiB，说明宿主上的持续内核活动速率高于当前 Forwarder/API 投递速度；coverage-gaps 未出现该 run 的新 projection 错误，但 interaction 查询仍为 0。这个结果不能证明 semantic projection 成功，也不能继续通过扩大采集来掩盖 backlog。
 - 运行时还发现 Deployment 的 hostPath overlay `scripts/.local-bin/aggregation.service.js` 比当前源码旧，已在开发机仅同步必要的 `runId/traceId` 过滤和 2 秒 durable read 超时；该中间 overlay 未纳入 Git。源码修复 `b11f3ea` 仍是正式可审查变更。
 - A/B 容器已全部停止并删除；当前仅保留 AnySentry、Observer 和本地 registry。Observer classic SSL WIP 未改动。
+
+## 2026-09-15 parent/worker Session scope verification
+
+- 在修复 `2b19aec` 部署后重新运行 Design B，业务调用 `12+12` 返回 `completed/pass`，run=`0023cd94-3937-4528-b932-434f275d2ecd`，trace=`ebee29513ed9c67b7c82deace19ce76d`。
+- interaction 查询最终返回父 orchestrator 与 worker 的 6 条记录。父侧运行实例为 `host-root:...:4077834:6976435`，canonical Session=`sess_f618de6ee7aa6e151a87c218`；worker 侧运行实例为 `host-root:...:4078576:6977190`，canonical Session=`sess_b33430d0e9ccf7d587971560`。两者共享 run/trace，但不再因为 `/app`、Source 或 provider run 相同而合并到同一个 Session。
+- 父侧 interaction 包含模型调用、sandbox 调用和模型返回；worker 侧包含 delegation 入口及自身模型调用。worker delegation 保留父 run 关联，满足父视图保留子 Agent 入口、子视图保留内部细节的归属方向。
+- `/v1/sessions/sess_f618de6ee7aa6e151a87c218` 与 `/v1/sessions/sess_b33430d0e9ccf7d587971560` 均可点查，但 coverage 为 `asset_only / semantic_projection_expired_or_missing`，`interactionIds` 已存在而 `completeInteractions=0`。因此 Session 边界修复通过，canonical semantic durable projection 仍未通过最终验收。
