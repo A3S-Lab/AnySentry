@@ -6795,10 +6795,16 @@ function universalFromOtelAttrs(
   const content = attrText(combined, 'anysentry.content', 'gen_ai.prompt', 'llm.prompt', 'log.record.body');
   const explicitKind = attrText(combined, 'anysentry.event.kind', 'event.kind', 'event.name');
   const genAiOperation = attrText(combined, 'gen_ai.operation.name');
+  const adapterRuntime = attrText(combined, 'anysentry.adapter.runtime', 'telemetry.sdk.name');
+  const workflowNode = attrText(combined, 'anysentry.workflow.node', 'langgraph.node', 'workflow.node');
   const inferredKind =
     explicitKind ??
     (genAiOperation === 'execute_tool' ? 'AgentTool' : undefined) ??
     (genAiOperation === 'invoke_agent' ? 'AgentInvocation' : undefined) ??
+    // A capability-declared workflow span is semantic even when it does not carry a vendor
+    // specific event name. Preserve the node boundary generically; do not require LangGraph or
+    // a tool name to be present.
+    (adapterRuntime && workflowNode ? 'NodeRun' : undefined) ??
     (command ? 'tool' : undefined) ??
     (filePath ? 'file' : undefined) ??
     (dnsQuery ? 'dns' : undefined) ??
@@ -15586,6 +15592,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 /** Narrow pure helpers exposed only for deterministic repository-level contract tests. They do
  * not form a runtime API and contain no product/version-specific branching. */
 export const semanticProjectionTesting = {
+  universalFromOtelAttrs,
   semanticToolHints,
   canonicalInteractionForSemanticEvent,
   canonicalSemanticRecordForEvent,
