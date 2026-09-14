@@ -88,15 +88,16 @@ function processInfo(observerEvent) {
 
 function behaviorKey(observerEvent, attribution) {
   // A physical workload is the retention boundary, not a process-generation identity.  A
-  // restarted service (or two agent roots sharing one pod/cgroup) must not inherit the previous
-  // short-window score.  Prefer the generation key supplied by the attribution lane while still
-  // retaining workload-level aggregation for fixtures and older collectors that do not provide
-  // one yet.
+  // A restarted service (or two agent roots sharing one pod/cgroup) must not inherit the previous
+  // short-window score. Use explicit runtime/root fences when available, while retaining
+  // workload-level aggregation for child processes and older collectors without a root fence.
   if (text(attribution?.physicalWorkloadId)) {
+    // processGenerationKey identifies an individual observed process in the kernel lane, not
+    // necessarily the workload root. Prefer explicit runtime/AgentInstance fences and root
+    // start-time facts; otherwise child Tool/Network/File processes in one physical workload
+    // must share the same cold-start window.
     const generation = text(
-      attribution?.processGenerationKey
-        ?? attribution?.process_generation_key
-        ?? attribution?.agentInstanceId
+      attribution?.agentInstanceId
         ?? attribution?.agent_instance_id
         ?? attribution?.runtimeInstanceId
         ?? attribution?.runtime_instance_id,
