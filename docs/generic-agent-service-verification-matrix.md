@@ -186,3 +186,20 @@ AnySentry API 以提交 `e1adf79` 构建并部署到开发 Kubernetes，运行�
 且未被 infrastructure 规则拒绝；但按该 run/trace 查询 `events/list` 和 `agents/interactions` 仍均为 0，
 coverage 为 `exact_as_observed/partial=false`。故当前故障点已从 Forwarder 候选判定进一步收敛到
 F2/F3 canonical ingest 或 interaction projection，而不是冷启动识别或 API 字段隐藏。
+
+### 2026-09-15 raw commit 边界修复
+
+coverage-gaps 对本轮 source `src_c6afd3f7e7c4e847` 连续报告
+`stage=raw_commit, reason=parser_failed, validation=raw_observation_has_missing_or_invalid_required_fields`。
+根因是 Observer 事件在冷启动重组窗口可能没有 `eventAtUnixNs`，而 canonical raw validator 将
+`eventAtUnixNs/receivedAtUnixNs` 视为必填，导致事件在 semantic parser 之前无法进入 RawObservation。
+
+提交 `eeb91b3` 对已认证 Observer raw lane 增加有界时间回退：缺少采集事件时间时使用 API receive
+clock，标记 `eventTimeQuality=api_received` 和 `anysentry.event_time_fallback=api_received`，不伪造
+provider/application 时间。AnySentry API 以 digest
+`127.0.0.1:5000/anysentry@sha256:fe1276a595ccac15c889f44851d769ca636906cb6b3ab5ccb21488cfee443978`
+部署，旧 Pod 已停止并删除。部署后未再启动 customer 测试容器；Forwarder WAL 已清理为 0 bytes，
+Observer DaemonSet 已恢复 Ready rollout。
+
+尚待一次新镜像下的 customer A/B 受控请求验证 raw commit gap 是否消失，以及 interaction point-read
+是否恢复；在该验证前不宣称 canonical Session/Run 已通过。
