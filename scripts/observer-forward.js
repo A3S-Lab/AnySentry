@@ -1002,6 +1002,21 @@ function eventKind(o) {
   return Object.keys(o.event)[0] || '';
 }
 
+// A decoded LlmInteraction carrying an application correlation tuple is already a
+// protocol-level Agent signal.  Keep this generic: it does not inspect a tool name,
+// vendor host, port, or framework version.  The tuple is only a candidate signal; it
+// never creates a LogicalAgent by itself and remains visible in the attribution reason.
+function hasCorrelatedLlmInteraction(o) {
+  const input = o?.event?.LlmInteraction;
+  if (!input || typeof input !== 'object') return false;
+  const runId = input.runId ?? input.run_id;
+  const traceId = input.traceId ?? input.trace_id;
+  const sessionId = input.sessionId ?? input.session_id;
+  return typeof runId === 'string' && runId.trim().length > 0
+    && (typeof traceId === 'string' && traceId.trim().length > 0
+      || typeof sessionId === 'string' && sessionId.trim().length > 0);
+}
+
 function durableRecordKind(body) {
   try {
     return eventKind(JSON.parse(String(body?.line || '')));
@@ -4019,13 +4034,34 @@ function handleLine(raw, fromDeferred = false) {
       ? behaviorDetector.observe(o, catalogClassification.attribution)
       : undefined) ??
     catalogClassification;
-  const classification = infrastructureEvaluation?.classification
+  let classification = infrastructureEvaluation?.classification
     ? mergeAttributionClassifications(
         identityClassification,
         workloadClassification,
         infrastructureEvaluation.classification,
       ) ?? identityClassification
     : identityClassification;
+  // Correlation headers on a decoded LLM interaction are a bounded discovery signal.  A
+  // previously unknown workload must be allowed into the candidate/full-evidence path so the
+  // API can join its first run; requiring a pre-existing process rule here creates a cold-start
+  // deadlock.  Infrastructure/non-agent conclusions remain authoritative.
+  if (
+    hasCorrelatedLlmInteraction(o)
+    && classification.state === 'unknown'
+    && classification.attribution?.classification !== 'non_agent'
+  ) {
+    classification = {
+      ...classification,
+      state: 'agent',
+      attribution: {
+        ...(classification.attribution || {}),
+        classification: 'probable_agent',
+        confidence: Math.max(Number(classification.attribution?.confidence) || 0, 0.5),
+        source: 'correlation_header',
+        reason: 'correlated_llm_interaction_candidate',
+      },
+    };
+  }
   const classificationSemantics = classificationSemanticsEnvelope(classification, o);
   const unknownReason = classificationSemantics.classificationSemantics?.unknownReason;
   if (unknownReason) {
