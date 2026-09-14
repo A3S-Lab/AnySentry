@@ -18,7 +18,8 @@ import type {
 } from './unknown-learning';
 import type { JudgedEvent } from './types';
 import type { UnknownInfrastructureRecommendationEvidence } from './infrastructure-rule.types';
-import { BehaviorAgentScorer, type BehaviorAgentScore } from './behavior-agent-scorer';
+import { BehaviorCandidateRegistry } from './behavior-candidate-registry.service';
+import type { BehaviorAgentScore } from './behavior-agent-scorer';
 
 function envEnabled(value: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
@@ -74,11 +75,6 @@ function hasLearnableUnknownIdentity(event: JudgedEvent): boolean {
 
 @Injectable()
 export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDestroy {
-  private readonly behaviorScorer = new BehaviorAgentScorer({
-    windowMs: envInteger(process.env.ANYSENTRY_BEHAVIOR_CANDIDATE_WINDOW_MS, 60_000, 10_000, 15 * 60_000),
-    threshold: envInteger(process.env.ANYSENTRY_BEHAVIOR_CANDIDATE_THRESHOLD, 8, 3, 100),
-    maxScopes: envInteger(process.env.ANYSENTRY_BEHAVIOR_CANDIDATE_MAX_SCOPES, 1024, 16, 100_000),
-  });
   private readonly configuredEnabled = envEnabled(process.env.ANYSENTRY_UNKNOWN_LEARNING_ENABLED);
   private readonly persistIntervalMs = envInteger(
     process.env.ANYSENTRY_UNKNOWN_LEARNING_PERSIST_INTERVAL_MS,
@@ -111,7 +107,10 @@ export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDest
   private lastPersistedAt?: number;
   private persistenceErrors = 0;
 
-  constructor(private readonly judge: SentryJudgeService) {}
+  constructor(
+    private readonly judge: SentryJudgeService,
+    private readonly behaviorCandidates: BehaviorCandidateRegistry,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     if (!this.configuredEnabled) return;
@@ -174,10 +173,6 @@ export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDest
       };
     }
     const candidates = events.filter(hasLearnableUnknownIdentity);
-    // Candidate discovery is intentionally derived from the same bounded Unknown stream. The
-    // score is exposed to the rule projection bridge; it never changes the durable event ACK or
-    // authoritatively drops anything.
-    for (const event of candidates) this.behaviorScorer.observe(event);
     if (candidates.length === 0) {
       const current = this.core.status();
       return {
@@ -210,7 +205,7 @@ export class UnknownLearningRuntimeService implements OnModuleInit, OnModuleDest
   }
 
   behaviorScore(scopeKey: string): BehaviorAgentScore | undefined {
-    return this.behaviorScorer.get(scopeKey);
+    return this.behaviorCandidates.get(scopeKey);
   }
 
   listClusters(limit = 200): UnknownCluster[] {

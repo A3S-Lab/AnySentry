@@ -36,6 +36,7 @@ import {
 } from './trusted-correlation';
 import { AgentInteractionQuery, AgentInteractionRecord, CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 import { FilterRuleCatalogService } from './filter-rule-catalog.service';
+import { BehaviorCandidateRegistry } from './behavior-candidate-registry.service';
 import type { FilterRuleDecisionReceipt } from './filter-rule.types';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
@@ -500,6 +501,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     private readonly currentState: DistributedCurrentStateService,
     private readonly relational: RelationalBusinessStore,
     @Optional() private readonly filterRules?: FilterRuleCatalogService,
+    @Optional() private readonly behaviorCandidates?: BehaviorCandidateRegistry,
   ) {}
 
   private sentry!: Sentry;
@@ -1455,6 +1457,29 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   prepareAcceptWithDisposition(line: string, meta: EventMeta, at = Date.now()): PreparedJudgeAcceptOutcome {
     const base = this.eventBase(line, meta, at);
+    const candidateScore = this.behaviorCandidates?.observe(base as JudgedEvent);
+    if (candidateScore?.candidate) {
+      base.attribution = {
+        ...(base.attribution ?? { monitored: true }),
+        monitored: true,
+        classification: 'probable_agent',
+        agentInstanceId: '__behavior_candidate__',
+        source: 'behavior',
+        reason: 'hint_only',
+        confidence: Math.min(0.99, Math.max(0.01, candidateScore.score / 100)),
+      };
+      base.classificationSemantics = {
+        ...(base.classificationSemantics ?? {
+          schemaVersion: 'anysentry.classification_semantics.v1',
+          workloadRole: 'ordinary_process',
+          captureProfile: 'unknown_discovery',
+        }),
+        identityClassification: 'probable_agent',
+        effectiveIdentityClassification: 'probable_agent',
+        classificationSource: 'candidate_auto_promoted',
+        captureProfile: 'probable_investigation',
+      };
+    }
     if (!SECURITY_JUDGED_KINDS.has(base.eventKind) && !OBSERVER_KINDS.has(base.eventKind) && base.source !== 'api') {
       return { disposition: 'rejected', reasonCode: 'unsupported_or_unparseable' };
     }
