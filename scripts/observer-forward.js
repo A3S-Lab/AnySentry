@@ -3183,7 +3183,8 @@ function finishBatch(batch, outcome, retryDelivery) {
     const rejectedKinds = [...new Set(rejectedItems.map((item) => {
       try {
         const parsed = typeof item.body === 'string' ? JSON.parse(item.body) : item.body;
-        return parsed?.eventKind || parsed?.observerEvent?.eventKind || 'unknown';
+        const line = typeof parsed?.line === 'string' ? JSON.parse(parsed.line) : parsed?.observerEvent ?? parsed;
+        return line?.eventKind || (line?.event && Object.keys(line.event)[0]) || 'unknown';
       } catch {
         return 'malformed';
       }
