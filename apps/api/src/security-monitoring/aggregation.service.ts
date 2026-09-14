@@ -3403,7 +3403,10 @@ export class AggregationService implements OnModuleDestroy {
       agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
       agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
       model: resolveConversationId ? undefined : filter.model,
-      limit: 500,
+      // Keep the first semantic read bounded even for raw Session projections. The ClickHouse
+      // interaction query performs GROUP BY/argMax before LIMIT, so a large limit still causes a
+      // wide merge sort and can exceed the node memory budget before pagination happens.
+      limit: CONVERSATION_INTERACTIONS_PER_AGENT,
     };
     const inventoryQuery: T.AgentInventoryQuery = {
       timeType: filter.timeType,
@@ -3414,7 +3417,7 @@ export class AggregationService implements OnModuleDestroy {
       agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
       agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
       includeUnclassified: false,
-      limit: 500,
+      limit: CONVERSATION_INTERACTIONS_PER_AGENT,
     };
     const preciseContentQuery = Boolean(
       filter.agentAssetId
