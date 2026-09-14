@@ -12982,6 +12982,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       throw new NotFoundException('session not found');
     }
     conversationId = session.conversationId ?? session.sessionId;
+    // Canonical Session requests must keep the immutable membership selector through the
+    // projection call.  Resolving only through the compatibility conversation alias can miss
+    // freshly persisted members before the alias binding is materialized, yielding an empty
+    // timeline even though Session GET already has exact interactionIds.
+    const projectionConversationId = /^sess_[a-f0-9]{24}$/u.test(sessionId)
+      && session.interactionIds.length > 0
+      ? sessionId
+      : conversationId;
     const hotInteraction = session.interactionIds
       .map((interactionId) => this.agg.getAgentInteractionHot(interactionId))
       .find((interaction): interaction is T.AgentInteractionRecord => Boolean(interaction));
@@ -12994,7 +13002,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         scope: 'raw',
         classificationView: query.classificationView,
         includeBackground: true,
-        conversationId,
+        conversationId: projectionConversationId,
         limit: query.limit,
       }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
     } catch (error) {
@@ -13043,7 +13051,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               scope: 'raw',
               classificationView: query.classificationView,
         includeBackground: true,
-              conversationId,
+              conversationId: projectionConversationId,
               limit: query.limit,
             }), CANONICAL_SEMANTIC_TIMELINE_TIMEOUT_MS);
           }
