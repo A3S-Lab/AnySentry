@@ -32,6 +32,9 @@ const dockerMarker = `marker-docker-template-${suffix}`;
 const unknownMarker = `marker-unknown-behavior-${suffix}`;
 const k8sAgentMarker = `marker-k8s-agent-${suffix}`;
 const k8sSidecarMarker = `marker-k8s-sidecar-${suffix}`;
+const ingestMarkerPrefix = `asel-marker-${suffix}-docker-shadow-`;
+const ingestDockerMarker = `${ingestMarkerPrefix}pi`;
+const ingestUnknownMarker = `${ingestMarkerPrefix}unknown-filter-canary`;
 const namespace = process.env.ANYSENTRY_REAL_K8S_NAMESPACE || 'default';
 const controlNamespace = process.env.ANYSENTRY_REAL_CONTROL_NAMESPACE || 'anysentry';
 const capacityGate = process.env.ANYSENTRY_REAL_CAPACITY_GATE !== 'off';
@@ -396,6 +399,7 @@ export function collectorLaunch(snapshotPort, nodeName, credentials, controlToke
     FORWARD_SCOPE: 'shadow',
     ANYSENTRY_SOURCE_TYPE: 'observer',
     ANYSENTRY_SOURCE_NAME: 'real-agent-filter-chain',
+    ANYSENTRY_E2E_INGEST_MARKER_PREFIX: ingestMarkerPrefix,
   };
   return {
     args: [
@@ -450,7 +454,7 @@ async function triggerScenarios() {
     templateName,
     '/bin/sh',
     '-c',
-    `printf '%s' ${dockerMarker} >/tmp/${dockerMarker}; sleep 2`,
+    `printf '%s' ${ingestDockerMarker}; printf '%s' ${dockerMarker} >/tmp/${dockerMarker}; sleep 2`,
   ]);
 
   // Keep each phase alive briefly. Observer exports exec, connect and file records from
@@ -473,7 +477,7 @@ async function triggerScenarios() {
     unknownName,
     '/bin/sh',
     '-c',
-    `printf '%s' ${unknownMarker} >/tmp/${unknownMarker}; sleep 2`,
+    `printf '%s' ${ingestUnknownMarker}; printf '%s' ${unknownMarker} >/tmp/${unknownMarker}; sleep 2`,
   ]);
   // The file write completes tool A -> network/decision -> tool B -> workspace change.
   // Verify a later tool inherits the resulting probable identity instead of accepting raw
