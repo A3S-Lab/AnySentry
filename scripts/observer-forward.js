@@ -4284,6 +4284,16 @@ async function start() {
   }
   const dockerStarted = await dockerDiscovery.start((snapshot) => {
     latestDockerIdentitySnapshot = snapshot;
+    // Keep Docker discovery failures distinguishable from an empty inventory. This is a
+    // bounded control-plane diagnostic only: never log labels, argv, credentials, or payloads.
+    const discoveredAgents = Array.isArray(snapshot?.entries)
+      ? snapshot.entries.filter((entry) => entry?.classification === 'confirmed_agent').length
+      : 0;
+    console.error(
+      `[observer-forward] docker snapshot: version=${Number(snapshot?.version) || 0}; ` +
+      `ready=${snapshot?.ready === true}; containers=${Array.isArray(snapshot?.entries) ? snapshot.entries.length : 0}; ` +
+      `confirmed_agents=${discoveredAgents}; errors=${Number(snapshot?.errors) || 0}`,
+    );
     // Include already-discovered host/SSH roots whenever Docker inventory changes, while keeping
     // the local projection idempotent when neither side's admission facts changed.
     lastTlsScopeFingerprint = '';
