@@ -1257,6 +1257,8 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
         return invalidBatchAck(batchLength, 'batch endpoint retryable items are not a contiguous suffix');
       }
       rejectedItems++;
+      batch[index].rejectReasonCode = typeof item.reasonCode === 'string' ? item.reasonCode : '';
+      batch[index].rejectReason = typeof item.reason === 'string' ? item.reason.slice(0, 300) : '';
       rejectedBatchItems.push(batch[index]);
     } else {
       return invalidBatchAck(batchLength, 'batch endpoint returned an invalid rejected disposition');
@@ -3189,7 +3191,9 @@ function finishBatch(batch, outcome, retryDelivery) {
         return 'malformed';
       }
     }))];
-    console.error(`[observer-forward] rejected event details count=${rejectedItems.length} kinds=${rejectedKinds.join(',') || 'unknown'} reason=${outcome.reason || 'permanent ingest rejection'}`);
+    const rejectionReasons = [...new Set(rejectedItems.map((item) =>
+      `${item.rejectReasonCode || 'unknown'}:${item.rejectReason || outcome.reason || 'permanent ingest rejection'}`))];
+    console.error(`[observer-forward] rejected event details count=${rejectedItems.length} kinds=${rejectedKinds.join(',') || 'unknown'} reasons=${rejectionReasons.join('|')}`);
     spool.deadLetter(
       rejectedItems
         .filter((item) => item.spoolId)
