@@ -1092,13 +1092,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     };
   }
 
-  async listDurableSessionMemberships(limit = 1_000, interactionId?: string): Promise<SessionMembership[]> {
+  async listDurableSessionMemberships(limit = 1_000, interactionId?: string, sessionId?: string): Promise<SessionMembership[]> {
     const requested = Number(limit);
     const bounded = Number.isFinite(requested) ? Math.max(1, Math.min(10_000, Math.trunc(requested))) : 1_000;
     const durable = this.sink?.loadSessionMemberships
       ? (await this.sink.loadSessionMemberships({
           limit: bounded,
           ...(interactionId ? { interactionIds: [interactionId] } : {}),
+          ...(sessionId ? { sessionIds: [sessionId] } : {}),
         }).catch(() => []))
           .flatMap((candidate) => {
             const safe = safeDurableSessionMembership(candidate);
@@ -1108,7 +1109,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     return this.mergeDurableFirst(
       durable,
       this.sessionMemberships.list(Math.min(10_000, bounded * (interactionId ? 8 : 1)))
-        .filter((membership) => !interactionId || membership.interactionId === interactionId),
+        .filter((membership) => (!interactionId || membership.interactionId === interactionId)
+          && (!sessionId || membership.sessionId === sessionId)),
       (membership) => `${membership.membershipId}\0${membership.resolutionRevision}`,
     )
       .sort((left, right) => left.validFromUnixNs === right.validFromUnixNs

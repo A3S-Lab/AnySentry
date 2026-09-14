@@ -12185,14 +12185,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     // reconciling one conversation makes a small deep link pay for a large PostgreSQL/WAL scan.
     // Resolve the bounded interaction ID set first and fetch only those membership rows; broad
     // membership listing remains reserved for the directory path.
-    const selectedMemberships = query.sessionId && this.conversationBindings
-      ? await this.conversationBindings.interactionIdsForConversation(query.sessionId, 512)
-      : undefined;
-    const membershipIds = selectedMemberships?.interactionIds ?? [];
-    const memberships = membershipIds.length > 0
-      ? (await Promise.all(membershipIds.map((interactionId) =>
-          this.canonicalObservability.listDurableSessionMemberships(16, interactionId))))
-        .flat()
+    const memberships = query.sessionId
+      ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
       : await this.canonicalObservability.listDurableSessionMemberships(512);
     const membershipBySession = new Map<string, T.SessionMembership[]>();
     for (const membership of memberships) {
