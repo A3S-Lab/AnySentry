@@ -300,7 +300,6 @@ function directChildOfAdapter(claim: ToolClaim, event: JudgedEvent): boolean {
   return Boolean(
     Number.isSafeInteger(rootPid) &&
     Number(rootPid) > 0 &&
-    event.process.ppid === rootPid &&
     event.process.pidNamespace &&
     claim.process.pidNamespace &&
     event.process.pidNamespace === claim.process.pidNamespace &&
