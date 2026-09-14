@@ -243,3 +243,26 @@ canonical Session IDs and interaction references. The Session point endpoint nev
 projection for coverage. Commit `9510935` adds a bounded durable-record reconciliation to the
 Session projection. The source builds successfully with `pnpm --filter @anysentry/api build`; the
 new behavior still needs an image rebuild and a fresh A/B runtime check.
+
+### 2026-09-15 rebuilt image and A/B runtime check
+
+Image `127.0.0.1:5000/anysentry:session-reconcile-9510935` was built from commit `9510935`,
+pushed to the local registry with digest `sha256:6ffc25e670279eb025be9ca94fc9e551a81a47f5a7ae8a6ef8a9ad154509fcda`,
+and rolled out as the only ready AnySentry replica. The previous ReplicaSet terminated normally.
+
+Design A was rebuilt and run through `:18090/runs`; it returned `completed`, sandbox exit code 0,
+and `1 + 1 = 2`. AnySentry recorded six interactions in canonical Session
+`sess_a8ce5a98ce4c71a3544897d7` for run `1e3dc726-f8ad-419d-b309-204c999cc754`.
+
+Design B was then rebuilt after Design A cleanup. The orchestrator, worker and sandbox health checks
+passed; `/runs` returned `completed`, the worker returned `remote_ok`, and the correlation payload
+contained a worker hop and sandbox execution. AnySentry recorded six interactions in canonical Session
+`sess_982d3b0f4adcca5cf5819eb6`, including model, sandbox and gateway traffic. The Session point
+query returned `coverage.status=partial`, with `completeInteractions=3` and
+`partialInteractions=3`, and no `semantic_projection_expired_or_missing` reason. The partial state
+is retained because the run contains pending/less-complete semantic records; it is not promoted to
+complete by the durable reconciliation.
+
+The customer A/B containers, networks and dangling images were removed after verification; the
+pre-existing local registry was retained. Observer logs showed bounded reassembly and dynamic PID
+allowlist admission; classic SSL static-signature warnings remain the separately protected WIP boundary.
