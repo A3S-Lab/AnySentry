@@ -12171,7 +12171,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       agentInstanceId: query.agentInstanceId,
       product: query.product,
       q: query.q,
-      limit: 500,
+      // Session directory reads are interactive and must stay below the bounded semantic
+      // projection scan budget. The caller applies its own page size after canonical membership
+      // reconciliation; asking ClickHouse for 500 wide summaries first can trigger a global sort
+      // and exceed the node memory limit under ordinary history volume.
+      limit: CANONICAL_SEMANTIC_SESSION_SCAN_MAX,
     });
     const memberships = await this.canonicalObservability.listDurableSessionMemberships(10_000);
     const membershipBySession = new Map<string, T.SessionMembership[]>();
