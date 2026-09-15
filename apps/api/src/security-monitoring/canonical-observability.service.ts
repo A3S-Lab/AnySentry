@@ -353,6 +353,12 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     1,
     64,
   );
+  private readonly asyncPersistenceWaitMs = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_PERSIST_WAIT_MS',
+    250,
+    0,
+    2_000,
+  );
   private asyncPersistenceInFlight = 0;
   private asyncPersistenceScheduled = 0;
   private asyncPersistenceCompleted = 0;
@@ -431,10 +437,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         return false;
       }
     }
-    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
-      this.asyncPersistenceDropped += 1;
-      reportFailure();
-      return false;
+    const waitUntil = Date.now() + this.asyncPersistenceWaitMs;
+    while (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+      const remaining = waitUntil - Date.now();
+      if (remaining <= 0 || this.closed) {
+        this.asyncPersistenceDropped += 1;
+        reportFailure();
+        return false;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(remaining, 10)));
     }
     this.asyncPersistenceInFlight += 1;
     this.asyncPersistenceScheduled += 1;
