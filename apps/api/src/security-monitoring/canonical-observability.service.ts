@@ -380,7 +380,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncRawBatchQueue: Array<{ observation: RawObservation; onFailure: () => void }> = [];
   private asyncRawBatchQueueBytes = 0;
   private asyncRawBatchTimer?: ReturnType<typeof setTimeout>;
-  private asyncKernelBatchQueue: Array<{ fact: KernelFact; onFailure: () => void }> = [];
+  private readonly asyncKernelBatchMaxBytes = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_KERNEL_BATCH_MAX_BYTES',
+    8 * 1024 * 1024,
+    64 * 1024,
+    32 * 1024 * 1024,
+  );
+  private asyncKernelBatchQueue: Array<{ fact: KernelFact; bytes: number; onFailure: () => void }> = [];
+  private asyncKernelBatchQueueBytes = 0;
   private asyncKernelBatchTimer?: ReturnType<typeof setTimeout>;
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
@@ -536,12 +543,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private enqueueKernelFact(fact: KernelFact, onFailure: () => void): boolean {
     if (!this.sink || this.closed) return false;
     const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
-    if (this.asyncKernelBatchQueue.length >= capacity) {
+    const bytes = Buffer.byteLength(JSON.stringify(fact));
+    if (this.asyncKernelBatchQueue.length >= capacity
+      || this.asyncKernelBatchQueueBytes + bytes > this.asyncKernelBatchMaxBytes) {
       this.asyncPersistenceDropped += 1;
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
-    this.asyncKernelBatchQueue.push({ fact, onFailure });
+    this.asyncKernelBatchQueue.push({ fact, bytes, onFailure });
+    this.asyncKernelBatchQueueBytes += bytes;
     this.asyncPersistenceScheduled += 1;
     if (this.asyncKernelBatchQueue.length >= this.asyncRawBatchMaxRows) void this.flushKernelFactBatch();
     else {
@@ -569,6 +579,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       return;
     }
     const batch = this.asyncKernelBatchQueue.splice(0, this.asyncRawBatchMaxRows);
+    this.asyncKernelBatchQueueBytes -= batch.reduce((sum, item) => sum + item.bytes, 0);
     this.asyncPersistenceInFlight += 1;
     const task = Promise.resolve()
       .then(() => this.sink?.saveKernelFacts?.(batch.map(({ fact }) => fact)) ?? false)
@@ -1358,6 +1369,9 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncRawBatchQueueBytes: number;
     asyncRawBatchMaxRows: number;
     asyncRawBatchMaxBytes: number;
+    asyncKernelBatchQueueRows: number;
+    asyncKernelBatchQueueBytes: number;
+    asyncKernelBatchMaxBytes: number;
   } {
     return {
       entries: this.gaps.size,
@@ -1384,6 +1398,9 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncRawBatchQueueBytes: this.asyncRawBatchQueueBytes,
       asyncRawBatchMaxRows: this.asyncRawBatchMaxRows,
       asyncRawBatchMaxBytes: this.asyncRawBatchMaxBytes,
+      asyncKernelBatchQueueRows: this.asyncKernelBatchQueue.length,
+      asyncKernelBatchQueueBytes: this.asyncKernelBatchQueueBytes,
+      asyncKernelBatchMaxBytes: this.asyncKernelBatchMaxBytes,
     };
   }
 
@@ -1631,6 +1648,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     }
     this.asyncRawBatchQueue = [];
     this.asyncRawBatchQueueBytes = 0;
+    if (this.asyncKernelBatchTimer) clearTimeout(this.asyncKernelBatchTimer);
+    this.asyncKernelBatchTimer = undefined;
+    for (const item of this.asyncKernelBatchQueue) {
+      this.asyncPersistenceDropped += 1;
+      try { item.onFailure(); } catch { /* coverage is best effort */ }
+    }
+    this.asyncKernelBatchQueue = [];
+    this.asyncKernelBatchQueueBytes = 0;
     this.closed = true;
     this.raw.close();
     this.kernel.close();

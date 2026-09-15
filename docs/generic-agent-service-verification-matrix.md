@@ -470,9 +470,9 @@ Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经
 
 同一开发机上做了一个短时 F3 对照：将 AnySentry 的 `ANYSENTRY_CANONICAL_PERSIST` 临时设为 `off` 后，Collector 队列从约 9,300 降到约 4,370，新增 `droppedEvents/outputDropped/queueDropped` 仍为 0；恢复部署时已重新设置 `ANYSENTRY_CANONICAL_PERSIST=on`、`ANYSENTRY_CANONICAL_ASYNC_PERSIST=on`、`ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT=4`，并清理旧 Pod。该对照把容量瓶颈定位到 canonical durable persistence/F3 处理路径，而不是 eBPF Ring 或前置过滤；它不构成关闭持久化的产品方案，也不构成稳定性通过证据。
 
-`f7d9207` 的 API `dist` 已通过 `kubectl cp` 临时热替换到当前开发 Pod（Docker daemon 对镜像 `create/pull` 超时，未将临时镜像误记为正式 digest 部署）。重启后 Collector 先回到 `queueDepth=2`，规则投影仍为 `ready`，新增丢弃为 0；持续 45 秒后队列再次升至约 2,511，仍为 `spool_backlog_over_slo`。这证明 KernelFact 批量代码已能在真实进程启动，但单项优化尚不足以抵消主机约 3,100 events/min 的输入负载，最终稳定性验收仍未通过。
+更正此前的部署结论：曾把 `f7d9207` 的 API `dist` 复制到旧 Pod，随后删除了该 Pod。副本重建会从 Deployment 镜像恢复，复制内容不会保留。当前 Pod 文件 SHA-256 为 `4760a017932bc59be9e95f26f5a70b867794202001eccbb8b519c7704247f756`，且没有 `enqueueKernelFact`；因此原先声称“批量代码已在真实进程启动”的结论撤回。队列与 A/B 观测仍是旧镜像配合运行参数的证据，不能归因于 `f7d9207`。后续必须在 digest 部署后比较容器内代码哈希，再做持久化验收。
 
-随后将开发机 Observer Forwarder 的有界单批配置从 `FORWARD_BATCH_SIZE=128`、`FORWARD_BATCH_MAX_BYTES=131072` 调整为 `512` 和 `524288`，保持 `FORWARD_MAX_INFLIGHT=4` 不变。滚动替换旧 Pod 后，Collector 连续两个 45 秒窗口分别报告 `healthy/queueDepth=184` 和 `healthy/queueDepth=0`，`droppedEvents=0`、`outputDropped=0`、`queueDropped=0`。这说明主要容量问题是 HTTP/ClickHouse 小批提交开销，扩大有限批次后已达到当前开发机稳定基线；仍需在该基线下重新执行真实 A/B LangGraph 和 canonical 完整点查。
+随后将开发机 Observer Forwarder 的有界单批配置从 `FORWARD_BATCH_SIZE=128`、`FORWARD_BATCH_MAX_BYTES=131072` 调整为 `512` 和 `524288`，保持 `FORWARD_MAX_INFLIGHT=4` 不变。滚动替换旧 Pod 后，Collector 连续两个 45 秒窗口分别报告 `healthy/queueDepth=184` 和 `healthy/queueDepth=0`，`droppedEvents=0`、`outputDropped=0`、`queueDropped=0`。这些短窗口与扩大有限批次后吞吐改善一致，但同时发生 Pod 重启，尚不能独立证明瓶颈或长期稳定；仍需在该基线下重新执行真实 A/B LangGraph 和 canonical 完整点查。
 
 在该稳定基线下重新执行 customer LangGraph：
 
