@@ -553,3 +553,20 @@ Correction to causal claims above: lane counters identify derived **admission** 
 database activity snapshots show WAL waits. These observations do not isolate WAL as the sole root
 cause, nor do zero raw-admission drops prove complete raw durability or end-to-end capture. Future
 comparisons must include durable point reads, write failures, query latency and all pipeline drops.
+
+### 2026-09-15 semantic durable microbatch deployment
+
+Commit `7107a45` adds a bounded relational SemanticRecord microbatcher. It snapshots accepted
+records, limits combined queued plus in-flight work to 4,096 rows/8 MiB by default, coalesces up
+to 128 rows per SQL call over a 10 ms window, isolates conflicting callers, and drains admitted
+work during shutdown. The deterministic module test passed together with the canonical contract,
+raw batch, kernel batch and lane-isolation tests.
+
+The resulting API image was deployed as digest
+`sha256:39bf93b5d92ee7ea581ee24464bd0423539cbc13b9838742aa8b6fc8b98fe656`. Startup took about 86
+seconds on this development host; the old Pod was removed after the new Pod became Ready. In the
+first controlled post-deploy samples, `asyncRawPersistenceDropped=0`, `asyncPersistenceFailed=0`,
+Raw/Kernel queues returned to zero between samples, and Derived drops increased 220 -> 225 -> 268
+across the observed windows. This is an improvement over the previous Derived-only lane sample,
+but it is not a no-gap result because EvidenceLink and SessionMembership are not yet microbatched
+and canonical durable point reads have not yet been rerun.
