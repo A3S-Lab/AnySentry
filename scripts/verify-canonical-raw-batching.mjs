@@ -18,9 +18,9 @@ const service = new CanonicalObservabilityService();
 const writes = [];
 service.setSink({ saveRawObservations: async (rows) => { writes.push(rows); return true; } });
 try {
-  // A non-raw writer occupies the shared slot, then completes without another ingest event.
+  // A raw side-lane writer occupies the raw slot, then completes without another ingest event.
   let release;
-  await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {});
+  await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {}, 'raw');
   const commits = await Promise.all(['one', 'two', 'three'].map(id =>
     service.commitObserverLine(JSON.stringify({ kind: 'fixture', id }), context(id))));
   assert(commits.every(result => result.observation && result.durable === false));

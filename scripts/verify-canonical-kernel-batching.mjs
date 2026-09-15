@@ -22,7 +22,7 @@ service.setSink({
 });
 try {
   let release;
-  await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {});
+  await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {}, 'raw');
   const results = [];
   for (const id of ['one', 'two', 'three']) {
     results.push(await service.commitObserverLine(JSON.stringify({ kind: 'Exec', id }), {

@@ -359,7 +359,16 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     0,
     2_000,
   );
+  // Keep derived semantic/session/evidence writes from being starved by raw/kernel batches.
+  // Both pools remain bounded; this is capacity isolation, not an unbounded retry queue.
+  private readonly asyncDerivedPersistenceMaxInFlight = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_DERIVED_MAX_INFLIGHT',
+    4,
+    1,
+    32,
+  );
   private asyncPersistenceInFlight = 0;
+  private asyncDerivedPersistenceInFlight = 0;
   private asyncPersistenceScheduled = 0;
   private asyncPersistenceCompleted = 0;
   private asyncPersistenceFailed = 0;
@@ -421,6 +430,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private async writeCanonicalSideLane(
     operation: () => Promise<boolean>,
     onFailure: () => void,
+    lane: 'raw' | 'derived' = 'derived',
   ): Promise<boolean> {
     if (!this.sink || this.closed) return false;
     const reportFailure = () => {
@@ -438,7 +448,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       }
     }
     const waitUntil = Date.now() + this.asyncPersistenceWaitMs;
-    while (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+    const laneInFlight = () => lane === 'derived'
+      ? this.asyncDerivedPersistenceInFlight
+      : this.asyncPersistenceInFlight;
+    const laneMaxInFlight = lane === 'derived'
+      ? this.asyncDerivedPersistenceMaxInFlight
+      : this.asyncPersistenceMaxInFlight;
+    while (laneInFlight() >= laneMaxInFlight) {
       const remaining = waitUntil - Date.now();
       if (remaining <= 0 || this.closed) {
         this.asyncPersistenceDropped += 1;
@@ -447,7 +463,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       }
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(remaining, 10)));
     }
-    this.asyncPersistenceInFlight += 1;
+    if (lane === 'derived') this.asyncDerivedPersistenceInFlight += 1;
+    else this.asyncPersistenceInFlight += 1;
     this.asyncPersistenceScheduled += 1;
     let task!: Promise<void>;
     task = Promise.resolve()
@@ -464,7 +481,11 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         reportFailure();
       })
       .finally(() => {
-        this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        if (lane === 'derived') {
+          this.asyncDerivedPersistenceInFlight = Math.max(0, this.asyncDerivedPersistenceInFlight - 1);
+        } else {
+          this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        }
         this.asyncPersistenceTasks.delete(task);
       });
     this.asyncPersistenceTasks.add(task);
@@ -698,6 +719,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         durable = await this.writeCanonicalSideLane(
           () => this.sink!.saveRawObservations!([sanitized]),
           failure,
+          'raw',
         );
         if (!durable) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
       }
@@ -1372,6 +1394,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncPersistence: boolean;
     asyncPersistenceInFlight: number;
     asyncPersistenceMaxInFlight: number;
+    asyncDerivedPersistenceInFlight: number;
+    asyncDerivedPersistenceMaxInFlight: number;
     asyncPersistenceScheduled: number;
     asyncPersistenceCompleted: number;
     asyncPersistenceFailed: number;
@@ -1401,6 +1425,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncPersistence: this.asyncPersistence,
       asyncPersistenceInFlight: this.asyncPersistenceInFlight,
       asyncPersistenceMaxInFlight: this.asyncPersistenceMaxInFlight,
+      asyncDerivedPersistenceInFlight: this.asyncDerivedPersistenceInFlight,
+      asyncDerivedPersistenceMaxInFlight: this.asyncDerivedPersistenceMaxInFlight,
       asyncPersistenceScheduled: this.asyncPersistenceScheduled,
       asyncPersistenceCompleted: this.asyncPersistenceCompleted,
       asyncPersistenceFailed: this.asyncPersistenceFailed,
