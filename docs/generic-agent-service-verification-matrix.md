@@ -502,3 +502,21 @@ Commit `4513bc6` adds a bounded wait (default 250 ms, maximum 2 s) before reject
 After deployment, the Collector remained active with `droppedEvents=0`, `outputDropped=0`, and `queueDropped=0`; the current Collector queue was bounded but degraded while it caught up. The canonical health samples showed bounded KernelFact queues (0--98 rows, 0--42,684 bytes) and no unbounded memory growth, but `asyncPersistenceDropped` continued to rise (1,285 -> 1,403 in a 30-second sample) and `asyncPersistenceFailed` remained at 321. The bounded wait therefore prevents an unbounded queue but does not yet provide canonical durable no-gap behavior. This is the current remaining F3 bottleneck; it must be addressed with independent lane capacity or a durable lossless handoff before claiming canonical Session/semantic projection stability.
 
 The health query also exposed historical Collector identities as `down`; the live Observer logs showed the current process forwarding events and reporting zero pipeline drops. These are separate stale health records and should not be used as evidence that the current Ring/Forwarder dropped events. A follow-up must reconcile Collector heartbeat identity and run a fresh A/B request against the new digest before the final canonical point-read gate.
+
+### 2026-09-15 derived persistence lane isolation
+
+Commit `bb9b58b` separates asynchronous derived canonical writes (SemanticRecord, EvidenceLink and
+SessionMembership) from the bounded Raw/KernelFact persistence pool. Commit `6827955` adds lane
+specific admission counters and a deterministic isolation test. The API image containing both
+changes was deployed as digest
+`sha256:b216492184025bd3cfc8603732a76a2eff8e7494a1ef6660108be5e042420c61`.
+
+On the first deployment with `ANYSENTRY_CANONICAL_ASYNC_DERIVED_MAX_INFLIGHT=4`, the health
+snapshot showed `asyncRawPersistenceDropped=0` and `asyncDerivedPersistenceDropped=4,352`; this
+proved the remaining drops were in the derived lane rather than Raw/Kernel admission. A bounded
+runtime comparison at derived concurrency 16 reduced the short-window increase but did not make it
+zero: `asyncPersistenceDropped` increased from 1,156 to 1,190 in 15 seconds, while both raw and
+kernel queues drained to zero and `asyncPersistenceFailed=0`. PostgreSQL showed WALWrite/WalSync
+waits, and the API remained within its configured memory limit. The concurrency change is retained
+as a bounded development-machine setting, not treated as a durable-loss fix. Canonical no-gap
+acceptance and A/B point-read verification remain open.
