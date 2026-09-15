@@ -739,7 +739,7 @@ function publishColdStartWorkloadCapture(snapshot = latestDockerIdentitySnapshot
   for (const entry of entries) {
     if (entry?.coldStartCandidate !== true) continue;
     const cgroupId = text(entry?.cgroupId);
-    const rootPid = Number(entry?.hostPid);
+    const rootPid = Number(entry?.hostPid ?? entry?.rootPid);
     const physicalWorkloadId = text(entry?.physicalWorkloadId);
     if (!cgroupId || !Number.isSafeInteger(rootPid) || rootPid <= 0 || !physicalWorkloadId) continue;
     if (filterRulePublisher.observeDecision({
