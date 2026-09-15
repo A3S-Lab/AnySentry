@@ -485,6 +485,8 @@ A/B 完成后的受控观察窗口中，Collector 有一次 API health 请求超
 
 最终本地接缝复核还通过了 canonical identity/session、canonical contract、raw side-lane batching、Session membership durable read、behavior discovery、Candidate attribution、2,000-rule performance 和 S5 capture profile。2026-09-15 10:28 的 Collector health 为 `healthy`，`queueDepth=0`、`droppedEvents=0`、`outputDropped=0`，规则模式为 `enforce`，`identitySnapshotReady=true`，`unifiedProjectionState=ready`。
 
+Observer 分支随后执行了完整 `cargo test --workspace`：`a3s-observer` 35 tests、workload contract 7 tests、collector 200 tests、common 9 tests 全部通过；其中 collector 包含 TLS attach、classic SSL、TLS scope、Ring admission、process generation、bounded pipeline、interaction reassembly 和 capture profile 测试。该结果是代码级覆盖证据，不替代真实容器中的 TLS/OCI 镜像验收。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
