@@ -464,7 +464,10 @@ an initial runtime regression check, not yet a sustained load or canonical point
 
 Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经返回 `coverage.completeness=exact_as_observed`、`partial=false`，但当前 run 只有 `/v1/chat/completions`，工具部分仍为 `tool_pending`。Collector 重组日志确认请求和响应均完成，critical/semantic/bulk 队列和 output drop 均为 0，因此该结果不能归因于 Ring 或 Forwarder 丢失。
 
+### 2026-09-15 clean spool stability follow-up
+
+重启并切换到开发机专用的空 spool 后，当前 Observer Pod 为 `a3s-observer-79mjs`，旧 customer LangGraph 容器、网络、volume 和本轮临时证据目录均已清理。Collector health 仍报告 `filterMetricsReported=true`、`identitySnapshotReady=true`、规则版本非零，且新增 `droppedEvents=0`、`queueDropped=0`、`outputDropped=0`；不过事件输入速率仍高于当前 F2/F3 发送速率，队列从约 1,900 增至约 4,630，delivery 状态保持 `degraded/spool_backlog_over_slo`。因此这次复核证明了清理后没有新的无界丢失，但尚不能作为持续稳定性通过。`FORWARD_MAX_INFLIGHT=4` 与 `FORWARD_BATCH_MAX_BYTES=131072` 保持有界配置，未为追求排空积压而全局放开采集或无界提高并发；后续验收必须先证明队列收敛，再进行重复真实服务测试。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
-
