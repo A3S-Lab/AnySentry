@@ -4380,10 +4380,18 @@ async function start() {
     const discoveredAgents = Array.isArray(snapshot?.entries)
       ? snapshot.entries.filter((entry) => entry?.classification === 'confirmed_agent').length
       : 0;
+    const coldStartCandidates = Array.isArray(snapshot?.entries)
+      ? snapshot.entries.filter((entry) => entry?.coldStartCandidate === true).length
+      : 0;
+    const coldStartRuntimeReady = Array.isArray(snapshot?.entries)
+      ? snapshot.entries.filter((entry) => entry?.coldStartCandidate === true
+        && text(entry?.cgroupId) && Number(entry?.hostPid) > 0).length
+      : 0;
     console.error(
       `[observer-forward] docker snapshot: version=${Number(snapshot?.version) || 0}; ` +
       `ready=${snapshot?.ready === true}; containers=${Array.isArray(snapshot?.entries) ? snapshot.entries.length : 0}; ` +
-      `confirmed_agents=${discoveredAgents}; errors=${Number(snapshot?.errors) || 0}`,
+      `confirmed_agents=${discoveredAgents}; cold_start_candidates=${coldStartCandidates}; ` +
+      `cold_start_runtime_ready=${coldStartRuntimeReady}; errors=${Number(snapshot?.errors) || 0}`,
     );
     // Include already-discovered host/SSH roots whenever Docker inventory changes, while keeping
     // the local projection idempotent when neither side's admission facts changed.
