@@ -474,6 +474,13 @@ Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经
 
 随后将开发机 Observer Forwarder 的有界单批配置从 `FORWARD_BATCH_SIZE=128`、`FORWARD_BATCH_MAX_BYTES=131072` 调整为 `512` 和 `524288`，保持 `FORWARD_MAX_INFLIGHT=4` 不变。滚动替换旧 Pod 后，Collector 连续两个 45 秒窗口分别报告 `healthy/queueDepth=184` 和 `healthy/queueDepth=0`，`droppedEvents=0`、`outputDropped=0`、`queueDropped=0`。这说明主要容量问题是 HTTP/ClickHouse 小批提交开销，扩大有限批次后已达到当前开发机稳定基线；仍需在该基线下重新执行真实 A/B LangGraph 和 canonical 完整点查。
 
+在该稳定基线下重新执行 customer LangGraph：
+
+- Design B：完成一次真实 `/runs`，canonical 查询返回 7 条 interaction，`completeness=exact_as_observed`、`partial=false`，路径包含 `/runs`、`/v1/chat/completions`、`/execute`，来源为 `tcp_plaintext`，`transport_incomplete=0`；conversation-directory 找到父 orchestrator 与 worker 两个 LangGraph thread，timeline 均包含工具调用和工具结果。
+- Design A：同进程子图完成一次真实 `/runs`，canonical 查询返回 8 条 interaction，`completeness=exact_as_observed`、`partial=false`，每条 interaction 的 `transportCompleteness=complete`，并保留同一 run/trace 的 Session 归属与 KernelFact 进程代次。
+
+两种方案测试结束后已停止并清理 customer compose 容器、volume 和 network；AnySentry/Observer 基础设施保持运行。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
