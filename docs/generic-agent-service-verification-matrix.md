@@ -470,6 +470,8 @@ Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经
 
 同一开发机上做了一个短时 F3 对照：将 AnySentry 的 `ANYSENTRY_CANONICAL_PERSIST` 临时设为 `off` 后，Collector 队列从约 9,300 降到约 4,370，新增 `droppedEvents/outputDropped/queueDropped` 仍为 0；恢复部署时已重新设置 `ANYSENTRY_CANONICAL_PERSIST=on`、`ANYSENTRY_CANONICAL_ASYNC_PERSIST=on`、`ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT=4`，并清理旧 Pod。该对照把容量瓶颈定位到 canonical durable persistence/F3 处理路径，而不是 eBPF Ring 或前置过滤；它不构成关闭持久化的产品方案，也不构成稳定性通过证据。
 
+`f7d9207` 的 API `dist` 已通过 `kubectl cp` 临时热替换到当前开发 Pod（Docker daemon 对镜像 `create/pull` 超时，未将临时镜像误记为正式 digest 部署）。重启后 Collector 先回到 `queueDepth=2`，规则投影仍为 `ready`，新增丢弃为 0；持续 45 秒后队列再次升至约 2,511，仍为 `spool_backlog_over_slo`。这证明 KernelFact 批量代码已能在真实进程启动，但单项优化尚不足以抵消主机约 3,100 events/min 的输入负载，最终稳定性验收仍未通过。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
