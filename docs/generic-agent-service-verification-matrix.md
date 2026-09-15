@@ -489,6 +489,8 @@ Observer 分支随后执行了完整 `cargo test --workspace`：`a3s-observer` 3
 
 `f3f8aae` 已通过依赖相同的 runtime overlay 构建并推送到开发机 loopback registry：`127.0.0.1:5000/anysentry@sha256:033d38d5b381245ed3e6518813f58a0e5d8a566cb3acc95c783aa44ff6c13d5a`。Deployment 已滚动到该 digest，旧 Replica 已清理；容器内 `canonical-observability.service.js` SHA-256 与本地 `apps/api/dist` 均为 `e904cd5ed124dca44c1032ffec6f36e486305ffb0a5394fabd05dd981fa61d05`。新代码的 health snapshot 暴露 KernelFact batch rows/bytes/maxBytes，Collector 随后报告 `healthy/queueDepth=0/droppedEvents=0/outputDropped=0`。
 
+正式 digest 运行后，`ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT=4` 的初始窗口出现 `asyncPersistenceDropped` 增长，虽然 KernelFact 队列有界、Collector `droppedEvents/outputDropped/queueDropped` 保持 0。将该并发提高到 16/32 的短时对照仍有增长并使 API health 出现超时，因此已恢复 4，不把提高并发当作修复。该结果定位了剩余缺口：semantic/raw 相关 canonical durable side lane 仍可能因共享异步槽位饱和形成显式 CoverageGap；需继续做按 lane 的批量持久化和独立容量控制后，才能通过 canonical 无缺口验收。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
