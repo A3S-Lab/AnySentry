@@ -380,6 +380,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncRawBatchQueue: Array<{ observation: RawObservation; onFailure: () => void }> = [];
   private asyncRawBatchQueueBytes = 0;
   private asyncRawBatchTimer?: ReturnType<typeof setTimeout>;
+  private asyncKernelBatchQueue: Array<{ fact: KernelFact; onFailure: () => void }> = [];
+  private asyncKernelBatchTimer?: ReturnType<typeof setTimeout>;
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
@@ -530,6 +532,65 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     this.asyncPersistenceTasks.add(task);
   }
 
+  /** Batch derived KernelFacts as well as raw observations; one SQL round trip per bounded block. */
+  private enqueueKernelFact(fact: KernelFact, onFailure: () => void): boolean {
+    if (!this.sink || this.closed) return false;
+    const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
+    if (this.asyncKernelBatchQueue.length >= capacity) {
+      this.asyncPersistenceDropped += 1;
+      try { onFailure(); } catch { /* coverage is best effort */ }
+      return false;
+    }
+    this.asyncKernelBatchQueue.push({ fact, onFailure });
+    this.asyncPersistenceScheduled += 1;
+    if (this.asyncKernelBatchQueue.length >= this.asyncRawBatchMaxRows) void this.flushKernelFactBatch();
+    else {
+      if (!this.asyncKernelBatchTimer && !this.closed) {
+        this.asyncKernelBatchTimer = setTimeout(() => {
+          this.asyncKernelBatchTimer = undefined;
+          void this.flushKernelFactBatch();
+        }, this.asyncRawBatchWindowMs);
+        this.asyncKernelBatchTimer.unref?.();
+      }
+    }
+    return true;
+  }
+
+  private async flushKernelFactBatch(): Promise<void> {
+    if (this.asyncKernelBatchQueue.length === 0 || this.closed) return;
+    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+      if (!this.asyncKernelBatchTimer) {
+        this.asyncKernelBatchTimer = setTimeout(() => {
+          this.asyncKernelBatchTimer = undefined;
+          void this.flushKernelFactBatch();
+        }, this.asyncRawBatchWindowMs);
+        this.asyncKernelBatchTimer.unref?.();
+      }
+      return;
+    }
+    const batch = this.asyncKernelBatchQueue.splice(0, this.asyncRawBatchMaxRows);
+    this.asyncPersistenceInFlight += 1;
+    const task = Promise.resolve()
+      .then(() => this.sink?.saveKernelFacts?.(batch.map(({ fact }) => fact)) ?? false)
+      .then((durable) => {
+        if (durable) this.asyncPersistenceCompleted += batch.length;
+        else {
+          this.asyncPersistenceFailed += batch.length;
+          for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+      })
+      .finally(() => {
+        this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+        if (this.asyncKernelBatchQueue.length > 0) void this.flushKernelFactBatch();
+      });
+    this.asyncPersistenceTasks.add(task);
+  }
+
   registryCatalog(): {
     agents: ReturnType<AgentAdapterRegistry['list']>;
     transports: ReturnType<ContractRegistry['list']>;
@@ -657,10 +718,13 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
             sanitized.observationId,
             { kernelFact: 'durability_unavailable' },
           );
-          await this.writeCanonicalSideLane(
-            () => this.sink!.saveKernelFacts!([kernelFact!]),
-            kernelFailure,
-          );
+          if (this.asyncPersistence) this.enqueueKernelFact(kernelFact, kernelFailure);
+          else {
+            await this.writeCanonicalSideLane(
+              () => this.sink!.saveKernelFacts!([kernelFact!]),
+              kernelFailure,
+            );
+          }
         }
       }
       if (kernelResult.status === 'rejected' || kernelResult.status === 'conflict') {
