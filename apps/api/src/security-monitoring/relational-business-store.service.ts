@@ -84,6 +84,21 @@ const SEMANTIC_KERNEL_RELATION_MAX_ROWS = 100_000;
 const SEMANTIC_KERNEL_RELATION_MAX_BYTES = 32 * 1024 * 1024;
 const CANONICAL_WRITE_MAX_BYTES = 64 * 1024 * 1024;
 
+type ProjectionBatchEntry<T> = {
+  rows: readonly T[];
+  bytes: number;
+  resolve: (value: boolean) => void;
+};
+
+type ProjectionBatchState<T> = {
+  queue: Array<ProjectionBatchEntry<T>>;
+  pendingRows: number;
+  pendingBytes: number;
+  timer?: ReturnType<typeof setTimeout>;
+  inFlight?: Promise<void>;
+  closed: boolean;
+};
+
 function validatedRawRecord(value: unknown): RawObservation | undefined {
   const checked = validateRawObservation(value);
   if (!checked.ok) return undefined;
@@ -220,6 +235,27 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private semanticBatchQueue: Array<{ rows: readonly SemanticRecord[]; bytes: number; resolve: (value: boolean) => void }> = [];
   private semanticBatchTimer?: ReturnType<typeof setTimeout>;
   private semanticBatchFlushInFlight?: Promise<void>;
+  private readonly evidenceBatchMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_EVIDENCE_BATCH_ROWS, 128, 2_000,
+  );
+  private readonly sessionBatchMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_SESSION_BATCH_ROWS, 128, 2_000,
+  );
+  private readonly projectionBatchWindowMs = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_PROJECTION_BATCH_WINDOW_MS, 10, 1_000,
+  );
+  private readonly projectionPendingMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_PROJECTION_PENDING_ROWS, 4_096, 200_000,
+  );
+  private readonly projectionPendingMaxBytes = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_PROJECTION_PENDING_BYTES, 8 * 1024 * 1024, CANONICAL_WRITE_MAX_BYTES,
+  );
+  private evidenceBatch: ProjectionBatchState<EvidenceLink> = {
+    queue: [], pendingRows: 0, pendingBytes: 0, closed: false,
+  };
+  private sessionBatch: ProjectionBatchState<SessionMembership> = {
+    queue: [], pendingRows: 0, pendingBytes: 0, closed: false,
+  };
   private evidenceLinksReadFailureAt = 0;
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
@@ -250,6 +286,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     this.semanticBatchClosed = true;
+    this.evidenceBatch.closed = true;
+    this.sessionBatch.closed = true;
     if (this.rawBatchTimer) clearTimeout(this.rawBatchTimer);
     this.rawBatchTimer = undefined;
     while (this.rawBatchFlushInFlight || this.rawBatchQueue.length > 0) {
@@ -259,6 +297,22 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     this.semanticBatchTimer = undefined;
     while (this.semanticBatchFlushInFlight || this.semanticBatchQueue.length > 0) {
       await (this.semanticBatchFlushInFlight ?? this.flushSemanticBatchQueue());
+    }
+    for (const state of [this.evidenceBatch, this.sessionBatch]) {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = undefined;
+    }
+    while (this.evidenceBatch.inFlight || this.evidenceBatch.queue.length > 0) {
+      await (this.evidenceBatch.inFlight ?? this.flushProjectionBatch(
+        this.evidenceBatch, this.evidenceBatchMaxRows,
+        rows => this.saveEvidenceLinksNow(rows), row => `${row.linkId}\0${row.resolutionRevision}`,
+      ));
+    }
+    while (this.sessionBatch.inFlight || this.sessionBatch.queue.length > 0) {
+      await (this.sessionBatch.inFlight ?? this.flushProjectionBatch(
+        this.sessionBatch, this.sessionBatchMaxRows,
+        rows => this.saveSessionMembershipsNow(rows), row => `${row.membershipId}\0${row.resolutionRevision}`,
+      ));
     }
     const pool = this.pool;
     this.pool = undefined;
@@ -1483,7 +1537,78 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private enqueueProjectionBatch<T>(
+    state: ProjectionBatchState<T>, rows: readonly T[], maxRows: number,
+    keyOf: (row: T) => string,
+    flushRows: (rows: readonly T[]) => Promise<boolean>,
+  ): Promise<boolean> {
+    if (state.closed || rows.length === 0) return Promise.resolve(state.closed ? false : true);
+    if (rows.length + state.pendingRows > this.projectionPendingMaxRows) return Promise.resolve(false);
+    let serialized: string;
+    try { serialized = JSON.stringify(rows); } catch { return Promise.resolve(false); }
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes + state.pendingBytes > this.projectionPendingMaxBytes) return Promise.resolve(false);
+    const snapshot: T[] = JSON.parse(serialized);
+    if (batchHasConflictingRecords(snapshot, keyOf)) return Promise.resolve(false);
+    state.pendingRows += snapshot.length;
+    state.pendingBytes += bytes;
+    return new Promise<boolean>((resolve) => {
+      state.queue.push({ rows: snapshot, bytes, resolve });
+      if (state.pendingRows >= maxRows) void this.flushProjectionBatch(state, maxRows, flushRows, keyOf);
+      else if (!state.timer) {
+        state.timer = setTimeout(() => {
+          state.timer = undefined;
+          void this.flushProjectionBatch(state, maxRows, flushRows, keyOf);
+        }, this.projectionBatchWindowMs);
+        state.timer.unref?.();
+      }
+    });
+  }
+
+  private async flushProjectionBatch<T>(
+    state: ProjectionBatchState<T>, maxRows: number,
+    flushRows: (rows: readonly T[]) => Promise<boolean>,
+    keyOf: (row: T) => string,
+  ): Promise<void> {
+    if (state.inFlight) return state.inFlight;
+    if (state.queue.length === 0) return;
+    const entries: Array<ProjectionBatchEntry<T>> = [];
+    const fingerprints = new Map<string, string>();
+    let rows = 0;
+    while (state.queue.length > 0) {
+      const next = state.queue[0];
+      if (entries.length > 0 && rows + next.rows.length > maxRows) break;
+      const incoming = next.rows.map(row => [keyOf(row), stableRecordJson(row)] as const);
+      if (incoming.some(([key, value]) => fingerprints.has(key) && fingerprints.get(key) !== value)) break;
+      for (const [key, value] of incoming) fingerprints.set(key, value);
+      state.queue.shift();
+      entries.push(next);
+      rows += next.rows.length;
+    }
+    const combined = entries.flatMap(entry => entry.rows);
+    state.inFlight = Promise.resolve().then(() => flushRows(combined)).catch(() => false)
+      .then(result => {
+        for (const entry of entries) {
+          state.pendingRows -= entry.rows.length;
+          state.pendingBytes -= entry.bytes;
+          entry.resolve(result);
+        }
+      }).finally(() => {
+        state.inFlight = undefined;
+        if (state.queue.length > 0) void this.flushProjectionBatch(state, maxRows, flushRows, keyOf);
+      });
+    await state.inFlight;
+  }
+
   async saveSessionMemberships(memberships: readonly SessionMembership[]): Promise<boolean> {
+    return this.enqueueProjectionBatch(
+      this.sessionBatch, memberships, this.sessionBatchMaxRows,
+      row => `${row.membershipId}\0${row.resolutionRevision}`,
+      rows => this.saveSessionMembershipsNow(rows),
+    );
+  }
+
+  private async saveSessionMembershipsNow(memberships: readonly SessionMembership[]): Promise<boolean> {
     if (memberships.length === 0) return true;
     if (memberships.length > SESSION_MEMBERSHIP_LIMIT) return false;
     const bounded = memberships.slice(0, SESSION_MEMBERSHIP_LIMIT);
@@ -1714,6 +1839,14 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async saveEvidenceLinks(links: readonly EvidenceLink[]): Promise<boolean> {
+    return this.enqueueProjectionBatch(
+      this.evidenceBatch, links, this.evidenceBatchMaxRows,
+      row => `${row.linkId}\0${row.resolutionRevision}`,
+      rows => this.saveEvidenceLinksNow(rows),
+    );
+  }
+
+  private async saveEvidenceLinksNow(links: readonly EvidenceLink[]): Promise<boolean> {
     if (links.length === 0) return true;
     if (links.length > SEMANTIC_RECORD_LIMIT) return false;
     const bounded = links.slice(0, SEMANTIC_RECORD_LIMIT);
