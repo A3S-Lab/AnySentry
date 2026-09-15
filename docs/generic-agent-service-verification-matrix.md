@@ -494,3 +494,11 @@ Observer 分支随后执行了完整 `cargo test --workspace`：`a3s-observer` 3
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
+
+### 2026-09-15 bounded persistence-wait deployment
+
+Commit `4513bc6` adds a bounded wait (default 250 ms, maximum 2 s) before rejecting an asynchronous canonical side-lane admission when all persistence slots are occupied. The implementation was built into `127.0.0.1:5000/anysentry:backpressure-4513bc6` and deployed as digest `sha256:7369a720ad5a1f760a650e326fda108cfa3983903204d8e480be5d9de74576b`; the new Pod became Ready and the previous Pod was removed. The startup path took about 58 seconds while PostgreSQL and ClickHouse connections initialized, then reported `Nest application successfully started`.
+
+After deployment, the Collector remained active with `droppedEvents=0`, `outputDropped=0`, and `queueDropped=0`; the current Collector queue was bounded but degraded while it caught up. The canonical health samples showed bounded KernelFact queues (0--98 rows, 0--42,684 bytes) and no unbounded memory growth, but `asyncPersistenceDropped` continued to rise (1,285 -> 1,403 in a 30-second sample) and `asyncPersistenceFailed` remained at 321. The bounded wait therefore prevents an unbounded queue but does not yet provide canonical durable no-gap behavior. This is the current remaining F3 bottleneck; it must be addressed with independent lane capacity or a durable lossless handoff before claiming canonical Session/semantic projection stability.
+
+The health query also exposed historical Collector identities as `down`; the live Observer logs showed the current process forwarding events and reporting zero pipeline drops. These are separate stale health records and should not be used as evidence that the current Ring/Forwarder dropped events. A follow-up must reconcile Collector heartbeat identity and run a fresh A/B request against the new digest before the final canonical point-read gate.
