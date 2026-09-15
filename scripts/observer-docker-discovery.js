@@ -411,7 +411,14 @@ class DockerDiscovery {
       if (liveIds.has(id)) continue;
       this.invalidateInspect(id);
     }
-    const pending = ids.filter((id) => !this.inspectById.has(id));
+    const pending = ids.filter((id) => {
+      if (!this.inspectById.has(id)) return true;
+      const runtime = this.runtimeById.get(id);
+      // Docker may publish the create event before the init process has a visible cgroup
+      // membership. Do not negative-cache that transient state: the next bounded refresh must
+      // retry identity materialization so a cold-start candidate can enter F1 with a real cgroup.
+      return !runtime || !text(runtime.cgroupId) || !text(runtime.rootStartTimeTicks);
+    });
     let cursor = 0;
     const worker = async () => {
       while (cursor < pending.length) {
@@ -426,7 +433,10 @@ class DockerDiscovery {
   }
 
   async inspectContainer(id) {
-    if (this.inspectById.has(id)) return;
+    if (this.inspectById.has(id)) {
+      const runtime = this.runtimeById.get(id);
+      if (runtime && text(runtime.cgroupId) && text(runtime.rootStartTimeTicks)) return;
+    }
     const existing = this.inspectInFlight.get(id);
     if (existing) return existing;
     const epoch = this.inspectEpoch.get(id) ?? 0;

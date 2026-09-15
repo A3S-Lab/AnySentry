@@ -265,8 +265,8 @@ const discovery = new DockerDiscovery({
     const id = requestPath.split('/')[2];
     inspectRequests.set(id, (inspectRequests.get(id) ?? 0) + 1);
     return id === unknownId
-      ? { Config: { Healthcheck: { Test: ['CMD-SHELL', 'test -f /tmp/agent-ready || exit 1'] } } }
-      : { Config: {} };
+      ? { State: { Pid: process.pid }, Config: { Healthcheck: { Test: ['CMD-SHELL', 'test -f /tmp/agent-ready || exit 1'] } } }
+      : { State: { Pid: process.pid }, Config: {} };
   },
   streamFactory: () => ({ destroy() {} }),
   refreshMs: 3_600_000,
@@ -297,7 +297,7 @@ const retryingDiscovery = new DockerDiscovery({
     if (requestPath === '/containers/json?all=1') return [containers[0]];
     inspectAttempts++;
     if (inspectAttempts === 1) throw new Error('transient inspect failure');
-    return { Config: {} };
+    return { State: { Pid: process.pid }, Config: {} };
   },
   streamFactory: () => ({ destroy() {} }),
   refreshMs: 3_600_000,
