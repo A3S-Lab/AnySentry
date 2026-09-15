@@ -457,3 +457,14 @@ only ready API replica. The previous `raw-no-advisory-966ff06` pod was allowed t
 PostgreSQL, ClickHouse, Redis and Observer infrastructure remained running. During the first two
 minutes after readiness, the new API log contained no duplicate-key or raw-save warnings. This is
 an initial runtime regression check, not yet a sustained load or canonical point-read acceptance.
+
+### 2026-09-15 A/B 冷启动 settle 闸门复核
+
+本轮在不改变 AnySentry/Observer 产品代码的前提下重新执行 customer-langgraph-sim-lab。Design A 真实调用返回 `completed/pass`；应用侧同一 `run_id=session_id` 下包含 `plan`、`work`、`verify`、模型交互和 sandbox 工具调用，模型网关与 sandbox 均返回 200。
+
+Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经返回 `coverage.completeness=exact_as_observed`、`partial=false`，但当前 run 只有 `/v1/chat/completions`，工具部分仍为 `tool_pending`。Collector 重组日志确认请求和响应均完成，critical/semantic/bulk 队列和 output drop 均为 0，因此该结果不能归因于 Ring 或 Forwarder 丢失。
+
+将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
+
+该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
+
