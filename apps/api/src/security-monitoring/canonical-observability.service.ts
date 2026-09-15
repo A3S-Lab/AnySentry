@@ -373,6 +373,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncPersistenceCompleted = 0;
   private asyncPersistenceFailed = 0;
   private asyncPersistenceDropped = 0;
+  private asyncRawPersistenceDropped = 0;
+  private asyncDerivedPersistenceDropped = 0;
   private readonly asyncPersistenceTasks = new Set<Promise<void>>();
   private readonly asyncRawBatchMaxRows = boundedEnvInt(
     'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS',
@@ -458,11 +460,14 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       const remaining = waitUntil - Date.now();
       if (remaining <= 0 || this.closed) {
         this.asyncPersistenceDropped += 1;
+        if (lane === 'derived') this.asyncDerivedPersistenceDropped += 1;
+        else this.asyncRawPersistenceDropped += 1;
         reportFailure();
         return false;
       }
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(remaining, 10)));
     }
+    if (this.closed) return false;
     if (lane === 'derived') this.asyncDerivedPersistenceInFlight += 1;
     else this.asyncPersistenceInFlight += 1;
     this.asyncPersistenceScheduled += 1;
@@ -507,6 +512,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     if (this.asyncRawBatchQueue.length >= capacity
       || this.asyncRawBatchQueueBytes + observationBytes > this.asyncRawBatchMaxBytes) {
       this.asyncPersistenceDropped += 1;
+      this.asyncRawPersistenceDropped += 1;
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
@@ -579,6 +585,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     if (this.asyncKernelBatchQueue.length >= capacity
       || this.asyncKernelBatchQueueBytes + bytes > this.asyncKernelBatchMaxBytes) {
       this.asyncPersistenceDropped += 1;
+      this.asyncRawPersistenceDropped += 1;
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
@@ -1400,6 +1407,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncPersistenceCompleted: number;
     asyncPersistenceFailed: number;
     asyncPersistenceDropped: number;
+    asyncRawPersistenceDropped: number;
+    asyncDerivedPersistenceDropped: number;
     asyncRawBatchQueueRows: number;
     asyncRawBatchQueueBytes: number;
     asyncRawBatchMaxRows: number;
@@ -1431,6 +1440,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncPersistenceCompleted: this.asyncPersistenceCompleted,
       asyncPersistenceFailed: this.asyncPersistenceFailed,
       asyncPersistenceDropped: this.asyncPersistenceDropped,
+      asyncRawPersistenceDropped: this.asyncRawPersistenceDropped,
+      asyncDerivedPersistenceDropped: this.asyncDerivedPersistenceDropped,
       asyncRawBatchQueueRows: this.asyncRawBatchQueue.length,
       asyncRawBatchQueueBytes: this.asyncRawBatchQueueBytes,
       asyncRawBatchMaxRows: this.asyncRawBatchMaxRows,
