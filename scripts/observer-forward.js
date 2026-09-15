@@ -732,6 +732,39 @@ function publishLabeledHttpToolBackendCapture(snapshot = latestDockerIdentitySna
   return promoted;
 }
 
+function publishColdStartWorkloadCapture(snapshot = latestDockerIdentitySnapshot) {
+  if (CAPTURE_PROFILE_MODE === 'legacy') return 0;
+  const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+  let promoted = 0;
+  for (const entry of entries) {
+    if (entry?.coldStartCandidate !== true) continue;
+    const cgroupId = text(entry?.cgroupId);
+    const rootPid = Number(entry?.hostPid);
+    const physicalWorkloadId = text(entry?.physicalWorkloadId);
+    if (!cgroupId || !Number.isSafeInteger(rootPid) || rootPid <= 0 || !physicalWorkloadId) continue;
+    if (filterRulePublisher.observeDecision({
+      cgroupId,
+      scopeType: 'cgroup',
+      scopeKey: `cgroup:${cgroupId}`,
+      action: 'keep',
+      policyAction: 'keep',
+      authority: 'candidate',
+      classification: 'unknown',
+      captureProfile: 'probable_investigation',
+      reasonCode: 'cold_start_workload',
+      promotionReason: 'cold_start_workload',
+      physicalWorkloadId,
+      rootPid,
+      rootProcessKey: `cold-start-workload:${physicalWorkloadId}`,
+      rootStartTimeTicks: text(entry.rootStartTimeTicks) || undefined,
+      expiresAt: new Date(Date.now() + HTTP_TOOL_BACKEND_CAPTURE_TTL_MS).toISOString(),
+      ttlMs: HTTP_TOOL_BACKEND_CAPTURE_TTL_MS,
+    })) promoted += 1;
+  }
+  if (promoted > 0) filterRulePublisher.flush();
+  return promoted;
+}
+
 function promoteHttpToolBackendFromToolInteraction(observerEvent) {
   const interaction = observerEvent?.event?.LlmInteraction;
   if (!interaction || typeof interaction !== 'object') return false;
@@ -4357,6 +4390,7 @@ async function start() {
     lastTlsScopeFingerprint = '';
     publishTlsAgentRuntimeScope();
     publishLabeledHttpToolBackendCapture(snapshot);
+    publishColdStartWorkloadCapture(snapshot);
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
   });
   if (closing) return;

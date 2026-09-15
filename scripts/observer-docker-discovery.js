@@ -201,6 +201,10 @@ function dockerEntry(container, options = {}) {
     ...(workloadRole ? { workloadRole } : {}),
     ...(observationRole ? { observationRole } : {}),
     ...(httpToolBackend ? { httpToolBackend: true } : {}),
+    // Every unlabeled live workload gets a bounded cold-start observation window. This is the
+    // discovery entry point for generic HTTP/Agent services; scoring and TTL promotion decide
+    // whether it becomes an Agent, while infrastructure labels remain explicit exclusions.
+    ...(!selectedAgent && !explicitNonAgent ? { coldStartCandidate: true } : {}),
     ...(options.runtimeById?.get(id) ?? {}),
     ...(options.inspectById?.get(id)?.length
       ? { platformHealthchecks: options.inspectById.get(id).map((probe) => ({ ...probe, argv: [...probe.argv] })) }
