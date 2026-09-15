@@ -520,3 +520,15 @@ kernel queues drained to zero and `asyncPersistenceFailed=0`. PostgreSQL showed 
 waits, and the API remained within its configured memory limit. The concurrency change is retained
 as a bounded development-machine setting, not treated as a durable-loss fix. Canonical no-gap
 acceptance and A/B point-read verification remain open.
+
+### 2026-09-15 derived lane bounded concurrency comparison
+
+After the lane-specific metrics deployment, the development Deployment was rolled with
+`ANYSENTRY_CANONICAL_ASYNC_DERIVED_MAX_INFLIGHT=16` while the Raw/Kernel lane remained at its
+bounded default. In two 15-second health samples, `asyncRawPersistenceDropped` stayed at zero,
+Raw/Kernel queue rows fell from 631/625 to zero, and `asyncPersistenceFailed` stayed at zero.
+Derived admission drops nevertheless increased from 1,156 to 1,190. This is a controlled
+capacity comparison, not a no-loss result: increasing bounded concurrency does not remove the
+PostgreSQL/WAL throughput limit. Further work should reduce transaction/query count through
+projection batching and preserve the current bounded limits rather than globally opening capture
+or creating an unbounded retry queue.
