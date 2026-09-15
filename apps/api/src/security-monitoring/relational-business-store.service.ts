@@ -198,6 +198,28 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private rawBatchQueue: Array<{ rows: readonly RawObservation[]; resolve: (value: boolean) => void }> = [];
   private rawBatchTimer?: ReturnType<typeof setTimeout>;
   private rawBatchFlushInFlight?: Promise<void>;
+  private readonly semanticBatchMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_SEMANTIC_BATCH_ROWS,
+    128,
+    2_000,
+  );
+  private readonly semanticBatchWindowMs = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_SEMANTIC_BATCH_WINDOW_MS,
+    10,
+    1_000,
+  );
+  private readonly semanticPendingMaxRows = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_SEMANTIC_PENDING_ROWS, 4_096, SEMANTIC_RECORD_LIMIT,
+  );
+  private readonly semanticPendingMaxBytes = positiveInt(
+    process.env.ANYSENTRY_RELATIONAL_SEMANTIC_PENDING_BYTES, 8 * 1024 * 1024, CANONICAL_WRITE_MAX_BYTES,
+  );
+  private semanticPendingRows = 0;
+  private semanticPendingBytes = 0;
+  private semanticBatchClosed = false;
+  private semanticBatchQueue: Array<{ rows: readonly SemanticRecord[]; bytes: number; resolve: (value: boolean) => void }> = [];
+  private semanticBatchTimer?: ReturnType<typeof setTimeout>;
+  private semanticBatchFlushInFlight?: Promise<void>;
   private evidenceLinksReadFailureAt = 0;
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
@@ -227,9 +249,17 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.semanticBatchClosed = true;
     if (this.rawBatchTimer) clearTimeout(this.rawBatchTimer);
     this.rawBatchTimer = undefined;
-    await this.flushRawBatchQueue();
+    while (this.rawBatchFlushInFlight || this.rawBatchQueue.length > 0) {
+      await (this.rawBatchFlushInFlight ?? this.flushRawBatchQueue());
+    }
+    if (this.semanticBatchTimer) clearTimeout(this.semanticBatchTimer);
+    this.semanticBatchTimer = undefined;
+    while (this.semanticBatchFlushInFlight || this.semanticBatchQueue.length > 0) {
+      await (this.semanticBatchFlushInFlight ?? this.flushSemanticBatchQueue());
+    }
     const pool = this.pool;
     this.pool = undefined;
     this.ready = false;
@@ -1278,6 +1308,69 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async saveSemanticRecords(records: readonly SemanticRecord[]): Promise<boolean> {
+    if (this.semanticBatchClosed) return false;
+    if (records.length === 0) return true;
+    if (records.length + this.semanticPendingRows > this.semanticPendingMaxRows) return false;
+    let serialized: string;
+    try { serialized = JSON.stringify(records); } catch { return false; }
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes + this.semanticPendingBytes > this.semanticPendingMaxBytes) return false;
+    // Snapshot accepted records: caller mutation must not alter a deferred durable write.
+    const snapshot: SemanticRecord[] = JSON.parse(serialized);
+    if (batchHasConflictingRecords(snapshot, row => `${row.semanticRecordId}\0${row.revision ?? 1}`)) return false;
+    this.semanticPendingRows += snapshot.length;
+    this.semanticPendingBytes += bytes;
+    return new Promise<boolean>((resolve) => {
+      this.semanticBatchQueue.push({ rows: snapshot, bytes, resolve });
+      const queued = this.semanticBatchQueue.reduce((sum, item) => sum + item.rows.length, 0);
+      if (queued >= this.semanticBatchMaxRows) void this.flushSemanticBatchQueue();
+      else if (!this.semanticBatchTimer) {
+        this.semanticBatchTimer = setTimeout(() => {
+          this.semanticBatchTimer = undefined;
+          void this.flushSemanticBatchQueue();
+        }, this.semanticBatchWindowMs);
+        this.semanticBatchTimer.unref?.();
+      }
+    });
+  }
+
+  private async flushSemanticBatchQueue(): Promise<void> {
+    if (this.semanticBatchFlushInFlight) return this.semanticBatchFlushInFlight;
+    if (this.semanticBatchQueue.length === 0) return;
+    const entries: typeof this.semanticBatchQueue = [];
+    let rows = 0;
+    const fingerprints = new Map<string, string>();
+    while (this.semanticBatchQueue.length > 0) {
+      const next = this.semanticBatchQueue[0];
+      if (entries.length > 0 && rows + next.rows.length > this.semanticBatchMaxRows) break;
+      const incoming = next.rows.map(row => [
+        `${row.semanticRecordId}\0${row.revision ?? 1}`, stableRecordJson(row),
+      ] as const);
+      // Conflicting independent callers must reach the existing conflict check separately.
+      if (incoming.some(([key, value]) => fingerprints.has(key) && fingerprints.get(key) !== value)) break;
+      for (const [key, value] of incoming) fingerprints.set(key, value);
+      this.semanticBatchQueue.shift();
+      entries.push(next);
+      rows += next.rows.length;
+    }
+    const combined = entries.flatMap((entry) => entry.rows);
+    this.semanticBatchFlushInFlight = Promise.resolve().then(() => this.saveSemanticRecordsNow(combined))
+      .catch(() => false)
+      .then((result) => {
+        for (const entry of entries) {
+          this.semanticPendingRows -= entry.rows.length;
+          this.semanticPendingBytes -= entry.bytes;
+          entry.resolve(result);
+        }
+      })
+      .finally(() => {
+        this.semanticBatchFlushInFlight = undefined;
+        if (this.semanticBatchQueue.length > 0) void this.flushSemanticBatchQueue();
+      });
+    await this.semanticBatchFlushInFlight;
+  }
+
+  private async saveSemanticRecordsNow(records: readonly SemanticRecord[]): Promise<boolean> {
     if (records.length === 0) return true;
     if (records.length > SEMANTIC_RECORD_LIMIT) return false;
     const bounded = records.slice(0, SEMANTIC_RECORD_LIMIT);

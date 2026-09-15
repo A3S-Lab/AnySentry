@@ -532,3 +532,24 @@ capacity comparison, not a no-loss result: increasing bounded concurrency does n
 PostgreSQL/WAL throughput limit. Further work should reduce transaction/query count through
 projection batching and preserve the current bounded limits rather than globally opening capture
 or creating an unbounded retry queue.
+
+### Semantic microbatch boundary verification
+
+The next local implementation coalesces same-window `saveSemanticRecords` calls in the relational
+store, preserving the existing SQL conflict checks. Its outstanding budget includes queued and
+in-flight records (default 4,096 rows / 8 MiB), with a 10 ms window and 128-row coalescing target.
+An individual caller remains atomic and may exceed the coalescing target within the outstanding
+budget. Oversized admissions return false. Records are snapshotted on admission; conflicting
+independent callers are split into separate batches. Shutdown rejects new semantic admissions and
+waits for both the active write and trailing queue before ending the database pool.
+
+`verify-relational-semantic-batching.mjs` verifies coalescing, immutable snapshots, conflicting
+caller separation, byte/row capacity including active writes, failed sink propagation and shutdown
+drain against a controlled sink. API compilation and existing canonical contract/raw/kernel/lane
+tests pass. This is module-level evidence; database throughput and A/B canonical completeness have
+not yet been verified with this implementation.
+
+Correction to causal claims above: lane counters identify derived **admission** rejection, while
+database activity snapshots show WAL waits. These observations do not isolate WAL as the sole root
+cause, nor do zero raw-admission drops prove complete raw durability or end-to-end capture. Future
+comparisons must include durable point reads, write failures, query latency and all pipeline drops.
