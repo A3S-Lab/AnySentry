@@ -481,6 +481,8 @@ Design B 首次在 12 秒固定启动等待后执行时，canonical 查询已经
 
 两种方案测试结束后已停止并清理 customer compose 容器、volume 和 network；AnySentry/Observer 基础设施保持运行。
 
+A/B 完成后的受控观察窗口中，Collector 有一次 API health 请求超时，随后两个连续采样恢复为 `healthy`，队列分别为 `0` 和 `8`，输入约 3,270 events/min，`droppedEvents=0`、`outputDropped=0`。这属于查询面瞬时繁忙，不能直接等价为事件丢失；后续长稳报告仍需把 API 查询延迟和 F3 delivery 状态分开记录。
+
 将受控实验的 Observer startup settle 闸门扩大到 30 秒后重跑，得到当前 run 的 5 条 interaction，路径同时包含 `/v1/chat/completions` 和 `/execute`，来源为 `tcp_plaintext`，无 transport incomplete；conversation-directory 找到编排器和 worker 两个 LangGraph 线程，timeline 均包含 `tool_call` 与 `tool_result`。A/B compose 容器、网络、volume 和本轮 `.runtime` 证据目录已清理。
 
 该复核确认：应用健康不代表新容器的 F1 规则、进程 admission 和工具后端捕获资格已经稳定。startup settle 只能作为测试闸门，不能把缺失证据标记为成功；后续应把规则 epoch、工作负载 identity readiness 和 tool-backend capture readiness 暴露为可轮询条件，减少对固定睡眠时间的依赖。
