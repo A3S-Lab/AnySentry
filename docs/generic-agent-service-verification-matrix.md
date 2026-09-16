@@ -696,6 +696,20 @@ Container `canonical-observability.service.js` SHA-256 matched local dist
 `asyncDerivedPersistenceDropped` 0→0, `asyncRawPersistenceDropped` 0→0,
 `asyncPersistenceFailed` 0→0, `asyncDerivedBatchQueueRows` present and 0→0.
 
-This closes the previously observed ambient derived-drop regression on this host for the
-sampled window. Remaining open gates: Design B point-read under the new digest,
-longer sustained no-gap, classic SSL WIP. Infrastructure untouched.
+**Ambient 300s follow-up** (uptime ~1747→2047s): derived drops remained 0→0 and
+`asyncPersistenceFailed` 0→0, but `asyncRawPersistenceDropped` had already reached
+**178** before the window and stayed flat (178→178). Derived coalescing therefore stops
+the prior ambient derived-slot regression; raw-lane loss during the intervening period
+still blocks claiming full sustained no-gap.
+
+**Design B spot-check blocked (host Docker):** after the ambient samples, `docker compose`
+build/create hung; `dockerd` PID 2233 became zombie with sibling threads stuck in
+uninterruptible `D` on `ovl_sync_fs` / `sync_inodes_sb` during overlay unmount. Docker
+restart fails while that PID exists (`process with PID 2233 is still running`). K8s /
+AnySentry API (containerd) stayed Ready on digest `e3f82106…` with derived drops still
+zero. Lab compose was not left running; no infrastructure or classic SSL WIP changes.
+Design B point-read under this digest remains pending until host Docker recovers.
+
+Remaining open: Design B point-read on this digest, raw-lane no-gap investigation,
+longer sustained no-gap, classic SSL WIP.
+
