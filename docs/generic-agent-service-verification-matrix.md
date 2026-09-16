@@ -605,3 +605,40 @@ Remaining open gates unchanged in scope: sustained no-gap under prolonged ambien
 classic SSL WIP, and readiness polling instead of fixed settle sleeps. Lab compose project
 `langgraph-goal-182615` is cleaned after this evidence record; infrastructure and classic SSL WIP
 were not modified.
+
+### 2026-09-16 Phase C pollable Observer readiness gate
+
+Replaced the Design B fixed `OBSERVER_STARTUP_SETTLE_SECONDS` sleep with
+`AnySentry/scripts/wait-observer-readiness.mjs`, wired from
+`customer-langgraph-sim-lab/scripts/verify-observer.sh`.
+
+**Plane gates (always):** `collectors/health` must report
+`filterMetricsReported`, `identitySnapshotReady`, `unifiedProjectionState=ready`,
+`captureProfileControlPlaneState=ready` (when present), and optional `dockerReady`.
+
+**Cold-start docker signal:** host compose labs are gated on
+`filterMetrics.dockerEntries >= OBSERVER_READY_MIN_DOCKER_ENTRIES` (Design B default 4).
+Observer logs confirmed `docker snapshot ... containers=7; confirmed_agents=2;
+cold_start_candidates=1` while the lab was up. Platform `GET /identity/snapshot` still
+does **not** list labeled compose agents (`customer-langgraph-sim-orchestrator` /
+`customer-langgraph-sim-worker`); requiring those agent ids there times out and is not
+used as the default lab gate.
+
+**Live evidence (`COMPOSE_PROJECT_NAME=langgraph-ready-1904`):** readiness became ready in
+**89 ms** (`dockerEntries=7`, plane reasons empty). Controlled `POST /runs` completed with
+`verify_status=pass`, `run_id=session_id=23140878-efb1-4e69-9cae-a8e8bf4a9bff`,
+`trace_id=b8ecaf5ea5e621a65f74a5280b59c21e`. Canonical interactions: **6** items,
+`coverage.completeness=exact_as_observed`, `partial=false`, paths
+`/runs` `/v1/chat/completions` `/execute`, `captureSource=tcp_plaintext`,
+`transport_incomplete=0` (2 interactions still `tool_pending`). Conversation directory
+found parent `cv_2088da325cf7872bb551d8d5` with `relatedConversations` `delegates_to` →
+worker `cv_6e829263405579fefb9910b1` at strength `exact`.
+
+**Honest gap:** `timeline-v3` for both directory ids (and their
+`redirectTarget`/`canonicalConversationId` `cv_a2338a87ff9b9462e73f51b7`) stayed
+`turns=[]` / `coverage.partial=true` for >40s after interactions were exact. Verifier now
+polls timelines with redirect follow-up, but this run did not fill. Not treated as a
+readiness-gate failure.
+
+Lab project `langgraph-ready-1904` cleaned after this record. Classic SSL WIP and
+infrastructure were not modified. Goal remains open for sustained no-gap and SSL WIP.
