@@ -570,3 +570,38 @@ Raw/Kernel queues returned to zero between samples, and Derived drops increased 
 across the observed windows. This is an improvement over the previous Derived-only lane sample,
 but it is not a no-gap result because EvidenceLink and SessionMembership are not yet microbatched
 and canonical durable point reads have not yet been rerun.
+
+### 2026-09-16 tip 8442bda digest deploy and Design B point-read
+
+Deployed local tip `8442bda` (`perf(canonical): batch evidence and session projections`) as
+`127.0.0.1:5000/anysentry@sha256:5e5b4e0bd267693c2fcf983413b207fde56c323e4b9f81f91df339e25ad9dd0a`.
+Container `relational-business-store.service.js` SHA-256 matched the local dist
+(`69b194d6e3d31fca7b8a83f809f86305f154345251a85e721c4beb3e7fad7056`), confirming EvidenceLink and
+SessionMembership projection microbatch code is live. The previous Pod on digest `39bf93b5…`
+was removed after the new Pod became Ready.
+
+Controlled Design B lab (`COMPOSE_PROJECT_NAME=langgraph-goal-182615`) completed
+`POST /runs` with `status=completed` and `verify_status=pass`,
+`run_id=session_id=ffd2f4ce-1965-4934-919b-d279b9e28a5f`,
+`trace_id=3ba0c6dc2c5be15b2b89dc0e33fc2633`. After Observer settle, canonical
+`POST /agents/interactions` returned **8** items with
+`coverage.completeness=exact_as_observed` and `partial=false`. Items included
+`remote_agent` (`worker-agent:18091`), model calls, and tool calls to `tool-mocks:18092`,
+all `captureSource=tcp_plaintext`.
+
+Conversation list for the run included parent `cv_0be58fba7119961c80923482` (LangGraph) with
+`relatedConversations` `delegates_to` → worker `cv_94342f06b1e96db450c3e182`
+(`displayName=customer-langgraph-sim-worker`, strength `exact`) and a second same-run peer.
+`timeline-v3` for the parent showed `delegation_send`/`delegation_reply` plus tool events;
+the worker timeline showed `tool_call`/`tool_result` without parent-internal duplication.
+
+Post-run health on the new digest: `semantic.dropped=0`, `evidence.dropped=0`,
+`sessionMembership.dropped=0`. Hot ring occupancy remained high from ambient host traffic and is
+recorded separately from durable derived admission. Module tests
+`verify-relational-projection-batching.mjs`, `verify-relational-semantic-batching.mjs`, and
+`verify-canonical-lane-isolation.mjs` passed before deploy.
+
+Remaining open gates unchanged in scope: sustained no-gap under prolonged ambient load,
+classic SSL WIP, and readiness polling instead of fixed settle sleeps. Lab compose project
+`langgraph-goal-182615` is cleaned after this evidence record; infrastructure and classic SSL WIP
+were not modified.
