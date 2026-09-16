@@ -849,3 +849,23 @@ slim OCI archive (`ctr images import --local --no-unpack`). Deployed:
 persistence dropped and failed deltas all **0**. Docker-labeled Design B still
 open (compose/`docker run` still I/O-fragile). Classic SSL WIP untouched.
 
+### 2026-09-16 tip digest host Design B point-read (no hostPath)
+
+Host uvicorn Design B against digest `cdcf85f8…` / pod
+`anysentry-6d6f9975f6-wpblw` (no `local-session-coverage-fix` mounts).
+
+- Run `6769cb33-986f-439b-99bd-73a287caf809` /
+  `trace_id=5da0a34e0b45f57cbfae6833e5e6e435` → `status=completed`,
+  `verify_status=pass`, sandbox stdout `4`, `parent_session_id` +
+  `delegation_id=cceb26df-…` present.
+- Canonical `POST /agents/interactions`: **6** items,
+  `coverage.completeness=exact_as_observed`, `partial=false`, paths
+  `/v1/chat/completions` `/execute` `/runs`.
+- Session `sess_b03844c48d6b62ac080a74df` coverage
+  `status=complete`, `completeInteractions=6`, `partialInteractions=0`.
+- Async raw/derived/persistence dropped remain **0** on the tip digest.
+
+**Coverage boundary:** host attribution (no Docker labels /
+`dockerEntries`); labeled Design B still blocked by host `docker create`
+hangs under NVMe saturation. Classic SSL WIP untouched. Lab ports cleaned.
+
