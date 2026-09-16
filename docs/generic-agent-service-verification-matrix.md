@@ -728,6 +728,9 @@ drained between bursts; healthz remained responsive (no prior 16/32 timeout
 regression). CoverageGap `persistenceDropped` continued to rise and is recorded as a
 separate gap-store counter, not canonical raw/derived admission.
 
-Host Docker recovered from the earlier D-state hang after the zombie dockerd exited;
-Design B point-read on this digest remains the next gate. Classic SSL WIP untouched.
+Host Docker briefly cleared its earlier zombie, then failed to finish starting
+(`volumes/metadata.db` open timeout; restore stuck on overlay writeback while other
+host processes including Postgres checkpointer were also in `D`). Design B point-read
+on this digest remains blocked until host Docker is healthy again. Classic SSL WIP
+untouched. Goal remains open.
 
