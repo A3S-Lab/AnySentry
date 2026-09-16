@@ -763,3 +763,23 @@ turns.
 and Observer `dockerEntries` readiness remain pending until host Docker recovers.
 Host lab processes stopped after evidence. Classic SSL WIP untouched.
 
+### 2026-09-16 host Design B Session/EvidenceLink/KernelFact point-read
+
+Follow-up durable reads for run `6aa2f931-3750-4dc2-98d9-3f4ad8b9e8c7` /
+canonical session `sess_b7c54d5cc5cf3595c255861a` on digest `e3f82106…`:
+
+- `GET /v1/sessions/sess_b7c54…` **200**; coverage endpoint reports
+  `status=partial` with `completeInteractions=3`, `partialInteractions=2`
+  (not `coverage=complete`).
+- `GET /v1/evidence-links` matched **4** links for the run's observation refs:
+  two **strong** (`network_effect` / `executes_as`+`command`) targeting
+  `kf_4b30382…` and `kf_ce66cb0…`, plus one unmatched `executes_as` (honest gap).
+- `GET /v1/kernel-facts/{id}` for both strong targets **200** with
+  `coverage.status=complete` and `authority=attested_observer`
+  (`kind=network` and `kind=exec`).
+
+Observer spool at check time: active≈258, parked=0, `spoolAtCapacity=false`,
+collector `droppedEvents/outputDropped/queueDropped=0` — no disposable WAL
+cleanup required. Docker-labeled Design B and session `coverage=complete` remain
+open. Classic SSL WIP untouched.
+
