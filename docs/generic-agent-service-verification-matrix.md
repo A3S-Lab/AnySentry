@@ -734,3 +734,32 @@ host processes including Postgres checkpointer were also in `D`). Design B point
 on this digest remains blocked until host Docker is healthy again. Classic SSL WIP
 untouched. Goal remains open.
 
+### 2026-09-16 host Design B point-read while Docker down
+
+System Docker remained `failed`; disposable lab dockerd also hung on buildkit. Ran
+Design B on the host venv instead (sandbox `:18088`, tool-mocks `:18092`, worker
+`:18091`, orchestrator `:18090`) with localhost URL overrides.
+
+**Run:** `status=completed` `verify_status=pass`
+`run_id=session_id=6aa2f931-3750-4dc2-98d9-3f4ad8b9e8c7`
+`trace_id=54ba22b23e8593e05abc9373ed1abef7`.
+
+**Interactions:** **6** items for the run, all `captureSource=tcp_plaintext`, paths
+`/runs` `/v1/chat/completions` `/execute`, hops `orchestrator`/`worker`. Post-run
+health: `asyncRawPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`,
+`asyncPersistenceFailed=0` on digest `e3f82106…` / maxInFlight=8.
+
+**Directory:** parent `cv_0e6d5220e59cf2b4d8078fae` `delegates_to` worker
+`cv_a1625ba75236993e27d33b3e` at strength `exact` (hop-fence held; no alias collapse).
+
+**Timelines:** parent events include `delegation_send`/`delegation_reply` plus plan
+tools; worker events include `tool_call`/`tool_result`/`model_final`. Coverage reports
+`partial=true` with `partialReason=scan_limit` (ambient ClickHouse window), not empty
+turns.
+
+**Honest coverage boundary:** without Docker labels, agent product resolved as host
+`user@1001.service` / `environment=host` rather than
+`customer-langgraph-sim-{orchestrator,worker}`. Docker-labeled cold-start attribution
+and Observer `dockerEntries` readiness remain pending until host Docker recovers.
+Host lab processes stopped after evidence. Classic SSL WIP untouched.
+
