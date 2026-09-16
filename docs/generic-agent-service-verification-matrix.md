@@ -672,3 +672,30 @@ include `tool_call`/`tool_result` / `model_final`.
 
 Lab cleaned after evidence. Classic SSL WIP untouched. Remaining open: sustained no-gap,
 classic SSL WIP.
+
+### 2026-09-16 derived coalescing: ambient derived drops closed on e3f82106
+
+**Problem:** after evidence/session microbatch (`8442bda`), ambient host traffic still
+incremented `asyncDerivedPersistenceDropped` (+127 over a prior 60s window) because each
+derived Semantic/Evidence/Session write held an in-flight slot for the full SQL round trip
+and expired the 250 ms admission wait.
+
+**Fix:** coalesce derived Semantic / EvidenceLink / SessionMembership writes behind the same
+bounded-queue pattern as Raw/Kernel (`ANYSENTRY_CANONICAL_ASYNC_DERIVED_BATCH_*`): one
+derived slot per flush, queue later admissions instead of wait-timeout drops, expose
+`asyncDerivedBatchQueueRows` in health gaps. Module test
+`verify-canonical-derived-batching.mjs` passed.
+
+**Digest deploy:** thin overlay tagged `derived-batch-753327b` as
+`127.0.0.1:5000/anysentry@sha256:e3f8210665e556de89c0e62ce5d9ecb532851e2b09d2009749594251cf4b2399`.
+Container `canonical-observability.service.js` SHA-256 matched local dist
+(`e50d08b8ca62b6a54355ec70849b969a407fe175836cb6cc7b4bbd329d2085c1`). New Pod
+`anysentry-5b75bc495c-crsj2` Ready; port-forward retargeted off the terminating prior Pod.
+
+**Ambient 60s health delta** (no Design B lab, new digest uptime ~198→261s):
+`asyncDerivedPersistenceDropped` 0→0, `asyncRawPersistenceDropped` 0→0,
+`asyncPersistenceFailed` 0→0, `asyncDerivedBatchQueueRows` present and 0→0.
+
+This closes the previously observed ambient derived-drop regression on this host for the
+sampled window. Remaining open gates: Design B point-read under the new digest,
+longer sustained no-gap, classic SSL WIP. Infrastructure untouched.

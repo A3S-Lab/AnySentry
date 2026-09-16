@@ -406,6 +406,36 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncKernelBatchQueue: Array<{ fact: KernelFact; bytes: number; onFailure: () => void }> = [];
   private asyncKernelBatchQueueBytes = 0;
   private asyncKernelBatchTimer?: ReturnType<typeof setTimeout>;
+  // Semantic / Evidence / Session writes previously each occupied a derived in-flight slot for
+  // the whole SQL round trip. Ambient ingest then expired the 250 ms wait. Coalesce them the
+  // same way as Raw/Kernel: bounded queue + one slot per flush, never an unbounded retry.
+  private readonly asyncDerivedBatchMaxRows = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_DERIVED_BATCH_ROWS',
+    128,
+    1,
+    512,
+  );
+  private readonly asyncDerivedBatchWindowMs = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_DERIVED_BATCH_WINDOW_MS',
+    25,
+    1,
+    1_000,
+  );
+  private readonly asyncDerivedBatchMaxBytes = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_DERIVED_BATCH_MAX_BYTES',
+    8 * 1024 * 1024,
+    64 * 1024,
+    32 * 1024 * 1024,
+  );
+  private derivedSemanticQueue: Array<{ record: SemanticRecord; bytes: number; onFailure: () => void }> = [];
+  private derivedEvidenceQueue: Array<{ link: EvidenceLink; bytes: number; onFailure: () => void }> = [];
+  private derivedSessionQueue: Array<{ membership: SessionMembership; bytes: number; onFailure: () => void }> = [];
+  private derivedSemanticQueueBytes = 0;
+  private derivedEvidenceQueueBytes = 0;
+  private derivedSessionQueueBytes = 0;
+  private derivedSemanticTimer?: ReturnType<typeof setTimeout>;
+  private derivedEvidenceTimer?: ReturnType<typeof setTimeout>;
+  private derivedSessionTimer?: ReturnType<typeof setTimeout>;
 
   constructor(@Optional() relationalStore?: RelationalBusinessStore) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
@@ -639,6 +669,281 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         if (this.asyncKernelBatchQueue.length > 0) void this.flushKernelFactBatch();
       });
     this.asyncPersistenceTasks.add(task);
+  }
+
+  private derivedQueueCapacity(): number {
+    return this.asyncDerivedPersistenceMaxInFlight * this.asyncDerivedBatchMaxRows;
+  }
+
+  private derivedQueuedRows(): number {
+    return this.derivedSemanticQueue.length
+      + this.derivedEvidenceQueue.length
+      + this.derivedSessionQueue.length;
+  }
+
+  private derivedQueuedBytes(): number {
+    return this.derivedSemanticQueueBytes
+      + this.derivedEvidenceQueueBytes
+      + this.derivedSessionQueueBytes;
+  }
+
+  private admitDerivedBytes(bytes: number): boolean {
+    return this.derivedQueuedRows() < this.derivedQueueCapacity()
+      && this.derivedQueuedBytes() + bytes <= this.asyncDerivedBatchMaxBytes;
+  }
+
+  private rejectDerivedAdmission(onFailure: () => void): false {
+    this.asyncPersistenceDropped += 1;
+    this.asyncDerivedPersistenceDropped += 1;
+    try { onFailure(); } catch { /* coverage is best effort */ }
+    return false;
+  }
+
+  private enqueueDerivedSemantic(
+    records: readonly SemanticRecord[],
+    onFailure: () => void,
+  ): boolean {
+    if (!this.sink?.saveSemanticRecords || this.closed || records.length === 0) return false;
+    const snapshots = records.map((record) => {
+      const copy = structuredClone(record);
+      return { record: copy, bytes: Buffer.byteLength(JSON.stringify(copy)), onFailure };
+    });
+    const bytes = snapshots.reduce((sum, item) => sum + item.bytes, 0);
+    if (!this.admitDerivedBytes(bytes)
+      || this.derivedSemanticQueue.length + snapshots.length > this.derivedQueueCapacity()) {
+      return this.rejectDerivedAdmission(onFailure);
+    }
+    this.derivedSemanticQueue.push(...snapshots);
+    this.derivedSemanticQueueBytes += bytes;
+    this.asyncPersistenceScheduled += snapshots.length;
+    if (this.derivedSemanticQueue.length >= this.asyncDerivedBatchMaxRows) {
+      void this.flushDerivedSemanticBatch();
+    } else this.scheduleDerivedSemanticFlush();
+    return true;
+  }
+
+  private scheduleDerivedSemanticFlush(): void {
+    if (this.derivedSemanticTimer || this.closed) return;
+    this.derivedSemanticTimer = setTimeout(() => {
+      this.derivedSemanticTimer = undefined;
+      void this.flushDerivedSemanticBatch();
+    }, this.asyncDerivedBatchWindowMs);
+    this.derivedSemanticTimer.unref?.();
+  }
+
+  private async flushDerivedSemanticBatch(): Promise<void> {
+    if (this.derivedSemanticQueue.length === 0 || this.closed) return;
+    if (this.asyncDerivedPersistenceInFlight >= this.asyncDerivedPersistenceMaxInFlight) {
+      this.scheduleDerivedSemanticFlush();
+      return;
+    }
+    const batch = this.derivedSemanticQueue.splice(0, this.asyncDerivedBatchMaxRows);
+    this.derivedSemanticQueueBytes = Math.max(
+      0,
+      this.derivedSemanticQueueBytes - batch.reduce((sum, item) => sum + item.bytes, 0),
+    );
+    this.asyncDerivedPersistenceInFlight += 1;
+    const task = Promise.resolve()
+      .then(() => this.sink?.saveSemanticRecords?.(batch.map(({ record }) => record)) ?? false)
+      .then((durable) => {
+        if (durable) this.asyncPersistenceCompleted += batch.length;
+        else {
+          this.asyncPersistenceFailed += batch.length;
+          for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+      })
+      .finally(() => {
+        this.asyncDerivedPersistenceInFlight = Math.max(0, this.asyncDerivedPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+        if (this.derivedSemanticQueue.length > 0) void this.flushDerivedSemanticBatch();
+        if (this.derivedEvidenceQueue.length > 0) void this.flushDerivedEvidenceBatch();
+        if (this.derivedSessionQueue.length > 0) void this.flushDerivedSessionBatch();
+      });
+    this.asyncPersistenceTasks.add(task);
+  }
+
+  private enqueueDerivedEvidence(
+    links: readonly EvidenceLink[],
+    onFailure: () => void,
+  ): boolean {
+    if (!this.sink?.saveEvidenceLinks || this.closed || links.length === 0) return false;
+    const snapshots = links.map((link) => {
+      const copy = structuredClone(link);
+      return { link: copy, bytes: Buffer.byteLength(JSON.stringify(copy)), onFailure };
+    });
+    const bytes = snapshots.reduce((sum, item) => sum + item.bytes, 0);
+    if (!this.admitDerivedBytes(bytes)
+      || this.derivedEvidenceQueue.length + snapshots.length > this.derivedQueueCapacity()) {
+      return this.rejectDerivedAdmission(onFailure);
+    }
+    this.derivedEvidenceQueue.push(...snapshots);
+    this.derivedEvidenceQueueBytes += bytes;
+    this.asyncPersistenceScheduled += snapshots.length;
+    if (this.derivedEvidenceQueue.length >= this.asyncDerivedBatchMaxRows) {
+      void this.flushDerivedEvidenceBatch();
+    } else {
+      if (!this.derivedEvidenceTimer && !this.closed) {
+        this.derivedEvidenceTimer = setTimeout(() => {
+          this.derivedEvidenceTimer = undefined;
+          void this.flushDerivedEvidenceBatch();
+        }, this.asyncDerivedBatchWindowMs);
+        this.derivedEvidenceTimer.unref?.();
+      }
+    }
+    return true;
+  }
+
+  private async flushDerivedEvidenceBatch(): Promise<void> {
+    if (this.derivedEvidenceQueue.length === 0 || this.closed) return;
+    if (this.asyncDerivedPersistenceInFlight >= this.asyncDerivedPersistenceMaxInFlight) {
+      if (!this.derivedEvidenceTimer) {
+        this.derivedEvidenceTimer = setTimeout(() => {
+          this.derivedEvidenceTimer = undefined;
+          void this.flushDerivedEvidenceBatch();
+        }, this.asyncDerivedBatchWindowMs);
+        this.derivedEvidenceTimer.unref?.();
+      }
+      return;
+    }
+    const batch = this.derivedEvidenceQueue.splice(0, this.asyncDerivedBatchMaxRows);
+    this.derivedEvidenceQueueBytes = Math.max(
+      0,
+      this.derivedEvidenceQueueBytes - batch.reduce((sum, item) => sum + item.bytes, 0),
+    );
+    this.asyncDerivedPersistenceInFlight += 1;
+    const task = Promise.resolve()
+      .then(() => this.sink?.saveEvidenceLinks?.(batch.map(({ link }) => link)) ?? false)
+      .then((durable) => {
+        if (durable) this.asyncPersistenceCompleted += batch.length;
+        else {
+          this.asyncPersistenceFailed += batch.length;
+          for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+      })
+      .finally(() => {
+        this.asyncDerivedPersistenceInFlight = Math.max(0, this.asyncDerivedPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+        if (this.derivedEvidenceQueue.length > 0) void this.flushDerivedEvidenceBatch();
+        if (this.derivedSemanticQueue.length > 0) void this.flushDerivedSemanticBatch();
+        if (this.derivedSessionQueue.length > 0) void this.flushDerivedSessionBatch();
+      });
+    this.asyncPersistenceTasks.add(task);
+  }
+
+  private enqueueDerivedSession(
+    memberships: readonly SessionMembership[],
+    onFailure: () => void,
+  ): boolean {
+    if (!this.sink?.saveSessionMemberships || this.closed || memberships.length === 0) return false;
+    const snapshots = memberships.map((membership) => {
+      const copy = structuredClone(membership);
+      return { membership: copy, bytes: Buffer.byteLength(JSON.stringify(copy)), onFailure };
+    });
+    const bytes = snapshots.reduce((sum, item) => sum + item.bytes, 0);
+    if (!this.admitDerivedBytes(bytes)
+      || this.derivedSessionQueue.length + snapshots.length > this.derivedQueueCapacity()) {
+      return this.rejectDerivedAdmission(onFailure);
+    }
+    this.derivedSessionQueue.push(...snapshots);
+    this.derivedSessionQueueBytes += bytes;
+    this.asyncPersistenceScheduled += snapshots.length;
+    if (this.derivedSessionQueue.length >= this.asyncDerivedBatchMaxRows) {
+      void this.flushDerivedSessionBatch();
+    } else {
+      if (!this.derivedSessionTimer && !this.closed) {
+        this.derivedSessionTimer = setTimeout(() => {
+          this.derivedSessionTimer = undefined;
+          void this.flushDerivedSessionBatch();
+        }, this.asyncDerivedBatchWindowMs);
+        this.derivedSessionTimer.unref?.();
+      }
+    }
+    return true;
+  }
+
+  private async flushDerivedSessionBatch(): Promise<void> {
+    if (this.derivedSessionQueue.length === 0 || this.closed) return;
+    if (this.asyncDerivedPersistenceInFlight >= this.asyncDerivedPersistenceMaxInFlight) {
+      if (!this.derivedSessionTimer) {
+        this.derivedSessionTimer = setTimeout(() => {
+          this.derivedSessionTimer = undefined;
+          void this.flushDerivedSessionBatch();
+        }, this.asyncDerivedBatchWindowMs);
+        this.derivedSessionTimer.unref?.();
+      }
+      return;
+    }
+    const batch = this.derivedSessionQueue.splice(0, this.asyncDerivedBatchMaxRows);
+    this.derivedSessionQueueBytes = Math.max(
+      0,
+      this.derivedSessionQueueBytes - batch.reduce((sum, item) => sum + item.bytes, 0),
+    );
+    this.asyncDerivedPersistenceInFlight += 1;
+    const task = Promise.resolve()
+      .then(() => this.sink?.saveSessionMemberships?.(batch.map(({ membership }) => membership)) ?? false)
+      .then((durable) => {
+        if (durable) this.asyncPersistenceCompleted += batch.length;
+        else {
+          this.asyncPersistenceFailed += batch.length;
+          for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+        }
+      })
+      .catch(() => {
+        this.asyncPersistenceFailed += batch.length;
+        for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
+      })
+      .finally(() => {
+        this.asyncDerivedPersistenceInFlight = Math.max(0, this.asyncDerivedPersistenceInFlight - 1);
+        this.asyncPersistenceTasks.delete(task);
+        if (this.derivedSessionQueue.length > 0) void this.flushDerivedSessionBatch();
+        if (this.derivedSemanticQueue.length > 0) void this.flushDerivedSemanticBatch();
+        if (this.derivedEvidenceQueue.length > 0) void this.flushDerivedEvidenceBatch();
+      });
+    this.asyncPersistenceTasks.add(task);
+  }
+
+  private failDerivedQueue(kind: 'semantic' | 'evidence' | 'session'): void {
+    if (kind === 'semantic') {
+      if (this.derivedSemanticTimer) clearTimeout(this.derivedSemanticTimer);
+      this.derivedSemanticTimer = undefined;
+      for (const item of this.derivedSemanticQueue) {
+        this.asyncPersistenceDropped += 1;
+        this.asyncDerivedPersistenceDropped += 1;
+        try { item.onFailure(); } catch { /* coverage is best effort */ }
+      }
+      this.derivedSemanticQueue = [];
+      this.derivedSemanticQueueBytes = 0;
+      return;
+    }
+    if (kind === 'evidence') {
+      if (this.derivedEvidenceTimer) clearTimeout(this.derivedEvidenceTimer);
+      this.derivedEvidenceTimer = undefined;
+      for (const item of this.derivedEvidenceQueue) {
+        this.asyncPersistenceDropped += 1;
+        this.asyncDerivedPersistenceDropped += 1;
+        try { item.onFailure(); } catch { /* coverage is best effort */ }
+      }
+      this.derivedEvidenceQueue = [];
+      this.derivedEvidenceQueueBytes = 0;
+      return;
+    }
+    if (this.derivedSessionTimer) clearTimeout(this.derivedSessionTimer);
+    this.derivedSessionTimer = undefined;
+    for (const item of this.derivedSessionQueue) {
+      this.asyncPersistenceDropped += 1;
+      this.asyncDerivedPersistenceDropped += 1;
+      try { item.onFailure(); } catch { /* coverage is best effort */ }
+    }
+    this.derivedSessionQueue = [];
+    this.derivedSessionQueueBytes = 0;
   }
 
   registryCatalog(): {
@@ -1004,13 +1309,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.record);
     let durable = false;
     if (acceptedRecords.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveSemanticRecords) {
-      durable = await this.writeCanonicalSideLane(
-        () => this.sink!.saveSemanticRecords!(acceptedRecords),
-        () => this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length }),
-      );
-      // A scheduled asynchronous write is pending, not yet durable from the caller's point of
-      // view.  The hot SemanticRecord remains queryable while the completion updates the durable
-      // sink or records a bounded gap.
+      durable = this.asyncPersistence
+        ? this.enqueueDerivedSemantic(
+          acceptedRecords,
+          () => this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length }),
+        )
+        : await this.writeCanonicalSideLane(
+          () => this.sink!.saveSemanticRecords!(acceptedRecords),
+          () => this.recordGap('projection', 'storage_unavailable', 'semantic_record', { count: acceptedRecords.length }),
+        );
       if (this.asyncPersistence) durable = false;
     }
     return {
@@ -1077,10 +1384,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.link);
     let durable = false;
     if (acceptedLinks.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveEvidenceLinks) {
-      durable = await this.writeCanonicalSideLane(
-        () => this.sink!.saveEvidenceLinks!(acceptedLinks),
-        () => this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length }),
-      );
+      durable = this.asyncPersistence
+        ? this.enqueueDerivedEvidence(
+          acceptedLinks,
+          () => this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length }),
+        )
+        : await this.writeCanonicalSideLane(
+          () => this.sink!.saveEvidenceLinks!(acceptedLinks),
+          () => this.recordGap('projection', 'storage_unavailable', 'evidence_link', { count: acceptedLinks.length }),
+        );
       if (this.asyncPersistence) durable = false;
     }
     return {
@@ -1309,10 +1621,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       .map((result) => result.membership);
     let durable = false;
     if (acceptedMemberships.length > 0 && this.canonicalPersistenceEnabled && this.sink?.saveSessionMemberships) {
-      durable = await this.writeCanonicalSideLane(
-        () => this.sink!.saveSessionMemberships!(acceptedMemberships),
-        () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
-      );
+      durable = this.asyncPersistence
+        ? this.enqueueDerivedSession(
+          acceptedMemberships,
+          () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
+        )
+        : await this.writeCanonicalSideLane(
+          () => this.sink!.saveSessionMemberships!(acceptedMemberships),
+          () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
+        );
       if (this.asyncPersistence) durable = false;
     }
     return {
@@ -1416,6 +1733,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncKernelBatchQueueRows: number;
     asyncKernelBatchQueueBytes: number;
     asyncKernelBatchMaxBytes: number;
+    asyncDerivedBatchQueueRows: number;
+    asyncDerivedBatchQueueBytes: number;
+    asyncDerivedBatchMaxRows: number;
+    asyncDerivedBatchMaxBytes: number;
   } {
     return {
       entries: this.gaps.size,
@@ -1449,6 +1770,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncKernelBatchQueueRows: this.asyncKernelBatchQueue.length,
       asyncKernelBatchQueueBytes: this.asyncKernelBatchQueueBytes,
       asyncKernelBatchMaxBytes: this.asyncKernelBatchMaxBytes,
+      asyncDerivedBatchQueueRows: this.derivedQueuedRows(),
+      asyncDerivedBatchQueueBytes: this.derivedQueuedBytes(),
+      asyncDerivedBatchMaxRows: this.asyncDerivedBatchMaxRows,
+      asyncDerivedBatchMaxBytes: this.asyncDerivedBatchMaxBytes,
     };
   }
 
@@ -1704,6 +2029,9 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     }
     this.asyncKernelBatchQueue = [];
     this.asyncKernelBatchQueueBytes = 0;
+    this.failDerivedQueue('semantic');
+    this.failDerivedQueue('evidence');
+    this.failDerivedQueue('session');
     this.closed = true;
     this.raw.close();
     this.kernel.close();
