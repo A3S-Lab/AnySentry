@@ -832,3 +832,20 @@ stalled on saturated NVMe write latency (≈3s await, many D-state tasks includi
 system `containerd`/`dockerd`), so digest bake of tip `c18ec52` and
 Docker-labeled Design B remain open. Classic SSL WIP untouched.
 
+### 2026-09-16 tip Session-coverage digest deploy (no hostPath)
+
+Bypassed hung `dockerd` create/build by exporting base digest `e3f82106…` from
+k3s containerd, appending an OCI layer with tip `c18ec52`
+`security-monitoring.controller.js` + `agent-conversation.js`, and importing a
+slim OCI archive (`ctr images import --local --no-unpack`). Deployed:
+
+- Image: `127.0.0.1:5000/anysentry@sha256:cdcf85f884503a2ddd2d516592e55c18c76298bc64aa53872e5d37bb6779cbe5`
+- Pod: `anysentry-6d6f9975f6-wpblw` Ready; `imageID` matches the tip digest
+- hostPath `local-session-coverage-fix` removed from Deployment/Pod
+- In-container SHA-256 matches tip `apps/api/dist` for both JS files
+  (`645edb1b…` / `24277708…`)
+
+**Ambient 30s** on the new digest (uptime 230→260s): async raw/derived/
+persistence dropped and failed deltas all **0**. Docker-labeled Design B still
+open (compose/`docker run` still I/O-fragile). Classic SSL WIP untouched.
+
