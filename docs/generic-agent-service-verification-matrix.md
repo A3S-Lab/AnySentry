@@ -713,3 +713,21 @@ Design B point-read under this digest remains pending until host Docker recovers
 Remaining open: Design B point-read on this digest, raw-lane no-gap investigation,
 longer sustained no-gap, classic SSL WIP.
 
+### 2026-09-16 maxInFlight=8 ambient: raw+derived drops flat 300s
+
+After derived coalescing on digest `e3f82106…`, a later ambient window on the same
+digest (maxInFlight still 4) showed `asyncRawPersistenceDropped` already at **178**
+with flat growth afterward. Controlled env-only bump
+`ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT=4→8` (same digest, image already on
+node; no rebuild). New Pod `anysentry-8694b754d5-wnclr` Ready.
+
+**120s + 300s ambient samples** on the new Pod: `asyncRawPersistenceDropped` 0→0,
+`asyncDerivedPersistenceDropped` 0→0, `asyncPersistenceFailed` 0→0 throughout.
+Raw queue oscillated (0–138 rows) while raw in-flight often saturated at 8 and still
+drained between bursts; healthz remained responsive (no prior 16/32 timeout
+regression). CoverageGap `persistenceDropped` continued to rise and is recorded as a
+separate gap-store counter, not canonical raw/derived admission.
+
+Host Docker recovered from the earlier D-state hang after the zombie dockerd exited;
+Design B point-read on this digest remains the next gate. Classic SSL WIP untouched.
+
