@@ -509,6 +509,25 @@ export function conversationLogicalScopeKeyV2(record: T.AgentInteractionRecord):
   ].join('\u0000'));
 }
 
+/**
+ * Keep orchestrator / worker Conversations independent even when Design-B delegation reuses the
+ * same runId / sessionId / providerConversationId across the hop. Projection and resolver must
+ * use the same fence or route aliases collapse parent+child into one empty canonical Thread.
+ */
+export function hopConversationFence(record: T.AgentInteractionRecord): string {
+  const hop = record.hop?.trim().toLowerCase();
+  if (hop === 'orchestrator' || hop === 'worker') return `\u0000hop:${hop}`;
+  const header = record.agentIdHeader?.trim().toLowerCase() ?? '';
+  if (header.includes('orchestrator') || header.includes('worker')) {
+    return `\u0000agent-id:${header}`;
+  }
+  return '';
+}
+
+function conversationHopScopeKey(record: T.AgentInteractionRecord): string {
+  return `${conversationLogicalScopeKeyV2(record)}${hopConversationFence(record)}`;
+}
+
 export function conversationDeploymentScopeKey(record: T.AgentInteractionRecord): string {
   const applicationMode = ['workflow_definition', 'service_definition'].includes(record.logicalScopeMode ?? '');
   if (!applicationMode) return '';
@@ -569,12 +588,19 @@ function anchorScopeKey(
     return stableId('as', `ephemeral\0${record.interactionId}`);
   }
   const definition = canonicalDefinitionForRecord(record);
+  const hopFence = hopConversationFence(record);
   if (definition.stable) {
     const applicationResumeBridge = record.logicalScopeMode === 'service_definition'
       && providerSessionAnchorKey(record)
       && resumeBridgeKeys.has(providerSessionAnchorKey(record)!);
-    if (applicationResumeBridge) return resumeLogicalScopeKey(record);
-    return stableId('as', [conversationLogicalScopeKeyV2(record), conversationDeploymentScopeKey(record)].join('\u0000'));
+    if (applicationResumeBridge) {
+      return stableId('as', [resumeLogicalScopeKey(record), hopFence].join('\u0000'));
+    }
+    return stableId('as', [
+      conversationLogicalScopeKeyV2(record),
+      conversationDeploymentScopeKey(record),
+      hopFence,
+    ].join('\u0000'));
   }
   return stableId('as', [
     // Continuity anchors must be able to bridge one synthetic/missing workspace during resume.
@@ -584,6 +610,7 @@ function anchorScopeKey(
     normalized(record.tenantId),
     normalized(record.environmentId),
     normalized(record.process?.hostId),
+    hopFence,
   ].join('\u0000'));
 }
 
@@ -808,6 +835,12 @@ function canMerge(
     || rightProvider.size === 0
     || [...leftProvider].some((value) => rightProvider.has(value));
   if (!providerCompatible) return false;
+  // Design-B parent/worker hops share run/session/provider IDs by design. Never fold them into one
+  // Canonical Thread — relatedConversations + EvidenceLink express the hop, not route aliases.
+  const hopFences = new Set([...left, ...right]
+    .map((index) => hopConversationFence(records[index]))
+    .filter((value) => Boolean(value)));
+  if (hopFences.size > 1) return false;
   // A synthetic/unknown workspace is missing evidence, not a contradictory identity. Strong
   // provider, response-chain, continuity, tool or replay anchors may bridge it to one explicit
   // workspace. Two different explicit workspaces remain a hard conflict so an anchor collision
@@ -884,7 +917,7 @@ function canonicalConversationId(
   continuityConflictIndexes?: Set<number>,
 ): { conversationId: string; idSource: T.AgentConversationSummary['idSource'] } {
   const first = records[indexes[0]];
-  const scope = conversationLogicalScopeKeyV2(first);
+  const scope = conversationHopScopeKey(first);
   // A stateless service creates one Session per POST. Provider payloads may still repeat the same
   // native-looking conversation/session value across requests, so that value is evidence only and
   // must not become the canonical Conversation key for an ephemeral group. Prefer the server-

@@ -642,3 +642,33 @@ readiness-gate failure.
 
 Lab project `langgraph-ready-1904` cleaned after this record. Classic SSL WIP and
 infrastructure were not modified. Goal remains open for sustained no-gap and SSL WIP.
+
+### 2026-09-16 Design B hop-fence: empty timeline alias collapse fixed
+
+**Root cause:** conversation projection already applied `hopConversationFence` so Design B
+parent/worker kept independent directory Conversations, but resolver v2 merged them by
+shared `runId`/`sessionId`/`providerConversationId` into one canonical Thread and then
+route-aliased both ids onto an empty target (`turns=[]`, `coverage.partial=true`).
+
+**Fix:** export shared `hopConversationFence` from `agent-conversation-resolution-v2`,
+apply it in `anchorScopeKey` / canonical id minting, and refuse `canMerge` when hop
+fences disagree. Module test `verify-agent-conversation-resolution-v2.mjs` covers the
+shared-run Design B case.
+
+**Digest deploy:** thin overlay on tip `5e5b4e0bd267…` as
+`127.0.0.1:5000/anysentry@sha256:c13fc66acd14e21408bbe5cef976f798b104e83709da70ba563581568b02a3b8`
+(`hop-fence-d36119f`). Container
+`agent-conversation-resolution-v2.js` SHA-256 matched local dist
+(`92dc565dd4176d272b5f84473ba96015cd5331ba01a6e896b212995b589c2499`).
+
+**Design B re-verify** (`COMPOSE_PROJECT_NAME=langgraph-hop-194244`): readiness ready in
+101 ms (`dockerEntries=4`). Run `3b9cc27d-088a-4724-8d20-aab5f7de4f8b` /
+`trace_id=573a22107fa64db38c12ebb9130ea499` completed. Interactions **8**,
+`exact_as_observed`, paths `/runs` `/v1/chat/completions` `/execute`,
+`tcp_plaintext`. Directory: parent `cv_e0c0809deae5c39b54ba77f9` and worker
+`cv_181c7c2d2a1f8a742f4382cf`. Timelines non-empty without cross-alias collapse:
+parent kinds include `delegation_send`/`delegation_reply` plus tools; worker kinds
+include `tool_call`/`tool_result` / `model_final`.
+
+Lab cleaned after evidence. Classic SSL WIP untouched. Remaining open: sustained no-gap,
+classic SSL WIP.

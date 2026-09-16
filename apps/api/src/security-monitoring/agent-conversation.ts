@@ -11,6 +11,7 @@ import {
   conversationLogicalScopeKeyV2,
   conversationDeploymentScopeKey,
   canonicalPerRequestConversationId,
+  hopConversationFence,
 } from './agent-conversation-resolution-v2';
 import {
   closeToolCallsAcrossInteractions,
@@ -137,18 +138,6 @@ function rootIdentity(record: T.AgentInteractionRecord): string {
     process?.pid ?? '',
     hopConversationFence(record),
   ].join('\u0000');
-}
-
-function hopConversationFence(record: T.AgentInteractionRecord): string {
-  // Keep orchestrator / worker LogicalAgent conversations independent even when they share
-  // runId/sessionId correlation headers across a Design-B delegation hop.
-  const hop = record.hop?.trim().toLowerCase();
-  if (hop === 'orchestrator' || hop === 'worker') return `\u0000hop:${hop}`;
-  const header = record.agentIdHeader?.trim().toLowerCase() ?? '';
-  if (header.includes('orchestrator') || header.includes('worker')) {
-    return `\u0000agent-id:${header}`;
-  }
-  return '';
 }
 
 function explicitConversation(

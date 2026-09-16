@@ -1287,4 +1287,71 @@ const unknownProviderResolution = resolveAgentConversationsV2(unknownProviderRec
 assert.equal(new Set(unknownProviderResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
   'an unknown provider anchor without a session key must not merge stateless requests');
 
+// Design B: orchestrator and worker intentionally share runId/sessionId/providerConversationId.
+// Resolver must keep independent Conversations; relatedConversations express the hop, not aliases.
+const designBRunId = 'design-b-shared-run';
+const designBHopRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_designb_orch', at: base + 10_000, instance: 'designb-orch',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-b-orch',
+      providerConversationId: designBRunId,
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'plan 1+1' }] },
+      responseId: 'designb-orch-response',
+      interactionType: 'remote_agent',
+      trafficRole: 'delegation',
+      path: '/runs',
+    }),
+    hop: 'orchestrator',
+    runId: designBRunId,
+    sessionId: designBRunId,
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentIdHeader: 'customer-langgraph-sim-orchestrator',
+    agentAssetId: 'agent-designb-orch',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_designb_worker', at: base + 10_100, instance: 'designb-worker',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-b-worker',
+      providerConversationId: designBRunId,
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'execute 1+1' }] },
+      responseId: 'designb-worker-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'worker',
+    runId: designBRunId,
+    sessionId: designBRunId,
+    parentSessionId: designBRunId,
+    delegationId: 'designb-delegation-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentIdHeader: 'customer-langgraph-sim-worker',
+    agentAssetId: 'agent-designb-worker',
+  },
+];
+const designBResolution = resolveAgentConversationsV2(designBHopRecords);
+const designBConversationIds = [...new Set(
+  designBResolution.conversationRecords.map((item) => item.conversationId),
+)];
+assert.equal(designBConversationIds.length, 2,
+  'Design B orchestrator/worker hops must not collapse into one Canonical Thread');
+assert.equal(
+  designBResolution.aliases.filter((item) =>
+    item.aliasConversationId !== item.canonicalConversationId
+    && designBConversationIds.includes(item.aliasConversationId)
+    && designBConversationIds.includes(item.canonicalConversationId)).length,
+  0,
+  'Design B hops must not alias parent Conversation onto worker or vice versa',
+);
+const designBProjection = projectAgentConversations(
+  designBResolution.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(designBProjection.summaries.filter((item) => item.hasContent).length, 2,
+  'projection keeps independent parent/worker Conversations for Design B');
+
 console.log('Agent Conversation Resolver V2 verification passed');
