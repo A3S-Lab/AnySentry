@@ -810,3 +810,25 @@ Post-run `asyncRawPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`.
 Host lab cleaned. System Docker still stuck at buildkit init; tip remains
 hostPath-overlaid on digest `e3f82106…` until an image rebuild is possible.
 
+### 2026-09-16 ambient 60s no-gap + Docker recover attempt
+
+**Ambient 60s health delta** on digest `e3f82106…` / maxInFlight=8 / hostPath
+Session-coverage overlay (uptime ~845→905s):
+
+| counter | Δ |
+| --- | ---: |
+| `asyncRawPersistenceDropped` | 0 |
+| `asyncDerivedPersistenceDropped` | 0 |
+| `asyncPersistenceDropped` | 0 |
+| `asyncPersistenceFailed` | 0 |
+| `persistenceDropped` (legacy non-async) | +2165 |
+
+Raw/derived queues grew under host I/O pressure (`asyncRawBatchQueueRows`
+128→1041) but did not admit explicit async CoverageGaps in this window.
+
+**Docker:** quarantined disposable buildkit DBs (`cache.db` / `history_c8d.db` /
+`metadata_v2.db`); daemon returned to `active`. Tip thin-overlay rebuild then
+stalled on saturated NVMe write latency (≈3s await, many D-state tasks including
+system `containerd`/`dockerd`), so digest bake of tip `c18ec52` and
+Docker-labeled Design B remain open. Classic SSL WIP untouched.
+
