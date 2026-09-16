@@ -724,7 +724,8 @@ function effectiveInteractionState(
   };
 }
 
-function conversationCoverage(
+/** Shared by conversation directory and canonical Session coverage point-reads. */
+export function conversationCoverage(
   interactions: T.AgentInteractionRecord[],
 ): T.AgentConversationCoverage {
   if (interactions.length === 0) {

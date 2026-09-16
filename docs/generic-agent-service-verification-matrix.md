@@ -783,3 +783,19 @@ collector `droppedEvents/outputDropped/queueDropped=0` — no disposable WAL
 cleanup required. Docker-labeled Design B and session `coverage=complete` remain
 open. Classic SSL WIP untouched.
 
+### 2026-09-16 Session coverage respects P2 tool-closure
+
+**Bug:** `GET /v1/sessions/:id/coverage` rebuilt coverage from durable
+`SemanticRecord.completeness`, which still stored Observer single-row
+`tool_result_pending` after a later interaction closed the tool call. Conversation
+directory already reported `coverage=complete` via P2 closure for the same run.
+
+**Fix:** export `conversationCoverage` and, on exact Session reads that already load
+membership interactions, recompute Session coverage from that interaction set after
+durable reconcile (hostPath overlay of `security-monitoring.controller.js` +
+`agent-conversation.js` while Docker image rebuild remains blocked).
+
+**Point-read:** session `sess_b7c54d5cc5cf3595c255861a` now returns
+`coverage.status=complete`, `completeInteractions=6`, `partialInteractions=0`.
+Raw/derived async drops remain 0 on digest `e3f82106…` / maxInFlight=8.
+

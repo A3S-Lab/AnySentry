@@ -10,7 +10,7 @@ import {
   enrichAgentConversationDirectoryV2,
   projectAgentConversationDirectory,
 } from './agent-conversation-directory';
-import { projectAgentConversations } from './agent-conversation';
+import { conversationCoverage, projectAgentConversations } from './agent-conversation';
 import { projectSemanticConversationTimeline } from './agent-semantic-timeline';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
@@ -12207,12 +12207,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       ? await this.canonicalObservability.listDurableSessionMemberships(512, undefined, query.sessionId)
       : await this.canonicalObservability.listDurableSessionMemberships(512);
     let conversations: T.AgentConversationList;
+    let sessionInteractions: T.AgentInteractionRecord[] = [];
     if (memberships.length > 0 && query.sessionId) {
       const selected = await this.agg.agentInteractions({
         scope: 'raw',
         interactionIds: memberships.map((membership) => membership.interactionId).filter((id): id is string => Boolean(id)),
         limit: 5_000,
       });
+      sessionInteractions = selected.items;
       const projection = projectAgentConversations(selected.items, [], { scope: 'raw', includeBackground: true });
       // The compatibility projector may derive a per-request `cv_…` key for ephemeral records.
       // For an exact canonical Session, preserve the immutable Interaction conversation alias so
@@ -12450,6 +12452,30 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               || record.sourceRefs.some((ref) => interactionIds.has(ref))),
           );
           if (records.length === 0) continue;
+          // Prefer interaction-level coverage (includes P2 cross-interaction ToolResult
+          // closure) over durable SemanticRecord.completeness, which still stores Observer's
+          // single-row tool_result_pending after a later interaction closed the call.
+          const scopedInteractions = sessionInteractions.filter((item) =>
+            interactionIds.has(item.interactionId)
+            || item.canonicalSessionId === resource.sessionId
+            || item.sessionId === resource.sessionId
+            || item.canonicalSessionId === resource.canonicalSessionId
+            || item.sessionId === resource.canonicalSessionId);
+          if (scopedInteractions.length > 0) {
+            const closed = conversationCoverage(scopedInteractions);
+            resource.coverage = {
+              status: closed.status === 'complete' ? 'complete' : 'partial',
+              reasons: closed.status === 'complete'
+                ? []
+                : [...new Set([
+                  ...resource.coverage.reasons.filter((reason) => reason !== 'semantic_projection_expired_or_missing'),
+                  ...closed.reasons,
+                ])],
+              completeInteractions: closed.completeInteractions,
+              partialInteractions: closed.partialInteractions,
+            };
+            continue;
+          }
           const completeInteractions = new Set(
             records.filter((record) => record.completeness === 'complete')
               .flatMap((record) => record.sourceRefs.filter((ref) => interactionIds.has(ref))),
@@ -12472,6 +12498,32 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         if (!isCanonicalProjectionDegradation(error)) throw error;
         // Keep the existing explicit projection gap; durable storage was unavailable within the
         // bounded read budget and must not be represented as complete.
+      }
+    }
+    // Exact Session reads already load the membership interaction set. Apply P2 tool-closure
+    // coverage even when the durable semantic reconcile path was empty or timed out.
+    if (sessionInteractions.length > 0) {
+      for (const resource of resourcesByKey.values()) {
+        const interactionIds = new Set(resource.interactionIds);
+        const scopedInteractions = sessionInteractions.filter((item) =>
+          interactionIds.has(item.interactionId)
+          || item.canonicalSessionId === resource.sessionId
+          || item.sessionId === resource.sessionId
+          || item.canonicalSessionId === resource.canonicalSessionId
+          || item.sessionId === resource.canonicalSessionId);
+        if (scopedInteractions.length === 0) continue;
+        const closed = conversationCoverage(scopedInteractions);
+        resource.coverage = {
+          status: closed.status === 'complete' ? 'complete' : 'partial',
+          reasons: closed.status === 'complete'
+            ? []
+            : [...new Set([
+              ...resource.coverage.reasons.filter((reason) => reason !== 'semantic_projection_expired_or_missing'),
+              ...closed.reasons,
+            ])],
+          completeInteractions: closed.completeInteractions,
+          partialInteractions: closed.partialInteractions,
+        };
       }
     }
     const resources = [...resourcesByKey.values()].filter((resource) => canonicalScopeMatches({
