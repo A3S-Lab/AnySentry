@@ -799,3 +799,14 @@ durable reconcile (hostPath overlay of `security-monitoring.controller.js` +
 `coverage.status=complete`, `completeInteractions=6`, `partialInteractions=0`.
 Raw/derived async drops remain 0 on digest `e3f82106…` / maxInFlight=8.
 
+### 2026-09-16 host Design B re-verify after Session coverage fix
+
+Module test `verify-session-coverage-tool-closure.mjs` passed. Fresh host Design B
+run `6d903f4c-80d4-401a-964b-951e14621438` /
+`trace_id=2e7003753cf2455c1c9c467b5fae4221` completed with `verify_status=pass`.
+Canonical session `sess_22b7e932f8a1f132d6691de0` point-read:
+`coverage.status=complete`, `completeInteractions=7`, `partialInteractions=0`.
+Post-run `asyncRawPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`.
+Host lab cleaned. System Docker still stuck at buildkit init; tip remains
+hostPath-overlaid on digest `e3f82106…` until an image rebuild is possible.
+
