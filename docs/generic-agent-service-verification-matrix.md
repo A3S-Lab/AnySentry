@@ -1348,3 +1348,24 @@ Controlled POST `/runs` goal `用 Python 计算 4+5 并打印结果` →
 
 Lab ports cleaned after evidence. **Still open:** labeled Docker Design B,
 classic SSL live, disposable spool, raw-lane pressure under sustained NO-GO.
+
+### 2026-09-17 goal completion audit (incomplete)
+
+**Verdict: Goal NOT complete** — keep active.
+
+| Objective requirement | Evidence | Status |
+| --- | --- | --- |
+| Tip digest true deploy (no hostPath) | pod `…-4m5h5` `@sha256:16e25b86…`, volumes empty | **Met** |
+| Phase C pollable readiness | collectors/health plane ready; dockerEntries=1 | **Met** (labeled cold-start still open) |
+| Phase D parent/child views | host Design B on digest: delegation + worker tools | **Met** (host path) |
+| Canonical Session/Run/EvidenceLink point-read | run `aa9c86a8…`: 6 interactions, Session complete, 4 EvidenceLinks | **Met** with caveats |
+| No unexpected derived drop | derived Δ=0 on ambient + Design B window | **Met** for derived |
+| Clean A/B without unexpected raw drop | raw Δ **+6165** during Design B (queue ~15k/16k) | **Unmet** |
+| Labeled Design B (compose) | capacity NO-GO | **Unmet** |
+| Disposable spool/WAL cleaned | `spool-clean-20260915.wal` ≈26–30Mi **active** | **Unmet** |
+| Classic SSL live + tip | unit 5/5; collector process age >1d, WIP uncommitted | **Unmet** |
+| Protect infra / no push | local commits only | **Met** |
+
+Live tip gaps now: `asyncRawPersistenceDropped≈9853`, queueRows≈12.7k/16k,
+kernelDropped=385, derived=0. Capacity **NO-GO**. Next: wait GO for raw-lane
+relief / labeled B / SSL collector tip; do not truncate active spool.
