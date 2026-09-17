@@ -923,16 +923,19 @@ startup probe connection-refused until listen). In-pod checks:
 - dist symbol `asyncKernelPersistenceMaxInFlight` present
 - healthz gaps: raw/kernel/derived drops **0**; `kernelMax=4`
 - Δ60s ambient sample: raw/kernel/derived/total drops **0** (uptime≈365s)
+- Δ120s ambient sample after sole replica: raw/kernel/derived/total drops **0**
+  (uptime≈664s)
 
-Old tip replica `…wpblw` (digest `cdcf85f8…`) Terminating under NVMe saturation.
+Old tip replica `…wpblw` (digest `cdcf85f8…`) hung Terminating under NVMe
+saturation; force-deleted (`--grace-period=0`) once new tip was Ready.
+Docker `Created` leftovers pruned (`docker_created=0`).
 
 ### 2026-09-17 capacity watch (concurrent with deploy)
 
-`check-host-capacity.sh` remains **NO-GO**:
-load1≈20–21 / 16 CPUs; MemAvailable≈19–21Gi; swap≈3.5Gi; disk≈81%;
-PSI io full avg10≈56–58%; nvme util≈97–99%; D-state≈11–18
+`check-host-capacity.sh` remains **NO-GO** (post-rollout sample):
+load1≈15 / 16 CPUs; MemAvailable≈20Gi; swap≈3.5Gi; disk≈81%;
+PSI io full avg10≈52%; nvme util≈98%; D-state≈7
 (postgres checkpointer/bgwriter/autovacuum, a3s-observer-collector, jbd2/flush).
-CPU PSI near zero. Docker `Created` leftover `distracted_cartwright` observed
-(rm deferred while docker API stalls). Prefer docs/k8s-light; defer labeled
-Design B / compose until gate GO.
+CPU PSI near zero. Prefer docs/k8s-light; defer labeled Design B / compose
+until gate GO.
 
