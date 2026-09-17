@@ -1033,3 +1033,19 @@ Point-read: interactions **6**, `exact_as_observed`; Session
 `sess_6b7c64e35c694bd99be540a2` coverage **complete** (6/0); post-run async
 raw/kernel/derived drops **0**. Lab ports cleaned. Digest replace of hostPath
 and labeled Design B remain open under NO-GO. Classic SSL WIP untouched.
+
+### 2026-09-17 rawq tip digest deploy (hostPath removed)
+
+Re-ingested overlay blobs, rebuilt **flat** OCI (amd64 manifest direct), and
+`ctr images import --local --no-unpack` succeeded as
+`127.0.0.1:5000/anysentry:rawq-44db727` /
+`sha256:9becbbf805fabb20b86698e7eae8a757c5f9099dff952c4945846d4534822a60`
+(113.7 MiB, linux/amd64). Nested-index import had been incomplete (425 B).
+
+Deployment switched off `local-rawq-fix`; pod
+`anysentry-5665b9dbb7-h9vc4` Ready with `imageID` matching `9becbbf8…`,
+in-pod `HAS_RAWQ`, `asyncRawQueueCapacityRows=16384`, `maxRows=1024`, no
+hostPath mounts. Δ60s ambient raw/kernel/derived drops **0**.
+
+Capacity still **NO-GO** for labeled Design B / compose. Classic SSL WIP
+untouched. Goal remains open for labeled cold-start attribution and SSL WIP.
