@@ -1049,3 +1049,20 @@ hostPath mounts. Δ60s ambient raw/kernel/derived drops **0**.
 
 Capacity still **NO-GO** for labeled Design B / compose. Classic SSL WIP
 untouched. Goal remains open for labeled cold-start attribution and SSL WIP.
+
+### 2026-09-17 host Design B on pure rawq digest tip
+
+Sole Ready pod `anysentry-cdd6f9cd4-c6fgj` /
+`imageID=…@sha256:9becbbf805fabb20b86698e7eae8a757c5f9099dff952c4945846d4534822a60`
+(no hostPath). Controlled host Design B run
+`48df0c4b-8759-45a2-b95d-2da314b4efa1` /
+`trace_id=db92f89ffa97c5e5d47568280dded3bf` → `completed`/`pass`, stdout `8`,
+`delegation_id=bdb4c2c9-…`.
+
+Point-read: interactions **6**, `exact_as_observed`; Session
+`sess_71c03932f29733b666c5a53f` coverage **complete** (6/0); EvidenceLinks
+matched to run obs: **4** (strong `network_effect`/`executes_as` + unmatched);
+post-run async raw/kernel/derived drops **0** (`cap=16384`). Lab cleaned.
+
+**Still open:** labeled Docker Design B (capacity NO-GO), classic SSL WIP,
+longer sustained no-gap under GO capacity. Infrastructure protected.
