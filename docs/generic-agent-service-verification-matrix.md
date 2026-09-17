@@ -1292,3 +1292,32 @@ in-image SHA-256 of the four files match stage; `HAS_REPAIR` /
 
 Still open: labeled/host Design B point-read on this digest, disposable spool
 proof, classic SSL live, ambient no-gap on new tip.
+
+### 2026-09-17 digest tip ambient + prior-run gap (capacity NO-GO)
+
+Tip still `anysentry@sha256:16e25b86…` (no hostPath). Capacity **NO-GO**
+(PSI≈55–63, nvme≈100%, D≈6–12); Design B / SSL live / spool truncate deferred.
+
+**Phase C plane** (`POST collectors/health`): collector `pjnl261070032` healthy;
+`identitySnapshotReady` / `unifiedProjectionState=ready` /
+`captureProfileControlPlaneState=ready` / `dockerReady` true; `queueDropped=0`.
+
+**Ambient Δ≈114s** (`GET healthz` uptime 17031→17145):
+
+| metric | t0 → t1 | Δ |
+| --- | --- | --- |
+| asyncRawPersistenceDropped | 3259 → 3259 | **0** |
+| asyncKernelPersistenceDropped | 0 → 0 | **0** |
+| asyncDerivedPersistenceDropped | 0 → 0 | **0** |
+| asyncPersistenceFailed | 251 → 251 | **0** |
+| asyncRawBatchQueueRows | 23 → 216 | +193 (backlog under stall) |
+
+Cumulative **asyncRawPersistenceDropped=3259** since tip up = admission drops under
+in-flight/queue backpressure (PG/I/O stall), not derived-lane loss. Derived stays
+0. Sync `gaps.persistenceDropped` still rising.
+
+**Prior Phase D run** `9abdb257-…` point-read on digest tip:
+`POST agents/interactions` with `runId` + `last_24h` → **total=0**
+(`exact_as_observed`) — durable window no longer holds that run (likely aged /
+raw-admission gaps). Fresh host/labeled Design B on this digest remains required
+for Phase E A/B evidence; blocked by capacity gate.
