@@ -1017,3 +1017,19 @@ Pod `anysentry-79b8f7874b-n5lwb` Ready: in-pod `HAS_RAWQ`, healthz
 counters reset; Δ60s ambient raw/kernel/derived drops **0** (queue absorbed).
 Replace hostPath with digest `9becbbf8…` / `rawq-44db727` when gate GO.
 Classic SSL WIP untouched; labeled Design B still deferred.
+
+### 2026-09-17 rawq tip Δ120s no-gap + host Design B
+
+On pod `anysentry-79b8f7874b-n5lwb` (hostPath rawq / `44db727` tunables):
+Δ120s ambient raw/kernel/derived drops **0** (queue 0→66, cap 16384, inFlight=8).
+Capacity still **NO-GO** (PSI io≈60%; nvme util briefly ≈84%).
+
+Host Design B (uvicorn, writable `CHECKPOINT_SQLITE_PATH=/tmp/...`) run
+`e2ffded6-9481-457a-bb1e-ffb999cadb7d` /
+`trace_id=2283efbddcddd02736adeaa6acaf3a92` → `completed`/`pass`, stdout `6`,
+`delegation_id=e5e89234-…`.
+
+Point-read: interactions **6**, `exact_as_observed`; Session
+`sess_6b7c64e35c694bd99be540a2` coverage **complete** (6/0); post-run async
+raw/kernel/derived drops **0**. Lab ports cleaned. Digest replace of hostPath
+and labeled Design B remain open under NO-GO. Classic SSL WIP untouched.
