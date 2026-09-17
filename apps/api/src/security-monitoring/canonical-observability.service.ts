@@ -389,7 +389,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS',
     128,
     1,
-    512,
+    2_048,
   );
   private readonly asyncRawBatchWindowMs = boundedEnvInt(
     'ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_WINDOW_MS',
@@ -403,7 +403,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     64 * 1024,
     256 * 1024 * 1024,
   );
-  private asyncRawBatchQueue: Array<{ observation: RawObservation; onFailure: () => void }> = [];
+  // Queue depth in batch-sized units. Default matches inFlight so short PG stalls can
+  // coalesce without admitting unbounded backlog; raise only under measured capacity.
+  private readonly asyncRawQueueBatches = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_RAW_QUEUE_BATCHES',
+    0,
+    0,
+    64,
+  );
+  private asyncRawBatchQueue: Array<{ observation: RawObservation; bytes: number; onFailure: () => void }> = [];
   private asyncRawBatchQueueBytes = 0;
   private asyncRawBatchTimer?: ReturnType<typeof setTimeout>;
   private readonly asyncKernelBatchMaxBytes = boundedEnvInt(
@@ -541,12 +549,19 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
    * already accepted each immutable observation, so this queue only controls durable delivery;
    * failures remain explicit CoverageGaps and never become an implicit ACK.
    */
+  private rawQueueCapacityRows(): number {
+    const batches = this.asyncRawQueueBatches > 0
+      ? this.asyncRawQueueBatches
+      : this.asyncPersistenceMaxInFlight;
+    return batches * this.asyncRawBatchMaxRows;
+  }
+
   private enqueueRawObservation(
     observation: RawObservation,
     onFailure: () => void,
   ): boolean {
     if (!this.sink || this.closed) return false;
-    const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
+    const capacity = this.rawQueueCapacityRows();
     const observationBytes = Buffer.byteLength(JSON.stringify(observation));
     if (this.asyncRawBatchQueue.length >= capacity
       || this.asyncRawBatchQueueBytes + observationBytes > this.asyncRawBatchMaxBytes) {
@@ -555,7 +570,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
-    this.asyncRawBatchQueue.push({ observation, onFailure });
+    this.asyncRawBatchQueue.push({ observation, bytes: observationBytes, onFailure });
     this.asyncRawBatchQueueBytes += observationBytes;
     this.asyncPersistenceScheduled += 1;
     if (this.asyncRawBatchQueue.length >= this.asyncRawBatchMaxRows) {
@@ -576,18 +591,15 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private async flushRawObservationBatch(): Promise<void> {
     if (this.asyncRawBatchQueue.length === 0 || this.closed) return;
     if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
-      // Derived writes share the task limit. Their completion does not flush this queue, so
-      // retain a timer even when no new observation arrives after capacity becomes available.
+      // Raw lane owns asyncPersistenceInFlight (derived/kernel use isolated pools).
+      // Keep a timer so a free slot drains the queue without needing new ingest traffic.
       this.scheduleRawObservationFlush();
       return;
     }
     const batch = this.asyncRawBatchQueue.splice(0, this.asyncRawBatchMaxRows);
     this.asyncRawBatchQueueBytes = Math.max(
       0,
-      this.asyncRawBatchQueueBytes - batch.reduce(
-        (sum, item) => sum + Buffer.byteLength(JSON.stringify(item.observation)),
-        0,
-      ),
+      this.asyncRawBatchQueueBytes - batch.reduce((sum, item) => sum + item.bytes, 0),
     );
     this.asyncPersistenceInFlight += 1;
     const task = Promise.resolve()
@@ -1743,6 +1755,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncRawBatchQueueBytes: number;
     asyncRawBatchMaxRows: number;
     asyncRawBatchMaxBytes: number;
+    asyncRawQueueCapacityRows: number;
     asyncKernelBatchQueueRows: number;
     asyncKernelBatchQueueBytes: number;
     asyncKernelBatchMaxBytes: number;
@@ -1783,6 +1796,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncRawBatchQueueBytes: this.asyncRawBatchQueueBytes,
       asyncRawBatchMaxRows: this.asyncRawBatchMaxRows,
       asyncRawBatchMaxBytes: this.asyncRawBatchMaxBytes,
+      asyncRawQueueCapacityRows: this.rawQueueCapacityRows(),
       asyncKernelBatchQueueRows: this.asyncKernelBatchQueue.length,
       asyncKernelBatchQueueBytes: this.asyncKernelBatchQueueBytes,
       asyncKernelBatchMaxBytes: this.asyncKernelBatchMaxBytes,

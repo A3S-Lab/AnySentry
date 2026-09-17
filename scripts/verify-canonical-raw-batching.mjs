@@ -8,6 +8,7 @@ process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST = 'on';
 process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT = '1';
 process.env.ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS = '4';
 process.env.ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_WINDOW_MS = '10';
+process.env.ANYSENTRY_CANONICAL_ASYNC_RAW_QUEUE_BATCHES = '2';
 const context = (id) => ({ sourceId: 'batch-fixture', sourceType: 'api', sourceSequence: id,
   eventAtUnixNs: '1788000000000000000', receivedAtUnixNs: '1788000000000000000' });
 async function until(predicate) {
@@ -18,6 +19,7 @@ const service = new CanonicalObservabilityService();
 const writes = [];
 service.setSink({ saveRawObservations: async (rows) => { writes.push(rows); return true; } });
 try {
+  assert.equal(service.gapStats().asyncRawQueueCapacityRows, 8, 'queue batches * rows bounds capacity');
   // A raw side-lane writer occupies the raw slot, then completes without another ingest event.
   let release;
   await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {}, 'raw');
