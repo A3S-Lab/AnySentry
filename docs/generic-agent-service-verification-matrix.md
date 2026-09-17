@@ -909,6 +909,30 @@ kernel overflows until tip redeploy.
 Kernel durable batches no longer share `asyncPersistenceInFlight` with raw.
 New bounded pool `ANYSENTRY_CANONICAL_ASYNC_KERNEL_MAX_INFLIGHT` (default 4)
 with `asyncKernelPersistenceInFlight` metrics. Verifier confirms kernel flush
-proceeds while a raw side-lane slot is held. Host capacity remains NO-GO
-(PSI io / nvme); tip digest redeploy deferred.
+proceeds while a raw side-lane slot is held.
+
+### 2026-09-17 tip digest deploy (kernel-isol) — verified
+
+Bypassed hung `docker create` via k3s slim OCI import (`--local --no-unpack`)
+as `kernel-isol-5c9d25f`. Deployment image:
+`127.0.0.1:5000/anysentry@sha256:dc90e4f31de5a0eed7d66e004b26f442a6293356e092f8cf93137bd7005b0885`
+with `ANYSENTRY_CANONICAL_ASYNC_KERNEL_MAX_INFLIGHT=4`, no hostPath overlay.
+
+Pod `anysentry-5867c447f8-ckj5t` Ready after ~5m (Nest start delayed under I/O;
+startup probe connection-refused until listen). In-pod checks:
+- dist symbol `asyncKernelPersistenceMaxInFlight` present
+- healthz gaps: raw/kernel/derived drops **0**; `kernelMax=4`
+- Δ60s ambient sample: raw/kernel/derived/total drops **0** (uptime≈365s)
+
+Old tip replica `…wpblw` (digest `cdcf85f8…`) Terminating under NVMe saturation.
+
+### 2026-09-17 capacity watch (concurrent with deploy)
+
+`check-host-capacity.sh` remains **NO-GO**:
+load1≈20–21 / 16 CPUs; MemAvailable≈19–21Gi; swap≈3.5Gi; disk≈81%;
+PSI io full avg10≈56–58%; nvme util≈97–99%; D-state≈11–18
+(postgres checkpointer/bgwriter/autovacuum, a3s-observer-collector, jbd2/flush).
+CPU PSI near zero. Docker `Created` leftover `distracted_cartwright` observed
+(rm deferred while docker API stalls). Prefer docs/k8s-light; defer labeled
+Design B / compose until gate GO.
 
