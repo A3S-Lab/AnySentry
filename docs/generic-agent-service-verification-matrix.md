@@ -1235,3 +1235,11 @@ overlay under NO-GO.
 | Disposable clean spool only | **Open** | WAL still active; no truncate |
 
 Goal remains **active** — do not mark complete.
+
+### 2026-09-17 capacity hold (~13:00–13:20 CST)
+
+Repeated gate samples stayed **NO-GO** (PSI full avg10 ≈29–65; nvme util
+≈90–100%; D-state 4–12; load ≈11–18). `:5000` remained down. Tip pod
+`anysentry-b469d4444-sscf4` Ready throughout; spool ≈13–14Mi. Heavy steps
+(digest publish / hostPath removal / labeled Design B / collector tip / live
+SSL) stay deferred; Observer WIP uncommitted. Local matrix commit `b5bfa2a`.
