@@ -1185,8 +1185,8 @@ classic SSL WIP finish + verify; longer sustained no-gap under GO.
 
 Capacity still **NO-GO** (PSI io≈55–59%, nvme≈98–100%, D-state≈11–19).
 
-Overlay tip Δ120s (uptime≈999→…): raw/kernel/derived Δdrops **0** (queue
-present under PG stall; cap 16384). Alias-repair verifier still **PASS**.
+Overlay tip Δ120s (uptime 999→1160): raw/kernel/derived Δdrops **0**
+(queue 398→70; cap 16384). Alias-repair verifier still **PASS**.
 
 Unmatched `executes_as` EvidenceLinks remain an **honest gap** (same class as
 prior Design B proofs); strong `network_effect` is the closed plaintext↔kernel
@@ -1198,3 +1198,40 @@ Full `cargo test --bin` deferred under NO-GO I/O. Observer dirty tree untouched.
 
 `publish-local-oci-overlay.mjs` is the digest-replace path when gate GO (base
 `rawq-44db727` / `9becbbf8…` + Phase D overlay sources); hostPath remains interim.
+
+### 2026-09-17 classic SSL unit suite green (WIP still open)
+
+Capacity **NO-GO** (sampled ~12:50 CST): PSI io full avg10/60 ≈ **55.8 / 56.6**;
+nvme0n1 util ≈ **95–98%**; iowait ≈ **42%**; load ≈ **20 / 17.5 / 16.7**; D-state ≥5
+(postgres + flush/jbd2); MemAvailable ≈21 GiB. Local registry `:5000` **not listening**
+(digest publish blocked). Spool `spool-clean-20260915.wal` ≈14–28Mi active — not
+truncated. Root FS ~81% used (171G free). Deferred under gate: OCI overlay publish,
+hostPath removal, labeled Design B compose, collector tip roll, spool truncate.
+
+Observer classic SSL reassembly unit tests (bin `a3s-observer-collector`, filter
+`classic_`): **5 passed** / 0 failed
+(`classic_ssl_ptr_and_socket_cookie_halves_reassemble_http11`,
+`classic_fd_then_cookie_request_buffers_merge_and_complete`,
+`classic_parallel_posts_cookie_body_follows_matching_fd_sock_key`,
+`classic_mid_body_english_remounts_onto_header_sibling`,
+`classic_sticky_request_parse_error_does_not_poison_response_gap`).
+Hygiene: dropped unused `HTTP_METHOD_PREFIX_MAX_LEN` import in
+`a3s-observer-ebpf/src/main.rs`.
+
+Dirty Observer tree left **uncommitted** (live classic SSL / Claude capture
+proof and collector tip deploy still open). AnySentry tip remains hostPath
+overlay under NO-GO.
+
+### 2026-09-17 requirement gap (evidence-only)
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Phase D hop parent/worker + Session multi-hot | **Proven** (hostPath tip) | run `9abdb257…`; Session 13 events; Δ60/Δ120 async drops 0 |
+| EvidenceLinks honesty | **Proven** | 3 links: 1 strong `network_effect`, 2 unmatched `executes_as` gap |
+| Empty route-alias repair | **Proven** | verifier PASS; wired resolution-v2/aggregation |
+| Tip = pure digest (no hostPath) | **Open** | registry `:5000` down + capacity NO-GO |
+| Labeled Design B (compose) | **Open** | deferred under I/O gate; host Design B used |
+| Classic SSL live capture | **Open** | bin unit 5/5 PASS; live/collector tip not proven |
+| Disposable clean spool only | **Open** | WAL still active; no truncate |
+
+Goal remains **active** — do not mark complete.
