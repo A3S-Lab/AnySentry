@@ -985,3 +985,22 @@ raw-lane CoverageGaps while kernel/derived stayed flat (isolation holds):
 Sustained no-gap and labeled Design B remain open under NVMe saturation; do not
 widen capture. Classic SSL WIP untouched.
 
+
+### 2026-09-17 raw queue coalesce under PG stalls (code; deploy pending)
+
+Ambient sample after lab cleanup: rawDrop Δ30s **0** while `asyncPersistenceInFlight`
+pinned at **8** and `asyncRawBatchQueueRows` grew 0→877→1370 — flush throughput is
+PG/NVMe bound, not unbounded capture. Kernel/derived drops remained **0**.
+
+**Code (`44db727`, local verify PASS):**
+- cache per-row byte lengths on the raw batch queue (match kernel lane)
+- raise `ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS` ceiling 512→2048
+- add bounded `ANYSENTRY_CANONICAL_ASYNC_RAW_QUEUE_BATCHES` (default=maxInFlight)
+  and expose `asyncRawQueueCapacityRows`
+- clarify raw owns `asyncPersistenceInFlight` (derived/kernel already isolated)
+
+Verifiers: `verify-canonical-raw-batching.mjs`, kernel, derived — all PASS.
+Slim OCI overlay `rawq-44db727` / manifest `9becbbf8…` built (40KiB) but
+`k3s ctr import --local --no-unpack` timed out under capacity **NO-GO**
+(load≈25/16, PSI io≈67%, nvme≈98%). Live tip remains `dc90e4f3…`. Tip redeploy
+and labeled Design B deferred until gate GO. Classic SSL WIP untouched.
