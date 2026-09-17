@@ -1243,3 +1243,23 @@ Repeated gate samples stayed **NO-GO** (PSI full avg10 ≈29–65; nvme util
 `anysentry-b469d4444-sscf4` Ready throughout; spool ≈13–14Mi. Heavy steps
 (digest publish / hostPath removal / labeled Design B / collector tip / live
 SSL) stay deferred; Observer WIP uncommitted. Local matrix commit `b5bfa2a`.
+
+### 2026-09-17 ambient Δ~125s tip (healthz lanes; capacity NO-GO)
+
+First `collectors/health` Δ60 attempt **failed** (PF race + curl 28). Retried via
+`GET /security-center/healthz` on tip uptime 3406→3531s (hostPath overlay still
+mounted; registry `:5000` down).
+
+| lane | t0 → t1 | Δ |
+| --- | --- | --- |
+| asyncRawPersistenceDropped | 0 → 0 | **0** |
+| asyncKernelPersistenceDropped | 0 → 0 | **0** |
+| asyncDerivedPersistenceDropped | 0 → 0 | **0** |
+| asyncPersistenceDropped / Failed | 0 → 0 | **0** |
+| asyncRawBatchQueueRows | 1664 → 1565 | −99 (drain) |
+| asyncKernelBatchQueueRows | 461 → 32 | −429 (drain) |
+| asyncDerivedBatchQueueRows | 22 → 0 | −22 (drain) |
+| gaps.persistenceDropped (sync) | 142389 → 147038 | +4649 (PG stall counter; not async lane) |
+
+Capacity at sample end: PSI10≈17.7, nvme util≈94% → still **NO-GO**. Phase E
+pure-digest tip / labeled Design B / live classic SSL remain open.
