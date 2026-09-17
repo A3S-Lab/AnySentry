@@ -651,11 +651,27 @@ function canonicalSessionResourceFromHotInteraction(
 
 function canonicalHotSessionTimeline(
   session: T.CanonicalSessionResource,
-  interaction: T.AgentInteractionRecord,
+  interactions: T.AgentInteractionRecord | T.AgentInteractionRecord[],
   query: CanonicalEntityQuery,
   revision: number,
 ): T.AgentConversationTimelineV3 {
+  // Membership-backed Session deep links can outlive a single hot row. Project every immutable
+  // interaction still present in the ring so a WAL/projector stall does not collapse a multi-hop
+  // Session (orchestrator + remote_agent + worker) into the first matching row alone.
+  const ordered = (Array.isArray(interactions) ? interactions : [interactions])
+    .filter((interaction): interaction is T.AgentInteractionRecord => Boolean(interaction))
+    .slice()
+    .sort((left, right) => {
+      const started = left.startedAtUnixNs.localeCompare(right.startedAtUnixNs);
+      return started !== 0 ? started : left.interactionId.localeCompare(right.interactionId);
+    });
+  const interaction = ordered[0];
+  if (!interaction) {
+    return degradedCanonicalTimeline(session.sessionId, query, revision);
+  }
   const conversationId = session.sessionId;
+  const agentAssetIds = [...new Set(ordered.map((item) => item.agentAssetId).filter(Boolean))];
+  const models = [...new Set(ordered.map((item) => item.model).filter((value): value is string => Boolean(value)))];
   const summary: T.AgentConversationSummary = {
     conversationId,
     idSource: interaction.sessionIdentityQuality === 'confirmed' ? 'provider' : 'inferred',
@@ -676,27 +692,27 @@ function canonicalHotSessionTimeline(
     ...(interaction.parentSessionId ? { parentSessionId: interaction.parentSessionId } : {}),
     ...(interaction.canonicalParentSessionId ? { canonicalParentSessionId: interaction.canonicalParentSessionId } : {}),
     hasContent: true,
-    agentAssetId: interaction.agentAssetId,
-    agentAssetIds: [interaction.agentAssetId],
+    agentAssetId: agentAssetIds[0] ?? interaction.agentAssetId,
+    agentAssetIds: agentAssetIds.length ? agentAssetIds : [interaction.agentAssetId],
     agentInstanceIds: session.agentInstanceIds,
     agentProduct: interaction.agentProduct ?? 'Agent',
     displayName: interaction.agentProduct ?? 'Agent',
     environment: interaction.environment ?? 'unknown',
     classification: interaction.currentEffectiveClassification ?? interaction.detectedClassification,
     workspacePath: interaction.workspacePath,
-    startedAtUnixNs: interaction.startedAtUnixNs,
-    lastActivityAtUnixNs: interaction.endedAtUnixNs,
-    turnCount: interaction.turnId ? 1 : 0,
-    modelCallCount: interaction.interactionType === 'model' ? 1 : 0,
-    toolCallCount: interaction.toolCalls.length,
-    toolResultCount: interaction.toolResults.length,
-    errorCount: interaction.statusCode >= 400 ? 1 : 0,
-    models: interaction.model ? [interaction.model] : [],
+    startedAtUnixNs: ordered[0]!.startedAtUnixNs,
+    lastActivityAtUnixNs: ordered[ordered.length - 1]!.endedAtUnixNs,
+    turnCount: ordered.filter((item) => item.turnId).length,
+    modelCallCount: ordered.filter((item) => item.interactionType === 'model').length,
+    toolCallCount: ordered.reduce((sum, item) => sum + item.toolCalls.length, 0),
+    toolResultCount: ordered.reduce((sum, item) => sum + item.toolResults.length, 0),
+    errorCount: ordered.filter((item) => item.statusCode >= 400).length,
+    models,
     usage: session.usage,
     instanceUsage: [],
     coverage: session.coverage,
   };
-  const turns = projectSemanticConversationTimeline(summary, [interaction], []);
+  const turns = projectSemanticConversationTimeline(summary, ordered, []);
   const requestKey = createHash('sha256').update([
     conversationId,
     query.timeType ?? '',
@@ -716,7 +732,7 @@ function canonicalHotSessionTimeline(
     thread: summary,
     segments: [],
     turns,
-    interactionIds: [interaction.interactionId],
+    interactionIds: ordered.map((item) => item.interactionId),
     parserId: 'anysentry.canonical-hot-session-fallback',
     parserVersion: 1,
     contextReplaySummaries: [],
@@ -13063,7 +13079,25 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       if (hot) {
         session = canonicalSessionResourceFromHotInteraction(hot, sessions.revision, 'session_projection_timeout');
         if (session) {
-          timeline = canonicalHotSessionTimeline(session, hot, query, sessions.revision);
+          const sessionKeys = new Set([
+            session.sessionId,
+            session.canonicalSessionId,
+            hot.canonicalSessionId,
+            hot.sessionId,
+            hot.sessionKey,
+          ].filter((value): value is string => Boolean(value)));
+          const membershipHot = hotCandidates.filter((candidate) => [
+            candidate.canonicalSessionId,
+            candidate.sessionId,
+            candidate.sessionKey,
+            candidate.conversationId,
+          ].some((value) => value && sessionKeys.has(value)));
+          timeline = canonicalHotSessionTimeline(
+            session,
+            membershipHot.length ? membershipHot : [hot],
+            query,
+            sessions.revision,
+          );
           conversationId = session.sessionId;
           sessionDegraded = true;
         }
@@ -13114,9 +13148,9 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       && session.interactionIds.length > 0
       ? sessionId
       : conversationId;
-    const hotInteraction = session.interactionIds
+    const hotInteractions = session.interactionIds
       .map((interactionId) => this.agg.getAgentInteractionHot(interactionId))
-      .find((interaction): interaction is T.AgentInteractionRecord => Boolean(interaction));
+      .filter((interaction): interaction is T.AgentInteractionRecord => Boolean(interaction));
     try {
       timeline ??= await withCanonicalProjectionTimeout(this.agg.agentConversationTimelineV3({
         timeType: query.timeType,
@@ -13132,17 +13166,32 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     } catch (error) {
       if (!isCanonicalProjectionDegradation(error)) throw error;
       timelineDegraded = true;
-      timeline = hotInteraction
-        ? canonicalHotSessionTimeline(session, hotInteraction, query, sessions.revision)
+      timeline = hotInteractions.length
+        ? canonicalHotSessionTimeline(session, hotInteractions, query, sessions.revision)
         : degradedCanonicalTimeline(conversationId, query, sessions.revision);
     }
     // A compatibility projector can return an empty thread while the hot interaction is already
     // complete (for example, its PostgreSQL membership write is still waiting on WAL). Prefer the
     // bounded hot semantic timeline in that case; retain the partial coverage marker so callers
     // know the result is not yet a durable historical projection.
-    if (timeline && timeline.turns.length === 0 && hotInteraction) {
+    if (timeline && timeline.turns.length === 0 && hotInteractions.length) {
       timelineDegraded = true;
-      timeline = canonicalHotSessionTimeline(session, hotInteraction, query, sessions.revision);
+      timeline = canonicalHotSessionTimeline(session, hotInteractions, query, sessions.revision);
+    }
+    // Under projector stalls the first hot row alone can hide peer-hop members that are already
+    // in the ring (e.g. orchestrator remote_agent + worker tools). Prefer the full membership
+    // hot projection when it covers more immutable interactionIds than the degraded timeline.
+    if (
+      timeline
+      && hotInteractions.length > 1
+      && (
+        timeline.parserId === 'anysentry.canonical-hot-session-fallback'
+        || timeline.coverage.partialReason === 'projection_timeout'
+      )
+      && timeline.interactionIds.length < hotInteractions.length
+    ) {
+      timelineDegraded = true;
+      timeline = canonicalHotSessionTimeline(session, hotInteractions, query, sessions.revision);
     }
     // A freshly committed membership may become visible before the compatibility interaction
     // projection. Retry the exact interaction reference briefly instead of caching an empty

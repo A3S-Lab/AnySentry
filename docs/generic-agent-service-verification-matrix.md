@@ -1066,3 +1066,56 @@ post-run async raw/kernel/derived drops **0** (`cap=16384`). Lab cleaned.
 
 **Still open:** labeled Docker Design B (capacity NO-GO), classic SSL WIP,
 longer sustained no-gap under GO capacity. Infrastructure protected.
+
+### 2026-09-17 Phase D audit on rawq tip + capacity watch
+
+Concurrent `check-host-capacity.sh` during Phase D point-reads remained **NO-GO**:
+load1≈11–20 / 16; MemAvailable≈21–23Gi; swap≈3.5Gi; disk≈81%;
+PSI io full avg10≈49–60%; nvme util≈89–105%; D-state≈6–14;
+`docker_created=0`. Prefer code/docs/k8s-light; defer labeled compose.
+
+On tip `9becbbf8…` / run `48df0c4b-…` / Session `sess_71c03932…`:
+
+| check | result |
+| --- | --- |
+| interactions | **6**; hops `orchestrator`/`worker`; paths `/runs` `/v1/chat/completions` `/execute`; `remote_agent` + `delegationId=bdb4c2c9-…` |
+| directory | parent `cv_a7ed5b79…` + worker `cv_db14d89e…`; both `coverage=complete`; `relatedConversations` bidirectional `exact` |
+| worker timeline | POST `agents/conversations/timeline` **7** items (`tool_call`/`tool_result`/model); timeline-v3 **1** turn / **7** events |
+| Session GET/coverage | **complete** 6/0; parent `sess_f30f467b…` |
+| Session timeline | hot-fallback parser; **only worker** events (4) — membership has 6 ids but fallback projected **one** hot row |
+| parent timeline | POST timeline / timeline-v3 **0** events; route alias `cv_a7ed5b79…` → empty `cv_db0a5419…` |
+| async gaps (healthz) | raw/kernel/derived `async*PersistenceDropped` **0**; `asyncRawQueueCapacityRows=16384` |
+
+**Code (local; tip redeploy deferred under NO-GO):**
+- `canonicalHotSessionTimeline` projects **all** membership hot-ring interactions (not first-only), so Session deep links keep orch `remote_agent` → `delegation_send`/`delegation_reply` + worker tools under projector stall.
+- conversation projection: if a route alias target has empty membership but the requested Thread id still has members, keep the requested id (stop blanking hop-fenced parent timelines).
+
+**Still open after this audit:** live tip proof of the two fixes (digest redeploy when gate GO); labeled Design B; classic SSL WIP; parent conversation timeline on live tip until redeploy.
+
+### 2026-09-17 Phase C readiness plane (live tip; no compose)
+
+Capacity still **NO-GO** (PSI io≈56–61%, nvme≈90–99%). No docker/compose.
+
+Against tip pod `anysentry-cdd6f9cd4-c6fgj` / digest `9becbbf8…`,
+`POST /collectors/health` (`timeType=last_1h`) returned collector
+`pjnl261070032` `state=healthy` with plane gates:
+
+| gate | value |
+| --- | --- |
+| filterMetricsReported | true |
+| identitySnapshotReady | true |
+| unifiedProjectionState | ready |
+| captureProfileControlPlaneState | ready |
+| dockerReady | true |
+| dockerEntries | 1 |
+| identitySnapshotAgeSeconds | 5 |
+| queueDropped | 0 |
+
+`GET /identity/snapshot`: `ready=true`, `entries=29`, `version=28`.
+Async gaps still raw/kernel/derived **0** (queue rows rising under PG stall;
+cap 16384). Phase C pollable plane is live; labeled workload cold-start
+(`OBSERVER_READY_MIN_DOCKER_ENTRIES` / compose agents) remains blocked by
+capacity. Classic SSL WIP (Observer dirty tree) untouched.
+
+Phase D code fixes remain local (uncommitted→commit this turn) pending tip
+redeploy when gate GO.

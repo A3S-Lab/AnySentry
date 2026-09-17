@@ -3395,16 +3395,36 @@ export class AggregationService implements OnModuleDestroy {
     const persistedAlias = requestedConversationId
       ? await this.conversationBindings?.resolveRouteAlias(requestedConversationId)
       : undefined;
-    const initialConversationId = persistedAlias?.targetType === 'conversation'
+    let initialConversationId = persistedAlias?.targetType === 'conversation'
       ? persistedAlias.canonicalConversationId
       : requestedConversationId;
-    const resolveConversationId = Boolean(initialConversationId);
-    const membershipSelection = initialConversationId && this.conversationBindings
+    let resolveConversationId = Boolean(initialConversationId);
+    let membershipSelection = initialConversationId && this.conversationBindings
       ? await this.conversationBindings.interactionIdsForConversation(
           initialConversationId,
           5_000,
         )
       : undefined;
+    // A stale route alias can point a still-valid Thread id at an empty canonical target (common
+    // after hop-fence repairs). Prefer the requested conversation's own membership when the alias
+    // target has none, so timeline deep links do not go blank while directory coverage stays complete.
+    if (
+      requestedConversationId
+      && initialConversationId
+      && initialConversationId !== requestedConversationId
+      && this.conversationBindings
+      && !(membershipSelection?.interactionIds.length)
+    ) {
+      const requestedMembership = await this.conversationBindings.interactionIdsForConversation(
+        requestedConversationId,
+        5_000,
+      );
+      if (requestedMembership.interactionIds.length) {
+        initialConversationId = requestedConversationId;
+        membershipSelection = requestedMembership;
+      }
+    }
+    resolveConversationId = Boolean(initialConversationId);
     const exactMembershipIds = canonicalSessionRead
       ? membershipSelection?.interactionIds ?? []
       : membershipSelection?.interactionIds.length ? membershipSelection.interactionIds : undefined;
@@ -3510,9 +3530,12 @@ export class AggregationService implements OnModuleDestroy {
     const routeAlias = requestedConversationId
       ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
       : undefined;
-    let canonicalConversationId = routeAlias?.targetType === 'conversation'
-      ? routeAlias.canonicalConversationId
-      : initialConversationId;
+    // Prefer the membership-selected conversation (after empty-alias repair) over a stale route
+    // alias target that would otherwise blank the timeline while directory coverage stays complete.
+    let canonicalConversationId = initialConversationId
+      ?? (routeAlias?.targetType === 'conversation'
+        ? routeAlias.canonicalConversationId
+        : undefined);
     const projection = projectAgentConversations(boundInteractions, inventory.items, {
       ...filter,
       ...(canonicalSessionRead ? { conversationId: undefined }
