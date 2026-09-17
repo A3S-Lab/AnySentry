@@ -1274,3 +1274,21 @@ bound to loopback. Registry `_catalog` only has `learning/python-test` — tip b
 cannot fetch the base yet. Overlay stage `/tmp/anysentry-phase-d-overlay-stage`
 SHA-matches live hostPath tip. Capacity still **NO-GO** (PSI≈37–42, nvme≈94–100%)
 — defer ctr→registry base re-push and digest tip roll.
+
+### 2026-09-17 Phase E tip = pure digest (hostPath removed)
+
+Capacity still elevated (PSI≈35–49, nvme often >90%) but registry was up.
+`k3s ctr images push --plain-http` restored base `anysentry:rawq-44db727`
+(`sha256:9becbbf8…`, **16/16** layer blobs present). Then
+`publish-local-oci-overlay.mjs` published Phase D overlay tag `phase-d-410d082`:
+
+- manifest **`sha256:16e25b869e30104bcf92b3644f5c95cb7affb39e47502cc1182abc0ca9fc9559`**
+- layerBytes 197168 (4 JS under `/app/dist/security-monitoring`)
+
+Deploy set image to that digest and **removed** `phase-d-overlay` hostPath
+volume/mounts. Pod `anysentry-6d85899f54-4m5h5` Ready; imageID matches digest;
+in-image SHA-256 of the four files match stage; `HAS_REPAIR` /
+`HAS_MULTI_HOT` / `HAS_ALIAS_WIRE` **true**. Old hostPath pod terminating.
+
+Still open: labeled/host Design B point-read on this digest, disposable spool
+proof, classic SSL live, ambient no-gap on new tip.
