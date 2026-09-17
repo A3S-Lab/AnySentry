@@ -900,9 +900,8 @@ for docker create/compose; memory headroom still OK (~20Gi available).
 `asyncRawPersistenceDropped`. KernelFact CoverageGaps are now counted as
 `asyncKernelPersistenceDropped` (and still in `asyncPersistenceDropped`).
 `verify-canonical-kernel-batching.mjs` asserts raw counters stay flat on
-kernel byte-bound/close drops. Tip digest image not yet rebuilt under NO-GO I/O;
-live pod still reports historical rawDrop=2115 which may include misattributed
-kernel overflows until tip redeploy.
+kernel byte-bound/close drops. Tip digest `dc90e4f3…` later redeployed (see
+kernel-isol deploy section); post-redeploy counters reset to 0.
 
 ### 2026-09-17 KernelFact lane capacity isolation
 
