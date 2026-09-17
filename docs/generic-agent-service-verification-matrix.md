@@ -1180,3 +1180,21 @@ Forwarder spool `spool-clean-20260915.wal` ≈3.2Mi — still active, not trunca
 
 **Still open:** pure digest tip (remove hostPath) when gate GO; labeled Design B;
 classic SSL WIP finish + verify; longer sustained no-gap under GO.
+
+### 2026-09-17 Δ120s no-gap + EvidenceLink unmatched boundary
+
+Capacity still **NO-GO** (PSI io≈55–59%, nvme≈98–100%, D-state≈11–19).
+
+Overlay tip Δ120s (uptime≈999→…): raw/kernel/derived Δdrops **0** (queue
+present under PG stall; cap 16384). Alias-repair verifier still **PASS**.
+
+Unmatched `executes_as` EvidenceLinks remain an **honest gap** (same class as
+prior Design B proofs); strong `network_effect` is the closed plaintext↔kernel
+link for this run. Not treating unmatched executes_as as a derived-lane drop.
+
+Classic SSL WIP unit test lives in collector bin (`interaction.rs` cfg(test));
+`cargo test -p a3s-observer-collector --lib` is invalid (bin-only package).
+Full `cargo test --bin` deferred under NO-GO I/O. Observer dirty tree untouched.
+
+`publish-local-oci-overlay.mjs` is the digest-replace path when gate GO (base
+`rawq-44db727` / `9becbbf8…` + Phase D overlay sources); hostPath remains interim.
