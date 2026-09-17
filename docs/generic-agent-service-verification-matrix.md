@@ -1321,3 +1321,30 @@ in-flight/queue backpressure (PG/I/O stall), not derived-lane loss. Derived stay
 (`exact_as_observed`) — durable window no longer holds that run (likely aged /
 raw-admission gaps). Fresh host/labeled Design B on this digest remains required
 for Phase E A/B evidence; blocked by capacity gate.
+
+### 2026-09-17 host Design B on Phase D digest tip (`16e25b86…`)
+
+Capacity still **NO-GO** (PSI≈55–65, nvme≈90–100%). Tip digest unchanged
+(no hostPath). Started host uvicorn Design B (`:18088/:18092/:18091/:18090`,
+sqlite under `/tmp/host-design-b-digest-*`).
+
+Controlled POST `/runs` goal `用 Python 计算 4+5 并打印结果` →
+`status=completed`, `verify_status=pass`, stdout `9`,
+`run_id=aa9c86a8-2528-432c-9d10-4743207c3b01`,
+`trace_id=07722ff0d7d5a9daac1197482faa4ae3`,
+`delegation_id=4608578e-35a9-49bd-b423-17bd274f8557`.
+
+| check | result |
+| --- | --- |
+| interactions | **6**, `exact_as_observed`, paths `/v1/chat/completions` `/execute` `/runs`, includes `remote_agent` |
+| directory | parent `cv_a7c0ce13…` ↔ worker `cv_a41d107a…`, related `exact` / `delegates_to` |
+| parent timeline-v3 | **6** events incl. **`delegation_send`/`delegation_reply`** |
+| worker timeline-v3 | **6** events incl. `tool_call`/`tool_result`/`model_final` |
+| Session `sess_d6187aff…` | coverage **complete** 2/0 (membership thinner than 6 interactions) |
+| EvidenceLinks | **4** matched to run obs: 2 **strong** (`network_effect`, `executes_as`), 2 unmatched `executes_as` |
+| async derived drop Δ | **0** |
+| async kernel drop Δ | **0** |
+| async raw drop Δ | **+6165** (queue was ~15k/16k cap under PG/I/O stall — capacity-induced admission) |
+
+Lab ports cleaned after evidence. **Still open:** labeled Docker Design B,
+classic SSL live, disposable spool, raw-lane pressure under sustained NO-GO.
