@@ -869,3 +869,23 @@ Host uvicorn Design B against digest `cdcf85f8…` / pod
 `dockerEntries`); labeled Design B still blocked by host `docker create`
 hangs under NVMe saturation. Classic SSL WIP untouched. Lab ports cleaned.
 
+### 2026-09-17 labeled Design B still blocked; tip ambient 120s
+
+`docker compose` / sequential `docker run` for labeled Design B timed out while
+creating containers (NVMe write await multi-second; many `Created` ghosts pruned).
+Docker daemon remains `active`, but container create is not reliable for lab bring-up.
+
+**Ambient 120s** on tip digest `cdcf85f8…` / pod `anysentry-6d6f9975f6-wpblw`
+(uptime ~39891→40011s):
+
+| counter | absolute | Δ120s |
+| --- | ---: | ---: |
+| `asyncRawPersistenceDropped` | 2115 | 0 |
+| `asyncDerivedPersistenceDropped` | 0 | 0 |
+| `asyncPersistenceDropped` | 2115 | 0 |
+| `asyncPersistenceFailed` | 0 | 0 |
+
+Overnight ambient load accumulated **2115** raw-lane CoverageGaps; the sampled
+window did not add more. Sustained no-gap remains open pending raw-lane capacity
+work. Labeled Design B and classic SSL WIP still open.
+
