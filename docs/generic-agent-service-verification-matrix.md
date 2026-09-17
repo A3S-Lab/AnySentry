@@ -889,3 +889,18 @@ Overnight ambient load accumulated **2115** raw-lane CoverageGaps; the sampled
 window did not add more. Sustained no-gap remains open pending raw-lane capacity
 work. Labeled Design B and classic SSL WIP still open.
 
+### 2026-09-17 host capacity gate + KernelFact drop attribution
+
+Added `scripts/check-host-capacity.sh` (load / MemAvailable / swap / disk /
+PSI io / nvme util / D-state / docker Created). Lab host sample at 10:19+08:
+load≈23/16, PSI io full avg10≈69%, nvme util≈95–99%, swap≈3.5Gi → **NO-GO**
+for docker create/compose; memory headroom still OK (~20Gi available).
+
+**Bugfix (code):** `enqueueKernelFact` overflow previously incremented
+`asyncRawPersistenceDropped`. KernelFact CoverageGaps are now counted as
+`asyncKernelPersistenceDropped` (and still in `asyncPersistenceDropped`).
+`verify-canonical-kernel-batching.mjs` asserts raw counters stay flat on
+kernel byte-bound/close drops. Tip digest image not yet rebuilt under NO-GO I/O;
+live pod still reports historical rawDrop=2115 which may include misattributed
+kernel overflows until tip redeploy.
+

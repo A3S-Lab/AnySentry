@@ -51,9 +51,17 @@ try {
   await until(() => service.gapStats().asyncPersistenceInFlight === 0);
 
   const oversized = { ...results[0].kernelFact, sourceRefs: ['x'.repeat(65536)] };
+  const rawDroppedBefore = service.gapStats().asyncRawPersistenceDropped;
+  const kernelDroppedBefore = service.gapStats().asyncKernelPersistenceDropped || 0;
   assert.equal(service.enqueueKernelFact(oversized, () => failures++), false);
   assert.equal(service.gapStats().asyncKernelBatchQueueRows, 0);
   assert.equal(service.gapStats().asyncPersistenceDropped, 1);
+  assert.equal(
+    service.gapStats().asyncRawPersistenceDropped,
+    rawDroppedBefore,
+    'KernelFact byte-bound drops must not inflate asyncRawPersistenceDropped',
+  );
+  assert.equal(service.gapStats().asyncKernelPersistenceDropped, kernelDroppedBefore + 1);
 
   service.enqueueKernelFact(results[1].kernelFact, () => failures++);
   service.close();
@@ -61,6 +69,11 @@ try {
   assert.equal(service.gapStats().asyncKernelBatchQueueRows, 0);
   assert.equal(service.gapStats().asyncKernelBatchQueueBytes, 0);
   assert.equal(service.gapStats().asyncPersistenceDropped, 2);
+  assert.equal(
+    service.gapStats().asyncRawPersistenceDropped,
+    rawDroppedBefore,
+    'closing a KernelFact queue must not inflate asyncRawPersistenceDropped',
+  );
   await delay(30);
   assert.equal(failures, 3, 'cancelled timer must not write or report failure twice');
 } finally { service.close(); }

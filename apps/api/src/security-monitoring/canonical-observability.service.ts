@@ -374,6 +374,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private asyncPersistenceFailed = 0;
   private asyncPersistenceDropped = 0;
   private asyncRawPersistenceDropped = 0;
+  private asyncKernelPersistenceDropped = 0;
   private asyncDerivedPersistenceDropped = 0;
   private readonly asyncPersistenceTasks = new Set<Promise<void>>();
   private readonly asyncRawBatchMaxRows = boundedEnvInt(
@@ -614,8 +615,9 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     const bytes = Buffer.byteLength(JSON.stringify(fact));
     if (this.asyncKernelBatchQueue.length >= capacity
       || this.asyncKernelBatchQueueBytes + bytes > this.asyncKernelBatchMaxBytes) {
+      // KernelFact overflow is its own CoverageGap lane — never inflate raw drops.
       this.asyncPersistenceDropped += 1;
-      this.asyncRawPersistenceDropped += 1;
+      this.asyncKernelPersistenceDropped += 1;
       try { onFailure(); } catch { /* coverage is best effort */ }
       return false;
     }
@@ -1725,6 +1727,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncPersistenceFailed: number;
     asyncPersistenceDropped: number;
     asyncRawPersistenceDropped: number;
+    asyncKernelPersistenceDropped: number;
     asyncDerivedPersistenceDropped: number;
     asyncRawBatchQueueRows: number;
     asyncRawBatchQueueBytes: number;
@@ -1762,6 +1765,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncPersistenceFailed: this.asyncPersistenceFailed,
       asyncPersistenceDropped: this.asyncPersistenceDropped,
       asyncRawPersistenceDropped: this.asyncRawPersistenceDropped,
+      asyncKernelPersistenceDropped: this.asyncKernelPersistenceDropped,
       asyncDerivedPersistenceDropped: this.asyncDerivedPersistenceDropped,
       asyncRawBatchQueueRows: this.asyncRawBatchQueue.length,
       asyncRawBatchQueueBytes: this.asyncRawBatchQueueBytes,
@@ -2017,6 +2021,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     this.asyncRawBatchTimer = undefined;
     for (const item of this.asyncRawBatchQueue) {
       this.asyncPersistenceDropped += 1;
+      this.asyncRawPersistenceDropped += 1;
       try { item.onFailure(); } catch { /* coverage is best effort */ }
     }
     this.asyncRawBatchQueue = [];
@@ -2025,6 +2030,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     this.asyncKernelBatchTimer = undefined;
     for (const item of this.asyncKernelBatchQueue) {
       this.asyncPersistenceDropped += 1;
+      this.asyncKernelPersistenceDropped += 1;
       try { item.onFailure(); } catch { /* coverage is best effort */ }
     }
     this.asyncKernelBatchQueue = [];
