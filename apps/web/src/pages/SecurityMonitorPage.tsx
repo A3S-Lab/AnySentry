@@ -3398,6 +3398,7 @@ function TierStatusStrip({
   const collectorTotal = collectorSummary?.totalCollectors ?? 0;
   const collectorOnline = (collectorSummary?.healthyCollectors ?? 0) + (collectorSummary?.quietCollectors ?? 0);
   const collectorDown = collectorSummary?.downCollectors ?? 0;
+  const collectorWarnings = collectorSummary?.warningCollectors ?? 0;
   const collectorAbnormal = (collectorSummary?.degradedCollectors ?? 0)
     + (collectorSummary?.staleCollectors ?? 0)
     + collectorDown;
@@ -3409,6 +3410,8 @@ function TierStatusStrip({
         ? "offline"
         : collectorAbnormal > 0
           ? "partial"
+          : collectorWarnings > 0
+            ? "warning"
           : "online";
   const observerLabel = observerState === "loading"
     ? "检测中"
@@ -3418,11 +3421,13 @@ function TierStatusStrip({
         ? "未连接"
         : observerState === "partial"
           ? "部分异常"
+          : observerState === "warning"
+            ? "存在提醒"
           : "正常";
   const observerHealthy = observerState === "online";
-  const observerWarn = observerState === "partial" || observerState === "loading";
+  const observerWarn = observerState === "partial" || observerState === "warning" || observerState === "loading";
   const observerTitle = collectorTotal > 0
-    ? t(`Collector ${collectorOnline}/${collectorTotal} 在线${collectorAbnormal > 0 ? `，${collectorAbnormal} 个异常` : ""}`)
+    ? t(`Collector ${collectorOnline}/${collectorTotal} 在线${collectorAbnormal > 0 ? `，${collectorAbnormal} 个异常` : ""}${collectorWarnings > 0 ? `，${collectorWarnings} 个提醒` : ""}`)
     : t("未发现有效的 Observer Collector 心跳");
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-[#232a37] bg-[#0f131a] px-4 py-2.5">

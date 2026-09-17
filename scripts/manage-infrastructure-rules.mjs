@@ -57,7 +57,7 @@ const knownKubernetesWorkloads = new Set([
   'anysentry/Deployment/flink-jobmanager/jobmanager',
   'anysentry/Deployment/flink-taskmanager/taskmanager',
   'anysentry/StatefulSet/kafka/kafka',
-  'anysentry/Deployment/kafka-topic-manager/topic-manager',
+  'anysentry/Job/kafka-topic-manager/topic-manager',
   'anysentry/Deployment/l3-worker/l3-worker',
   'anysentry/StatefulSet/redis/redis',
   'anysentry/Deployment/stream-worker/stream-worker',

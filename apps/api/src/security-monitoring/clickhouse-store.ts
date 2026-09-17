@@ -54,6 +54,8 @@ function delay(ms: number): Promise<void> {
 }
 
 const TABLE = 'events';
+const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
+const SHA256_HEX = /^[a-f0-9]{64}$/u;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
@@ -1103,6 +1105,8 @@ export interface EventCommitCursor {
   decisionRevision: number;
 }
 
+export type DurableReplayEventStatus = 'new' | 'duplicate' | 'conflict';
+
 export interface EventCommitChange {
   cursor: EventCommitCursor;
   eventAtMs: number;
@@ -1395,10 +1399,47 @@ export function eventRevisionIdentity(e: JudgedEvent): {
   delete canonicalAttributes.writerVersion;
   delete canonicalAttributes.idempotencyProtocolVersion;
   canonicalPayload.attributes = canonicalAttributes;
+  const sourcePayloadDigest = attrString(e.attributes, OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE);
   return {
     logicalKey,
-    fingerprint: createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
+    fingerprint: SHA256_HEX.test(sourcePayloadDigest)
+      ? `observer-source:${sourcePayloadDigest}`
+      : createHash('sha256').update(canonicalJson(canonicalPayload)).digest('hex'),
   };
+}
+
+/**
+ * ClickHouse JSONEachRow rejects an escaped lone UTF-16 surrogate and would otherwise retain a
+ * whole durable batch behind that one value forever. Preserve valid pairs byte-for-byte and
+ * replace only malformed code units at the persistence boundary.
+ */
+function clickHouseWellFormedText(value: string): string {
+  let repaired = '';
+  let segmentStart = 0;
+  let changed = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1;
+        continue;
+      }
+    } else if (unit < 0xdc00 || unit > 0xdfff) {
+      continue;
+    }
+    repaired += value.slice(segmentStart, index) + '\ufffd';
+    segmentStart = index + 1;
+    changed = true;
+  }
+  return changed ? repaired + value.slice(segmentStart) : value;
+}
+
+function clickHouseWellFormedRow(row: Row): Row {
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value === 'string') (row as unknown as Record<string, unknown>)[key] = clickHouseWellFormedText(value);
+  }
+  return row;
 }
 
 function toRow(e: JudgedEvent): Row {
@@ -1415,7 +1456,7 @@ function toRow(e: JudgedEvent): Row {
   const process = visibleProcessContext(e.process);
   const evidenceIndex = toolEvidenceIndexFields(e);
   const revisionIdentity = eventRevisionIdentity(e);
-  return {
+  return clickHouseWellFormedRow({
     schemaVersion: e.schemaVersion,
     eventId: e.eventId,
     sourceEventId: e.sourceEventId ?? '',
@@ -1520,7 +1561,7 @@ function toRow(e: JudgedEvent): Row {
     agentHasInternalHelperRoot: isInternalAgentHelperRootEvent(e) ? 1 : 0,
     judgment: JSON.stringify(e.judgment ?? {}),
     rawPreview: e.rawPreview ?? '',
-  };
+  });
 }
 
 function prepareCommitBatch(rows: Row[], requestedBatchId?: string): Row[] {
@@ -2151,6 +2192,11 @@ export class ClickHouseStore {
         WHERE eventLogicalKey IN {logicalKeys:Array(String)}
         GROUP BY eventLogicalKey`,
       query_params: { logicalKeys: [...new Set(logicalKeys)] },
+      clickhouse_settings: {
+        max_threads: 1,
+        max_memory_usage: String(32 * 1024 * 1024),
+        max_execution_time: 5,
+      },
       format: 'JSONEachRow',
     });
     const rows = await result.json() as Array<{
@@ -2371,6 +2417,31 @@ export class ClickHouseStore {
       ? Number(eventAt)
       : undefined;
     return (await this.eventsByIds([normalized], boundedAt, boundedAt))[0];
+  }
+
+  /**
+   * Resolve authenticated Forwarder WAL replay at event granularity. A restart may regroup WAL
+   * records into a new HTTP batch, so the batch cache alone cannot prove an already-durable event.
+   */
+  async classifyDurableReplayEvents(
+    events: readonly JudgedEvent[],
+  ): Promise<DurableReplayEventStatus[] | null> {
+    if (!this.client || !this.ready || this.closing || this.eventWritePermanentError) return null;
+    const incomingRows = events.map(toRow);
+    const existing = await this.existingRevisionFingerprints(
+      incomingRows.map((row) => row.eventLogicalKey),
+    );
+    return incomingRows.map((row) => {
+      const existingFingerprint = existing.get(row.eventLogicalKey);
+      if (!existingFingerprint) return 'new';
+      // New writers bind the exact authenticated Forwarder body into a namespaced fingerprint.
+      // Old rows predate that field; their durable logical key plus the hot-cache comparison in
+      // SentryJudge is the bounded migration proof. Never run a wide events-table scan in ingest.
+      if (existingFingerprint.startsWith('observer-source:')) {
+        return existingFingerprint === row.payloadFingerprint ? 'duplicate' : 'conflict';
+      }
+      return 'duplicate';
+    });
   }
 
   /**
@@ -2636,7 +2707,19 @@ export class ClickHouseStore {
     return `${row.eventId}\0${Math.max(1, Math.trunc(Number(row.decisionRevision) || 1))}`;
   }
 
-  private eventRevisionDigest(row: Row): string {
+  private eventRevisionSourcePayloadDigest(row: Row): string {
+    try {
+      const attributes = JSON.parse(String(row.attributes ?? '{}')) as Record<string, unknown>;
+      const digest = String(attributes?.[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE] ?? '').trim();
+      return SHA256_HEX.test(digest) ? digest : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private eventRevisionDigest(row: Row, preferSourcePayload = true): string {
+    const sourcePayloadDigest = this.eventRevisionSourcePayloadDigest(row);
+    if (preferSourcePayload && sourcePayloadDigest) return `observer-source:${sourcePayloadDigest}`;
     // Receipt timestamps and generated span ids may legitimately change when an old observer client
     // retries a sourceEventId. They do not change the semantic revision. Every decision/evidence
     // field remains covered so a real revision conflict is still rejected.
@@ -2648,6 +2731,7 @@ export class ClickHouseStore {
       payloadFingerprintVersion: _payloadFingerprintVersion,
       payloadFingerprint: _payloadFingerprint,
       at: _at,
+      receivedAt: _receivedAt,
       decisionUpdatedAt: _decisionUpdatedAt,
       spanId: _spanId,
       invocationId: _invocationId,
@@ -2670,6 +2754,16 @@ export class ClickHouseStore {
       attribution,
       ...semanticRevision
     } = row;
+    const attributes = String(semanticRevision.attributes ?? '');
+    try {
+      const parsed = JSON.parse(attributes) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        delete parsed[OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE];
+        semanticRevision.attributes = JSON.stringify(parsed);
+      }
+    } catch {
+      // Preserve malformed legacy payloads byte-for-byte in the digest.
+    }
     const process = String(semanticRevision.process ?? '');
     try {
       const parsed = JSON.parse(process) as Record<string, unknown>;

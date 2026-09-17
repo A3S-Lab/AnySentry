@@ -12,6 +12,7 @@ export type FilterRuleCategory =
   | "learning_candidate";
 export type FilterRuleKind =
   | "runtime_signature"
+  | "non_agent_runtime_signature"
   | "agent_template"
   | "deployment_binding"
   | "reviewed_identity_binding"

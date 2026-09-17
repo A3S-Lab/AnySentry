@@ -44,7 +44,7 @@ const MAX_OPERATIONS = 2_000;
 const PREVIEW_TTL_MS = 5 * 60_000;
 const ALLOWED_FIELDS = new Set<FilterRuleConditionField>([
   'process.comm', 'process.exe_basename', 'process.argv0_basename', 'process.argv_prefix',
-  'identity.classification', 'workload.role', 'workload.placement', 'workload.cluster',
+  'identity.classification', 'identity.source_rule', 'workload.role', 'workload.placement', 'workload.cluster',
   'workload.namespace', 'workload.owner_kind', 'workload.owner_name', 'workload.container',
   'workload.service', 'workload.systemd_unit', 'workload.label', 'asset.id', 'runtime.id',
   'runtime.state', 'binding.quality', 'signal.name',
@@ -52,7 +52,7 @@ const ALLOWED_FIELDS = new Set<FilterRuleConditionField>([
   'decision.structural_risk',
 ]);
 const CATEGORY_KINDS: Record<FilterRuleCategory, Set<FilterRuleKind>> = {
-  agent_identity: new Set(['runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate']),
+  agent_identity: new Set(['runtime_signature', 'non_agent_runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate']),
   infrastructure: new Set(['workload_role_binding']),
   capture_profile: new Set(['capture_profile', 'signal_enablement']),
   forwarder_retention: new Set(['semantic_retention']),
@@ -105,7 +105,7 @@ function validHash(record: FilterRuleRecord): boolean {
 }
 
 function stageSet(kind: FilterRuleKind): FilterRuleStage[] {
-  if (['runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate', 'workload_role_binding'].includes(kind)) {
+  if (['runtime_signature', 'non_agent_runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate', 'workload_role_binding'].includes(kind)) {
     return ['f0', 'f1', 'f2', 'f3'];
   }
   if (kind === 'capture_profile') return ['f0', 'f1', 'f2'];
@@ -118,7 +118,7 @@ function stageSet(kind: FilterRuleKind): FilterRuleStage[] {
 }
 
 function domainsForRule(rule: Pick<FilterRuleRecord, 'ruleKind'>): Array<keyof FilterRuleDomainVersions> {
-  if (['runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate', 'workload_role_binding', 'learning_candidate'].includes(rule.ruleKind)) {
+  if (['runtime_signature', 'non_agent_runtime_signature', 'agent_template', 'deployment_binding', 'reviewed_identity_binding', 'behavior_candidate', 'workload_role_binding', 'learning_candidate'].includes(rule.ruleKind)) {
     return ['identity'];
   }
   if (rule.ruleKind === 'capture_profile') return ['capture', 'forwarder'];
@@ -195,6 +195,13 @@ function validateEffect(
       errors.push('Runtime Signature may only emit probable_agent with confidence <= 0.9');
     }
     if (!conditions.some((condition) => condition.field.startsWith('process.'))) errors.push('Runtime Signature requires an exact process condition');
+  } else if (kind === 'non_agent_runtime_signature') {
+    if (effect.type !== 'emit_identity' || effect.classification !== 'non_agent' || effect.confidence !== 1) {
+      errors.push('Non-Agent Runtime Signature must emit exact non_agent identity with confidence=1');
+    }
+    if (!conditions.some((condition) => condition.field.startsWith('process.'))) {
+      errors.push('Non-Agent Runtime Signature requires an exact process condition');
+    }
   } else if (kind === 'agent_template' || kind === 'deployment_binding' || kind === 'reviewed_identity_binding' || kind === 'behavior_candidate') {
     if (effect.type !== 'emit_identity') errors.push(`${kind} requires emit_identity`);
   } else if (kind === 'workload_role_binding') {

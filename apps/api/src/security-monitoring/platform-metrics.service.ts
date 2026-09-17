@@ -174,6 +174,12 @@ export class PlatformMetricsService {
       '# HELP anysentry_event_loop_lag_p95_seconds P95 event loop delay in seconds.',
       '# TYPE anysentry_event_loop_lag_p95_seconds gauge',
       `anysentry_event_loop_lag_p95_seconds ${this.eventLoopDelay.percentile(95) / 1e9}`,
+      '# HELP anysentry_event_loop_lag_p99_seconds P99 event loop delay in seconds.',
+      '# TYPE anysentry_event_loop_lag_p99_seconds gauge',
+      `anysentry_event_loop_lag_p99_seconds ${this.eventLoopDelay.percentile(99) / 1e9}`,
+      '# HELP anysentry_event_loop_lag_max_seconds Maximum event loop delay since process start.',
+      '# TYPE anysentry_event_loop_lag_max_seconds gauge',
+      `anysentry_event_loop_lag_max_seconds ${this.eventLoopDelay.max / 1e9}`,
       '',
     );
     return lines.join('\n');

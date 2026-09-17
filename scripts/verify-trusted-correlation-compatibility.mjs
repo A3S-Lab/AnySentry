@@ -102,8 +102,13 @@ contains(
 );
 contains(
   'streaming/flink/src/main/java/org/a3s/anysentry/streaming/AnySentryStreamJob.java',
-  '.keyBy(event -> event.agentCorrelationId)',
-  'existing Flink profile state must keep agentCorrelationId',
+  '.keyBy(AnySentryStreamJob::riskProfileEntityKey)',
+  'Flink profile state must use the runtime-aware compatibility key',
+);
+contains(
+  'streaming/flink/src/main/java/org/a3s/anysentry/streaming/AnySentryStreamJob.java',
+  '? event.agentCorrelationId',
+  'Flink profile state must retain agentCorrelationId as the legacy-event fallback',
 );
 contains(
   'streaming/flink/src/main/java/org/a3s/anysentry/streaming/BehaviorSignal.java',

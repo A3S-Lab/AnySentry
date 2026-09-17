@@ -64,6 +64,7 @@ function contextValue(
     case 'process.argv0_basename': return argv(context)[0] ? basename(argv(context)[0]) : undefined;
     case 'process.argv_prefix': return argv(context).join(' ');
     case 'identity.classification': return context.identityClassification;
+    case 'identity.source_rule': return context.identitySourceRule;
     case 'workload.role': return context.workloadRole;
     case 'workload.placement': return context.workload?.placement;
     case 'workload.cluster': return context.workload?.cluster;
@@ -115,6 +116,7 @@ function contextIndexKeys(context: FilterRuleEvaluationContext): string[] {
     ['process.argv0_basename', argv(context)[0] ? basename(argv(context)[0]) : undefined],
     ['process.argv_prefix', argv(context).join(' ')],
     ['identity.classification', context.identityClassification],
+    ['identity.source_rule', context.identitySourceRule],
     ['workload.role', context.workloadRole],
     ['workload.placement', context.workload?.placement],
     ['workload.cluster', context.workload?.cluster],
@@ -482,6 +484,7 @@ export function compileFilterRuleProjection(input: {
       templates,
     },
     identityRules: active.filter((rule) => [
+      'non_agent_runtime_signature',
       'deployment_binding',
       'reviewed_identity_binding',
       'behavior_candidate',

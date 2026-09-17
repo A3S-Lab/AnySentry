@@ -29,8 +29,8 @@ assert.match(source, /eventCommitCursorsForBuckets/);
 assert.match(source, /payloadChecksum/);
 assert.match(
   source,
-  /committedCutoffMs\(\): number \| undefined \{[\s\S]*return this\.committedThroughMs;/,
-  'pending or replayed event time must not hide facts that are already durable',
+  /committedCutoffMs\(\): number \| undefined \{[\s\S]*return this\.committedBoundaryComplete \? this\.committedThroughMs : undefined;/,
+  'only a complete commit boundary may expose the durable high-water mark, without pending or replayed time moving it backwards',
 );
 assert.match(queueSource, /ANYSENTRY_RESULT_APPLY_CONCURRENCY/);
 assert.match(queueSource, /Math\.max\(8, Math\.min\(128/);

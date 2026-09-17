@@ -60,6 +60,31 @@ function attributor(procEntries = []) {
 }
 
 {
+  const judge = attributor([
+    { pid: 700, ppid: 600, startTime: '70', comm: 'parent', exe: '/opt/parent' },
+    { pid: 701, ppid: 700, startTime: '71', comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh' },
+    { pid: 702, ppid: 701, startTime: '72', comm: 'tr', exe: '/usr/bin/tr' },
+  ]);
+  const root = observerEvent({
+    pid: 701, ppid: 700, comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh',
+    startTimeNs: '71', argv: ['/opt/vscode/cpuUsage.sh'],
+  });
+  assert.equal(judge.classify(root).state, 'unknown');
+  assert.equal(
+    judge.rememberTrustedNonAgent(root, 'fr_builtin_non_agent_runtime_vscode_cpu_sampler'),
+    true,
+  );
+  const child = judge.classify(observerEvent({
+    pid: 702, ppid: 701, comm: 'tr', exe: '/usr/bin/tr', startTimeNs: '72', argv: ['tr', 'a-z', 'A-Z'],
+  }));
+  assert.equal(child.state, 'non_agent');
+  assert(
+    child.attribution.evidence.includes('filter_rule:fr_builtin_non_agent_runtime_vscode_cpu_sampler:r1'),
+    'trusted negative rule provenance must propagate to short-lived descendants',
+  );
+}
+
+{
   const procs = new Map([
     [850, { pid: 850, tgid: 850, ppid: 1, startTime: '85', comm: 'a3s', exe: '/usr/bin/a3s', argv: 'a3s code', cwd: '/home/user/code' }],
     [851, { pid: 851, tgid: 851, ppid: 850, startTime: '86', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/tmp' }],

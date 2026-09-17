@@ -54,6 +54,14 @@ const identity = registry.identityCandidates(
 );
 assert(identity.some((candidate) => candidate.attribution.classification === fixture.expected.agentLabelClassification));
 assert(identity.some((candidate) => candidate.workloadRole === fixture.expected.agentLabelRole));
+const samplerIdentity = registry.identityCandidates(
+  { event: { ToolExec: { pid: 99, argv: ['cpuUsage.sh'] } }, process: { comm: 'cpuUsage.sh' } },
+  {
+    state: 'unknown',
+    attribution: { monitored: false, classification: 'unknown', confidence: 0, reason: 'not_evaluated', source: 'none' },
+  },
+).find((candidate) => candidate.ruleId === 'fr_builtin_non_agent_runtime_vscode_cpu_sampler');
+assert.equal(samplerIdentity?.attribution.classification, fixture.expected.vscodeSamplerClassification);
 
 const probable = {
   state: 'agent',
@@ -81,6 +89,20 @@ assert.equal(registry.semanticDecision(
   { event: { FileAccess: { path: '/var/lib/data' } }, process: { comm: 'clickhouse' } },
   infrastructure,
 )?.ruleId, fixture.expected.nonAgentF2RuleId);
+assert.equal(registry.semanticDecision(
+  { event: { ProcessExit: { pid: 42 } }, process: { comm: 'kafka-run-class' } },
+  infrastructure,
+)?.ruleId, fixture.expected.internalLifecycleF2RuleId);
+assert.equal(registry.semanticDecision(
+  { event: { ToolExec: { pid: 43, argv: ['tr'] } }, process: { comm: 'tr' } },
+  {
+    state: 'non_agent',
+    attribution: {
+      monitored: false, classification: 'non_agent', confidence: 1, source: 'process_graph',
+      evidence: ['filter_rule:fr_builtin_non_agent_runtime_vscode_cpu_sampler:r1'],
+    },
+  },
+)?.ruleId, fixture.expected.nonAgentFamilyF2RuleId);
 assert.equal(registry.semanticDecision(
   { event: { FileAccess: { path: '/home/user/a' } }, process: { comm: 'cat' } },
   unknown,

@@ -203,6 +203,24 @@ export function builtinFilterRules(): FilterRuleRecord[] {
     sourceRef: `runtime-signature:${signature.id}:v${BUILTIN_RUNTIME_SIGNATURE_VERSION}`,
   }));
 
+  const nonAgentRuntimeRules = [builtin({
+    ruleId: 'fr_builtin_non_agent_runtime_vscode_cpu_sampler',
+    name: 'VS Code CPU Sampler Process Family',
+    description: '精确识别 VS Code Server cpuUsage.sh 采样器根；负身份按 ProcessKey 父链传播，不按 tr/cut/grep 等通用工具名全局降级。',
+    category: 'agent_identity', ruleKind: 'non_agent_runtime_signature', priority: 780,
+    matcher: {
+      any: [
+        { field: 'process.comm', operator: 'one_of', value: ['cpuUsage.sh', 'cpuUsage.s'] },
+        { field: 'process.exe_basename', operator: 'one_of', value: ['cpuUsage.sh', 'cpuUsage.s'] },
+        { field: 'process.argv0_basename', operator: 'one_of', value: ['cpuUsage.sh', 'cpuUsage.s'] },
+      ],
+      description: '进程 comm、exe basename 或 argv0 basename 精确等于 cpuUsage.sh（含内核定长截断 cpuUsage.s）',
+    },
+    effect: { type: 'emit_identity', classification: 'non_agent', confidence: 1, captureProfile: 'business_context' },
+    stages: ['f0', 'f1', 'f2', 'f3'],
+    sourceRef: 'non-agent-runtime-signature:vscode-cpu-sampler:v1',
+  })];
+
   const deploymentRules = [
     builtin({
       ruleId: 'fr_builtin_kubernetes_agent_label',
@@ -348,6 +366,40 @@ export function builtinFilterRules(): FilterRuleRecord[] {
       effect: { type: 'semantic_retention', action: 'aggregate', reasonCode: 'infrastructure_aggregate' }, stages: ['f2'],
     }),
     builtin({
+      ruleId: 'fr_builtin_f2_trusted_infrastructure_lifecycle_suppress',
+      name: 'F2 Trusted Infrastructure Lifecycle Suppression',
+      description: '仅对同时具备可信 non-Agent 身份和 Infrastructure/Self 角色的 Exec/Exit 抑制逐条转发；Agent、Unknown、冲突和 stale 控制状态仍由更高优先级 Guardrail 放行。',
+      category: 'forwarder_retention', ruleKind: 'semantic_retention', priority: 1150,
+      matcher: {
+        all: [
+          identityCondition('non_agent'),
+          roleCondition(['platform_infrastructure', 'anysentry_internal']),
+          eventCondition(['ToolExec', 'ProcessExit']),
+        ],
+        description: '可信 non_agent 且工作负载角色为 platform_infrastructure/anysentry_internal 的 ToolExec 或 ProcessExit',
+      },
+      effect: { type: 'semantic_retention', action: 'suppress', reasonCode: 'non_agent' },
+      stages: ['f2'],
+      sourceRef: 'trusted-infrastructure-lifecycle:v1',
+    }),
+    builtin({
+      ruleId: 'fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress',
+      name: 'F2 Trusted Non-Agent Family Lifecycle Suppression',
+      description: '对不可编辑的可信 Non-Agent 进程族及其 ProcessKey 后代抑制逐条 Exec/Exit；规则来源必须精确匹配，通用工具名不会单独触发。',
+      category: 'forwarder_retention', ruleKind: 'semantic_retention', priority: 1150,
+      matcher: {
+        all: [
+          identityCondition('non_agent'),
+          { field: 'identity.source_rule', operator: 'equals', value: 'fr_builtin_non_agent_runtime_vscode_cpu_sampler' },
+          eventCondition(['ToolExec', 'ProcessExit']),
+        ],
+        description: 'non_agent 身份来自可信 VS Code CPU sampler 进程族规则，且事件为 ToolExec/ProcessExit',
+      },
+      effect: { type: 'semantic_retention', action: 'suppress', reasonCode: 'non_agent' },
+      stages: ['f2'],
+      sourceRef: 'trusted-non-agent-family-lifecycle:v1',
+    }),
+    builtin({
       ruleId: 'fr_builtin_f2_priority_control', name: 'F2 Protected Priority Lane',
       description: '控制面、生命周期、安全和 Agent 证据进入受保护优先队列。',
       category: 'forwarder_retention', ruleKind: 'semantic_retention', priority: 1000,
@@ -437,5 +489,5 @@ export function builtinFilterRules(): FilterRuleRecord[] {
     }),
   ];
 
-  return [...runtimeRules, ...deploymentRules, ...profileRules, ...signalEnablementRules, ...forwarderRules, ...apiRules, ...guardrails];
+  return [...runtimeRules, ...nonAgentRuntimeRules, ...deploymentRules, ...profileRules, ...signalEnablementRules, ...forwarderRules, ...apiRules, ...guardrails];
 }

@@ -80,6 +80,7 @@ interface ObserverBatchIngestBody {
   events?: IngestBody[];
   batchId?: string;
   payloadDigest?: string;
+  durableReplay?: boolean;
 }
 
 const CLICKHOUSE_EVENT_BUFFER_FULL = 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL';
@@ -87,8 +88,10 @@ const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
 const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
 const OBSERVER_BATCH_MAX_EVENTS = 256;
 const OBSERVER_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
+const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
 const observerBatchIdDigests = new Map<string, string>();
 const OBSERVER_BATCH_RESULT_CACHE_SIZE = 512;
@@ -98,6 +101,11 @@ const observerBatchResults = new Map<string, {
   result: T.ObserverBatchIngestResult;
   bytes: number;
 }>();
+
+function yieldObserverBatchControl(index: number): Promise<void> | undefined {
+  if (index === 0 || index % OBSERVER_BATCH_CONTROL_YIELD_EVERY !== 0) return undefined;
+  return new Promise((resolve) => setImmediate(resolve));
+}
 let observerBatchResultBytes = 0;
 const UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE = 20_000;
 const universalEventIdempotency = new Map<string, {
@@ -7462,6 +7470,9 @@ export class SecurityMonitoringController {
     @Headers() headers: HeaderBag,
   ): Promise<T.ObserverBatchIngestResult> {
     const events = Array.isArray(body.events) ? body.events : [];
+    if (body.durableReplay !== undefined && typeof body.durableReplay !== 'boolean') {
+      throw new BadRequestException('observer durableReplay must be a boolean');
+    }
     if (events.length > OBSERVER_BATCH_MAX_EVENTS) {
       // Reject before processing any prefix. The Forwarder may safely split an HTTP 413 only when
       // the controller has consumed zero items; truncating here would make its retry ambiguous.
@@ -7506,6 +7517,7 @@ export class SecurityMonitoringController {
     // judgment jobs, and canonical jobs. Source resolution may refresh its discovery registry, but
     // only after the global count/byte/digest checks above have completed.
     for (let index = 0; index < events.length; index += 1) {
+      await yieldObserverBatchControl(index);
       const event = events[index];
       if (!event || typeof event.line !== 'string' || !event.line.trim()) {
         immediate.set(index, {
@@ -7633,6 +7645,9 @@ export class SecurityMonitoringController {
           ...(collectorId ? { collectorId } : {}),
           ...(nodeName ? { collectorNode: nodeName } : {}),
           ...(sourceResolution.source?.sourceId ? { sourceId: sourceResolution.source.sourceId } : {}),
+          [OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
+            .update(JSON.stringify(event))
+            .digest('hex'),
         },
       };
       const enriched = this.kube.enrich(deriveMeta(line, metaGiven));
@@ -7695,7 +7710,75 @@ export class SecurityMonitoringController {
       if (cached) return cached;
     }
 
-    const retainedPrepared = retained.map(({ prepared }) => prepared as PreparedRetainedJudgeAccept);
+    let retainedForPersistence = retained;
+    let durableReplayConflict = false;
+    if (
+      body.durableReplay === true
+      && retained.length > 0
+      && rejectedSources.size === 0
+      && legacyIndexes.size === 0
+    ) {
+      let replayStatuses: Awaited<ReturnType<SentryJudgeService['classifyDurableReplayEvents']>>;
+      try {
+        replayStatuses = await this.judge.classifyDurableReplayEvents(
+          retained.map(({ prepared }) => (prepared as PreparedRetainedJudgeAccept).event),
+        );
+      } catch {
+        replayStatuses = null;
+      }
+      if (!replayStatuses) {
+        return {
+          accepted: false,
+          ...(batchId ? { batchId } : {}),
+          payloadDigest: payload.digest,
+          acceptedEvents: 0,
+          retainedEvents: 0,
+          structuralEvents: 0,
+          discardedEvents: 0,
+          rejectedEvents: 0,
+          retryableEvents: events.length,
+          retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS,
+          items: events.map((_, index) => ({
+            index,
+            accepted: false,
+            disposition: 'retryable',
+            reasonCode: 'clickhouse_event_buffer_full',
+          })),
+        };
+      }
+      const newRetained: PreparedObserverBatchEvent[] = [];
+      for (let offset = 0; offset < retained.length; offset += 1) {
+        const context = retained[offset];
+        const status = replayStatuses[offset];
+        const prepared = context.prepared as PreparedRetainedJudgeAccept;
+        if (status === 'new') {
+          newRetained.push(context);
+        } else if (status === 'duplicate') {
+          immediate.set(context.index, {
+            index: context.index,
+            accepted: true,
+            disposition: 'retained',
+            reasonCode: 'durable_replay_duplicate',
+            reason: 'durable_replay_duplicate',
+            eventId: prepared.event.eventId,
+          });
+        } else {
+          durableReplayConflict = true;
+          immediate.set(context.index, {
+            index: context.index,
+            accepted: false,
+            disposition: 'rejected',
+            reasonCode: 'event_revision_conflict',
+            reason: 'event_revision_conflict',
+          });
+        }
+      }
+      retainedForPersistence = newRetained;
+    }
+
+    const retainedPrepared = retainedForPersistence.map(
+      ({ prepared }) => prepared as PreparedRetainedJudgeAccept,
+    );
     const structuralPrepared = structural.map(({ prepared }) => prepared as PreparedStructuralJudgeAccept);
     let revisionConflict = false;
     let retainedDurability: 'durable' | 'memory_only' = 'memory_only';
@@ -7766,7 +7849,7 @@ export class SecurityMonitoringController {
       ));
     }
     if (!revisionConflict && retainedDurability === 'durable') {
-      for (const context of retained) {
+      for (const context of retainedForPersistence) {
         this.materializeCommittedObservedAsset(context.meta, trustedCollectorEventTime(
           context.meta,
           isTrustedCollectorProducer(context.sourceResolution, context.collectorId),
@@ -7781,14 +7864,15 @@ export class SecurityMonitoringController {
     if (!revisionConflict && retainedPrepared.length > 0) {
       try {
         await this.judge.enqueuePreparedFastJobs(retainedPrepared);
-        await this.enqueueCanonicalBatchMany(retained);
+        await this.enqueueCanonicalBatchMany(retainedForPersistence);
       } catch (error) {
-        deliveryRetryFrom = Math.min(...retained.map(({ index }) => index));
+        deliveryRetryFrom = Math.min(...retainedForPersistence.map(({ index }) => index));
         deliveryError = error instanceof Error ? error.message : String(error);
       }
     }
     let retainedCommitted = 0;
     for (let index = 0; index < events.length; index += 1) {
+      await yieldObserverBatchControl(index);
       if (deliveryRetryFrom >= 0 && index >= deliveryRetryFrom) break;
       const precomputed = immediate.get(index);
       if (precomputed) {
@@ -7961,6 +8045,7 @@ export class SecurityMonitoringController {
     if (
       batchCacheKey
       && !revisionConflict
+      && !durableReplayConflict
       && retryableEvents === 0
       && rejectedSources.size === 0
       && legacyIndexes.size === 0

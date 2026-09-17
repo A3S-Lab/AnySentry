@@ -21,6 +21,7 @@ export type FilterRuleCategory =
   | 'learning_candidate';
 export type FilterRuleKind =
   | 'runtime_signature'
+  | 'non_agent_runtime_signature'
   | 'agent_template'
   | 'deployment_binding'
   | 'reviewed_identity_binding'
@@ -54,6 +55,7 @@ export type FilterRuleConditionField =
   | 'process.argv0_basename'
   | 'process.argv_prefix'
   | 'identity.classification'
+  | 'identity.source_rule'
   | 'workload.role'
   | 'workload.placement'
   | 'workload.cluster'
@@ -244,6 +246,7 @@ export interface FilterRuleEvaluationContext {
     argv?: string[];
   };
   identityClassification?: AgentClassification;
+  identitySourceRule?: string;
   workloadRole?: WorkloadRole;
   workload?: {
     placement?: 'kubernetes' | 'docker' | 'host';

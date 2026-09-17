@@ -255,6 +255,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private readonly latestCollectorHeartbeat = new Map<string, CollectorHeartbeatRecord>();
   /** Cumulative quality counters belong to one producer channel, not merely one collector ID. */
   private readonly latestCollectorQualityHeartbeat = new Map<string, CollectorHeartbeatRecord>();
+  private readonly collectorQualityStreak = new Map<string, { bad: number; clean: number }>();
   private persistTimer?: NodeJS.Timeout;
   private collectorTimer?: NodeJS.Timeout;
   private sourceTimer?: NodeJS.Timeout;
@@ -710,17 +711,47 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       heartbeat,
       previousQuality,
     );
-    const degraded = heartbeat.status !== 'ok' || droppedDelta > 0 || errorDelta > 0;
+    const metrics = heartbeat.filterMetrics;
+    const hardFailure = qualityOrigin === 'raw_collector'
+      ? heartbeat.status !== 'ok' || droppedDelta > 0
+      : droppedDelta > 0 ||
+        (metrics?.protectedQueueDropped ?? 0) > 0 ||
+        metrics?.spoolAtCapacity === true ||
+        ((metrics?.spoolRecords ?? 0) > 0 && (metrics?.spoolOldestAgeMs ?? 0) >= 60_000);
+    const softFailure = !hardFailure && qualityOrigin === 'forwarder' && (
+      heartbeat.status !== 'ok' ||
+      errorDelta > 0 ||
+      metrics?.controlPlaneState === 'degraded' ||
+      (metrics?.queueParked ?? 0) > 0 ||
+      (metrics?.retryParked ?? 0) > 0 ||
+      (metrics?.heartbeatDeliveryFailures ?? 0) > 0 ||
+      (metrics?.spoolParkedRecords ?? 0) > 0
+    );
+    const streak = this.collectorQualityStreak.get(qualityKey) ?? { bad: 0, clean: 0 };
+    if (hardFailure) {
+      streak.bad = Math.max(2, streak.bad + 1);
+      streak.clean = 0;
+    } else if (softFailure) {
+      streak.bad += 1;
+      streak.clean = 0;
+    } else {
+      streak.bad = 0;
+      streak.clean += 1;
+    }
+    this.collectorQualityStreak.set(qualityKey, streak);
+    const degraded = hardFailure || streak.bad >= 2;
     if (!degraded) {
-      this.resolveWhere(
-        matchesQualityOrigin,
-        heartbeat.at,
-        'collector quality recovered',
-      );
+      if (streak.clean >= 2) {
+        this.resolveWhere(
+          matchesQualityOrigin,
+          heartbeat.at,
+          'collector quality recovered after two clean heartbeats',
+        );
+      }
       return;
     }
 
-    const severity: Severity = heartbeat.status === 'error' || errorDelta > 0 || droppedDelta > 0 ? 'high' : 'medium';
+    const severity: Severity = hardFailure ? 'high' : 'medium';
     if (this.maintenance.activeFor({ collectorId: heartbeat.collectorId, nodeName: heartbeat.nodeName }, heartbeat.at)) {
       this.resolveWhere(
         (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId,

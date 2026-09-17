@@ -12,15 +12,15 @@
     "ttlMs": 120000
   },
   "projection": {
-    "contentHash": "c77878f7ed98d555c41c7ca1bb0ddbeb283501782d2b86e79d2db378db0b38b3",
-    "intentHash": "ca04b23be42c55cc034d1c18b1128dd5d4976fbd055e536278ca1b696529a824",
+    "contentHash": "a2dccd1e6a8f164ff3c2fadb68e75167a012281afc0822eb71148c5b9f408812",
+    "intentHash": "369b997ebb739e027e9d26aad29f12403c357ae594e2b32b22094b5ff691da2d",
     "counts": {
       "runtimeSignatures": 6,
       "agentTemplates": 0,
-      "identityRules": 10,
+      "identityRules": 11,
       "captureProfileRules": 8,
       "signalEnablementRules": 1,
-      "semanticRetentionRules": 5,
+      "semanticRetentionRules": 7,
       "persistenceRetentionRules": 5,
       "safetyGuardrails": 5
     }
@@ -29,10 +29,13 @@
     "codexRuntime": "codex",
     "agentLabelClassification": "confirmed_agent",
     "agentLabelRole": "agent",
+    "vscodeSamplerClassification": "non_agent",
     "probableCaptureProfile": "probable_investigation",
     "infrastructureCaptureProfile": "infrastructure_aggregate",
     "securityF2RuleId": "fr_guardrail_security_full",
     "nonAgentF2RuleId": "fr_builtin_f2_non_agent_suppress",
+    "internalLifecycleF2RuleId": "fr_builtin_f2_trusted_infrastructure_lifecycle_suppress",
+    "nonAgentFamilyF2RuleId": "fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress",
     "unknownF2RuleId": "fr_builtin_f2_unknown_keep"
   }
 }

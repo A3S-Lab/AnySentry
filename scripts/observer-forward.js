@@ -44,6 +44,16 @@ const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
 
+// Only immutable, software-versioned rules may override the generic lifecycle discovery
+// guardrail. User-created SUPPRESS rules can never add an ID to this closed set.
+const PROTECTED_LIFECYCLE_SUPPRESSION_RULES = new Set([
+  'fr_builtin_f2_trusted_infrastructure_lifecycle_suppress',
+  'fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress',
+]);
+const TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES = new Set([
+  'fr_builtin_non_agent_runtime_vscode_cpu_sampler',
+]);
+
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
@@ -181,7 +191,43 @@ const RETRY_MAX_DELAY_MS = boundedNumber(
 );
 const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
 const RETRY_JITTER_RATIO = 0.2;
+const SPOOL_REPLAY_INTERVAL_MS = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_INTERVAL_MS,
+  1_000,
+  100,
+  60_000,
+);
+const SPOOL_REPLAY_BATCH_SIZE = boundedNumber(
+  process.env.FORWARD_SPOOL_REPLAY_BATCH_SIZE,
+  256,
+  1,
+  4_096,
+);
+const SPOOL_DEGRADED_AGE_MS = boundedNumber(
+  process.env.FORWARD_SPOOL_DEGRADED_AGE_MS,
+  60_000,
+  1_000,
+  3_600_000,
+);
+const WAL_PENDING_MAX_EVENTS = boundedNumber(
+  process.env.FORWARD_WAL_PENDING_MAX_EVENTS,
+  65_536,
+  1_024,
+  250_000,
+);
+const WAL_PENDING_MAX_BYTES = boundedNumber(
+  process.env.FORWARD_WAL_PENDING_MAX_BYTES,
+  256 * 1024 * 1024,
+  16 * 1024 * 1024,
+  2 * 1024 * 1024 * 1024,
+);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
+const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
+  process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
+  15_000,
+  100,
+  120_000,
+);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_ACK_MAX_BYTES,
   1024 * 1024,
@@ -344,8 +390,14 @@ const spool = new DurableSpool({
   dlqPath: process.env.FORWARD_DLQ_PATH,
   maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
+  compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
+  onAsyncError(error) {
+    console.error(`[observer-forward] durable spool async operation failed: ${error.message}`);
+    if (rl) rl.pause();
+    process.exitCode = 1;
+  },
 });
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
@@ -543,12 +595,18 @@ function emptyAttributionCounts() {
     e2eMarkerScopedOut: 0,
     forwarded: 0,
     queueDropped: 0,
+    queueParked: 0,
     batches: 0,
     batchEvents: 0,
     retryQueued: 0,
     retryAttempts: 0,
     retryRecovered: 0,
     retryExhausted: 0,
+    retryParked: 0,
+    spoolReplayAttempts: 0,
+    spoolReplayAdmitted: 0,
+    spoolReplayDeferred: 0,
+    heartbeatDeliveryFailures: 0,
     workspaceConflict: 0,
     infrastructure: 0,
     deduplicated: 0,
@@ -569,7 +627,10 @@ let outstandingEvents = 0;
 let outstandingBytes = 0;
 let retryOutstandingEvents = 0;
 let retryOutstandingBytes = 0;
+let walPendingEvents = 0;
+let walPendingBytes = 0;
 const outstandingItems = new Set();
+const activeSpoolIds = new Set();
 const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
 const retryTasks = [];
 const activeEventRequests = new Set();
@@ -597,6 +658,7 @@ let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
 let retryTimer;
+let spoolReplayTimer;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -628,6 +690,53 @@ let runtimeSnapshotOperation = 0;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
+const controlPlaneLanes = Object.fromEntries(
+  ['identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot'].map((lane) => [
+    lane,
+    { lastSuccessAt: 0, lastFailureAt: 0, lastFailure: '' },
+  ]),
+);
+const enabledControlPlaneLanes = new Set([
+  ...(IDENTITY_SNAPSHOT_SECS > 0 ? ['identity'] : []),
+  ...(UNIFIED_FILTER_PROJECTION_SECS > 0 ? ['filter_rules'] : []),
+  ...(INFRASTRUCTURE_POLICY_SECS > 0 ? ['infrastructure_policy'] : []),
+  'runtime_snapshot',
+]);
+
+function markControlPlaneSuccess(lane) {
+  if (!controlPlaneLanes[lane]) return;
+  controlPlaneLanes[lane].lastSuccessAt = Date.now();
+}
+
+function markControlPlaneFailure(lane, reason) {
+  if (!controlPlaneLanes[lane]) return;
+  controlPlaneLanes[lane].lastFailureAt = Date.now();
+  controlPlaneLanes[lane].lastFailure = String(reason || 'control plane failure').slice(0, 500);
+}
+
+function controlPlaneMetrics() {
+  const failedLanes = [];
+  const startingLanes = [];
+  const lanes = {};
+  for (const [lane, state] of Object.entries(controlPlaneLanes)) {
+    if (!enabledControlPlaneLanes.has(lane)) continue;
+    if (!state.lastSuccessAt && !state.lastFailureAt) startingLanes.push(lane);
+    if (state.lastFailureAt > state.lastSuccessAt) failedLanes.push(lane);
+    lanes[lane] = {
+      ...(state.lastSuccessAt ? { lastSuccessAt: new Date(state.lastSuccessAt).toISOString() } : {}),
+      ...(state.lastFailureAt ? {
+        lastFailureAt: new Date(state.lastFailureAt).toISOString(),
+        lastFailure: state.lastFailure,
+      } : {}),
+    };
+  }
+  return {
+    state: failedLanes.length ? 'degraded' : startingLanes.length ? 'starting' : 'healthy',
+    failedLanes,
+    startingLanes,
+    lanes,
+  };
+}
 
 function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotVersion) {
   lastRuntimeSnapshotFailureAt = new Date().toISOString();
@@ -635,6 +744,7 @@ function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotV
   lastRuntimeSnapshotFailureVersion = Number.isSafeInteger(snapshotVersion) && snapshotVersion > 0
     ? snapshotVersion
     : 0;
+  markControlPlaneFailure('runtime_snapshot', lastRuntimeSnapshotFailure);
 }
 
 function retryableRuntimeSnapshotError(error) {
@@ -758,6 +868,7 @@ function postJson(url, bodyObj, timeoutMs, done) {
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -774,6 +885,7 @@ function postJson(url, bodyObj, timeoutMs, done) {
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(Boolean(failed), abortReason || reason);
   };
@@ -804,7 +916,11 @@ function postJson(url, bodyObj, timeoutMs, done) {
   activeControlRequests.add(state);
   req.on('error', () => finish(true));
   absoluteTimer = setTimeout(() => {
-    state.abort();
+    absoluteTimer = undefined;
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort();
+    });
   }, timeoutMs);
   req.end(body);
 }
@@ -839,6 +955,7 @@ function eventBatchEnvelope(batch) {
     schemaVersion: 'anysentry.observer_batch.v2',
     batchId,
     payloadDigest,
+    durableReplay: batch.some((item) => item.recovered === true),
     writerId: WRITER_ID,
     writerVersion: WRITER_VERSION,
     idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
@@ -1205,6 +1322,7 @@ function postJsonResponse(
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1221,6 +1339,7 @@ function postJsonResponse(
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1286,7 +1405,14 @@ function postJsonResponse(
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    state.abort('control endpoint request timed out');
+    absoluteTimer = undefined;
+    // A synchronous WAL or classification burst can resume the event loop after both the
+    // deadline and the HTTP response are already ready. Give the poll phase one turn to consume
+    // that on-time response before an overdue timer destroys its socket.
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort('control endpoint request timed out');
+    });
   }, timeoutMs);
   req.end(body);
   return state;
@@ -1305,6 +1431,7 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   }
   let settled = false;
   let absoluteTimer;
+  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1321,6 +1448,7 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
+    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1372,21 +1500,33 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    state.abort('identity snapshot timeout');
+    absoluteTimer = undefined;
+    // See postJsonResponse: an expired timer must not outrank response bytes that arrived while
+    // the Forwarder event loop was briefly occupied by the data plane.
+    timeoutAbortImmediate = setImmediate(() => {
+      timeoutAbortImmediate = undefined;
+      state.abort('control endpoint request timed out');
+    });
   }, timeoutMs);
   req.end();
   return state;
 }
 
+let identitySnapshotRefreshInFlight = false;
 function refreshIdentitySnapshot() {
-  getJson(identitySnapshotTarget, 5000, (error, snapshot) => {
+  if (identitySnapshotRefreshInFlight) return;
+  identitySnapshotRefreshInFlight = true;
+  getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
+    identitySnapshotRefreshInFlight = false;
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
+      markControlPlaneFailure('identity', error?.message || 'identity snapshot rejected');
       return;
     }
+    markControlPlaneSuccess('identity');
     synchronizeInfrastructurePolicyRules();
-  });
+  }, {}, false);
 }
 
 function synchronizeInfrastructurePolicyRules() {
@@ -1418,14 +1558,19 @@ function synchronizeInfrastructurePolicyRules() {
 
 let lastInfrastructurePolicyError = '';
 let lastLoggedInfrastructurePolicyVersion = -1;
+let infrastructurePolicyRefreshInFlight = false;
 function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
+  if (infrastructurePolicyRefreshInFlight) return;
+  infrastructurePolicyRefreshInFlight = true;
   getJson(
     infrastructurePolicyTarget,
-    5_000,
+    CONTROL_HTTP_TIMEOUT_MS,
     (error, policy) => {
+      infrastructurePolicyRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
       if (error) {
+        markControlPlaneFailure('infrastructure_policy', error.message);
         infrastructurePolicy.recordLoadError();
         filterRulePublisher.degradeToLastKnownGood(error.message);
         if (error.message !== lastInfrastructurePolicyError) {
@@ -1436,6 +1581,7 @@ function refreshInfrastructurePolicy() {
       }
       const loaded = infrastructurePolicy.replace(policy);
       if (!loaded.ok) {
+        markControlPlaneFailure('infrastructure_policy', loaded.error);
         filterRulePublisher.degradeToLastKnownGood(loaded.error);
         if (loaded.error !== lastInfrastructurePolicyError) {
           console.error(`[observer-forward] Infrastructure policy ignored: ${loaded.error}`);
@@ -1444,6 +1590,7 @@ function refreshInfrastructurePolicy() {
         return;
       }
       lastInfrastructurePolicyError = '';
+      markControlPlaneSuccess('infrastructure_policy');
       filterRulePublisher.markControlPlaneReady();
       const synchronized = synchronizeInfrastructurePolicyRules();
       if (loaded.version !== lastLoggedInfrastructurePolicyVersion) {
@@ -1465,20 +1612,28 @@ function refreshInfrastructurePolicy() {
 
 let lastUnifiedFilterProjectionError = '';
 let lastUnifiedFilterProjectionVersion = -1;
+let unifiedFilterProjectionRefreshInFlight = false;
 function refreshUnifiedFilterProjection(done = () => {}) {
   if (!UNIFIED_FILTER_PROJECTION_SECS) {
     done();
     return;
   }
+  if (unifiedFilterProjectionRefreshInFlight) {
+    done();
+    return;
+  }
+  unifiedFilterProjectionRefreshInFlight = true;
   getJson(
     unifiedFilterProjectionTarget,
-    5_000,
+    CONTROL_HTTP_TIMEOUT_MS,
     (error, projection) => {
+      unifiedFilterProjectionRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) {
         done();
         return;
       }
       if (error) {
+        markControlPlaneFailure('filter_rules', error.message);
         unifiedFilterPolicy.degrade(error.message);
         if (error.message !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection unavailable: ${error.message}`);
@@ -1489,6 +1644,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
       }
       const loaded = unifiedFilterPolicy.replace(projection);
       if (!loaded.ok) {
+        markControlPlaneFailure('filter_rules', loaded.error);
         unifiedFilterPolicy.degrade(loaded.error);
         if (loaded.error !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection ignored: ${loaded.error}`);
@@ -1498,6 +1654,7 @@ function refreshUnifiedFilterProjection(done = () => {}) {
         return;
       }
       lastUnifiedFilterProjectionError = '';
+      markControlPlaneSuccess('filter_rules');
       if (loaded.changed) {
         const signatureResult = signatureRegistry.replaceSafely(
           unifiedFilterPolicy.runtimeSignatureDocument(),
@@ -1558,7 +1715,7 @@ function runtimeLeaseRequest() {
         forwarderPid: processIdentity.pid,
         forwarderStartTimeTicks: processIdentity.startTimeTicks,
       },
-      5_000,
+      CONTROL_HTTP_TIMEOUT_MS,
       (error, ack) => {
         if (error) {
           resolve({ ok: false, reason: error.message, transient: true });
@@ -1636,7 +1793,7 @@ function runtimeSnapshotBody(ready = true) {
   };
 }
 
-function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
+function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS) {
   if (runtimeLeaseFenced) {
     done(true);
     return;
@@ -1740,6 +1897,7 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
         if (attempt > 1) runtimeSnapshotRecovered++;
         lastRuntimeSnapshotAt = new Date().toISOString();
         lastRuntimeSnapshotError = '';
+        markControlPlaneSuccess('runtime_snapshot');
         finish(false);
       });
     };
@@ -1836,6 +1994,31 @@ function eventQueueMetrics(now = Date.now()) {
     outstandingByteLimit: MAX_OUTSTANDING_BYTES,
     protectedReserveEvents: PROTECTED_RESERVE_EVENTS,
     protectedReserveBytes: PROTECTED_RESERVE_BYTES,
+    walPendingEvents,
+    walPendingBytes,
+    walPendingEventLimit: WAL_PENDING_MAX_EVENTS,
+    walPendingByteLimit: WAL_PENDING_MAX_BYTES,
+  };
+}
+
+function durableSpoolMetrics() {
+  const status = spool.status();
+  return {
+    records: status.records,
+    activeRecords: activeSpoolIds.size,
+    parkedRecords: Math.max(0, status.records - activeSpoolIds.size),
+    logicalBytes: status.logicalBytes,
+    walBytes: status.walBytes,
+    oldestAgeMs: status.oldestMs,
+    atCapacity: status.atCapacity,
+    fsyncMode: status.fsyncMode,
+    compactionDeferred: status.compactionDeferred,
+    compactions: status.compactions,
+    compactMaxLiveRecords: status.compactMaxLiveRecords,
+    pendingPutRecords: status.pendingPutRecords,
+    pendingPutBytes: status.pendingPutBytes,
+    pendingOperations: status.pendingOperations,
+    asyncSyncActive: status.asyncSyncActive,
   };
 }
 
@@ -1856,15 +2039,16 @@ function deliverPendingHeartbeat(done, timeoutMs) {
       && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
     if (failed && !intentionallySuperseded) {
       // The failed heartbeat window remains frozen for an exact retry. Its own transport failure
-      // belongs to the active next window, not to the payload whose delivery is uncertain.
-      outputDropped++;
+      // belongs to the active next window, not to the payload whose delivery is uncertain. A
+      // heartbeat transport failure is control evidence, not an event-output loss.
+      attributionCounts.heartbeatDeliveryFailures++;
       errorCount++;
     }
     done(Boolean(failed));
   });
 }
 
-function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
+function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
     done(false);
     return;
@@ -1894,6 +2078,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
     return;
   }
   const eventQueues = eventQueueMetrics();
+  const spoolMetrics = durableSpoolMetrics();
+  const controlPlane = controlPlaneMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
     queueBytes: eventQueues.queueBytes,
@@ -1932,7 +2118,13 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
   e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
-  const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
+  const status = (
+    dropped > 0
+    || errors > 0
+    || spoolMetrics.parkedRecords > 0
+    || spoolMetrics.oldestAgeMs > SPOOL_DEGRADED_AGE_MS
+    || spoolMetrics.atCapacity
+  ) ? 'degraded' : 'ok';
   const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
     ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
     : '';
@@ -2064,12 +2256,36 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         ...(filterReceipts.length ? { e2eFilterReceipts: filterReceipts } : {}),
         deduplicated: classifications.deduplicated,
         queueDropped: classifications.queueDropped,
+        queueParked: classifications.queueParked,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
         retryQueued: classifications.retryQueued,
         retryAttempts: classifications.retryAttempts,
         retryRecovered: classifications.retryRecovered,
         retryExhausted: classifications.retryExhausted,
+        retryParked: classifications.retryParked,
+        spoolReplayAttempts: classifications.spoolReplayAttempts,
+        spoolReplayAdmitted: classifications.spoolReplayAdmitted,
+        spoolReplayDeferred: classifications.spoolReplayDeferred,
+        heartbeatDeliveryFailures: classifications.heartbeatDeliveryFailures,
+        controlPlaneState: controlPlane.state,
+        controlPlaneFailedLanes: controlPlane.failedLanes,
+        controlPlaneStartingLanes: controlPlane.startingLanes,
+        controlPlaneLanes: controlPlane.lanes,
+        spoolRecords: spoolMetrics.records,
+        spoolActiveRecords: spoolMetrics.activeRecords,
+        spoolParkedRecords: spoolMetrics.parkedRecords,
+        spoolBytes: spoolMetrics.logicalBytes,
+        spoolWalBytes: spoolMetrics.walBytes,
+        spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
+        spoolAtCapacity: spoolMetrics.atCapacity,
+        spoolFsyncMode: spoolMetrics.fsyncMode,
+        spoolCompactionDeferred: spoolMetrics.compactionDeferred,
+        spoolCompactions: spoolMetrics.compactions,
+        spoolCompactMaxLiveRecords: spoolMetrics.compactMaxLiveRecords,
+        spoolPendingPutRecords: spoolMetrics.pendingPutRecords,
+        spoolPendingPutBytes: spoolMetrics.pendingPutBytes,
+        spoolPendingOperations: spoolMetrics.pendingOperations,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2086,6 +2302,10 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         outstandingByteLimit: eventQueues.outstandingByteLimit,
         protectedReserveEvents: eventQueues.protectedReserveEvents,
         protectedReserveBytes: eventQueues.protectedReserveBytes,
+        walPendingEvents: eventQueues.walPendingEvents,
+        walPendingBytes: eventQueues.walPendingBytes,
+        walPendingEventLimit: eventQueues.walPendingEventLimit,
+        walPendingByteLimit: eventQueues.walPendingByteLimit,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -2167,7 +2387,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; queue_parked=${classifications.queueParked}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_parked=${classifications.retryParked}; heartbeat_delivery_failures=${classifications.heartbeatDeliveryFailures}; spool_records=${spoolMetrics.records}; spool_parked=${spoolMetrics.parkedRecords}; spool_oldest_ms=${spoolMetrics.oldestAgeMs}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
   };
   pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };
@@ -2179,6 +2399,8 @@ function closeTransports() {
   transportsClosed = true;
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = undefined;
+  if (spoolReplayTimer) clearTimeout(spoolReplayTimer);
+  spoolReplayTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   captureProfileReporter.close();
@@ -2193,7 +2415,12 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
-  spool.close();
+  try {
+    spool.close();
+  } catch (error) {
+    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
+    process.exitCode = 1;
+  }
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }
@@ -2240,6 +2467,7 @@ function recordPipelineCounts(counts) {
 function trackOutstanding(item) {
   item.settled = false;
   outstandingItems.add(item);
+  if (item.spoolId) activeSpoolIds.add(item.spoolId);
   outstandingEvents++;
   outstandingBytes += item.bytes;
 }
@@ -2254,6 +2482,7 @@ function settleOutstanding(items) {
     item.settled = true;
     item.inflightSince = 0;
     outstandingItems.delete(item);
+    if (item.spoolId) activeSpoolIds.delete(item.spoolId);
     settled++;
     bytes += item.bytes;
     if (item.retryOwned) {
@@ -2265,6 +2494,7 @@ function settleOutstanding(items) {
   outstandingBytes = Math.max(0, outstandingBytes - bytes);
   retryOutstandingEvents = Math.max(0, retryOutstandingEvents - retrySettled);
   retryOutstandingBytes = Math.max(0, retryOutstandingBytes - retryBytes);
+  if (settled > 0 && !closing) scheduleSpoolReplay(0);
   return settled;
 }
 
@@ -2282,12 +2512,18 @@ function markRetryOwned(items) {
 }
 
 function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
-  const count = settleOutstanding(items);
+  const unsettled = items.filter((item) => !item.settled);
+  const parked = unsettled.filter((item) => item.spoolId).length;
+  const durableIds = unsettled.map((item) => item.spoolId).filter(Boolean);
+  const count = settleOutstanding(unsettled);
   if (!count) return;
   attributionCounts.retryExhausted += count;
-  outputDropped += count;
+  attributionCounts.retryParked += parked;
+  outputDropped += Math.max(0, count - parked);
   pipelineAccounting.record('queue_dropped', reason, count);
+  spool.defer(durableIds);
   if (operationalError) errorCount++;
+  scheduleSpoolReplay();
 }
 
 function retryDelayMs(item, retryAfterMs) {
@@ -2348,7 +2584,6 @@ function takeReadyRetryBatch(now = Date.now()) {
 }
 
 function finishBatch(batch, outcome, retryDelivery) {
-  outputDropped += outcome.dropped;
   errorCount += outcome.errors;
   recordPipelineCounts(outcome.pipelineCounts);
   inflight = Math.max(0, inflight - 1);
@@ -2361,8 +2596,21 @@ function finishBatch(batch, outcome, retryDelivery) {
   const terminalItems = batch.filter((item) => !retrySet.has(item));
   const acceptedItems = outcome.acceptedItems ?? [];
   const rejectedItems = outcome.rejectedItems ?? [];
+  const acceptedSet = new Set(acceptedItems);
+  const rejectedSet = new Set(rejectedItems);
+  const unresolvedTerminalItems = terminalItems.filter((item) =>
+    !acceptedSet.has(item) && !rejectedSet.has(item));
+  const parkedDropped = Math.min(
+    outcome.dropped,
+    unresolvedTerminalItems.filter((item) => item.spoolId).length,
+  );
+  outputDropped += Math.max(0, outcome.dropped - parkedDropped);
+  if (parkedDropped > 0) {
+    if (retryDelivery) attributionCounts.retryParked += parkedDropped;
+    else attributionCounts.queueParked += parkedDropped;
+  }
   if (acceptedItems.length) {
-    spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
+    spool.ackAsync(acceptedItems.map((item) => item.spoolId).filter(Boolean));
   }
   if (rejectedItems.length) {
     spool.deadLetter(
@@ -2451,8 +2699,9 @@ function flushPending() {
   pumpEventWork();
 }
 
-function recordQueueDrop(kind, priority, reason) {
-  outputDropped++;
+function recordQueueDrop(kind, priority, reason, durablyParked = false) {
+  if (durablyParked) attributionCounts.queueParked++;
+  else outputDropped++;
   attributionCounts.queueDropped++;
   const dropClass = queueDropClass(kind, priority);
   attributionCounts.queueDroppedByClass[dropClass] =
@@ -2464,7 +2713,8 @@ function recordQueueDrop(kind, priority, reason) {
 function dropQueuedItem(item, reason = 'priority_evicted') {
   if (!item) return;
   settleOutstanding([item]);
-  recordQueueDrop(item.kind, item.priority, reason);
+  recordQueueDrop(item.kind, item.priority, reason, Boolean(item.spoolId));
+  scheduleSpoolReplay();
 }
 
 function makeQueueRoom(bytes, priority) {
@@ -2489,8 +2739,8 @@ function makeQueueRoom(bytes, priority) {
 
 function inputAtCapacity() {
   return (
-    outstandingEvents >= MAX_OUTSTANDING_EVENTS
-    || outstandingBytes >= MAX_OUTSTANDING_BYTES
+    walPendingEvents >= WAL_PENDING_MAX_EVENTS
+    || walPendingBytes >= WAL_PENDING_MAX_BYTES
     || spool.atCapacity()
   );
 }
@@ -2501,46 +2751,25 @@ function updateInputFlow() {
   else rl.resume();
 }
 
-function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
-  const observedAt = Number(body.observedAt) || Date.now();
-  const durableBody = body.observedAt ? body : { ...body, observedAt };
-  let bytes;
-  try {
-    bytes = Buffer.byteLength(JSON.stringify(durableBody));
-  } catch {
-    recordQueueDrop(kind, priority, 'serialization_error');
-    return;
-  }
-  if (bytes > MAX_EVENT_BYTES) {
-    recordQueueDrop(kind, priority, 'event_too_large');
-    return;
-  }
-  const spoolId = kind === 'CollectorHeartbeat'
-    ? undefined
-    : String(durableBody.sourceEventId || '');
-  if (spoolId && !recovered) {
-    try {
-      spool.put({
-        id: spoolId,
-        body: durableBody,
-        priority,
-        queuedAt: observedAt,
-      });
-    } catch (error) {
-      recordQueueDrop(kind, priority, 'durable_spool_error');
-      console.error(`[observer-forward] durable spool write failed: ${error.message}`);
-      if (rl) rl.pause();
-      process.exitCode = 1;
-      return;
-    }
-  }
+function admitDurableEvent(
+  durableBody,
+  bytes,
+  spoolId,
+  priority,
+  countForwarded,
+  kind,
+  recovered,
+) {
   if (!makeQueueRoom(bytes, priority)) {
-    recordQueueDrop(
+    if (recovered) attributionCounts.spoolReplayDeferred++;
+    else recordQueueDrop(
       kind,
       priority,
       priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
+      Boolean(spoolId),
     );
-    return;
+    scheduleSpoolReplay();
+    return false;
   }
   const item = {
     body: durableBody,
@@ -2554,25 +2783,142 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     retryStartedAt: 0,
     retryDeadlineAt: 0,
     inflightSince: 0,
+    recovered,
     settled: false,
   };
   const result = pending.push(item, priority);
   if (!result.accepted) {
-    recordQueueDrop(kind, priority, 'queue_rejected');
-    return;
+    if (recovered) attributionCounts.spoolReplayDeferred++;
+    else recordQueueDrop(kind, priority, 'queue_rejected', Boolean(spoolId));
+    scheduleSpoolReplay();
+    return false;
   }
   if (result.dropped && !result.droppedIncoming) {
     dropQueuedItem(result.dropped);
   }
   trackOutstanding(item);
-  pipelineAccounting.record(
-    'queue_admitted',
-    countForwarded ? 'event' : 'collector_heartbeat',
-  );
+  if (!recovered) {
+    pipelineAccounting.record(
+      'queue_admitted',
+      countForwarded ? 'event' : 'collector_heartbeat',
+    );
+  }
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
   updateInputFlow();
+  return true;
+}
+
+function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
+  const observedAt = Number(body.observedAt) || Date.now();
+  const durableBody = body.observedAt ? body : { ...body, observedAt };
+  let bytes;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(durableBody));
+  } catch {
+    recordQueueDrop(kind, priority, 'serialization_error');
+    return false;
+  }
+  if (bytes > MAX_EVENT_BYTES) {
+    recordQueueDrop(kind, priority, 'event_too_large');
+    return false;
+  }
+  const spoolId = kind === 'CollectorHeartbeat'
+    ? undefined
+    : String(durableBody.sourceEventId || '');
+  if (!spoolId || recovered) {
+    return admitDurableEvent(
+      durableBody,
+      bytes,
+      spoolId,
+      priority,
+      countForwarded,
+      kind,
+      recovered,
+    );
+  }
+  if (
+    walPendingEvents + 1 > WAL_PENDING_MAX_EVENTS
+    || walPendingBytes + bytes > WAL_PENDING_MAX_BYTES
+    || spool.atCapacity()
+  ) {
+    recordQueueDrop(kind, priority, 'wal_pending_capacity');
+    updateInputFlow();
+    return false;
+  }
+  walPendingEvents += 1;
+  walPendingBytes += bytes;
+  spool.putAsync({
+    id: spoolId,
+    body: durableBody,
+    priority,
+    queuedAt: observedAt,
+  }, (error, inserted) => {
+    walPendingEvents = Math.max(0, walPendingEvents - 1);
+    walPendingBytes = Math.max(0, walPendingBytes - bytes);
+    if (error) {
+      recordQueueDrop(kind, priority, 'durable_spool_error');
+      updateInputFlow();
+      return;
+    }
+    if (inserted) {
+      admitDurableEvent(
+        durableBody,
+        bytes,
+        spoolId,
+        priority,
+        countForwarded,
+        kind,
+        false,
+      );
+    }
+    updateInputFlow();
+  });
+  updateInputFlow();
+  return true;
+}
+
+function scheduleSpoolReplay(delayMs = SPOOL_REPLAY_INTERVAL_MS) {
+  if (closing || transportsClosed || spoolReplayTimer) return;
+  spoolReplayTimer = setTimeout(() => {
+    spoolReplayTimer = undefined;
+    pumpDurableSpool();
+  }, Math.max(0, delayMs));
+  spoolReplayTimer.unref();
+}
+
+function pumpDurableSpool() {
+  if (closing || transportsClosed) return;
+  const spoolStatus = spool.status();
+  if (spoolStatus.records <= activeSpoolIds.size) {
+    scheduleSpoolReplay();
+    return;
+  }
+  const availableSlots = Math.max(0, MAX_OUTSTANDING_EVENTS - outstandingEvents);
+  if (availableSlots <= 0 || outstandingBytes >= MAX_OUTSTANDING_BYTES) {
+    scheduleSpoolReplay();
+    return;
+  }
+  const records = spool.available(
+    activeSpoolIds,
+    Math.min(SPOOL_REPLAY_BATCH_SIZE, availableSlots),
+  );
+  let admitted = 0;
+  for (const record of records) {
+    attributionCounts.spoolReplayAttempts++;
+    if (!enqueue(
+      record.body,
+      record.priority,
+      false,
+      durableRecordKind(record.body),
+      true,
+    )) break;
+    admitted++;
+    attributionCounts.spoolReplayAdmitted++;
+  }
+  if (admitted > 0) pumpEventWork();
+  scheduleSpoolReplay(admitted > 0 ? 0 : SPOOL_REPLAY_INTERVAL_MS);
 }
 
 function abandonPendingEvents() {
@@ -2592,6 +2938,21 @@ function remainingShutdownMs() {
   return Math.max(100, shutdownDeadline - Date.now());
 }
 
+function sendFinalHeartbeat(done) {
+  const attempt = () => {
+    const remainingMs = remainingShutdownMs();
+    const timeoutMs = Math.min(5_000, remainingMs);
+    sendHeartbeat((failed) => {
+      if (failed && Date.now() + 100 < shutdownDeadline) {
+        setTimeout(attempt, 50);
+        return;
+      }
+      done(Boolean(failed));
+    }, timeoutMs, true);
+  };
+  attempt();
+}
+
 function finishShutdownControlPlane() {
   if (shutdownFinalizing || transportsClosed) return;
   shutdownFinalizing = true;
@@ -2605,8 +2966,7 @@ function finishShutdownControlPlane() {
   // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
   // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
   sendRuntimeSnapshot(true, () => {
-    const heartbeatTimeout = Math.min(5_000, remainingShutdownMs());
-    sendHeartbeat(() => closeTransports(), heartbeatTimeout, true);
+    sendFinalHeartbeat(() => closeTransports());
   }, snapshotTimeout);
 }
 
@@ -2635,12 +2995,22 @@ function flushAndClose() {
   filterRulePublisher.close();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
-  const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
+  // Event evidence is already durable in the WAL, while the final runtime snapshot and heartbeat
+  // are the only lifecycle proof that the API can use during a rollout. Reserve half of the
+  // Forwarder budget for those two serial control requests instead of leaving them an exact,
+  // scheduler-fragile five-second tail.
+  const controlReserveMs = Math.min(10_000, Math.max(2_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 2)));
   eventDrainDeadline = shutdownDeadline - controlReserveMs;
   pumpEventWork();
   const waitForInflight = () => {
     pumpEventWork();
-    const hasEventWork = inflight > 0 || pending.length > 0 || retryTasks.length > 0;
+    const spoolStatus = spool.status();
+    const hasEventWork = inflight > 0
+      || pending.length > 0
+      || retryTasks.length > 0
+      || walPendingEvents > 0
+      || spoolStatus.pendingOperations > 0
+      || spoolStatus.asyncSyncActive;
     if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);
       return;
@@ -2836,9 +3206,24 @@ function handleLine(raw) {
     templateClassification,
   ) ?? processClassification;
   let catalogClassification = baseClassification;
+  let trustedNonAgentRuleId = '';
   for (const candidate of unifiedFilterPolicy.identityCandidates(o, catalogClassification)) {
+    if (
+      candidate.attribution?.classification === 'non_agent'
+      && TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES.has(candidate.ruleId)
+    ) {
+      trustedNonAgentRuleId = candidate.ruleId;
+    }
     catalogClassification = mergeAttributionClassifications(catalogClassification, candidate)
       ?? catalogClassification;
+  }
+  if (
+    trustedNonAgentRuleId
+    && catalogClassification.state === 'non_agent'
+    && catalogClassification.attribution?.classification === 'non_agent'
+    && catalogClassification.attribution?.conflict !== true
+  ) {
+    attributor.rememberTrustedNonAgent(o, trustedNonAgentRuleId);
   }
   const infrastructureEvaluation = infrastructurePolicy.evaluate(o, workloadClassification);
   // Stable authoritative inventory is resolved before heuristic behavior discovery. A weak
@@ -2913,8 +3298,13 @@ function handleLine(raw) {
   // workload identity was learned. Exact self/manual non-Agent inventory may suppress routine
   // syscall detail, but it must never suppress these event kinds merely because no central
   // Infrastructure rule happened to materialize for the same workload.
-  const alwaysKeep = alwaysKeepEventKind(kind);
   const semanticDecision = unifiedFilterPolicy.semanticDecision(o, classification);
+  const trustedLifecycleSuppression = (
+    (kind === 'ToolExec' || kind === 'ProcessExit')
+    && semanticDecision?.action === 'suppress'
+    && PROTECTED_LIFECYCLE_SUPPRESSION_RULES.has(semanticDecision.ruleId)
+  );
+  const alwaysKeep = alwaysKeepEventKind(kind) && !trustedLifecycleSuppression;
   if (!alwaysKeep && semanticDecision) {
     if (semanticDecision.action === 'suppress') {
       filterReason = semanticDecision.reasonCode || 'non_agent';
@@ -3004,22 +3394,13 @@ async function start() {
   rl.pause();
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
-  const recoveredRecords = spool.available(new Set(), MAX_OUTSTANDING_EVENTS);
-  for (const record of recoveredRecords) {
-    enqueue(
-      record.body,
-      record.priority,
-      false,
-      durableRecordKind(record.body),
-      true,
-    );
-  }
   const spoolStatus = spool.status();
   console.error(
     `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; `
     + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
     + `fsync=${spoolStatus.fsyncMode}`,
   );
+  pumpDurableSpool();
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one

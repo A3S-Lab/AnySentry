@@ -171,6 +171,15 @@ async function verifyCollectors() {
     errorCount: 1,
     eventKindCounts: { Egress: 1 },
   });
+  await sleep(5);
+  await request('/collectors/heartbeat', 'POST', {
+    sourceId: collectorSourceB,
+    collectorId: ids.collectorB,
+    nodeName: `${runId}-node-b`,
+    status: 'error',
+    errorCount: 1,
+    eventKindCounts: { Egress: 1 },
+  });
 
   const exact = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: ids.collectorA, limit: 20 });
   const pinned = await request('/collectors/health', 'POST', { timeType: 'last_30d', collectorId: ids.collectorA, q: ids.collectorB, limit: 20 });

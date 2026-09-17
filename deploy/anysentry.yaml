@@ -211,8 +211,10 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            # The durable AOF base can approach 1 GiB before replay overhead. Reserve its steady
+            # working set and leave bounded startup headroom so recovery is not OOM-killed.
+            requests: { cpu: 100m, memory: 1Gi }
+            limits: { cpu: "1", memory: 2Gi }
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -244,6 +246,9 @@ data:
   ANYSENTRY_CAPTURE_PROFILE_MODE: "shadow"
   ANYSENTRY_UNKNOWN_RETENTION_MODE: "shadow"
   ANYSENTRY_REDIS_URL: "redis://redis:6379/0"
+  # Redis carries only the latest Source cursor. Coalesce high-rate events before projection so
+  # Observer throughput cannot become equivalent AOF write throughput.
+  ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS: "1000"
   # The streaming resources remain available in deploy/streaming.yaml, but production operators
   # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
   ANYSENTRY_STREAMING: "off"

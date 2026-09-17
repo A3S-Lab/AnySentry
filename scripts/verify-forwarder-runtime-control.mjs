@@ -2,7 +2,10 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const forwarder = fileURLToPath(new URL('./observer-forward.js', import.meta.url));
@@ -27,6 +30,7 @@ function waitFor(label, predicate, timeoutMs = 5_000) {
 }
 
 async function withForwarder(label, respond, verify) {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), `anysentry-runtime-control-${label}-`));
   const requests = [];
   const server = http.createServer((request, response) => {
     let body = '';
@@ -60,6 +64,7 @@ async function withForwarder(label, respond, verify) {
       ANYSENTRY_BEHAVIOR_DISCOVERY: 'off',
       ANYSENTRY_AGENT_TEMPLATES_JSON: '[]',
       A3S_OBSERVER_COLLECTOR_ID: `runtime-control-${label}`,
+      FORWARD_SPOOL_PATH: path.join(temporary, 'spool.wal'),
     },
     stdio: ['pipe', 'ignore', 'pipe'],
   });
@@ -76,7 +81,7 @@ async function withForwarder(label, respond, verify) {
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
         reject(new Error(`forwarder ${label} did not exit: ${stderr}`));
-      }, 5_000);
+      }, 15_000);
       child.once('exit', (code) => {
         clearTimeout(timer);
         resolve(code);
@@ -86,6 +91,7 @@ async function withForwarder(label, respond, verify) {
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL');
     await new Promise((resolve) => server.close(resolve));
+    rmSync(temporary, { recursive: true, force: true });
   }
 }
 

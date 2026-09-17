@@ -15,7 +15,7 @@ const ACTIONS = new Set(['full', 'aggregate', 'sample', 'drop', 'not_enabled']);
 const STAGES = new Set(['f0', 'f1', 'f2', 'f3']);
 const FIELDS = new Set([
   'process.comm', 'process.exe_basename', 'process.argv0_basename', 'process.argv_prefix',
-  'identity.classification', 'workload.role', 'workload.placement', 'workload.cluster',
+  'identity.classification', 'identity.source_rule', 'workload.role', 'workload.placement', 'workload.cluster',
   'workload.namespace', 'workload.owner_kind', 'workload.owner_name', 'workload.container',
   'workload.service', 'workload.systemd_unit', 'workload.label', 'asset.id', 'runtime.id',
   'runtime.state', 'binding.quality', 'signal.name',
@@ -139,6 +139,9 @@ function evaluationContext(observerEvent, classification, options = {}) {
   const facts = object(classification?.infrastructureFacts) ?? {};
   const workloadRef = object(attribution.workloadRef) ?? {};
   const labels = object(facts.labels) ?? {};
+  const sourceRule = (Array.isArray(attribution.evidence) ? attribution.evidence : [])
+    .map((item) => /^filter_rule:([^:]+)(?::r\d+)?$/u.exec(text(item))?.[1] || '')
+    .find(Boolean) || '';
   const argv = Array.isArray(payload.argv) ? payload.argv.map(text).filter(Boolean) : [];
   return {
     process: {
@@ -147,6 +150,7 @@ function evaluationContext(observerEvent, classification, options = {}) {
       argv,
     },
     identityClassification: semantics.identityClassification,
+    identitySourceRule: sourceRule,
     workloadRole: semantics.workloadRole,
     workload: {
       placement: text(facts.placement || workloadRef.environment),
@@ -179,6 +183,7 @@ function contextValue(condition, context) {
     case 'process.argv0_basename': return context.process.argv[0] ? path.posix.basename(context.process.argv[0]) : '';
     case 'process.argv_prefix': return context.process.argv.join(' ');
     case 'identity.classification': return context.identityClassification;
+    case 'identity.source_rule': return context.identitySourceRule;
     case 'workload.role': return context.workloadRole;
     case 'workload.placement': return context.workload.placement;
     case 'workload.cluster': return context.workload.cluster;
@@ -272,6 +277,7 @@ function contextIndexKeys(context) {
     ['process.argv0_basename', context.process.argv[0] ? path.posix.basename(context.process.argv[0]) : ''],
     ['process.argv_prefix', context.process.argv.join(' ')],
     ['identity.classification', context.identityClassification],
+    ['identity.source_rule', context.identitySourceRule],
     ['workload.role', context.workloadRole],
     ['workload.placement', context.workload.placement],
     ['workload.cluster', context.workload.cluster],
@@ -562,6 +568,7 @@ class UnifiedFilterPolicyRegistry {
     if (identity) {
       const effect = identity.effect;
       candidates.push({
+        ruleId: identity.ruleId,
         state: identityClassificationState(effect.classification),
         ...(effect.captureProfile ? { captureProfile: effect.captureProfile } : {}),
         attribution: {
@@ -569,7 +576,7 @@ class UnifiedFilterPolicyRegistry {
           classification: effect.classification,
           confidence: Number(effect.confidence),
           reason: effect.classification === 'confirmed_agent' ? 'authoritative_anchor' : effect.classification === 'non_agent' ? 'not_agent' : 'hint_only',
-          source: 'self_register',
+          source: effect.classification === 'non_agent' ? 'filter_rule' : 'self_register',
           evidence: [`filter_rule:${identity.ruleId}:r${identity.revision}`],
         },
         decisionReceipt: decisionReceipt('f0', identity, this.catalogVersion, this.domainVersions.identity, this.now()),

@@ -254,6 +254,9 @@ async function verifyCollectorMetricFreshnessContract() {
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.droppedEvents === 2 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.outputDropped === 3 &&
       sameMillisecondHealth.items?.[0]?.windowErrorMaxima?.errorCount === 4 &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.capture?.state === 'healthy' &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.delivery?.state === 'degraded' &&
+      sameMillisecondHealth.items?.[0]?.healthChannels?.control?.state === 'warning' &&
       sameMillisecondHealth.items?.[0]?.filterMetricsReported === true,
     sameMillisecondHealth,
   );
@@ -471,9 +474,12 @@ async function verifyCollectorMetricFreshnessContract() {
     timeType: 'last_30d', collectorId: noFilterForwarder.collectorId,
   });
   assert(
-    'Forwarder heartbeat without filter metrics still drives operational health',
-    noFilterHealth.items?.[0]?.state === 'degraded' &&
+    'legacy Forwarder errors remain visible as a channel warning without masquerading as probe failure',
+    noFilterHealth.items?.[0]?.state === 'quiet' &&
       noFilterHealth.items?.[0]?.errorCount === 2 &&
+      noFilterHealth.items?.[0]?.healthChannels?.capture?.state === 'unknown' &&
+      noFilterHealth.items?.[0]?.healthChannels?.delivery?.state === 'healthy' &&
+      noFilterHealth.items?.[0]?.healthChannels?.control?.state === 'warning' &&
       noFilterHealth.items?.[0]?.filterMetrics?.scope === 'decoupled',
     noFilterHealth,
   );
@@ -802,8 +808,17 @@ async function verifyCollectorHeartbeatProvenanceContract() {
   });
   const alertAt = Date.now();
   alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt, { errorCount: 1 }));
-  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 1));
   let qualityAlerts = alerting.list({
+    timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
+  }).items.filter((item) => item.ruleId === 'collector.quality');
+  assert(
+    'one transient Forwarder error remains a warning and does not open a quality alert',
+    qualityAlerts.length === 0,
+    qualityAlerts,
+  );
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 1, { errorCount: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 2));
+  qualityAlerts = alerting.list({
     timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
   }).items.filter((item) => item.ruleId === 'collector.quality');
   assert(
@@ -812,8 +827,9 @@ async function verifyCollectorHeartbeatProvenanceContract() {
       item.status === 'open' && item.labels?.heartbeatOrigin === 'forwarder'),
     qualityAlerts,
   );
-  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 2, { droppedEvents: 1 }));
-  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 3));
+  alerting.observeCollectorHeartbeat(heartbeat('raw_collector', alertAt + 3, { droppedEvents: 1 }));
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 4));
+  alerting.observeCollectorHeartbeat(heartbeat('forwarder', alertAt + 5));
   qualityAlerts = alerting.list({
     timeType: 'last_30d', collectorId: alertCollector, kind: 'collector', limit: 10,
   }).items.filter((item) => item.ruleId === 'collector.quality');
@@ -852,7 +868,7 @@ async function verifyJudgeDispositionContract() {
       { observeEvent: () => undefined, observeIncident: () => undefined },
       { attribute: () => undefined },
       { enabled, enqueueFast: async () => { enqueued += 1; } },
-      { get: () => undefined },
+      { get: () => undefined, isCallable: (profile) => profile === 'fast_review' },
     );
     judge.applyPolicy(DEFAULT_POLICY);
     const meta = {
@@ -900,11 +916,12 @@ async function verifyJudgeDispositionContract() {
         attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
       });
       assert(
-        'Judge queued path retains and enqueues a supported event',
+        'Unknown l1_only routing is retained and completed without BullMQ amplification',
         retained.disposition === 'retained' &&
-          retained.event?.decisionStatus === 'pending' &&
+          retained.event?.decisionStatus === 'succeeded' &&
           retained.event?.activityContext === 'agent_action' &&
-          enqueued === 1,
+          retained.event?.judgment?.profile === 'l1_only' &&
+          enqueued === 0,
         { retained, enqueued },
       );
       const platform = await judge.acceptWithDisposition('{}', {
@@ -914,15 +931,68 @@ async function verifyJudgeDispositionContract() {
         attribution: { ...meta.attribution, classification: 'unknown', reason: 'not_evaluated', confidence: 0 },
       });
       assert(
-        'platform healthcheck keeps ToolExec and still enters the security judgment queue',
+        'platform healthcheck keeps ToolExec but terminates at local L1',
         platform.disposition === 'retained' &&
           platform.event?.eventKind === 'ToolExec' &&
           platform.event?.eventCategory === 'runtime' &&
           platform.event?.activityContext === 'platform_healthcheck' &&
           platform.event?.activitySubtype === 'k8s_readiness_probe' &&
-          platform.event?.decisionStatus === 'pending' &&
-          enqueued === 2,
+          platform.event?.decisionStatus === 'succeeded' &&
+          platform.event?.judgment?.profile === 'l1_only' &&
+          enqueued === 0,
         { platform, enqueued },
+      );
+      const fullTerminal = await judge.acceptWithDisposition('{}', {
+        ...meta,
+        attribution: {
+          ...meta.attribution,
+          monitored: true,
+          classification: 'confirmed_agent',
+          reason: 'authoritative_anchor',
+          confidence: 1,
+        },
+      });
+      assert(
+        'confirmed Agent full routing terminates locally when L1 has no escalation',
+        fullTerminal.disposition === 'retained' &&
+          fullTerminal.event?.decisionStatus === 'succeeded' &&
+          fullTerminal.event?.judgment?.profile === 'full' &&
+          enqueued === 0,
+        { fullTerminal, enqueued },
+      );
+      judge.applyPolicy({
+        ...DEFAULT_POLICY,
+        rules: [{
+          name: 'queued escalation contract',
+          on: 'ToolExec',
+          match: 'queue-escalation-contract',
+          verdict: 'escalate',
+          severity: 'high',
+          reason: 'queued escalation contract',
+        }],
+        llm: { url: 'http://127.0.0.1:9/v1', model: 'contract-model', timeoutS: 1 },
+      });
+      const fullEscalation = await judge.acceptWithDisposition(observerLine(
+        { agent: `${runId}-judge-agent`, session: `${runId}-judge-session`, task: 'queue-escalation' },
+        { ToolExec: { pid: 41_001, uid: 1000, cwd: `/workspace/${runId}/judge`, argv: ['queue-escalation-contract'] } },
+        { pid: 41_001, ppid: 1, comm: 'queue-escalation-contract', exe: '/usr/bin/queue-escalation-contract' },
+      ), {
+        ...meta,
+        attribution: {
+          ...meta.attribution,
+          monitored: true,
+          classification: 'confirmed_agent',
+          reason: 'authoritative_anchor',
+          confidence: 1,
+        },
+      });
+      assert(
+        'confirmed Agent full routing queues only an unresolved L1 escalation',
+        fullEscalation.disposition === 'retained' &&
+          fullEscalation.event?.decisionStatus === 'pending' &&
+          fullEscalation.event?.judgment?.profile === 'full' &&
+          enqueued === 1,
+        { fullEscalation, enqueued },
       );
     }
   }
@@ -1416,7 +1486,7 @@ async function verifyObserverBatch(sourceId, token) {
     source: 'kubernetes',
     evidence: ['label:anysentry.io/workload-kind=agent'],
   };
-  const events = Array.from({ length: 24 }, (_, index) => 1711 + index).map((pid) => ({
+  const events = Array.from({ length: 24 }, (_, index) => 1711 + index).map((pid, index) => ({
     line: observerLine(
       { agent: 'pod-batch', session: 'container-batch', task: String(pid) },
       {
@@ -1433,6 +1503,7 @@ async function verifyObserverBatch(sourceId, token) {
     collectorId: `${runId}-collector`,
     nodeName: `${runId}-node`,
     sourceType: 'observer',
+    sourceEventId: `${runId}-observer-batch-event-${index}`,
     attribution,
   }));
   assert(
@@ -1459,6 +1530,25 @@ async function verifyObserverBatch(sourceId, token) {
   );
   const eventId = result.items?.[0]?.eventId;
   if (!eventId) return;
+  const replayEvents = events.slice(0, 6);
+  const replayPayloadDigest = createHash('sha256').update(JSON.stringify(replayEvents)).digest('hex');
+  const replay = await request('/ingest/batch', 'POST', {
+    batchId: `${runId}-observer-regrouped-replay`,
+    payloadDigest: replayPayloadDigest,
+    durableReplay: true,
+    events: replayEvents,
+  }, sourceHeaders(sourceId, token));
+  assert(
+    'regrouped durable WAL replay acknowledges already-committed source events item by item',
+    replay.accepted === true &&
+      replay.acceptedEvents === replayEvents.length &&
+      replay.retainedEvents === replayEvents.length &&
+      replay.rejectedEvents === 0 &&
+      replay.retryableEvents === 0 &&
+      replay.items?.every((item) =>
+        item.accepted === true && item.reasonCode === 'durable_replay_duplicate'),
+    replay,
+  );
   await assertEvent('observer batch preserves workload-first attribution evidence', eventId, (event) =>
     event.attribution?.classification === 'confirmed_agent' &&
     event.attribution?.agentScopeId === `${runId}-batch-agent` &&
@@ -1792,6 +1882,7 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       ],
       deduplicated: 0,
       queueDropped: 6,
+      queueParked: 4,
       protectedQueueDropped: 3,
       queueDroppedByClass: {
         tool_exec: 2,
@@ -1806,6 +1897,30 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       retryAttempts: 4,
       retryRecovered: 3,
       retryExhausted: 1,
+      retryParked: 1,
+      spoolReplayAttempts: 8,
+      spoolReplayAdmitted: 7,
+      spoolReplayDeferred: 1,
+      heartbeatDeliveryFailures: 2,
+      spoolRecords: 11,
+      spoolActiveRecords: 7,
+      spoolParkedRecords: 4,
+      spoolBytes: 4096,
+      spoolWalBytes: 8192,
+      spoolOldestAgeMs: 65_000,
+      spoolAtCapacity: false,
+      spoolFsyncMode: 'always',
+      controlPlaneState: 'degraded',
+      controlPlaneFailedLanes: ['runtime_snapshot', 'untrusted_lane'],
+      controlPlaneStartingLanes: [],
+      controlPlaneLanes: {
+        runtime_snapshot: {
+          lastSuccessAt: '2026-08-14T00:00:00.000Z',
+          lastFailureAt: '2026-08-14T00:00:01.000Z',
+          lastFailure: 'snapshot transport timed out',
+        },
+        untrusted_lane: { lastFailure: 'must be removed' },
+      },
       queueBytes: 1234,
       inflightEvents: 2,
       inflightBytes: 567,
@@ -1935,6 +2050,19 @@ async function verifyDirectForwarderHeartbeat(sourceId, token) {
       health.items?.[0]?.filterMetrics?.retryAttempts === 4 &&
       health.items?.[0]?.filterMetrics?.retryRecovered === 3 &&
       health.items?.[0]?.filterMetrics?.retryExhausted === 1 &&
+      health.items?.[0]?.filterMetrics?.queueParked === 4 &&
+      health.items?.[0]?.filterMetrics?.retryParked === 1 &&
+      health.items?.[0]?.filterMetrics?.spoolReplayAdmitted === 7 &&
+      health.items?.[0]?.filterMetrics?.heartbeatDeliveryFailures === 2 &&
+      health.items?.[0]?.filterMetrics?.spoolRecords === 11 &&
+      health.items?.[0]?.filterMetrics?.spoolParkedRecords === 4 &&
+      health.items?.[0]?.filterMetrics?.spoolOldestAgeMs === 65_000 &&
+      health.items?.[0]?.filterMetrics?.spoolFsyncMode === 'always' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneState === 'degraded' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.[0] === 'runtime_snapshot' &&
+      health.items?.[0]?.filterMetrics?.controlPlaneFailedLanes?.length === 1 &&
+      health.items?.[0]?.filterMetrics?.controlPlaneLanes?.runtime_snapshot?.lastFailure === 'snapshot transport timed out' &&
+      !Object.prototype.hasOwnProperty.call(health.items?.[0]?.filterMetrics?.controlPlaneLanes ?? {}, 'untrusted_lane') &&
       health.items?.[0]?.filterMetrics?.queueBytes === 1234 &&
       health.items?.[0]?.filterMetrics?.inflightEvents === 2 &&
       health.items?.[0]?.filterMetrics?.inflightBytes === 567 &&

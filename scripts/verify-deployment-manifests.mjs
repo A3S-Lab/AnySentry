@@ -186,6 +186,12 @@ function verifyAnySentryManifest() {
     anySentryComposeService,
   );
   assert(
+    'Redis Source current-state projection is explicitly coalesced in Kubernetes and Compose',
+    /ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:\s*"1000"/u.test(runtimeConfig?.source ?? '') &&
+      /^      ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:\s*\$\{ANYSENTRY_CURRENT_STATE_SOURCE_FLUSH_MS:-1000\}\s*$/mu.test(anySentryComposeService),
+    { runtimeConfig: runtimeConfig?.source, compose: anySentryComposeService },
+  );
+  assert(
     'API V8 heap is fenced below the container memory limit',
     /\{\s*name:\s*NODE_OPTIONS,\s*value:\s*"--max-old-space-size=1024"\s*\}/u.test(anySentryDeployment?.source ?? '') &&
       /^      NODE_OPTIONS:\s*\$\{ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024\}\s*$/mu.test(anySentryComposeService),
@@ -405,6 +411,12 @@ function verifyAnySentryManifest() {
     redisStatefulSet?.source,
   );
   assert(
+    'Redis reserves its recovered working set and bounded AOF replay headroom',
+    /requests:\s*\{\s*cpu:\s*100m,\s*memory:\s*1Gi\s*\}/u.test(redisStatefulSet?.source ?? '') &&
+      /limits:\s*\{\s*cpu:\s*"1",\s*memory:\s*2Gi\s*\}/u.test(redisStatefulSet?.source ?? ''),
+    redisStatefulSet?.source,
+  );
+  assert(
     'Fast Judge runs the asynchronous worker with the fast role',
     /dist\/security-monitoring\/worker-main\.js/u.test(fastJudge?.source ?? '') &&
       /\{\s*name:\s*ANYSENTRY_WORKER_ROLE,\s*value:\s*"fast"\s*\}/u.test(fastJudge?.source ?? ''),
@@ -442,7 +454,7 @@ function verifyStreamingManifest() {
   const docs = documentsFromYaml(readText('deploy/streaming.yaml'));
   const kafka = docFor(docs, 'StatefulSet', 'kafka');
   const kafkaService = docFor(docs, 'Service', 'kafka');
-  const topicManager = docFor(docs, 'Deployment', 'kafka-topic-manager');
+  const topicManager = docFor(docs, 'Job', 'kafka-topic-manager');
   const checkpointPvc = docFor(docs, 'PersistentVolumeClaim', 'flink-checkpoints');
   const jobManagerService = docFor(docs, 'Service', 'flink-jobmanager');
   const jobManager = docFor(docs, 'Deployment', 'flink-jobmanager');
@@ -479,7 +491,7 @@ function verifyStreamingManifest() {
     kafka?.source,
   );
   assert(
-    'Kafka topic manager reconciles all required event topics',
+    'Kafka topic manager creates all required topics once without a permanent process loop',
     [
       'anysentry.events.canonical.v1',
       'anysentry.judgments.v1',
@@ -487,7 +499,11 @@ function verifyStreamingManifest() {
       'anysentry.stream.findings.v1',
       'anysentry.supply-chain.context.v1',
       'anysentry.stream.dlq.v1',
-    ].every((topic) => topicManager?.source.includes(topic)),
+    ].every((topic) => topicManager?.source.includes(topic)) &&
+      /restartPolicy:\s*OnFailure/u.test(topicManager?.source ?? '') &&
+      /backoffLimit:\s*20/u.test(topicManager?.source ?? '') &&
+      /ttlSecondsAfterFinished:\s*600/u.test(topicManager?.source ?? '') &&
+      !/while\s+true|sleep\s+60/u.test(topicManager?.source ?? ''),
     topicManager?.source,
   );
   assert(
@@ -630,6 +646,15 @@ function verifyObserverManifest() {
     /\{\s*name:\s*ANYSENTRY_IDENTITY_SNAPSHOT_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/identity\/snapshot"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES,\s*value:\s*"4194304"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_MAX_INFLIGHT,\s*value:\s*"4"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY,\s*value:\s*"262144"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*A3S_OBSERVER_BULK_INBOX_CAPACITY,\s*value:\s*"65536"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_CONTROL_HTTP_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_WAL_PENDING_MAX_EVENTS,\s*value:\s*"65536"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_WAL_PENDING_MAX_BYTES,\s*value:\s*"268435456"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /requests:\s*\{\s*cpu:\s*50m,\s*memory:\s*256Mi\s*\}/u.test(daemonSet?.source ?? '') &&
+      /limits:\s*\{\s*memory:\s*2Gi\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_BATCH_MAX_BYTES,\s*value:\s*"524288"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_EVENT_BYTES,\s*value:\s*"3145728"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_MAX_OUTSTANDING_EVENTS,\s*value:\s*"16384"\s*\}/u.test(daemonSet?.source ?? '') &&
@@ -639,7 +664,13 @@ function verifyObserverManifest() {
       /\{\s*name:\s*FORWARD_RETRY_BASE_DELAY_MS,\s*value:\s*"250"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETRY_MAX_DELAY_MS,\s*value:\s*"2000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_RETRY_MAX_AGE_MS,\s*value:\s*"45000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_REPLAY_INTERVAL_MS,\s*value:\s*"500"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_REPLAY_BATCH_SIZE,\s*value:\s*"256"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_DEGRADED_AGE_MS,\s*value:\s*"60000"\s*\}/u.test(daemonSet?.source ?? '') &&
       /\{\s*name:\s*FORWARD_SHUTDOWN_TIMEOUT_MS,\s*value:\s*"15000"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*FORWARD_SPOOL_PATH,\s*value:\s*"\/var\/lib\/anysentry-forwarder\/spool\.wal"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /name:\s*forwarder-spool[\s\S]*mountPath:\s*\/var\/lib\/anysentry-forwarder/u.test(daemonSet?.source ?? '') &&
+      /name:\s*forwarder-spool[\s\S]*hostPath:\s*\{\s*path:\s*\/var\/lib\/anysentry-forwarder,\s*type:\s*DirectoryOrCreate\s*\}/u.test(daemonSet?.source ?? '') &&
       !/\{\s*name:\s*FORWARD_MAX_QUEUE(?:_BYTES)?,/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );

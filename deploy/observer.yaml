@@ -60,6 +60,11 @@ spec:
             privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
+            # F0 reduces steady-state bulk traffic before Ring reservation; this bounded lane
+            # absorbs startup/profile convergence and short host-disk stalls without borrowing
+            # Critical or Semantic capacity. The Collector hard-caps the value at 262144.
+            - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "262144" }
+            - { name: A3S_OBSERVER_BULK_INBOX_CAPACITY, value: "65536" }
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
             # Set to "0" to reduce footprint on a busy node.
@@ -130,6 +135,12 @@ spec:
             # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
+            # Four concurrent bounded batches cover measured throughput while leaving the single
+            # API event loop responsive to identity/rule/runtime control requests.
+            - { name: FORWARD_MAX_INFLIGHT, value: "4" }
+            # A deadline is still strict, but an already-arrived response gets one I/O turn before
+            # an overdue timer aborts it after a synchronous data-plane burst.
+            - { name: FORWARD_CONTROL_HTTP_TIMEOUT_MS, value: "15000" }
             # Events are removed only after an item-level durable ack. The hostPath survives
             # container/Pod restarts; when full, stdin is paused instead of dropping evidence.
             - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
@@ -137,6 +148,14 @@ spec:
             - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
             - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
             - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
+            # A retry deadline parks evidence in the WAL; the same process continuously redrives
+            # bounded priority batches, so recovery never depends on a container restart.
+            - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }
+            - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "256" }
+            - { name: FORWARD_SPOOL_DEGRADED_AGE_MS, value: "60000" }
+            - { name: FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS, value: "16384" }
+            - { name: FORWARD_WAL_PENDING_MAX_EVENTS, value: "65536" }
+            - { name: FORWARD_WAL_PENDING_MAX_BYTES, value: "268435456" }
             - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
             - { name: FORWARD_MAX_EVENT_BYTES, value: "3145728" }
             - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
@@ -158,10 +177,10 @@ spec:
             - { name: filter-rules, mountPath: /run/anysentry-filter }
             - { name: forwarder-spool, mountPath: /var/lib/anysentry-forwarder }
           resources:
-            requests: { cpu: 50m, memory: 128Mi }
-            # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
-            # co-located node forwarder. No CPU limit: a tracer shouldn't be throttled into dropping.
-            limits: { memory: 1Gi }
+            requests: { cpu: 50m, memory: 256Mi }
+            # 2Gi covers streaming recovery of a 250k-record WAL plus the bounded 131k bulk export
+            # reserve. No CPU limit: a tracer should not be throttled into dropping kernel events.
+            limits: { memory: 2Gi }
       volumes:
         - { name: sys, hostPath: { path: /sys } }
         - { name: agent-templates, configMap: { name: anysentry-agent-templates } }

@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type AgentEventCategory,
+  type CollectorHealthChannel,
   type CollectorHealthItem,
   type CollectorHealthQuery,
   type CollectorHealthState,
@@ -81,6 +82,36 @@ function stateClass(state?: CollectorHealthState) {
   return "border-teal-400/30 bg-teal-500/10 text-teal-100";
 }
 
+function channelClass(state?: CollectorHealthChannel["state"]) {
+  if (state === "degraded") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (state === "warning") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  if (state === "unknown") return "border-zinc-500/30 bg-zinc-500/10 text-zinc-300";
+  return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+}
+
+const CHANNEL_REASON_LABELS: Record<string, string> = {
+  heartbeat_unavailable: "暂无对应心跳",
+  capture_pipeline_loss: "采集链路发生丢失",
+  capture_aggregate_ledger_degraded: "采集聚合账本异常",
+  capture_accounting_not_conserved: "采集计数不守恒",
+  permanent_output_loss: "存在永久输出丢失",
+  protected_queue_pressure: "高优先级队列承压",
+  spool_at_capacity: "WAL 已到容量上限",
+  spool_backlog_over_slo: "WAL 积压超过 SLO",
+  queue_parked: "事件已停放到 WAL",
+  retry_parked: "在线重试耗尽后已停放",
+  heartbeat_delivery_failed: "Forwarder 心跳发送失败",
+  spool_backlog: "WAL 存在待确认记录",
+  delivery_backlog_aged: "投递积压时间偏长",
+  control_plane_starting: "控制面尚在初始化",
+  capture_profile_lkg_degraded: "Capture Profile 使用降级 LKG",
+  filter_projection_degraded: "过滤规则投影异常",
+  identity_snapshot_not_ready: "身份快照未就绪",
+  capture_recovering_after_recent_failure: "采集链路正在确认恢复",
+  delivery_recovering_after_recent_failure: "投递链路正在确认恢复",
+  control_recovering_after_recent_failure: "控制面正在确认恢复",
+};
+
 function Pill({ children, className }: { children: string; className?: string }) {
   return (
     <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold", className)}>
@@ -104,6 +135,36 @@ function FieldValue({ label, value }: { label: string; value?: string | number }
       <p className="text-[11px] text-zinc-600">{label}</p>
       <p className="mt-1 truncate font-mono text-xs text-zinc-300" title={String(value ?? "")}>
         {value ?? "--"}
+      </p>
+    </div>
+  );
+}
+
+function ChannelHealthCard({
+  label,
+  path,
+  channel,
+}: {
+  label: string;
+  path: string;
+  channel: CollectorHealthChannel;
+}) {
+  const reasons = channel.reasons.map((reason) =>
+    CHANNEL_REASON_LABELS[reason] ?? (reason.startsWith("control_") ? `控制通道异常：${reason.slice(8).replace(/_failed$/u, "")}` : reason));
+  return (
+    <div className="rounded-[8px] border border-white/10 bg-white/[0.025] p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-zinc-200">{label}</p>
+          <p className="mt-0.5 truncate text-[11px] text-zinc-600">{path}</p>
+        </div>
+        <Pill className={channelClass(channel.state)}>{channel.stateText}</Pill>
+      </div>
+      <p className="mt-3 min-h-8 text-xs leading-4 text-zinc-400">
+        {reasons.length ? reasons.join(" · ") : "当前通道没有异常证据"}
+      </p>
+      <p className="mt-2 font-mono text-[10px] text-zinc-600">
+        bad {channel.consecutiveBad} · clean {channel.consecutiveClean}
       </p>
     </div>
   );
@@ -230,6 +291,18 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
       </div>
 
       <div className="space-y-4 p-4">
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-zinc-300">当前链路状态</p>
+            <p className="text-[11px] text-zinc-600">所选时间范围只影响下方历史统计</p>
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            <ChannelHealthCard label="Capture" path="eBPF → Ring → Collector" channel={collector.healthChannels.capture} />
+            <ChannelHealthCard label="Delivery" path="Forwarder → WAL → API" channel={collector.healthChannels.delivery} />
+            <ChannelHealthCard label="Control" path="Identity → Rules → Runtime Snapshot" channel={collector.healthChannels.control} />
+          </div>
+        </div>
+
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <FieldValue label="Collector" value={collector.collectorId} />
           <FieldValue label="Node" value={collector.nodeName} />
@@ -246,7 +319,7 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           <MetricTile label="窗口事件" value={collector.eventCount} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
           <MetricTile label="速率" value={`${collector.eventRatePerMin}/m`} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
           <MetricTile label="Agent 覆盖" value={collector.observedAgentCount} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
-          <MetricTile label="丢弃" value={collector.droppedEvents + collector.outputDropped} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
+          <MetricTile label="当前永久丢失" value={collector.droppedEvents + collector.outputDropped} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-3">
@@ -254,6 +327,8 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           <FieldValue label="Output Dropped" value={collector.outputDropped} />
           <FieldValue label="Queue Depth" value={collector.queueDepth} />
           <FieldValue label="Errors" value={collector.errorCount} />
+          <FieldValue label="所选窗口 Drop 峰值" value={`${collector.windowErrorMaxima.droppedEvents} / ${collector.windowErrorMaxima.outputDropped}`} />
+          <FieldValue label="所选窗口 Error 峰值" value={collector.windowErrorMaxima.errorCount} />
           <FieldValue label="Workspaces" value={collector.observedWorkspaceCount} />
           <FieldValue label="Message" value={collector.message} />
         </div>
@@ -474,10 +549,11 @@ export default function CollectorsPage() {
 
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <MetricTile label="Collector" value={data?.summary.totalCollectors ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
             <MetricTile label="健康" value={data?.summary.healthyCollectors ?? 0} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
-            <MetricTile label="降级" value={(data?.summary.degradedCollectors ?? 0) + (data?.summary.quietCollectors ?? 0)} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+            <MetricTile label="提醒" value={data?.summary.warningCollectors ?? 0} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+            <MetricTile label="降级" value={data?.summary.degradedCollectors ?? 0} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
             <MetricTile label="断流" value={(data?.summary.downCollectors ?? 0) + (data?.summary.staleCollectors ?? 0)} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
             <MetricTile label="窗口事件" value={data?.summary.observedEventCount ?? 0} tone="border-sky-400/25 bg-sky-500/10 text-sky-100" />
           </div>

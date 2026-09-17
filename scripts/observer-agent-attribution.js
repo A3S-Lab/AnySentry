@@ -409,6 +409,55 @@ class AgentAttributor {
     return cached.startTime;
   }
 
+  /**
+   * Memoize an immutable unified-rule negative root so immediately spawned helpers inherit the
+   * same Non-Agent provenance through ProcessKey ancestry. Exit-only observations are never
+   * reinserted after lifecycle cleanup, and PID reuse remains fenced by start/cgroup identity.
+   */
+  rememberTrustedNonAgent(observerEvent, ruleId) {
+    const normalizedRuleId = text(ruleId);
+    if (!normalizedRuleId || Object.hasOwn(observerEvent?.event ?? {}, 'ProcessExit')) return false;
+    const payload = eventPayload(observerEvent);
+    const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
+      ? observerEvent.process
+      : {};
+    const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
+    if (!pid) return false;
+    const observed = {
+      hostId: text(processInfo.hostId) || text(processInfo.host_id) || this.hostId,
+      bootId: text(processInfo.bootId) || text(processInfo.boot_id) || this.bootId,
+      pid,
+      tgid: positiveInt(processInfo.tgid),
+      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
+      startTime: text(
+        processInfo.startTimeTicks ?? processInfo.start_time_ticks
+        ?? processInfo.startTimeNs ?? processInfo.start_time_ns,
+      ),
+      cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
+      comm: text(processInfo.comm),
+      exe: text(processInfo.exe),
+      argv: argvText(payload.argv),
+      cgroup: text(processInfo.cgroup),
+      cwd: text(processInfo.cwd) || text(payload.cwd),
+    };
+    this.discardReusedPid(observed);
+    const cached = this.procs.getFor(observed, !observed.startTime);
+    const now = this.now();
+    this.remember({
+      ...(cached ?? {}),
+      ...observed,
+      ppid: observed.ppid || cached?.ppid,
+      startTime: observed.startTime || cached?.startTime,
+      cgroupId: observed.cgroupId || cached?.cgroupId,
+      state: 'non_agent',
+      nonAgentRuleId: normalizedRuleId,
+      evidence: [`filter_rule:${normalizedRuleId}:r1`, 'process_family:trusted_non_agent'],
+      lastSeen: now,
+      nextResolveAt: now + Math.max(5_000, this.negativeTtlMs),
+    });
+    return true;
+  }
+
   agentInstanceId(agentId, rootKey) {
     return `ari_${crypto.createHash('sha256')
       .update(text(agentId))
@@ -1111,7 +1160,7 @@ class AgentAttributor {
     // ProcessExit re-evaluate because they are lifecycle/high-signal boundaries and can repair
     // out-of-order parent information.
     if (!toolExec && !exiting && existing?.nextResolveAt > now) {
-      if (existing.state === 'non_agent') return this.nonAgentResult();
+      if (existing.state === 'non_agent') return this.nonAgentResult(existing);
       return this.unknown();
     }
 
@@ -1178,15 +1227,27 @@ class AgentAttributor {
     }
 
     if (ancestry.state === 'non_agent') {
-      this.remember({ ...current, state: 'non_agent', lastSeen: now });
-      return this.finish(pid, this.nonAgentResult(), exiting, current);
+      const record = {
+        ...current,
+        state: 'non_agent',
+        nonAgentRuleId: ancestry.nonAgentRuleId,
+        evidence: ancestry.evidence,
+        lastSeen: now,
+        nextResolveAt: ancestry.nonAgentRuleId
+          ? now + Math.max(5_000, this.negativeTtlMs)
+          : undefined,
+      };
+      this.remember(record);
+      return this.finish(pid, this.nonAgentResult(record), exiting, current);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
     return this.finish(pid, this.unknown(), exiting, current);
   }
 
-  nonAgentResult() {
+  nonAgentResult(record = {}) {
+    const ruleId = text(record.nonAgentRuleId);
+    const evidence = Array.isArray(record.evidence) ? record.evidence.map(text).filter(Boolean) : [];
     return {
       state: 'non_agent',
       attribution: {
@@ -1195,7 +1256,10 @@ class AgentAttributor {
         confidence: 1,
         reason: 'not_agent',
         source: 'process_graph',
-        evidence: ['process_lineage:pid1'],
+        evidence: [...new Set([
+          ...evidence,
+          ...(ruleId ? [`filter_rule:${ruleId}:r1`, 'process_lineage:trusted_non_agent_family'] : ['process_lineage:pid1']),
+        ])].slice(0, 16),
       },
     };
   }
@@ -1274,7 +1338,11 @@ class AgentAttributor {
       }
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
       if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
-        return { state: 'non_agent' };
+        return {
+          state: 'non_agent',
+          nonAgentRuleId: cached.nonAgentRuleId,
+          evidence: cached.evidence,
+        };
       }
       if (pid === 1) return { state: 'non_agent' };
 
@@ -1287,7 +1355,9 @@ class AgentAttributor {
       }
 
       const live = this.readProcess(pid, 'ancestry');
-      if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
+      if (!live) return cached?.state === 'non_agent'
+        ? { state: 'non_agent', nonAgentRuleId: cached.nonAgentRuleId, evidence: cached.evidence }
+        : { state: 'unknown' };
       this.discardReusedPid(live);
 
       const containerScope = this.matchInfrastructure(live);
