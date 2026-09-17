@@ -1119,3 +1119,18 @@ capacity. Classic SSL WIP (Observer dirty tree) untouched.
 
 Phase D code fixes remain local (uncommitted→commit this turn) pending tip
 redeploy when gate GO.
+
+### 2026-09-17 empty-alias verifier + Δ60s no-gap (capacity NO-GO)
+
+Capacity still **NO-GO** (PSI io≈54–56%, nvme≈91–102%, D-state≈10–18).
+Forwarder spool `/var/lib/anysentry-forwarder/spool-clean-20260915.wal` ≈36Mi —
+active WAL, **not** disposable (no truncate).
+
+`scripts/verify-empty-route-alias-repair.mjs` **PASS** (4 repair cases + hop
+fence distinct + controller multi-hot membership source assert). Semantic
+dist fixture skipped (`BigInt` mock gap under stale dist).
+
+Tip Δ60s ambient (uptime 1934→2023): raw/kernel/derived Δdrops **0**;
+`asyncRawBatchQueueRows` 1772→305 (flush progressing under stall); cap 16384.
+Classic SSL WIP / labeled Design B still open; tip redeploy of Phase D fixes
+deferred until gate GO.

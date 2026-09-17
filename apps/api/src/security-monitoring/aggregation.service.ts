@@ -67,7 +67,7 @@ import {
   projectConversationTimeline,
 } from './agent-conversation';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
-import { trafficRoleForInteraction } from './agent-conversation-resolution-v2';
+import { trafficRoleForInteraction, repairEmptyRouteAliasConversationId } from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
 import {
@@ -3419,7 +3419,13 @@ export class AggregationService implements OnModuleDestroy {
         requestedConversationId,
         5_000,
       );
-      if (requestedMembership.interactionIds.length) {
+      const repaired = repairEmptyRouteAliasConversationId({
+        requestedConversationId,
+        aliasCanonicalConversationId: initialConversationId,
+        aliasMembershipIds: membershipSelection?.interactionIds ?? [],
+        requestedMembershipIds: requestedMembership.interactionIds,
+      });
+      if (repaired === requestedConversationId) {
         initialConversationId = requestedConversationId;
         membershipSelection = requestedMembership;
       }

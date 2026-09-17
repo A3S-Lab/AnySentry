@@ -5,6 +5,15 @@ import {
   canonicalParentSessionIdForMembership,
   resolveLogicalAgentDefinition,
 } from './canonical-observability';
+import {
+  hopConversationFenceValue,
+  repairEmptyRouteAliasConversationId,
+} from './agent-conversation-route-alias-repair';
+
+export {
+  repairEmptyRouteAliasConversationId,
+  hopConversationFenceValue,
+} from './agent-conversation-route-alias-repair';
 
 export const AGENT_CONVERSATION_RESOLVER_V2 = 2;
 
@@ -515,13 +524,7 @@ export function conversationLogicalScopeKeyV2(record: T.AgentInteractionRecord):
  * use the same fence or route aliases collapse parent+child into one empty canonical Thread.
  */
 export function hopConversationFence(record: T.AgentInteractionRecord): string {
-  const hop = record.hop?.trim().toLowerCase();
-  if (hop === 'orchestrator' || hop === 'worker') return `\u0000hop:${hop}`;
-  const header = record.agentIdHeader?.trim().toLowerCase() ?? '';
-  if (header.includes('orchestrator') || header.includes('worker')) {
-    return `\u0000agent-id:${header}`;
-  }
-  return '';
+  return hopConversationFenceValue(record.hop, record.agentIdHeader);
 }
 
 function conversationHopScopeKey(record: T.AgentInteractionRecord): string {
