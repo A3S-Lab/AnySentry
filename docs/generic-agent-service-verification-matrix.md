@@ -904,3 +904,11 @@ kernel byte-bound/close drops. Tip digest image not yet rebuilt under NO-GO I/O;
 live pod still reports historical rawDrop=2115 which may include misattributed
 kernel overflows until tip redeploy.
 
+### 2026-09-17 KernelFact lane capacity isolation
+
+Kernel durable batches no longer share `asyncPersistenceInFlight` with raw.
+New bounded pool `ANYSENTRY_CANONICAL_ASYNC_KERNEL_MAX_INFLIGHT` (default 4)
+with `asyncKernelPersistenceInFlight` metrics. Verifier confirms kernel flush
+proceeds while a raw side-lane slot is held. Host capacity remains NO-GO
+(PSI io / nvme); tip digest redeploy deferred.
+

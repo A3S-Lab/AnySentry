@@ -359,16 +359,24 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     0,
     2_000,
   );
-  // Keep derived semantic/session/evidence writes from being starved by raw/kernel batches.
-  // Both pools remain bounded; this is capacity isolation, not an unbounded retry queue.
+  // Keep derived semantic/session/evidence writes from being starved by raw batches.
+  // KernelFacts use a third bounded pool so kernel durable delivery cannot fill raw slots
+  // (and vice versa). All pools remain bounded; this is capacity isolation, not unbounded retry.
   private readonly asyncDerivedPersistenceMaxInFlight = boundedEnvInt(
     'ANYSENTRY_CANONICAL_ASYNC_DERIVED_MAX_INFLIGHT',
     4,
     1,
     32,
   );
+  private readonly asyncKernelPersistenceMaxInFlight = boundedEnvInt(
+    'ANYSENTRY_CANONICAL_ASYNC_KERNEL_MAX_INFLIGHT',
+    4,
+    1,
+    32,
+  );
   private asyncPersistenceInFlight = 0;
   private asyncDerivedPersistenceInFlight = 0;
+  private asyncKernelPersistenceInFlight = 0;
   private asyncPersistenceScheduled = 0;
   private asyncPersistenceCompleted = 0;
   private asyncPersistenceFailed = 0;
@@ -611,7 +619,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   /** Batch derived KernelFacts as well as raw observations; one SQL round trip per bounded block. */
   private enqueueKernelFact(fact: KernelFact, onFailure: () => void): boolean {
     if (!this.sink || this.closed) return false;
-    const capacity = this.asyncPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
+    const capacity = this.asyncKernelPersistenceMaxInFlight * this.asyncRawBatchMaxRows;
     const bytes = Buffer.byteLength(JSON.stringify(fact));
     if (this.asyncKernelBatchQueue.length >= capacity
       || this.asyncKernelBatchQueueBytes + bytes > this.asyncKernelBatchMaxBytes) {
@@ -639,7 +647,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
 
   private async flushKernelFactBatch(): Promise<void> {
     if (this.asyncKernelBatchQueue.length === 0 || this.closed) return;
-    if (this.asyncPersistenceInFlight >= this.asyncPersistenceMaxInFlight) {
+    if (this.asyncKernelPersistenceInFlight >= this.asyncKernelPersistenceMaxInFlight) {
       if (!this.asyncKernelBatchTimer) {
         this.asyncKernelBatchTimer = setTimeout(() => {
           this.asyncKernelBatchTimer = undefined;
@@ -651,7 +659,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     }
     const batch = this.asyncKernelBatchQueue.splice(0, this.asyncRawBatchMaxRows);
     this.asyncKernelBatchQueueBytes -= batch.reduce((sum, item) => sum + item.bytes, 0);
-    this.asyncPersistenceInFlight += 1;
+    this.asyncKernelPersistenceInFlight += 1;
     const task = Promise.resolve()
       .then(() => this.sink?.saveKernelFacts?.(batch.map(({ fact }) => fact)) ?? false)
       .then((durable) => {
@@ -666,7 +674,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         for (const item of batch) { try { item.onFailure(); } catch { /* best effort */ } }
       })
       .finally(() => {
-        this.asyncPersistenceInFlight = Math.max(0, this.asyncPersistenceInFlight - 1);
+        this.asyncKernelPersistenceInFlight = Math.max(0, this.asyncKernelPersistenceInFlight - 1);
         this.asyncPersistenceTasks.delete(task);
         if (this.asyncKernelBatchQueue.length > 0) void this.flushKernelFactBatch();
       });
@@ -1722,6 +1730,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     asyncPersistenceMaxInFlight: number;
     asyncDerivedPersistenceInFlight: number;
     asyncDerivedPersistenceMaxInFlight: number;
+    asyncKernelPersistenceInFlight: number;
+    asyncKernelPersistenceMaxInFlight: number;
     asyncPersistenceScheduled: number;
     asyncPersistenceCompleted: number;
     asyncPersistenceFailed: number;
@@ -1760,6 +1770,8 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       asyncPersistenceMaxInFlight: this.asyncPersistenceMaxInFlight,
       asyncDerivedPersistenceInFlight: this.asyncDerivedPersistenceInFlight,
       asyncDerivedPersistenceMaxInFlight: this.asyncDerivedPersistenceMaxInFlight,
+      asyncKernelPersistenceInFlight: this.asyncKernelPersistenceInFlight,
+      asyncKernelPersistenceMaxInFlight: this.asyncKernelPersistenceMaxInFlight,
       asyncPersistenceScheduled: this.asyncPersistenceScheduled,
       asyncPersistenceCompleted: this.asyncPersistenceCompleted,
       asyncPersistenceFailed: this.asyncPersistenceFailed,

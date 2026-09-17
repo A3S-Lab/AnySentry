@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const { CanonicalObservabilityService } = require('../apps/api/dist/security-monitoring/canonical-observability.service.js');
 process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST = 'on';
 process.env.ANYSENTRY_CANONICAL_ASYNC_PERSIST_MAX_INFLIGHT = '1';
+process.env.ANYSENTRY_CANONICAL_ASYNC_KERNEL_MAX_INFLIGHT = '1';
 process.env.ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_ROWS = '4';
 process.env.ANYSENTRY_CANONICAL_ASYNC_RAW_BATCH_WINDOW_MS = '10';
 process.env.ANYSENTRY_CANONICAL_ASYNC_KERNEL_BATCH_MAX_BYTES = '65536';
@@ -21,6 +22,7 @@ service.setSink({
   saveKernelFacts: async rows => { facts.push(rows); return true; },
 });
 try {
+  // Occupy the raw shared slot; kernel must still flush on its own pool.
   let release;
   await service.writeCanonicalSideLane(() => new Promise(resolve => { release = resolve; }), () => {}, 'raw');
   const results = [];
@@ -31,12 +33,12 @@ try {
     }));
   }
   assert(results.every(result => result.kernelFact && !result.durable));
-  await delay(30);
-  assert.equal(facts.length, 0);
-  assert.equal(service.gapStats().asyncKernelBatchQueueRows, 3);
-  assert(service.gapStats().asyncKernelBatchQueueBytes > 0);
+  await until(() => facts.length === 1);
+  assert.equal(facts.length, 1, 'kernel lane must flush while raw inFlight is saturated');
+  assert.equal(service.gapStats().asyncKernelBatchQueueRows, 0);
+  assert.equal(raw.length, 0, 'raw flush must wait for its own slot');
   release(true);
-  await until(() => facts.length === 1 && raw.length === 3 && service.gapStats().asyncPersistenceInFlight === 0);
+  await until(() => raw.length === 3 && service.gapStats().asyncPersistenceInFlight === 0);
   assert.equal(raw.length, 3);
   assert.deepEqual(facts[0].map(fact => fact.factId), results.map(result => result.kernelFact.factId));
   assert.equal(service.gapStats().asyncKernelBatchQueueBytes, 0);
@@ -48,7 +50,7 @@ try {
   service.enqueueKernelFact(results[0].kernelFact, () => failures++);
   await until(() => failures === 1);
   assert.equal(service.gapStats().asyncPersistenceFailed, failedBefore + 1);
-  await until(() => service.gapStats().asyncPersistenceInFlight === 0);
+  await until(() => service.gapStats().asyncKernelPersistenceInFlight === 0);
 
   const oversized = { ...results[0].kernelFact, sourceRefs: ['x'.repeat(65536)] };
   const rawDroppedBefore = service.gapStats().asyncRawPersistenceDropped;
@@ -77,4 +79,4 @@ try {
   await delay(30);
   assert.equal(failures, 3, 'cancelled timer must not write or report failure twice');
 } finally { service.close(); }
-console.log('PASS kernel batching, shared capacity recovery, failed sink, byte bounds and close accounting');
+console.log('PASS kernel batching isolation, failed sink, byte bounds and close accounting');
