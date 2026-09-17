@@ -1004,3 +1004,16 @@ Slim OCI overlay `rawq-44db727` / manifest `9becbbf8…` built (40KiB) but
 `k3s ctr import --local --no-unpack` timed out under capacity **NO-GO**
 (load≈25/16, PSI io≈67%, nvme≈98%). Live tip remains `dc90e4f3…`. Tip redeploy
 and labeled Design B deferred until gate GO. Classic SSL WIP untouched.
+
+### 2026-09-17 rawq hostPath interim on tip (digest import blocked)
+
+`ctr content ingest` of overlay blobs succeeded, but `images import` still timed
+out under NO-GO I/O. Applied interim hostPath overlay of tip
+`canonical-observability.service.js` (`44db727`) onto digest `dc90e4f3…` with
+`RAW_BATCH_ROWS=1024`, `RAW_QUEUE_BATCHES=16` (capacity 16384).
+
+Pod `anysentry-79b8f7874b-n5lwb` Ready: in-pod `HAS_RAWQ`, healthz
+`asyncRawQueueCapacityRows=16384`, `asyncRawBatchMaxRows=1024`. Post-start
+counters reset; Δ60s ambient raw/kernel/derived drops **0** (queue absorbed).
+Replace hostPath with digest `9becbbf8…` / `rawq-44db727` when gate GO.
+Classic SSL WIP untouched; labeled Design B still deferred.
