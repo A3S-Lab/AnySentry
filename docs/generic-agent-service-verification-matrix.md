@@ -1134,3 +1134,28 @@ Tip Δ60s ambient (uptime 1934→2023): raw/kernel/derived Δdrops **0**;
 `asyncRawBatchQueueRows` 1772→305 (flush progressing under stall); cap 16384.
 Classic SSL WIP / labeled Design B still open; tip redeploy of Phase D fixes
 deferred until gate GO.
+
+### 2026-09-17 Phase D live on hostPath overlay tip (capacity NO-GO)
+
+Capacity still **NO-GO** (PSI io≈48–64%, nvme≈92–104%). Digest rebuild deferred;
+applied k8s-light **hostPath** overlay of Phase D tip JS (`410d082` + multi-hot
+controller / empty-alias aggregation) onto digest `9becbbf8…`.
+
+Pod `anysentry-b469d4444-sscf4` Ready (~3m Nest start under I/O); in-pod
+`HAS_REPAIR` / `HAS_MULTI_HOT`; async raw/kernel/derived drops **0**.
+
+Host Design B (uvicorn, no docker) run `9abdb257-7ebc-42e2-bcec-6d9b93365e70`
+/ `delegation_id=95fbee06-…` → `completed`/`pass`, stdout `3 + 5 = 8`.
+
+| check | result |
+| --- | --- |
+| interactions | **6**, hops orch/worker, paths `/runs` `/v1/chat/completions` `/execute` |
+| directory | parent `cv_bcb9354d…` + worker `cv_5cf0647a…`; both complete; related `exact` |
+| parent timeline-v3 | **6** events incl. **`delegation_send`/`delegation_reply`** (no empty alias) |
+| worker timeline-v3 | **7** events incl. `tool_call`/`tool_result` |
+| Session `sess_387318e4…` | coverage complete 6/0 |
+| Session timeline | hot-fallback **13** events; hops **orchestrator+worker**; hasDeleg |
+| async post-run | raw/kernel/derived **0** |
+
+Lab ports cleaned. Overlay replaces digest tip for these four JS files until
+flat OCI redeploy when gate GO. Classic SSL WIP / labeled Design B still open.
