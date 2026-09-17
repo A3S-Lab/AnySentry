@@ -966,3 +966,22 @@ Against digest `dc90e4f3…` / pod `anysentry-5867c447f8-ckj5t`:
 **Coverage boundary:** host attribution; labeled Design B still blocked by
 capacity NO-GO (`docker create`). Classic SSL WIP untouched.
 
+### 2026-09-17 ambient raw-gap after host Design B; lab cleaned
+
+Host Design B uvicorn lab (`:18088/:18090/:18091/:18092`) stopped after evidence.
+Observer spool ≈24–26Mi (`spool-clean-20260915.wal`) — no disposable truncate.
+Capacity remains **NO-GO** (PSI io full≈57%, nvme util≈99%, load≈19/16).
+
+On digest `dc90e4f3…` after ~22m uptime, ambient host I/O pressure produced
+raw-lane CoverageGaps while kernel/derived stayed flat (isolation holds):
+
+| sample | uptime s | rawDrop | kernelDrop | derivedDrop |
+| --- | ---: | ---: | ---: | ---: |
+| post Design B point-read | ~1120 | 0 | 0 | 0 |
+| capacity snapshot | 1317 | 511 | 0 | 0 |
+| before lab stop | 1344 | 2266 | 0 | 0 |
+| Δ60s after lab stop | 1407 | 2332 (+66) | 0 | 0 |
+
+Sustained no-gap and labeled Design B remain open under NVMe saturation; do not
+widen capture. Classic SSL WIP untouched.
+
