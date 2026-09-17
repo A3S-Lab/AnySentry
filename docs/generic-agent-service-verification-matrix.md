@@ -1263,3 +1263,14 @@ mounted; registry `:5000` down).
 
 Capacity at sample end: PSI10≈17.7, nvme util≈94% → still **NO-GO**. Phase E
 pure-digest tip / labeled Design B / live classic SSL remain open.
+
+### 2026-09-17 loopback registry restored (base still missing)
+
+`docker run` of `anysentry-local-registry` initially **timed out** under NO-GO;
+retry `docker start` on Created container succeeded: `127.0.0.1:5000` **v2=200**,
+bound to loopback. Registry `_catalog` only has `learning/python-test` — tip base
+`anysentry@sha256:9becbbf8…` / tag `rawq-44db727` is present in **k3s containerd**
+(~114Mi) but **not** in the registry volume, so `publish-local-oci-overlay.mjs`
+cannot fetch the base yet. Overlay stage `/tmp/anysentry-phase-d-overlay-stage`
+SHA-matches live hostPath tip. Capacity still **NO-GO** (PSI≈37–42, nvme≈94–100%)
+— defer ctr→registry base re-push and digest tip roll.
