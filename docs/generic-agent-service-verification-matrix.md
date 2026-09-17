@@ -931,10 +931,38 @@ Docker `Created` leftovers pruned (`docker_created=0`).
 
 ### 2026-09-17 capacity watch (concurrent with deploy)
 
-`check-host-capacity.sh` remains **NO-GO** (post-rollout sample):
-load1≈15 / 16 CPUs; MemAvailable≈20Gi; swap≈3.5Gi; disk≈81%;
-PSI io full avg10≈52%; nvme util≈98%; D-state≈7
+`check-host-capacity.sh` remains **NO-GO** (post-rollout / post Design B samples):
+load1≈13–15 / 16 CPUs; MemAvailable≈20Gi; swap≈3.5Gi; disk≈81%;
+PSI io full avg10≈43–54%; nvme util≈95–98%; D-state≈7–13
 (postgres checkpointer/bgwriter/autovacuum, a3s-observer-collector, jbd2/flush).
-CPU PSI near zero. Prefer docs/k8s-light; defer labeled Design B / compose
-until gate GO.
+CPU PSI near zero. Observer spool `spool-clean-20260915.wal` ≈28Mi — no disposable
+WAL truncate. Prefer docs/k8s-light / host uvicorn; defer labeled Design B /
+compose until gate GO.
+
+### 2026-09-17 host Design B on kernel-isol tip
+
+Restored host sandbox `:18088` (uvicorn `sandbox.api`); existing host orchestrator
+`:18090` / worker `:18091` / tool-mocks `:18092`. Controlled POST `/runs`
+goal `用 Python 计算 2+2 并打印结果` → `status=completed`, `verify_status=pass`,
+sandbox stdout `2+2 = 4`, `run_id=session_id=1e81be2b-d632-4394-8eff-01898643bfba`,
+`trace_id=5a99018df299f7903ab3fe3e1146eb39`,
+`delegation_id=016e707a-a381-42c1-92b3-eed98201564b`.
+
+Against digest `dc90e4f3…` / pod `anysentry-5867c447f8-ckj5t`:
+
+- `POST /agents/interactions`: **6** items, `coverage.completeness=exact_as_observed`,
+  `partial=false`, paths `/v1/chat/completions` `/execute` `/runs`, hops
+  `orchestrator`/`worker`, all `captureSource=tcp_plaintext`.
+- Session `sess_505d6eda5b8ced244184599d` coverage
+  `status=complete`, `completeInteractions=6`, `partialInteractions=0`
+  (parent `sess_5c5cc2b7e62502493ec19b6e`).
+- EvidenceLinks for run: **3** (2 **strong** `network_effect` /
+  `executes_as` → `kf_b0cb034…` network + `kf_9475237…` exec with
+  `authority=attested_observer`; 1 unmatched `executes_as`).
+- Conversation directory: two `coverage=complete` conversations under
+  host product `user@1001.service` (no Docker labels).
+- Post-run async raw/kernel/derived/persistence dropped **0** / failed **0**.
+
+**Coverage boundary:** host attribution; labeled Design B still blocked by
+capacity NO-GO (`docker create`). Classic SSL WIP untouched.
 
