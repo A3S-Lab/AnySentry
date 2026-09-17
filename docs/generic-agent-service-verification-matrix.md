@@ -1159,3 +1159,24 @@ Host Design B (uvicorn, no docker) run `9abdb257-7ebc-42e2-bcec-6d9b93365e70`
 
 Lab ports cleaned. Overlay replaces digest tip for these four JS files until
 flat OCI redeploy when gate GO. Classic SSL WIP / labeled Design B still open.
+
+### 2026-09-17 EvidenceLink + Δ60s on overlay tip; SSL WIP boundary
+
+Capacity still **NO-GO**. Tip `anysentry-b469d4444-sscf4` (hostPath Phase D overlay).
+
+Run `9abdb257-…` point-read:
+- interactions **6**, `exact_as_observed`, `partial=false`
+- `GET /v1/evidence-links?limit=200`: **3** links matched to run obs
+  (`1` **strong** `network_effect` → `kf_43156142…`; `2` unmatched `executes_as`)
+- `POST /agents/semantic-events/evidence` (worker `tool_call`): **1** canonical
+  link `el_62284e57…` / `src=canonical_store`
+- Δ60s ambient: raw/kernel/derived Δdrops **0** (queue 0→170, cap 16384)
+
+Forwarder spool `spool-clean-20260915.wal` ≈3.2Mi — still active, not truncated.
+
+**Classic SSL WIP (Observer, read-only):** dirty tree on
+`interaction.rs` (+classic SSL reassembly / BoringSSL bridge), `ebpf`,
+`capture_profile`, `common` — **untouched**; not closed this turn.
+
+**Still open:** pure digest tip (remove hostPath) when gate GO; labeled Design B;
+classic SSL WIP finish + verify; longer sustained no-gap under GO.
