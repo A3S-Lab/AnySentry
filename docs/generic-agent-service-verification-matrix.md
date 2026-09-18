@@ -1369,3 +1369,28 @@ classic SSL live, disposable spool, raw-lane pressure under sustained NO-GO.
 Live tip gaps now: `asyncRawPersistenceDropped≈9853`, queueRows≈12.7k/16k,
 kernelDropped=385, derived=0. Capacity **NO-GO**. Next: wait GO for raw-lane
 relief / labeled B / SSL collector tip; do not truncate active spool.
+
+### 2026-09-18 blockers + human-gate (Goal incomplete)
+
+Capacity **hard NO-GO**: PSI io full avg10/60 ≈ **70 / 66**, load ≈ **24**,
+nvme util ≈ **90–99%**, D-state ≥10 including **`a3s-observer-collector`**,
+multiple **postgres**, flush/jbd2. Registry `:5000` up; tip still
+`@sha256:16e25b86…` Ready.
+
+Live tip gaps (uptime ~79k s): `asyncRawPersistenceDropped≈417484` (severe
+admission under stall), kernelDropped≈3243, **derived=0**, raw queue
+≈10–14k / 16384. Spool WAL still **~29Mi active** — not disposable.
+
+Classic SSL WIP: `cargo test --bin a3s-observer-collector classic_` again
+**5 passed** (reconfirmed). Live collector binary still pre-WIP (process age
+>~1d, often D-state) — tip deploy deferred.
+
+**Human intervention needed:** reduce host I/O contention (Postgres / other
+writers / leave machine quiet) until capacity gate GO. Agent must not roll tip,
+compose labeled Design B, truncate spool, or rebuild/redeploy collector while
+NO-GO — that worsens raw drops and D-state.
+
+**Agent can resume without new decisions once GO:** (1) bump
+`ANYSENTRY_CANONICAL_ASYNC_RAW_QUEUE_BATCHES` 16→32 + re-verify host Design B
+raw Δ≈0; (2) labeled compose Design B; (3) Observer classic SSL collector tip +
+live capture; (4) spool truncate only if WAL proven idle.
