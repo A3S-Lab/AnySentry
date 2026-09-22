@@ -11,6 +11,12 @@ const readinessSource = readFileSync(
 assert.match(readinessSource, /anysentry\.observability_readiness\.v1/);
 assert.match(readinessSource, /globallyOpened/);
 assert.match(readinessSource, /enforcedInfrastructureRules/);
+const invocationSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/agent-invocation-resource.ts', import.meta.url),
+  'utf8',
+);
+assert.match(invocationSource, /anysentry\.agent_invocation\.v1/);
+assert.match(invocationSource, /Parent views never import child KernelFact/);
 
 const require = createRequire(import.meta.url);
 const {

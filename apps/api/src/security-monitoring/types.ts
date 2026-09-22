@@ -2484,6 +2484,30 @@ export interface CanonicalRunResource {
   resolutionRevision: number;
 }
 
+export type AgentInvocationView = 'parent' | 'child' | 'local';
+export type AgentInvocationKernelOwnership = 'owned' | 'unlinked' | 'not_expected';
+
+/**
+ * Hop-fenced AgentInvocation. A parent view is a summary plus deep link; it must not
+ * import the child's KernelFact rows. A child view keeps its own kernel coverage.
+ */
+export interface CanonicalAgentInvocationResource {
+  schemaVersion: 'anysentry.agent_invocation.v1';
+  invocationId: string;
+  sessionId: string;
+  conversationId?: string;
+  runId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  view: AgentInvocationView;
+  kernelOwnership: AgentInvocationKernelOwnership;
+  childDeepLink?: { runId: string };
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
 /**
  * Additive response envelope for the semantic-event evidence deep link.  The legacy evidence
  * response remains unchanged inside `evidence`; the envelope records which identifier the caller

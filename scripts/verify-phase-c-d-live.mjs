@@ -22,6 +22,7 @@ const {
   sessionResourceAliases,
 } = require('../apps/api/dist/security-monitoring/observability-coverage.js');
 const { expectedNoKernelTool, inMemoryPlanTool } = require('../apps/api/dist/security-monitoring/agent-tool-shape.js');
+const { projectAgentInvocation } = require('../apps/api/dist/security-monitoring/agent-invocation-resource.js');
 
 assert.equal(normalizeAgentRouteShape('/runs/thread-abc123/nodes/42?stream=true'), '/runs/:param/nodes/:param');
 assert.equal(normalizeAgentRouteShape('/invoke'), '/invoke');
@@ -97,6 +98,68 @@ assert.deepEqual(
   { status: 'complete', reasons: [], source: 'clickhouse' },
 );
 
+const parentSession = {
+  schemaVersion: 'anysentry.session.v1',
+  sessionId: 'run-shared',
+  conversationId: 'cv_parent',
+  parentSessionId: 'sess_upstream',
+  canonicalParentSessionId: 'sess_upstream',
+  agentInstanceIds: [],
+  segmentIds: [],
+  interactionIds: [],
+  turnCount: 1,
+  modelCallCount: 0,
+  toolCallCount: 0,
+  toolResultCount: 0,
+  errorCount: 0,
+  usage: {},
+  coverage: { status: 'complete', reasons: [] },
+  coverageLayers: {
+    ...parentLayers,
+    kernel: { ...parentLayers.kernel, reasons: ['tool_kernel_unlinked'] },
+    run: { ...parentLayers.run, runIds: ['run-shared'] },
+  },
+  sourceRefs: [],
+  resolutionRevision: 1,
+};
+const parentInvocation = projectAgentInvocation({ invocationId: 'cv_parent', session: parentSession });
+assert.equal(parentInvocation.view, 'parent');
+assert.equal(parentInvocation.kernelOwnership, 'unlinked');
+assert.deepEqual(parentInvocation.childDeepLink, { runId: 'run-shared' });
+assert.equal(parentInvocation.coverageLayers.kernel.factCount, 0, 'parent invocation must not import child KernelFact');
+
+const childInvocation = projectAgentInvocation({
+  invocationId: 'run-shared',
+  session: {
+    ...parentSession,
+    conversationId: 'cv_child',
+    coverageLayers: {
+      ...childLayers,
+      run: { ...childLayers.run, runIds: ['run-shared'] },
+    },
+  },
+});
+assert.equal(childInvocation.view, 'child');
+assert.equal(childInvocation.kernelOwnership, 'owned');
+assert.equal(childInvocation.childDeepLink, undefined);
+assert.equal(childInvocation.coverageLayers.kernel.factCount, 1);
+
+const localInvocation = projectAgentInvocation({
+  invocationId: 'run-local',
+  session: {
+    ...parentSession,
+    parentSessionId: undefined,
+    canonicalParentSessionId: undefined,
+    coverageLayers: {
+      ...parentLayers,
+      kernel: { status: 'complete', reasons: ['no_kernel_event_expected'], count: 0, factCount: 0 },
+      run: { ...parentLayers.run, runIds: ['run-local'] },
+    },
+  },
+});
+assert.equal(localInvocation.view, 'local');
+assert.equal(localInvocation.kernelOwnership, 'not_expected');
+
 console.log('verify-phase-c-d-live: local contracts ok');
 
 const base = process.env.ANYSENTRY_API_BASE?.replace(/\/$/u, '');
@@ -152,8 +215,11 @@ const discoveredRuns = runIds.length > 0
 
 let completeSession = 0;
 let completeRun = 0;
+let completeInvocation = 0;
 let parentUnlinked = 0;
 let childLinked = 0;
+let parentInvocations = 0;
+let childInvocations = 0;
 const sample = [];
 const instanceIds = [];
 
@@ -175,6 +241,23 @@ for (const timeType of timeTypes) {
       }
     }
     if ((kernel?.factCount ?? 0) > 0 && kernel?.status === 'complete') childLinked += 1;
+    const invocation = await get(`/v1/agent-invocations/${encodeURIComponent(id)}?timeType=${timeType}`, { allowNotFound: true });
+    if (invocation?.coverage?.status === 'complete' && invocation.item?.coverage?.status === 'complete') {
+      completeInvocation += 1;
+      sample.push({ kind: 'invocation', timeType, id, view: invocation.item.view, conversationId: invocation.item.conversationId });
+      if (invocation.item.view === 'parent') {
+        parentInvocations += 1;
+        assert.equal(invocation.item.kernelOwnership, 'unlinked');
+        assert.equal(invocation.item.coverageLayers?.kernel?.factCount ?? 0, 0, 'parent invocation must not import child KernelFact');
+        assert.ok(invocation.item.childDeepLink?.runId);
+      }
+      if (invocation.item.view === 'child') {
+        childInvocations += 1;
+        assert.equal(invocation.item.kernelOwnership, 'owned');
+        assert.ok((invocation.item.coverageLayers?.kernel?.factCount ?? 0) > 0);
+        assert.equal(invocation.item.childDeepLink, undefined);
+      }
+    }
   }
   for (const id of discoveredRuns) {
     const body = await get(`/v1/runs/${encodeURIComponent(id)}?timeType=${timeType}`, { allowNotFound: true });
@@ -223,15 +306,21 @@ assert.equal(kernelFacts.coverage?.status, 'complete');
 
 assert.ok(completeSession > 0, 'at least one Session point-read must be complete');
 assert.ok(completeRun > 0, 'at least one Run point-read must be complete');
+assert.ok(completeInvocation > 0, 'at least one AgentInvocation point-read must be complete');
+assert.ok(parentInvocations > 0, 'at least one parent AgentInvocation view must stay kernel-unlinked');
+assert.ok(childInvocations > 0, 'at least one child AgentInvocation view must own KernelFact');
 
 console.log(JSON.stringify({
   schemaVersion: 'anysentry.phase_c_d_live.v1',
   completeSession,
   completeRun,
+  completeInvocation,
   completeInstance,
   missingInstance,
   parentUnlinked,
   childLinked,
+  parentInvocations,
+  childInvocations,
   derivedDrops: {
     asyncRawPersistenceDropped: gaps.asyncRawPersistenceDropped,
     asyncKernelPersistenceDropped: gaps.asyncKernelPersistenceDropped,

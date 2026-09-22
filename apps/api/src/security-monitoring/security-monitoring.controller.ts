@@ -18,6 +18,7 @@ import {
   sessionResourceAliases,
   sessionResourceHydrated,
 } from './observability-coverage';
+import { projectAgentInvocation } from './agent-invocation-resource';
 import { projectSemanticConversationTimeline } from './agent-semantic-timeline';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
@@ -13236,6 +13237,30 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     };
   }
 
+  @Get('v1/agent-invocations/:invocationId')
+  @RequireManagementAuth()
+  async canonicalAgentInvocation(
+    @Param('invocationId') invocationId: string,
+    @Query() rawQuery: Record<string, unknown>,
+    @Headers() headers: HeaderBag,
+  ) {
+    const id = strictIdentityText(invocationId, 240);
+    if (!id) throw new BadRequestException('invocationId is invalid');
+    const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId: id });
+    const result = await this.canonicalSessionResourcesForExact(query, headers);
+    const session = result.items.find((candidate) => sessionResourceAliases(candidate).includes(id));
+    if (!session) throw new NotFoundException('agent invocation not found');
+    const item = projectAgentInvocation({ invocationId: id, session });
+    return {
+      schemaVersion: 'anysentry.agent_invocation.v1',
+      item,
+      revision: result.revision,
+      coverage: result.coverage,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
+  }
+
   @Get('v1/sessions/:sessionId/timeline')
   @RequireManagementAuth()
   async canonicalSessionTimeline(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
@@ -14047,6 +14072,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       sessionMembership: 'anysentry.session_membership.v1',
       evidenceLink: 'anysentry.evidence_link.v1',
       run: 'anysentry.run.v1',
+      agentInvocation: 'anysentry.agent_invocation.v1',
       coverageGap: 'anysentry.coverage_gap.v1',
       relationRevision: 'anysentry.relation_revision.v1',
       registries: this.canonicalObservability.registryCatalog(),

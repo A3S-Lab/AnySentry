@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:a48377fee11041f0612acbec0c8a87ec1f7ab8947e14e378ff78d6e708ffee50`
-- Overlay tag: `readiness-20260922b` (base `ifr-inventory-20260922c` / `02db8e57…`)
+- API pod image: `127.0.0.1:5000/anysentry@sha256:1b3776a1bc196128b741559d37d25684d90c3a69625aebe65f2b240db7c1ccc0`
+- Overlay tag: `invocation-20260922` (base `readiness-20260922b` / `a48377fe…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -21,7 +21,7 @@ All of the following returned `coverage=complete` on the digest above.
 | `cv_23a18a6377ced4a3b7b213b9` | Session (A execute hop) | itself | complete, `factCount=1` |
 | `cv_df08886c1da407fc6b6c593c` | Session (B execute hop) | itself | complete, `factCount=1` |
 
-Also complete: `GET /v1/kernel-facts`, `GET /v1/evidence-links`, contract `anysentry.run.v1`.
+Also complete: `GET /v1/kernel-facts`, `GET /v1/evidence-links`, `GET /v1/agent-invocations/:invocationId`, contracts `anysentry.run.v1` and `anysentry.agent_invocation.v1`.
 
 Thread/run IDs that only exist as membership stubs are resolved once through the stub’s hop-fenced `conversationId`. List-window gap reasons are not inherited.
 
@@ -46,10 +46,11 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 Repeatable gates: `GET /v1/observability/readiness` (`anysentry.observability_readiness.v1`) and `scripts/verify-phase-c-d-live.mjs`. The readiness GET is in-process: it does not open collection, does not scan ClickHouse, and does not promote candidate `ifr_*` drafts. After an API roll, poll until F0 realigns.
 
-Live `last_1d` on digest `a48377fe…` (2026-09-22T16:35Z), including the LangChain sample:
+Live `last_1d` on digest `1b3776a1…` (2026-09-22T16:40Z), including the LangChain sample:
 
 - 8 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`, `lc_aba557509de9432aa8c8` → `cv_c01225ad`)
 - 4 Run point-reads complete
+- 8 AgentInvocation point-reads complete: 1 parent view (`tool_kernel_unlinked`, no child KernelFact, `childDeepLink.runId` only), 2 child views (`kernelOwnership=owned`), the rest `local` (in-memory plan / expected-no-kernel)
 - 9 AgentInstance point-reads complete after lab teardown, including docker IDs that now hydrate from Session projection (`state=exited`, `dataSource=conversation_projection`). Live RuntimeInstance list for those IDs is empty and `complete` with `no_live_runtime_instance`.
 - parent hops kernel-unlinked: 4
 - child hops kernel-linked: 2
@@ -141,7 +142,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 | No unexplained Ring/Collector/Forwarder/WAL drop | Met on the one mixed 11.2 window; live WAL still grows |
 | Plaintext / KernelFact / Session / Run coverage reported separately | Met |
 | Parent/child not double-counted or merged | Met |
-| Canonical point-read `coverage=complete` | Met for Session/Run/EvidenceLink/KernelFact and hydrated AgentInstance |
+| Canonical point-read `coverage=complete` | Met for Session/Run/AgentInvocation/EvidenceLink/KernelFact and hydrated AgentInstance |
 | Failure/ambiguity stays partial/ambiguous/unlinked | Met (`semantic_only` / `no_kernel_event_expected` for in-process lookup and plan tools, parent `unlinked`, empty runtimes `no_live_runtime_instance`) |
 | Query latency and WAL backlog in budget | Agent directory `last_1d` stays inside the 30s in-flight timeout; not an empty-WAL pressure proof |
 | No product-name / tool-name / fixed-port identity | Met for the accepted algorithms |
