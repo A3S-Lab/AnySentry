@@ -559,6 +559,7 @@ function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemantic
 
 function resolvedToolCallIdsForTimeline(
   interactions: readonly T.AgentInteractionRecord[],
+  matches = closeToolCallsAcrossInteractions(interactions).matches,
 ): Set<string> {
   const callAt = new Map<string, bigint>();
   for (const interaction of interactions) {
@@ -584,10 +585,26 @@ function resolvedToolCallIdsForTimeline(
       resolved.add(result.toolCallId);
     }
   }
-  for (const match of closeToolCallsAcrossInteractions(interactions).matches) {
+  for (const match of matches) {
     if (match.firstSeen) resolved.add(match.toolCallId);
   }
   return resolved;
+}
+
+function leftoverResultByToolCallId(
+  interactions: readonly T.AgentInteractionRecord[],
+  matches: ReturnType<typeof closeToolCallsAcrossInteractions>['matches'],
+): Map<string, T.AgentInteractionRecord['toolResults'][number]> {
+  const byId = new Map(interactions.map((interaction) => [interaction.interactionId, interaction]));
+  const leftover = new Map<string, T.AgentInteractionRecord['toolResults'][number]>();
+  for (const match of matches) {
+    if (!match.firstSeen || leftover.has(match.toolCallId)) continue;
+    const resultInteraction = byId.get(match.resultInteractionId);
+    const result = resultInteraction?.toolResults.find((item) => item.toolCallId === match.toolCallId)
+      ?? resultInteraction?.toolResults[0];
+    if (result) leftover.set(match.toolCallId, result);
+  }
+  return leftover;
 }
 
 export function projectSemanticConversationTimeline(
@@ -614,7 +631,9 @@ export function projectSemanticConversationTimeline(
   const resultKeys = new Set<string>();
   const observedResultIds = new Set<string>();
   const observedUserItemIds = new Set<string>();
-  const resolvedToolCallIds = resolvedToolCallIdsForTimeline(ordered);
+  const closureMatches = closeToolCallsAcrossInteractions(ordered).matches;
+  const resolvedToolCallIds = resolvedToolCallIdsForTimeline(ordered, closureMatches);
+  const leftoverResults = leftoverResultByToolCallId(ordered, closureMatches);
   const unknownToolCallIds = new Set(ordered.flatMap((interaction) =>
     interaction.toolResults
       .filter((result) => typeof result.isError !== 'boolean')
@@ -794,6 +813,7 @@ export function projectSemanticConversationTimeline(
             catch { return 0; }
           })
           .at(0)
+          ?? leftoverResults.get(item.toolCallId)
         : undefined;
       const pairedResult = item.kind === 'tool_call' && Boolean(pairedToolResult);
       // A result ID alone proves that a result-shaped record arrived; it does not prove success.
@@ -926,7 +946,7 @@ export function projectSemanticConversationTimeline(
     : false;
   if (conversationStale) {
     for (const [toolCallId, event] of calls) {
-      if (observedResultIds.has(toolCallId)) continue;
+      if (observedResultIds.has(toolCallId) || resolvedToolCallIds.has(toolCallId)) continue;
       const turn = turns.get(event.turnId);
       if (!turn) continue;
       turn.diagnostics.push({

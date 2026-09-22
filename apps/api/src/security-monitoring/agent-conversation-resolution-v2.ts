@@ -6,13 +6,22 @@ import {
   resolveLogicalAgentDefinition,
 } from './canonical-observability';
 import {
+  boundHopRemintConversationId,
   hopConversationFenceValue,
   repairEmptyRouteAliasConversationId,
 } from './agent-conversation-route-alias-repair';
 
 export {
-  repairEmptyRouteAliasConversationId,
+  boundHopRemintConversationId,
+  conversationHopScopeSuffix,
+  hopAlignedConversationId,
+  hopFromLogicalScopeKey,
   hopConversationFenceValue,
+  hopLocalProjectionRecord,
+  persistedMembershipConversationId,
+  pointReadCanonicalConversationId,
+  repairEmptyRouteAliasConversationId,
+  shouldProjectHopLocal,
 } from './agent-conversation-route-alias-repair';
 
 export const AGENT_CONVERSATION_RESOLVER_V2 = 2;
@@ -39,7 +48,8 @@ export interface ConversationRouteAliasV1 {
     | 'provider_chain_merge'
     | 'continuity_anchor_merge'
     | 'replay_lineage_merge'
-    | 'control_activity_fold';
+    | 'control_activity_fold'
+    | 'hop_fence_bound_thread';
   evidence: string[];
   resolverVersion: typeof AGENT_CONVERSATION_RESOLVER_V2;
   resolutionRevision: number;
@@ -519,12 +529,52 @@ export function conversationLogicalScopeKeyV2(record: T.AgentInteractionRecord):
 }
 
 /**
- * Keep orchestrator / worker Conversations independent even when Design-B delegation reuses the
+ * Keep parent / child Conversations independent even when a delegation reuses the
  * same runId / sessionId / providerConversationId across the hop. Projection and resolver must
  * use the same fence or route aliases collapse parent+child into one empty canonical Thread.
  */
 export function hopConversationFence(record: T.AgentInteractionRecord): string {
   return hopConversationFenceValue(record.hop, record.agentIdHeader);
+}
+
+export const GENERIC_SESSION_IDS = new Set([
+  '', '-', 'none', 'null', 'unknown', 'legacy', 'default',
+  'tokio-rt-worker', 'reqwest-internal', 'mainthread',
+]);
+
+function durableSessionLabel(value: string | undefined): string | undefined {
+  const session = value?.trim();
+  if (!session || session.length > 512 || GENERIC_SESSION_IDS.has(session.toLowerCase())) {
+    return undefined;
+  }
+  return session;
+}
+
+/** Same scope string the directory uses for hop-fenced session-key Thread ids. */
+export function conversationDirectoryScopeKey(record: T.AgentInteractionRecord): string {
+  const logicalScopeKey = conversationLogicalScopeKeyV2(record);
+  const deploymentScopeKey = conversationDeploymentScopeKey(record);
+  const hopFence = hopConversationFence(record);
+  return `${deploymentScopeKey
+    ? `${logicalScopeKey}|deployment:${deploymentScopeKey}`
+    : logicalScopeKey}${hopFence}`;
+}
+
+/**
+ * Directory and v2 persist must mint the same Canonical Thread id for a hop-fenced
+ * durable Session. The formula is `session-key\\0scopeKey\\0session` — not a later
+ * remint of a provider/stamp hash, and not `bound\\0id\\0hop`.
+ */
+export function hopScopedSessionConversationId(
+  record: T.AgentInteractionRecord,
+): string | undefined {
+  const session = durableSessionLabel(record.sessionKey)
+    ?? (['confirmed', 'strong'].includes(record.sessionIdentityQuality ?? '')
+      && ['conversation', 'resumable'].includes(record.sessionMode ?? '')
+      ? durableSessionLabel(record.sessionId)
+      : undefined);
+  if (!session) return undefined;
+  return stableId('cv', `session-key\0${conversationDirectoryScopeKey(record)}\0${session}`);
 }
 
 function conversationHopScopeKey(record: T.AgentInteractionRecord): string {
@@ -738,6 +788,34 @@ function explicitProviderIds(
     .filter((value): value is string => Boolean(value)));
 }
 
+/** Session resume anchors only. Ephemeral / per-request IDs are not durable Thread keys. */
+export function durableSessionAnchor(record: {
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionId?: string;
+  sessionIdSource?: string;
+  sessionIdentityQuality?: string;
+  sessionMode?: string;
+}): string | undefined {
+  if (record.sessionMode === 'per_request'
+    || record.sessionMode === 'ephemeral'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'per_request') {
+    return undefined;
+  }
+  const canonical = record.canonicalSessionId?.trim()
+    || record.sessionKey?.trim()
+    || record.providerSessionIdHash?.trim();
+  if (canonical) return canonical;
+  if (record.sessionIdentityQuality === 'unknown'
+    || record.sessionIdentityQuality === 'unresolved'
+    || record.sessionIdSource === 'unresolved') {
+    return undefined;
+  }
+  return record.sessionId?.trim() || undefined;
+}
+
 function properSubset(left: Set<string>, right: Set<string>): boolean {
   return left.size > 0 && left.size < right.size && [...left].every((value) => right.has(value));
 }
@@ -838,6 +916,15 @@ function canMerge(
     || rightProvider.size === 0
     || [...leftProvider].some((value) => rightProvider.has(value));
   if (!providerCompatible) return false;
+  const leftSessions = new Set(left
+    .map((index) => durableSessionAnchor(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  const rightSessions = new Set(right
+    .map((index) => durableSessionAnchor(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  if (leftSessions.size > 0 && rightSessions.size > 0 && !setsIntersect(leftSessions, rightSessions)) {
+    return false;
+  }
   // Design-B parent/worker hops share run/session/provider IDs by design. Never fold them into one
   // Canonical Thread — relatedConversations + EvidenceLink express the hop, not route aliases.
   const hopFences = new Set([...left, ...right]
@@ -974,6 +1061,24 @@ function canonicalConversationId(
       Number(right[1].human) - Number(left[1].human)
       || left[1].at - right[1].at
       || left[0].localeCompare(right[0]))[0];
+  const hop = hopConversationFence(first);
+  const directoryId = hopScopedSessionConversationId(first);
+  const alreadyBound = indexes.some((index) => Boolean(records[index].conversationBindingVersion));
+  if (preferred) {
+    // Keep a persisted id when it is already the directory session-key, when
+    // there is no hop fence (Design A bound durable Threads stay as stored),
+    // or when v2 already bound the group (do not remint a durable Thread).
+    if (!hop || !directoryId || preferred[0] === directoryId || alreadyBound) {
+      return { conversationId: preferred[0], idSource: preferred[1].source };
+    }
+  }
+  if (hop && directoryId) {
+    return {
+      conversationId: directoryId,
+      idSource: preferred?.[1].source
+        ?? (first.sessionIdSource === 'provider' ? 'provider' : 'runtime'),
+    };
+  }
   if (preferred) return { conversationId: preferred[0], idSource: preferred[1].source };
 
   const provider = indexes
@@ -1224,6 +1329,28 @@ export function resolveAgentConversationsV2(
             ? 'replay_lineage_merge'
             : 'provider_chain_merge',
         evidence: [...new Set(evidence)].sort(),
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        resolutionRevision,
+        createdAt: decidedAt,
+      });
+    }
+    const remintIds = new Set<string>();
+    for (const index of indexes) {
+      const remintId = boundHopRemintConversationId(
+        canonical.conversationId,
+        records[index].hop,
+        records[index].agentIdHeader,
+      );
+      if (!remintId || remintId === canonical.conversationId || remintIds.has(remintId)) continue;
+      remintIds.add(remintId);
+      aliases.push({
+        schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+        aliasConversationId: remintId,
+        targetType: 'conversation',
+        targetId: canonical.conversationId,
+        canonicalConversationId: canonical.conversationId,
+        reason: 'hop_fence_bound_thread',
+        evidence: ['durable_thread', 'hop_fence'],
         resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
         resolutionRevision,
         createdAt: decidedAt,

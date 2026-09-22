@@ -354,8 +354,37 @@ const httpToolRelations = buildSemanticKernelRelations(
 );
 assert.equal(httpToolRelations[0].status, 'linked_strong');
 assert.equal(toolEvidenceHotPathTesting.semanticKernelEventCategory(httpToolCall), 'network');
-assert.equal(httpToolRelations[0].linkMethod, 'network');
+assert.ok(['network', 'network_endpoint'].includes(httpToolRelations[0].linkMethod),
+  'HTTP code tools without a matching ToolExec still keep the transport kernel witness');
 assert.equal(httpToolRelations[0].kernelEventId, sandboxEgress.eventId);
+const httpCodeExec = {
+  ...kernelEvent,
+  eventId: 'evt_http_code_exec',
+  eventKind: 'ToolExec',
+  subject: 'python -c print(42)',
+  agentRuntimeInstanceId: 'docker:python-sandbox:exec',
+  agentRuntimeInstanceAliases: [],
+  attributes: { argv: 'python -c print(42)' },
+  at: new Date(callAt + 40).toISOString(),
+  attribution: {
+    processGenerationKey: 'pgk_http_code_child',
+    parentProcessGenerationKey: 'pgk_http_code_parent',
+    parentLinkAuthority: 'forwarder_process_graph',
+  },
+};
+const httpCodeDelegated = buildSemanticKernelRelations(
+  httpToolCall,
+  toolResult,
+  httpToolInteraction,
+  [sandboxEgress, httpCodeExec],
+  13,
+  false,
+);
+assert.equal(httpCodeDelegated[0].kernelEventKind, 'ToolExec',
+  'HTTP tools that carry a code/command argument must prefer delegated ToolExec over transport Egress');
+assert.equal(httpCodeDelegated[0].linkMethod, 'command');
+assert.equal(httpCodeDelegated[0].lineageMethod, 'delegated_runtime');
+assert.equal(httpCodeDelegated[0].kernelEventId, httpCodeExec.eventId);
 const dnsCandidate = {
   ...sandboxEgress,
   eventId: 'evt_sandbox_dns',
@@ -1325,5 +1354,98 @@ assert.match(relationWriter, /SEMANTIC_KERNEL_RELATION_MAX_BYTES/iu,
   'relation persistence has an explicit byte bound');
 assert.match(relationWriter, /batchHasConflictingRecords/iu,
   'one incoming batch cannot contain two payloads for the same relation revision');
+
+const todoCall = {
+  ...toolCall,
+  semanticEventId: 'se_write_todos_call',
+  toolCallId: 'call-write-todos',
+  toolName: 'write_todos',
+  toolKind: 'write',
+  content: { todos: [{ content: 'plan work', status: 'pending' }] },
+};
+const strayTodoFile = {
+  ...kernelEvent,
+  eventId: 'evt_todo_file_noise',
+  eventKind: 'FileAccess',
+  subject: 'file /tmp/unrelated.txt',
+};
+const todoUnlinked = buildSemanticKernelRelations(
+  todoCall,
+  undefined,
+  interaction,
+  [strayTodoFile],
+  40,
+  true,
+);
+assert.equal(todoUnlinked[0].status, 'semantic_only',
+  'in-memory plan tools stay semantic_only even when the kernel page is partial');
+assert.equal(todoUnlinked[0].kernelEventId, undefined,
+  'write_todos must not invent a FileAccess link');
+
+const codeAt = callAt + 80_000;
+const executeInteraction = {
+  ...interaction,
+  interactionId: 'mi_http_execute',
+  interactionType: 'tool',
+  agentInstanceId: instanceId,
+  runtimeInstanceId: instanceId,
+  endpoint: 'python-sandbox:8080',
+  startedAtUnixNs: String(BigInt(codeAt) * 1_000_000n),
+};
+const modelAliasInteraction = {
+  ...interaction,
+  interactionId: 'mi_llm_run_python',
+  interactionType: 'model',
+  agentInstanceId: instanceId,
+  runtimeInstanceId: instanceId,
+  endpoint: 'llm.example:443',
+  startedAtUnixNs: String(BigInt(codeAt - 40) * 1_000_000n),
+};
+const executeCall = {
+  ...toolCall,
+  semanticEventId: 'se_http_execute',
+  conversationId: 'cv_alias_fold',
+  turnId: 'turn_alias',
+  toolCallId: 'sandbox-run-1',
+  toolName: 'http.code.execute',
+  toolKind: 'code',
+  content: { code: 'print(8 + 9)', timeout_ms: 4000 },
+  atUnixNs: String(BigInt(codeAt) * 1_000_000n),
+  sourceInteractionIds: [executeInteraction.interactionId],
+};
+const runPythonCall = {
+  ...executeCall,
+  semanticEventId: 'se_run_python_alias',
+  toolCallId: 'call-run-python',
+  toolName: 'run_python',
+  toolKind: 'code',
+  content: { code: 'print(8 + 9)' },
+  atUnixNs: String(BigInt(codeAt - 40) * 1_000_000n),
+  sourceInteractionIds: [modelAliasInteraction.interactionId],
+};
+const aliasSandboxEgress = {
+  ...kernelEvent,
+  eventId: 'evt_alias_sandbox_egress',
+  eventKind: 'Egress',
+  at: new Date(codeAt + 8).toISOString(),
+  subject: 'egress → python-sandbox:8080',
+  agentRuntimeInstanceId: instanceId,
+  agentRuntimeInstanceAliases: [instanceId],
+  attributes: { host: 'python-sandbox', port: 8080 },
+  verdict: 'allow',
+  riskScore: 0,
+};
+const aliasBatch = buildSemanticKernelRelationBatch([
+  { event: runPythonCall, result: undefined, interaction: modelAliasInteraction },
+  { event: executeCall, result: undefined, interaction: executeInteraction },
+], [aliasSandboxEgress], 41, false);
+const executeLinked = aliasBatch.relationsBySemanticEventId.get(executeCall.semanticEventId);
+const aliasLinked = aliasBatch.relationsBySemanticEventId.get(runPythonCall.semanticEventId);
+assert.equal(executeLinked?.[0].status, 'linked_strong');
+assert.equal(executeLinked?.[0].kernelEventId, aliasSandboxEgress.eventId);
+assert.equal(aliasLinked?.[0].status, 'linked_strong',
+  'LLM tool names must fold onto the wire/kernel owner by code fingerprint');
+assert.equal(aliasLinked?.[0].kernelEventId, aliasSandboxEgress.eventId);
+assert.notEqual(aliasLinked?.[0].toolInvocationId, executeLinked?.[0].toolInvocationId);
 
 console.log('Agent Semantic Tool to Kernel relation verification passed');

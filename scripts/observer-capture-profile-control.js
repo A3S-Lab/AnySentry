@@ -47,8 +47,8 @@ const PROFILE_PROBE_ACTIONS = Object.freeze({
     file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
   }),
   infrastructure_aggregate: Object.freeze({
-    exec: 'full', exit: 'full', tls: 'aggregate', connect: 'aggregate', dns: 'aggregate',
-    file_access: 'aggregate', file_delete: 'sample', llm: 'aggregate', ssl: 'aggregate', security: 'full', file_read: 'not_enabled',
+    exec: 'full', exit: 'full', tls: 'sample', connect: 'sample', dns: 'sample',
+    file_access: 'drop', file_delete: 'sample', llm: 'sample', ssl: 'sample', security: 'full', file_read: 'not_enabled',
   }),
   self_health: Object.freeze({
     exec: 'full', exit: 'full', tls: 'aggregate', connect: 'aggregate', dns: 'aggregate',

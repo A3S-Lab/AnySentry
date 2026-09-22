@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
   resolveAgentConversationsV2,
+  hopScopedSessionConversationId,
 } = require('../apps/api/dist/security-monitoring/agent-conversation-resolution-v2.js');
 const {
   projectAgentConversations,
@@ -1353,5 +1354,373 @@ const designBProjection = projectAgentConversations(
 );
 assert.equal(designBProjection.summaries.filter((item) => item.hasContent).length, 2,
   'projection keeps independent parent/worker Conversations for Design B');
+
+const fanoutRunId = 'fanout-shared-run';
+const fanoutHopRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_fanout_supervisor', at: base + 20_000, instance: 'fanout-supervisor',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/fanout-supervisor',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'fanout left' }] },
+      responseId: 'fanout-sup-response',
+      interactionType: 'remote_agent',
+      trafficRole: 'delegation',
+      path: '/invoke',
+    }),
+    hop: 'supervisor',
+    runId: fanoutRunId,
+    sessionId: fanoutRunId,
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    delegationId: 'fanout-delegation-1',
+    agentAssetId: 'agent-fanout-supervisor',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_fanout_specialist', at: base + 20_100, instance: 'fanout-specialist',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/fanout-specialist',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'nested arm' }] },
+      responseId: 'fanout-spec-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: fanoutRunId,
+    sessionId: fanoutRunId,
+    parentSessionId: fanoutRunId,
+    delegationId: 'fanout-delegation-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-fanout-specialist',
+  },
+];
+const fanoutResolution = resolveAgentConversationsV2(fanoutHopRecords);
+const fanoutConversationIds = [...new Set(
+  fanoutResolution.conversationRecords.map((item) => item.conversationId),
+)];
+assert.equal(fanoutConversationIds.length, 2,
+  'unnamed hops must keep parent/child Conversations independent');
+assert.equal(
+  fanoutResolution.aliases.filter((item) =>
+    item.aliasConversationId !== item.canonicalConversationId
+    && fanoutConversationIds.includes(item.aliasConversationId)
+    && fanoutConversationIds.includes(item.canonicalConversationId)).length,
+  0,
+  'unnamed hops must not alias parent Conversation onto child or vice versa',
+);
+assert.deepEqual(
+  [...new Set(designBProjection.summaries.filter((item) => item.hasContent).map((item) => item.conversationId))].sort(),
+  designBConversationIds.slice().sort(),
+  'directory must reuse durable hop-scoped Thread ids instead of reminting bound aliases',
+);
+assert.equal(
+  hopScopedSessionConversationId(designBHopRecords[0]),
+  designBResolution.conversationRecords.find((item) => item.interactionId === 'mi_v2_designb_orch')?.conversationId,
+  'v2 must mint the directory session-key for a hop-fenced durable Session',
+);
+const unboundDesignBProjection = projectAgentConversations(
+  designBHopRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.deepEqual(
+  [...new Set(unboundDesignBProjection.summaries.filter((item) => item.hasContent).map((item) => item.conversationId))].sort(),
+  designBConversationIds.slice().sort(),
+  'unbound directory must mint the same hop-scoped session-key as v2 persist',
+);
+
+const ephRunId = 'design-a-eph-run';
+const ephSplitRecords = [
+  {
+    ...interaction({
+      id: 'mi_eph_model_a', at: base + 10_200, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '1+1' }] },
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+    sessionId: 'eph-thread-a',
+    sessionMode: 'conversation',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_tool_a', at: base + 10_210, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model' },
+      interactionType: 'tool',
+      path: '/execute',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_model_b', at: base + 10_220, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'tool result' }] },
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+    sessionId: 'eph-thread-b',
+    sessionMode: 'conversation',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_tool_b', at: base + 10_230, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model' },
+      interactionType: 'tool',
+      path: '/execute',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+  },
+];
+const ephProjection = projectAgentConversations(
+  ephSplitRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'one POST / one hop / one Run must stay one directory Thread even when some rows lack thread_id',
+);
+assert.equal(
+  ephProjection.summaries.find((item) => item.hasContent)?.conversationId,
+  hopScopedSessionConversationId(ephSplitRecords[0]),
+);
+
+const ephProductDriftRecords = ephSplitRecords.map((record, index) => ({
+  ...record,
+  interactionId: `${record.interactionId}_drift`,
+  agentProduct: index % 2 === 0
+    ? 'customer-langgraph-sim-lab-sim-workflow-1'
+    : 'f12f4e5f817e',
+  agentAssetId: 'agent-designa-eph',
+}));
+const ephDriftProjection = projectAgentConversations(
+  ephProductDriftRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephDriftProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'one POST / one hop / one Run / one asset must stay one Thread when product labels drift',
+);
+
+const ephPersistedSplit = ephProductDriftRecords.map((record, index) => ({
+  ...record,
+  conversationId: index < 2 ? 'cv_8154c2f5291e2bfdf94709cd' : 'cv_c6118efbaaa104e5f88a11a6',
+  conversationIdSource: 'inferred',
+  conversationBindingVersion: 2,
+}));
+const ephPersistedProjection = projectAgentConversations(
+  ephPersistedSplit,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephPersistedProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'persist-stamped product-drift rows of one POST must still coalesce to one directory Thread',
+);
+
+// Bound durable ids are already hop-scoped. Directory must not remint them or
+// timeline-v3 point-reads of directory keys return 0 turns (no route alias).
+const boundDurableId = 'cv_ddf7cdc36befaa8eaaf3ba2f';
+const boundProjection = projectAgentConversations(
+  [{
+    ...interaction({
+      id: 'mi_bound_dir_alias',
+      at: base + 11_000,
+      instance: 'designa-orch',
+      agentProduct: 'LangGraph',
+      workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '2+3' }] },
+      conversationId: boundDurableId,
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    sessionId: '4721c522-e3e3-4b8d-8629-ecb4f40546ff',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    conversationId: boundDurableId,
+    conversationIdSource: 'inferred',
+    conversationBindingVersion: 2,
+  }],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 10 },
+);
+assert.equal(
+  boundProjection.summaries[0]?.conversationId,
+  boundDurableId,
+  'directory must reuse the durable hop-scoped Thread id',
+);
+const boundHopRecords = [{
+  ...interaction({
+    id: 'mi_bound_hop_alias',
+    at: base + 11_100,
+    instance: 'designa-orch',
+    agentProduct: 'LangGraph',
+    workspacePath: '/workspace/design-a',
+    request: { model: 'lg-model', messages: [{ role: 'user', content: '2+3' }] },
+    conversationId: boundDurableId,
+    path: '/v1/chat/completions',
+  }),
+  hop: 'orchestrator',
+  sessionId: '4721c522-e3e3-4b8d-8629-ecb4f40546ff',
+  sessionMode: 'resumable',
+  sessionIdentityQuality: 'strong',
+  conversationId: boundDurableId,
+  conversationIdSource: 'inferred',
+  conversationBindingVersion: 2,
+}];
+const boundHopResolution = resolveAgentConversationsV2(boundHopRecords);
+assert.equal(
+  boundHopResolution.aliases.some((item) =>
+    item.aliasConversationId === 'cv_2901172e7ca0eaa4307877db'
+    && item.canonicalConversationId === boundDurableId
+    && item.reason === 'hop_fence_bound_thread'),
+  true,
+  'resolver must alias the hop remint key back to the durable Thread',
+);
+
+// Unbound provider ids may still be reused across hops; remint those only.
+const sharedProviderId = 'cv_shared_provider_thread';
+const unboundHopProjection = projectAgentConversations(
+  [
+    {
+      ...interaction({
+        id: 'mi_unbound_orch',
+        at: base + 12_000,
+        instance: 'unbound-orch',
+        agentProduct: 'LangGraph',
+        workspacePath: '/workspace/unbound-orch',
+        request: { model: 'lg-model', messages: [{ role: 'user', content: 'parent' }] },
+        conversationId: sharedProviderId,
+        path: '/v1/chat/completions',
+      }),
+      hop: 'orchestrator',
+      conversationId: sharedProviderId,
+      conversationIdSource: 'provider',
+      conversationBindingVersion: undefined,
+    },
+    {
+      ...interaction({
+        id: 'mi_unbound_worker',
+        at: base + 12_100,
+        instance: 'unbound-worker',
+        agentProduct: 'LangGraph',
+        workspacePath: '/workspace/unbound-worker',
+        request: { model: 'lg-model', messages: [{ role: 'user', content: 'child' }] },
+        conversationId: sharedProviderId,
+        path: '/v1/chat/completions',
+      }),
+      hop: 'worker',
+      conversationId: sharedProviderId,
+      conversationIdSource: 'provider',
+      conversationBindingVersion: undefined,
+    },
+  ],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 10 },
+);
+const unboundIds = unboundHopProjection.summaries
+  .filter((item) => item.hasContent)
+  .map((item) => item.conversationId);
+assert.equal(unboundIds.length, 2, 'unbound shared provider ids stay hop-isolated');
+assert.equal(unboundIds.includes(sharedProviderId), false,
+  'unbound hop remint must not keep the shared provider id');
+
+// Same container + same prompt must not reuse a child Thread across distinct Session/Run anchors.
+const childRerunSharedPrompt = { model: 'lg-model', messages: [{ role: 'user', content: 'print(12+13)' }] };
+const childRerunRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_child_run1', at: base + 30_000, instance: 'same-specialist-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/specialist',
+      request: childRerunSharedPrompt,
+      responseId: 'child-run1-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: 'fanout-run-1',
+    sessionId: 'fanout-run-1',
+    parentSessionId: 'fanout-run-1',
+    delegationId: 'delegation-run-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-specialist',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_child_run2', at: base + 31_000, instance: 'same-specialist-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/specialist',
+      request: childRerunSharedPrompt,
+      responseId: 'child-run2-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: 'fanout-run-2',
+    sessionId: 'fanout-run-2',
+    parentSessionId: 'fanout-run-2',
+    delegationId: 'delegation-run-2',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-specialist',
+  },
+];
+const childRerunResolution = resolveAgentConversationsV2(childRerunRecords);
+assert.equal(new Set(childRerunResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'same-container child reruns with distinct session/run anchors stay independent');
+
+const statefulSameSession = [
+  {
+    ...interaction({
+      id: 'mi_v2_stateful_run1', at: base + 32_000, instance: 'designa-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '4+5' }] },
+      responseId: 'stateful-r1',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: 'stateful-run-1',
+    sessionId: 's113-stateful-shared',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-designa',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_stateful_run2', at: base + 33_000, instance: 'designa-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '4+5' }, { role: 'user', content: '6+7' }] },
+      responseId: 'stateful-r2',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: 'stateful-run-2',
+    sessionId: 's113-stateful-shared',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-designa',
+  },
+];
+const statefulResolution = resolveAgentConversationsV2(statefulSameSession);
+assert.equal(new Set(statefulResolution.conversationRecords.map((item) => item.conversationId)).size, 1,
+  'same thread_id across two runs stays one Conversation');
 
 console.log('Agent Conversation Resolver V2 verification passed');

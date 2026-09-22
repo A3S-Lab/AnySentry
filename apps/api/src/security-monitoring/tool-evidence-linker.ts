@@ -8,7 +8,9 @@ export const TOOL_EVIDENCE_RELATION_VERSION = 2 as const;
 
 export type ToolEvidenceLinkMethod =
   | 'same_process_resource'
-  | 'direct_child_command';
+  | 'direct_child_command'
+  | 'delegated_command'
+  | 'network';
 
 export type ToolEvidenceStatus =
   | 'linked'
@@ -18,9 +20,13 @@ export type ToolEvidenceStatus =
 export type ToolEvidenceReason =
   | 'exact_process_and_resource'
   | 'exact_child_and_command'
+  | 'delegated_command'
+  | 'network_witness'
   | 'overlapping_exact_claims'
   | 'kernel_read_not_captured'
-  | 'no_matching_kernel_evidence';
+  | 'no_matching_kernel_evidence'
+  | 'no_kernel_event_expected'
+  | 'candidates_truncated';
 
 export interface KernelEvidenceReference {
   eventId: string;
@@ -63,6 +69,7 @@ export interface ToolEvidenceResponse extends ToolEvidenceBundle {
   dataSource: 'clickhouse_relation' | 'clickhouse+hot_delta' | 'memory_hot_ring';
   partial: boolean;
   partialReasons?: Array<'trusted_correlation_off' | 'storage_unavailable' | 'scan_limit' | 'process_scope_limit'>;
+  coverageLayers?: import('./types').ObservabilityCoverageLayers;
   updateTime: string;
 }
 

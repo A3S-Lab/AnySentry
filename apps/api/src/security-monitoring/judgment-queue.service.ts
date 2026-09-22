@@ -13,6 +13,13 @@ const DEFAULT_JOB_OPTIONS: JobsOptions = {
   removeOnComplete: { age: 24 * 60 * 60, count: 10_000 },
   removeOnFail: { age: 7 * 24 * 60 * 60, count: 20_000 },
 };
+const FAST_WORKER_CACHE_MS = 5_000;
+
+export type FastEnqueueResult = {
+  accepted: number;
+  skipped: number;
+  reason?: 'no_workers';
+};
 
 export function decisionResultWorkerConcurrency(
   value = process.env.ANYSENTRY_RESULT_APPLY_CONCURRENCY
@@ -44,6 +51,8 @@ export class JudgmentQueueService implements OnModuleDestroy {
   private readonly fastQueue?: Queue<FastJudgeJob>;
   private readonly l3Queue?: Queue<L3JudgeJob>;
   private readonly resultQueue?: Queue<DecisionResultJob>;
+  private fastWorkerCount = -1;
+  private fastWorkerCheckedAt = 0;
 
   constructor() {
     if (!this.enabled) return;
@@ -52,18 +61,41 @@ export class JudgmentQueueService implements OnModuleDestroy {
     this.resultQueue = new Queue<DecisionResultJob>(DECISION_RESULTS_QUEUE, { connection: this.connection, defaultJobOptions: DEFAULT_JOB_OPTIONS });
   }
 
-  async enqueueFast(job: FastJudgeJob): Promise<void> {
+  async countFastWorkers(): Promise<number | null> {
+    if (!this.fastQueue) return 0;
+    if (typeof this.fastQueue.getWorkers !== 'function') return null;
+    const now = Date.now();
+    if (this.fastWorkerCount >= 0 && now - this.fastWorkerCheckedAt < FAST_WORKER_CACHE_MS) {
+      return this.fastWorkerCount;
+    }
+    try {
+      this.fastWorkerCount = (await this.fastQueue.getWorkers()).length;
+    } catch {
+      return null;
+    }
+    this.fastWorkerCheckedAt = now;
+    return this.fastWorkerCount;
+  }
+
+  async enqueueFast(job: FastJudgeJob): Promise<FastEnqueueResult> {
     if (!this.fastQueue) throw new Error('asynchronous judgment queue is disabled');
+    if ((await this.countFastWorkers()) === 0) {
+      return { accepted: 0, skipped: 1, reason: 'no_workers' };
+    }
     await this.fastQueue.add('judge-by-identity-route', job, {
       jobId: job.evaluationId,
       attempts: 2,
       backoff: { type: 'exponential', delay: 5_000 },
     });
+    return { accepted: 1, skipped: 0 };
   }
 
-  async enqueueFastBatch(jobs: readonly FastJudgeJob[]): Promise<void> {
-    if (!jobs.length) return;
+  async enqueueFastBatch(jobs: readonly FastJudgeJob[]): Promise<FastEnqueueResult> {
+    if (!jobs.length) return { accepted: 0, skipped: 0 };
     if (!this.fastQueue) throw new Error('asynchronous judgment queue is disabled');
+    if ((await this.countFastWorkers()) === 0) {
+      return { accepted: 0, skipped: jobs.length, reason: 'no_workers' };
+    }
     await this.fastQueue.addBulk(jobs.map((job) => ({
       name: 'judge-by-identity-route',
       data: job,
@@ -73,6 +105,7 @@ export class JudgmentQueueService implements OnModuleDestroy {
         backoff: { type: 'exponential' as const, delay: 5_000 },
       },
     })));
+    return { accepted: jobs.length, skipped: 0 };
   }
 
   async enqueueL3(job: L3JudgeJob): Promise<void> {

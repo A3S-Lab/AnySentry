@@ -25,6 +25,14 @@ function loadRepairHelper() {
     import {
       repairEmptyRouteAliasConversationId,
       hopConversationFenceValue,
+      boundHopRemintConversationId,
+      pointReadCanonicalConversationId,
+      conversationHopScopeSuffix,
+      hopFromLogicalScopeKey,
+      hopLocalProjectionRecord,
+      hopAlignedConversationId,
+      persistedMembershipConversationId,
+      shouldProjectHopLocal,
     } from ${JSON.stringify(helperTs)};
     const cases = [
       {
@@ -76,11 +84,128 @@ function loadRepairHelper() {
     }
     const orch = hopConversationFenceValue('orchestrator');
     const worker = hopConversationFenceValue('worker');
+    const supervisor = hopConversationFenceValue('supervisor');
+    const specialist = hopConversationFenceValue('specialist');
     if (!orch || !worker || orch === worker) {
       console.error(JSON.stringify({ orch, worker }));
       process.exit(1);
     }
-    console.log(JSON.stringify({ ok: true, cases: cases.length, hopFenceDistinct: true }));
+    if (!supervisor || !specialist || supervisor === specialist || supervisor === orch) {
+      console.error(JSON.stringify({ supervisor, specialist, orch }));
+      process.exit(1);
+    }
+    if (hopConversationFenceValue('') || hopConversationFenceValue(undefined)) {
+      console.error('empty hop must not fence');
+      process.exit(1);
+    }
+    const durable = 'cv_ddf7cdc36befaa8eaaf3ba2f';
+    const remint = boundHopRemintConversationId(durable, 'orchestrator');
+    if (remint !== 'cv_2901172e7ca0eaa4307877db') {
+      console.error(JSON.stringify({ remint, expect: 'cv_2901172e7ca0eaa4307877db' }));
+      process.exit(1);
+    }
+    if (boundHopRemintConversationId(durable, 'worker') === remint) {
+      console.error('hop remint must stay hop-fenced');
+      process.exit(1);
+    }
+    if (boundHopRemintConversationId(durable) || boundHopRemintConversationId('', 'orchestrator')) {
+      console.error('remint requires a durable id and a hop fence');
+      process.exit(1);
+    }
+    const keptDirectory = pointReadCanonicalConversationId({
+      requestedConversationId: 'cv_dir_worker',
+      initialConversationId: 'cv_dir_worker',
+      membershipCount: 9,
+      selectedConversationId: 'cv_shared_parent',
+      projectionHasRequested: true,
+    });
+    if (keptDirectory !== 'cv_dir_worker') {
+      console.error(JSON.stringify({ keptDirectory, expect: 'cv_dir_worker' }));
+      process.exit(1);
+    }
+    const usesSelectedWhenMissing = pointReadCanonicalConversationId({
+      requestedConversationId: 'cv_dir_worker',
+      initialConversationId: 'cv_dir_worker',
+      membershipCount: 9,
+      selectedConversationId: 'cv_worker_local',
+      projectionHasRequested: false,
+    });
+    if (usesSelectedWhenMissing !== 'cv_worker_local') {
+      console.error(JSON.stringify({ usesSelectedWhenMissing, expect: 'cv_worker_local' }));
+      process.exit(1);
+    }
+    if (!shouldProjectHopLocal([{ hop: 'worker' }, { hop: 'worker' }])
+      || shouldProjectHopLocal([{ hop: 'worker' }, { hop: 'orchestrator' }])) {
+      console.error('hop-local projection is for a single hop membership');
+      process.exit(1);
+    }
+    const stripped = hopLocalProjectionRecord({
+      hop: 'worker',
+      conversationId: 'cv_shared_parent',
+      conversationIdSource: 'inferred',
+      conversationBindingVersion: 2,
+    });
+    if (stripped.conversationId || stripped.conversationBindingVersion) {
+      console.error('hop-local projection must drop a shared persisted Thread id');
+      process.exit(1);
+    }
+    if (persistedMembershipConversationId({
+      resolverConversationId: 'cv_worker_v2',
+      bindingConversationId: 'cv_orch_stamp',
+    }) !== 'cv_worker_v2') {
+      console.error('v2 hop-local membership must win over a v1 parent stamp');
+      process.exit(1);
+    }
+    const remintedWorker = hopAlignedConversationId({
+      conversationId: 'cv_a85602d5b8a4049aca517859',
+      hop: 'worker',
+      threadLogicalScopeKey: 'ls_fixture|hop:orchestrator',
+    });
+    const remintedOrch = hopAlignedConversationId({
+      conversationId: 'cv_a85602d5b8a4049aca517859',
+      hop: 'orchestrator',
+      threadLogicalScopeKey: 'ls_fixture|hop:orchestrator',
+    });
+    if (!remintedWorker || remintedWorker === remintedOrch || remintedOrch !== 'cv_a85602d5b8a4049aca517859') {
+      console.error(JSON.stringify({ remintedWorker, remintedOrch }));
+      process.exit(1);
+    }
+    if (hopAlignedConversationId({
+      conversationId: 'cv_worker_v2',
+      hop: 'worker',
+    }) !== 'cv_worker_v2') {
+      console.error('missing Thread must keep a hop-local membership id');
+      process.exit(1);
+    }
+    if (hopAlignedConversationId({
+      conversationId: 'cv_a85602d5b8a4049aca517859',
+      hop: 'worker',
+      threadLogicalScopeKey: 'ls_fixture',
+    }) !== 'cv_a85602d5b8a4049aca517859') {
+      console.error('hop-unscoped Thread must keep the persisted stamp');
+      process.exit(1);
+    }
+    const followsSelected = pointReadCanonicalConversationId({
+      requestedConversationId: 'cv_dir_worker',
+      initialConversationId: 'cv_shared_parent',
+      membershipCount: 9,
+      selectedConversationId: 'cv_shared_parent',
+    });
+    if (followsSelected !== 'cv_shared_parent') {
+      console.error(JSON.stringify({ followsSelected, expect: 'cv_shared_parent' }));
+      process.exit(1);
+    }
+    const orchSuffix = conversationHopScopeSuffix('orchestrator');
+    const workerSuffix = conversationHopScopeSuffix('worker');
+    if (!orchSuffix.startsWith('|hop:') || orchSuffix === workerSuffix || orchSuffix.indexOf(String.fromCharCode(0)) >= 0) {
+      console.error(JSON.stringify({ orchSuffix, workerSuffix }));
+      process.exit(1);
+    }
+    if (hopFromLogicalScopeKey('ls_fixture' + orchSuffix) !== 'orchestrator') {
+      console.error('scope hop suffix must round-trip');
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ ok: true, cases: cases.length, hopFenceDistinct: true, remintLocked: true }));
   `;
   const result = spawnSync(
     process.execPath,

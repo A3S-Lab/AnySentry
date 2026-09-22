@@ -4,8 +4,10 @@ import type * as T from './types';
 import { createEvidenceLink, type EvidenceLink } from './canonical-observability';
 import { matchAgentAdapterManifest, normalizeExecArgv } from './agent-adapter-execution';
 import { agentRuntimeInstanceIdsEquivalent } from './agent-identity';
+import { inMemoryPlanTool, toolContentCode, toolDelegatedCode } from './agent-tool-shape';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 7;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 9;
+const ALIAS_FOLD_WINDOW_MS = 60_000;
 const CLOCK_SKEW_MS = 2_000;
 /** Open-call fallback when ToolResult is still missing. Keep far shorter than a wall-clock
  *  session so late unrelated ToolExec/File/Egress cannot attach to a sticky pending ToolCall. */
@@ -136,16 +138,17 @@ function toolCommand(event: T.AgentSemanticEvent): string | undefined {
   if (typeof event.content === 'string') {
     try {
       const parsed = JSON.parse(event.content);
-      const nested = nestedString(parsed, ['cmd', 'command', 'script']);
+      const nested = nestedString(parsed, ['cmd', 'command', 'script', 'code']);
       if (nested) return nested;
     } catch {
       // Custom tools commonly encode a JavaScript orchestration snippet rather than JSON.
     }
     return quotedField(event.content, 'cmd')
       ?? quotedField(event.content, 'command')
-      ?? quotedField(event.content, 'script');
+      ?? quotedField(event.content, 'script')
+      ?? quotedField(event.content, 'code');
   }
-  return nestedString(event.content, ['cmd', 'command', 'script']);
+  return nestedString(event.content, ['cmd', 'command', 'script', 'code']);
 }
 
 const TOOL_RESOURCE_KEYS = [
@@ -484,6 +487,7 @@ function relationWindowEndMs(event: T.AgentSemanticEvent, result?: T.AgentSemant
   let end = resultAt;
   if (
     FILE_TOOL_PATTERN.test(normalizedToolLabel(event))
+    && !inMemoryPlanTool(normalizedToolLabel(event))
     && resultAt - start < COLLAPSED_TOOL_RESULT_MS
   ) {
     end = Math.max(end, start + COLLAPSED_FILE_GRACE_MS);
@@ -613,10 +617,15 @@ function sandboxTool(event: T.AgentSemanticEvent): boolean {
     .filter((value): value is string => Boolean(value))
     .join(' ')
     .toLowerCase();
+  if (inMemoryPlanTool(normalized)) return false;
   if (SANDBOX_TOOL_PATTERN.test(normalized)) return true;
   const endpoint = toolHost(event)
     ?? (typeof event.content === 'string' ? text(event.content, 512) : nestedString(event.content, ['endpoint', 'url']));
-  return Boolean(endpoint && /sandbox/iu.test(endpoint));
+  if (endpoint && /sandbox/iu.test(endpoint)) return true;
+  // Product-neutral: a `code` argument is a delegated runtime payload even when the LLM
+  // names the tool run_python / execute_code / something else. Do not require the word
+  // "sandbox" and do not invent FileAccess from that name.
+  return Boolean(toolDelegatedCode(event.content));
 }
 
 function sandboxRunnerExec(candidate: T.AgentEventListItem): boolean {
@@ -637,7 +646,7 @@ function shellHttpTool(
   event: T.AgentSemanticEvent,
   interaction: T.AgentInteractionRecord,
 ): boolean {
-  return SHELL_TOOL_PATTERN.test(normalizedToolLabel(event))
+  return (SHELL_TOOL_PATTERN.test(normalizedToolLabel(event)) || Boolean(toolCommand(event)))
     && httpToolBackendInteraction(interaction);
 }
 
@@ -817,7 +826,9 @@ function processLineageCandidate(
     .join(' ')
     .toLowerCase() || 'other';
   if (SHELL_TOOL_PATTERN.test(normalizedTool) && toolCommand(input.event)) return false;
-  if (FILE_TOOL_PATTERN.test(normalizedTool) && toolResource(input.event)) return false;
+  if (FILE_TOOL_PATTERN.test(normalizedTool)
+    && !inMemoryPlanTool(normalizedTool)
+    && toolResource(input.event)) return false;
   if (NETWORK_TOOL_PATTERN.test(normalizedTool)) return false;
   if (sandboxTool(input.event)) return false;
   const rootPid = candidate.attribution?.rootPid;
@@ -912,17 +923,25 @@ function potentialRelation(
   // LLM transcript but execute out-of-process. Admit transport Egress alongside ToolExec so a
   // missing remote execve (common for short allowlisted binaries) still leaves kernel evidence.
   const httpBackend = httpToolBackendInteraction(interaction);
-  const acceptedKinds = SHELL_TOOL_PATTERN.test(normalizedTool)
+  const executionShaped = Boolean(command) || SHELL_TOOL_PATTERN.test(normalizedTool);
+  const networkShaped = NETWORK_TOOL_PATTERN.test(normalizedTool);
+  const acceptedKinds = executionShaped
     ? (httpBackend
       ? new Set(['ToolExec', 'Egress', 'Dns', 'Tls'])
+      : networkShaped
+        // OTLP/application spans can carry a code/command argument on an HTTP-named tool
+        // without living in the wire tool lane. Keep both exec and transport candidates.
+        ? new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls'])
       // A local shell tool can perform file work in a child process. Keep the process
       // generation check in candidate arbitration, but admit same-runtime FileAccess facts so
       // bash writes do not degrade to semantic-only merely because the shell is not the Agent
       // root process itself.
-      : new Set(['ToolExec', 'FileAccess', 'FileDelete']))
+        : new Set(['ToolExec', 'FileAccess', 'FileDelete']))
+    : inMemoryPlanTool(normalizedTool)
+      ? new Set<string>()
     : FILE_TOOL_PATTERN.test(normalizedTool)
       ? new Set(['FileAccess', 'FileDelete'])
-      : NETWORK_TOOL_PATTERN.test(normalizedTool)
+      : networkShaped
         ? new Set(['Egress', 'Dns', 'Tls'])
         : new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls']);
   if (!acceptedKinds.has(candidate.eventKind) || !withinWindow(event, result, candidate)) {
@@ -1128,6 +1147,7 @@ function unlinkedRelation(
   resolutionRevision: number,
   coveragePartial: boolean,
 ): T.AgentSemanticKernelRelation {
+  const expectedNoKernel = inMemoryPlanTool(normalizedToolLabel(input.event));
   const invocationId = toolInvocationId(input.event, input.interaction);
   // Keep the unresolved relation on the exact same canonical-link identity path as linked and
   // ambiguous relations.  The previous `supports`/source-only link differed from
@@ -1149,7 +1169,7 @@ function unlinkedRelation(
       input.event.semanticEventId,
     ],
     algorithmVersion: `semantic-kernel-relation.v${AGENT_SEMANTIC_KERNEL_RELATION_VERSION}`,
-    status: coveragePartial ? 'coverage_gap' : 'unmatched',
+    status: expectedNoKernel || !coveragePartial ? 'unmatched' : 'coverage_gap',
     validFromUnixNs: input.interaction.startedAtUnixNs,
     resolutionRevision,
   });
@@ -1160,7 +1180,7 @@ function unlinkedRelation(
     conversationId: input.event.conversationId,
     turnId: input.event.turnId,
     toolInvocationId: invocationId,
-    status: coveragePartial ? 'coverage_gap' : 'semantic_only',
+    status: expectedNoKernel || !coveragePartial ? 'semantic_only' : 'coverage_gap',
     confidence: 0,
     authority: semanticRelationAuthority(input.interaction),
     relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
@@ -1454,10 +1474,97 @@ export function buildSemanticKernelRelationBatch(
     );
   }
 
+  foldDelegatedContentAliasRelations(boundedInputs, relationsBySemanticEventId);
+
   return {
     relationsBySemanticEventId,
     allRelations: [...relationsBySemanticEventId.values()].flat(),
   };
+}
+
+function observedRuntimeKey(interaction: T.AgentInteractionRecord): string | undefined {
+  return interaction.runtimeInstanceId
+    ?? interaction.canonicalAgentInstanceId
+    ?? interaction.agentInstanceId;
+}
+
+function hopCompatibleInteractions(
+  left: T.AgentInteractionRecord,
+  right: T.AgentInteractionRecord,
+): boolean {
+  const leftHop = typeof left.hop === 'string' ? left.hop.trim() : '';
+  const rightHop = typeof right.hop === 'string' ? right.hop.trim() : '';
+  if (!leftHop || !rightHop || leftHop === rightHop) return true;
+  return Boolean(left.delegationId && left.delegationId === right.delegationId);
+}
+
+function linkedKernelRelations(
+  relations: readonly T.AgentSemanticKernelRelation[] | undefined,
+): T.AgentSemanticKernelRelation[] {
+  return (relations ?? []).filter((relation) =>
+    Boolean(relation.kernelEventId)
+    && ['linked_exact', 'linked_strong'].includes(relation.status));
+}
+
+/**
+ * LLM tool names (run_python, run_in_sandbox, execute_code, …) and wire/kernel names
+ * (http.code.execute, runner.py, Egress) rarely match. Fold by content fingerprint
+ * (code/endpoint/command) onto a unique same-runtime HTTP backend that already owns Kernel.
+ * Never fold in-memory plan tools and never invent a Kernel row.
+ */
+function foldDelegatedContentAliasRelations(
+  inputs: readonly SemanticKernelRelationInput[],
+  relationsBySemanticEventId: Map<string, T.AgentSemanticKernelRelation[]>,
+): void {
+  const backends = inputs.filter((input) =>
+    input.interaction.interactionType === 'tool'
+    && linkedKernelRelations(relationsBySemanticEventId.get(input.event.semanticEventId)).length > 0);
+  if (backends.length === 0) return;
+
+  for (const input of inputs) {
+    if (input.interaction.interactionType === 'tool') continue;
+    if (inMemoryPlanTool(normalizedToolLabel(input.event))) continue;
+    const current = relationsBySemanticEventId.get(input.event.semanticEventId) ?? [];
+    if (linkedKernelRelations(current).length > 0) continue;
+    const fingerprint = toolContentCode(input.event.content);
+    if (!fingerprint) continue;
+    const runtime = observedRuntimeKey(input.interaction);
+    if (!runtime) continue;
+    const peers = backends
+      .map((backend) => {
+        if (observedRuntimeKey(backend.interaction) !== runtime) return undefined;
+        if (!hopCompatibleInteractions(input.interaction, backend.interaction)) return undefined;
+        const backendFingerprint = toolContentCode(backend.event.content);
+        if (backendFingerprint && backendFingerprint !== fingerprint) return undefined;
+        const distance = Math.abs(callAnchorMs(input) - callAnchorMs(backend));
+        if (distance > ALIAS_FOLD_WINDOW_MS) return undefined;
+        return { backend, distance };
+      })
+      .filter((entry): entry is { backend: SemanticKernelRelationInput; distance: number } => Boolean(entry))
+      .sort((left, right) => left.distance - right.distance
+        || left.backend.event.semanticEventId.localeCompare(right.backend.event.semanticEventId));
+    if (peers.length === 0) continue;
+    if (peers.length > 1 && peers[0]!.distance === peers[1]!.distance) continue;
+    const winnerRelations = linkedKernelRelations(
+      relationsBySemanticEventId.get(peers[0]!.backend.event.semanticEventId),
+    );
+    if (winnerRelations.length === 0) continue;
+    relationsBySemanticEventId.set(
+      input.event.semanticEventId,
+      sortRelations(winnerRelations.map((relation) => ({
+        ...relation,
+        relationId: stableId('skr', [
+          input.event.semanticEventId,
+          'alias',
+          relation.kernelEventId ?? relation.relationId,
+        ].join('\u0000')),
+        stableSemanticEventId: input.event.semanticEventId,
+        conversationId: input.event.conversationId,
+        turnId: input.event.turnId,
+        toolInvocationId: toolInvocationId(input.event, input.interaction),
+      }))),
+    );
+  }
 }
 
 export function buildSemanticKernelRelations(

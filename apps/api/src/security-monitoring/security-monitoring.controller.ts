@@ -11,6 +11,12 @@ import {
   projectAgentConversationDirectory,
 } from './agent-conversation-directory';
 import { conversationCoverage, projectAgentConversations } from './agent-conversation';
+import {
+  exactSessionPointReadCoverage,
+  observabilityCoverageLayers,
+  sessionResourceAliases,
+  sessionResourceHydrated,
+} from './observability-coverage';
 import { projectSemanticConversationTimeline } from './agent-semantic-timeline';
 import { AggregationService } from './aggregation.service';
 import { AlertingService } from './alerting.service';
@@ -12026,9 +12032,10 @@ export class SecurityMonitoringController implements OnModuleDestroy {
    * The canonical Session ID and the legacy conversation ID are intentionally different
    * namespaces.  During a membership/ClickHouse timeout the narrow query can therefore return no
    * row even though a bounded global conversation projection still contains the exact alias.  Do
-   * one explicitly bounded broad read, filter the returned rows locally, and mark the result
-   * partial.  This also protects against a compatibility projection that reports `complete` for
-   * its scanned page while omitting the requested alias; the retry is not recursive.
+   * one explicitly bounded broad read, then filter the returned rows locally. Coverage stays
+   * the matched rows' own status: a complete Session must not inherit list-window gaps from
+   * unrelated conversations. A membership stub that already carries a hop-fenced conversation
+   * id is resolved once through that id; the retry is otherwise not recursive.
    */
   private async canonicalSessionResourcesForExact(
     query: CanonicalEntityQuery,
@@ -12036,11 +12043,42 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   ): Promise<CanonicalSessionProjection> {
     const result = await this.canonicalSessionResources(query, headers);
     const requestedSessionId = query.sessionId;
+    const matchesRequested = (item: T.CanonicalSessionResource) =>
+      sessionResourceAliases(item).includes(requestedSessionId ?? '');
+    const narrowMatches = requestedSessionId ? result.items.filter(matchesRequested) : [];
+    const narrowHydrated = narrowMatches.filter(sessionResourceHydrated);
     if (!requestedSessionId
-      || /^sess_[a-f0-9]{24}$/u.test(requestedSessionId)
-      || result.items.some((item) => [item.sessionId, item.canonicalSessionId, item.conversationId].includes(requestedSessionId))) {
+      || (narrowHydrated.length > 0)
+      || (/^sess_[a-f0-9]{24}$/u.test(requestedSessionId) && narrowMatches.length > 0)) {
+      if (requestedSessionId && narrowHydrated.length > 0) {
+        return {
+          ...result,
+          items: narrowHydrated,
+          coverage: exactSessionPointReadCoverage(narrowHydrated, result.dataSource),
+        };
+      }
       return result;
     }
+    const hydrateViaConversation = async (
+      items: readonly T.CanonicalSessionResource[],
+    ): Promise<CanonicalSessionProjection | undefined> => {
+      const conversationId = items.find((item) =>
+        item.conversationId && item.conversationId !== requestedSessionId)?.conversationId;
+      if (!conversationId) return undefined;
+      const viaConversation = await this.canonicalSessionResourcesForExact({
+        ...query,
+        sessionId: conversationId,
+      }, headers);
+      const hydrated = viaConversation.items.filter(sessionResourceHydrated);
+      if (hydrated.length === 0) return undefined;
+      return {
+        ...viaConversation,
+        items: hydrated,
+        coverage: exactSessionPointReadCoverage(hydrated, viaConversation.dataSource),
+      };
+    };
+    const fromNarrow = await hydrateViaConversation(narrowMatches);
+    if (fromNarrow) return fromNarrow;
     try {
       const broad = await this.canonicalSessionResources({
         ...query,
@@ -12048,23 +12086,16 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         offset: 0,
         limit: CANONICAL_ENTITY_LIMIT_MAX,
       }, headers);
-      const exact = broad.items.filter((item) => [
-        item.sessionId,
-        item.canonicalSessionId,
-        item.conversationId,
-      ].includes(requestedSessionId));
-      if (exact.length === 0) return result;
+      const exact = broad.items.filter(matchesRequested);
+      const fromBroad = await hydrateViaConversation(exact);
+      if (fromBroad) return fromBroad;
+      const hydrated = exact.filter(sessionResourceHydrated);
+      const chosen = hydrated.length > 0 ? hydrated : exact;
+      if (chosen.length === 0) return result;
       return {
         ...broad,
-        items: exact,
-        coverage: {
-          ...broad.coverage,
-          status: 'partial',
-          reasons: [...new Set([
-            ...broad.coverage.reasons,
-            'canonical_session_bounded_alias_fallback',
-          ])].slice(0, 64),
-        },
+        items: chosen,
+        coverage: exactSessionPointReadCoverage(chosen, broad.dataSource),
       };
     } catch (error) {
       if (!isCanonicalProjectionDegradation(error)) throw error;
@@ -12224,7 +12255,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       : await this.canonicalObservability.listDurableSessionMemberships(512);
     let conversations: T.AgentConversationList;
     let sessionInteractions: T.AgentInteractionRecord[] = [];
-    if (memberships.length > 0 && query.sessionId) {
+    if (memberships.length > 0 && query.sessionId && /^sess_[a-f0-9]{24}$/u.test(query.sessionId)) {
       const selected = await this.agg.agentInteractions({
         scope: 'raw',
         interactionIds: memberships.map((membership) => membership.interactionId).filter((id): id is string => Boolean(id)),
@@ -12372,6 +12403,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         errorCount: summary.errorCount,
         usage: structuredClone(summary.usage),
         coverage: structuredClone(summary.coverage),
+        ...(summary.coverageLayers ? { coverageLayers: structuredClone(summary.coverageLayers) } : {}),
         sourceRefs: [...new Set([
           ...canonicalConversationSourceRefs(summary),
           ...related.flatMap((membership) => membership.sourceRefs),
@@ -12490,6 +12522,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
               completeInteractions: closed.completeInteractions,
               partialInteractions: closed.partialInteractions,
             };
+            resource.coverageLayers = observabilityCoverageLayers(
+              scopedInteractions,
+              await this.agg.toolEvidenceItemsForInteractions(scopedInteractions),
+              closed,
+            );
             continue;
           }
           const completeInteractions = new Set(
@@ -12540,6 +12577,11 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           completeInteractions: closed.completeInteractions,
           partialInteractions: closed.partialInteractions,
         };
+        resource.coverageLayers = observabilityCoverageLayers(
+          scopedInteractions,
+          await this.agg.toolEvidenceItemsForInteractions(scopedInteractions),
+          closed,
+        );
       }
     }
     const resources = [...resourcesByKey.values()].filter((resource) => canonicalScopeMatches({
@@ -12980,9 +13022,38 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalSession(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
     const result = await this.canonicalSessionResourcesForExact(query, headers);
-    const item = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    const item = result.items.find((candidate) => sessionResourceAliases(candidate).includes(sessionId));
     if (!item) throw new NotFoundException('session not found');
     return { schemaVersion: 'anysentry.session.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+  }
+
+  @Get('v1/runs/:runId')
+  @RequireManagementAuth()
+  async canonicalRun(@Param('runId') runId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
+    const id = strictIdentityText(runId, 240);
+    if (!id) throw new BadRequestException('runId is invalid');
+    const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId: id });
+    const result = await this.canonicalSessionResourcesForExact(query, headers);
+    const session = result.items.find((candidate) => sessionResourceAliases(candidate).includes(id));
+    if (!session) throw new NotFoundException('run not found');
+    const item: T.CanonicalRunResource = {
+      schemaVersion: 'anysentry.run.v1',
+      runId: id,
+      sessionId: session.sessionId,
+      ...(session.conversationId ? { conversationId: session.conversationId } : {}),
+      coverage: session.coverage,
+      ...(session.coverageLayers ? { coverageLayers: session.coverageLayers } : {}),
+      sourceRefs: session.sourceRefs,
+      resolutionRevision: session.resolutionRevision,
+    };
+    return {
+      schemaVersion: 'anysentry.run.v1',
+      item,
+      revision: result.revision,
+      coverage: result.coverage,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/sessions/:sessionId/timeline')
@@ -12990,7 +13061,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalSessionTimeline(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
     const sessions = await this.canonicalSessionResourcesForExact({ ...query, offset: 0, limit: 500 }, headers);
-    let session = sessions.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    let session = sessions.items.find((candidate) => sessionResourceAliases(candidate).includes(sessionId));
     let conversationId = session?.conversationId ?? session?.sessionId ?? sessionId;
     // A membership-only Session can legitimately outlive its compatibility Thread projection and
     // therefore have no `conversationId`. Resolve one bounded interaction by its immutable
@@ -13253,9 +13324,17 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalSessionCoverage(@Param('sessionId') sessionId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag) {
     const query = parseCanonicalEntityQuery({ ...rawQuery, sessionId });
     const result = await this.canonicalSessionResourcesForExact({ ...query, offset: 0, limit: 500 }, headers);
-    const session = result.items.find((candidate) => [candidate.sessionId, candidate.canonicalSessionId, candidate.conversationId].includes(sessionId));
+    const session = result.items.find((candidate) => sessionResourceAliases(candidate).includes(sessionId));
     if (!session) throw new NotFoundException('session not found');
-    return { schemaVersion: 'anysentry.session.coverage.v1', sessionId: session.sessionId, coverage: session.coverage, revision: result.revision, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+    return {
+      schemaVersion: 'anysentry.session.coverage.v1',
+      sessionId: session.sessionId,
+      coverage: session.coverage,
+      ...(session.coverageLayers ? { coverageLayers: session.coverageLayers } : {}),
+      revision: result.revision,
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/semantic-events/:semanticEventId/evidence')
@@ -13787,6 +13866,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       connectionIdentity: 'anysentry.connection_identity.v1',
       sessionMembership: 'anysentry.session_membership.v1',
       evidenceLink: 'anysentry.evidence_link.v1',
+      run: 'anysentry.run.v1',
       coverageGap: 'anysentry.coverage_gap.v1',
       relationRevision: 'anysentry.relation_revision.v1',
       registries: this.canonicalObservability.registryCatalog(),
@@ -15228,7 +15308,13 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     let deliveryError = '';
     if (!revisionConflict && retainedPrepared.length > 0) {
       try {
-        await this.judge.enqueuePreparedFastJobs(retainedPrepared);
+        const queued = await this.judge.enqueuePreparedFastJobs(retainedPrepared);
+        if (queued?.skipped > 0) {
+          this.canonicalObservability.recordGap('judgment', 'dropped', 'fast_judge', {
+            reason: queued.reason || 'no_workers',
+            count: queued.skipped,
+          });
+        }
       } catch (error) {
         deliveryRetryFrom = Math.min(...retainedForPersistence.map(({ index }) => index));
         // Fast-judgment enqueue is intentionally kept retryable: without a queue reservation the

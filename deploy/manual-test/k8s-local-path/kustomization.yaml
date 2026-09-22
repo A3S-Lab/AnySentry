@@ -9,6 +9,7 @@ resources:
   - ../../streaming.yaml
   - manual-support.yaml
   - service-context-probe.yaml
+  - prometheus.yaml
 
 images:
   - name: ghcr.io/a3s-lab/anysentry
@@ -30,3 +31,4 @@ patches:
   - path: anysentry-nodeport-patch.yaml
   - path: full-load-capacity-patch.yaml
   - path: anysentry-pressure-capacity-patch.yaml
+  - path: anysentry-prometheus-env-patch.yaml

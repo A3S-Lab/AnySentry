@@ -10,23 +10,23 @@ import {
   trafficRoleForInteraction,
   conversationLogicalScopeKeyV2,
   conversationDeploymentScopeKey,
+  conversationDirectoryScopeKey,
   canonicalPerRequestConversationId,
   hopConversationFence,
+  hopScopedSessionConversationId,
+  GENERIC_SESSION_IDS,
 } from './agent-conversation-resolution-v2';
 import {
   closeToolCallsAcrossInteractions,
   projectInteractionsWithReconstructedHistoryToolCalls,
 } from './agent-tool-closure';
+import { observabilityCoverageLayers } from './observability-coverage';
 
 function deploymentSessionScopeKeyForRecord(record: T.AgentInteractionRecord): string {
   return conversationDeploymentScopeKey(record);
 }
 
 const PREVIEW_CHARACTERS = 320;
-const GENERIC_SESSION_IDS = new Set([
-  '', '-', 'none', 'null', 'unknown', 'legacy', 'default',
-  'tokio-rt-worker', 'reqwest-internal', 'mainthread',
-]);
 
 export interface AgentConversationProjection {
   summaries: T.AgentConversationSummary[];
@@ -149,12 +149,8 @@ function explicitConversation(
   /** Scope is part of the grouping key even when a legacy/provider ID is reused. */
   scopeKey: string;
 } | undefined {
-  const logicalScopeKey = conversationLogicalScopeKeyV2(record);
-  const deploymentScopeKey = conversationDeploymentScopeKey(record);
   const hopFence = hopConversationFence(record);
-  const scopeKey = `${deploymentScopeKey
-    ? `${logicalScopeKey}|deployment:${deploymentScopeKey}`
-    : logicalScopeKey}${hopFence}`;
+  const scopeKey = conversationDirectoryScopeKey(record);
   const perRequestBoundary = record.sessionMode === 'per_request'
     || record.sessionIdentityQuality === 'ephemeral'
     || record.sessionIdSource === 'per_request'
@@ -176,21 +172,21 @@ function explicitConversation(
   }
   if (record.conversationId
     && (record.conversationIdSource !== 'inferred' || record.conversationBindingVersion)) {
+    // Durable v2 Thread ids are already hop-scoped. Hashing them again produces a directory
+    // key with no route alias, so timeline-v3 point-reads of that key return 0 turns.
+    // Keep the hop remint only for unbound provider/legacy ids that can be reused across hops.
     return {
-      conversationId: hopFence
+      conversationId: hopFence && !record.conversationBindingVersion
         ? stableId('cv', `bound\0${record.conversationId}${hopFence}`)
         : record.conversationId,
       source: record.conversationIdSource ?? 'inferred',
       scopeKey,
     };
   }
-  const explicitSession = stableRuntimeSession(record.sessionKey)
-    ?? (['confirmed', 'strong'].includes(record.sessionIdentityQuality ?? '')
-      && ['conversation', 'resumable'].includes(record.sessionMode ?? '')
-      ? stableRuntimeSession(record.sessionId) : undefined);
-  if (explicitSession) {
+  const directoryId = hopScopedSessionConversationId(record);
+  if (directoryId) {
     return {
-      conversationId: stableId('cv', `session-key\0${scopeKey}\0${explicitSession}`),
+      conversationId: directoryId,
       source: record.sessionIdSource === 'provider' ? 'provider' : 'runtime',
       scopeKey,
     };
@@ -267,6 +263,72 @@ function compareInteraction(
   right: T.AgentInteractionRecord,
 ): number {
   return left.at - right.at || left.interactionId.localeCompare(right.interactionId);
+}
+
+function scopeRunJoinKey(record: T.AgentInteractionRecord): string | undefined {
+  const run = record.runId?.trim() || record.invocationId?.trim() || record.producerRunId?.trim();
+  const asset = record.agentAssetId?.trim();
+  if (!run || !asset) return undefined;
+  return [
+    asset,
+    hopConversationFence(record),
+    run,
+  ].join('\u0000');
+}
+
+function groupScopeRunJoinKey(records: readonly T.AgentInteractionRecord[]): string | undefined {
+  const keys = new Set(records.map(scopeRunJoinKey).filter((value): value is string => Boolean(value)));
+  return keys.size === 1 ? [...keys][0] : undefined;
+}
+
+/**
+ * One POST / one hop / one Run is one Thread when any sibling already has a
+ * durable session-key id. Tool rows without a provider thread_id must not mint
+ * a second directory Conversation for the same request.
+ */
+function coalesceScopeRunSessionGroups(
+  grouped: Map<string, {
+    source: 'provider' | 'runtime' | 'inferred';
+    records: T.AgentInteractionRecord[];
+    conversationId: string;
+    scopeKey: string;
+  }>,
+): void {
+  const byJoin = new Map<string, string[]>();
+  for (const [key, group] of grouped) {
+    const join = groupScopeRunJoinKey(group.records);
+    if (!join) continue;
+    const keys = byJoin.get(join) ?? [];
+    keys.push(key);
+    byJoin.set(join, keys);
+  }
+  for (const keys of byJoin.values()) {
+    if (keys.length < 2) continue;
+    const hopScoped = keys
+      .map((key) => grouped.get(key))
+      .filter((group): group is NonNullable<typeof group> => Boolean(
+        group
+        && group.records.some((record) => Boolean(hopScopedSessionConversationId(record))),
+      ))
+      .sort((left, right) =>
+        right.records.length - left.records.length
+        || left.records[0]!.at - right.records[0]!.at);
+    const target = hopScoped[0];
+    if (!target) continue;
+    const targetKey = keys.find((key) => grouped.get(key) === target);
+    if (!targetKey) continue;
+    for (const key of keys) {
+      if (key === targetKey) continue;
+      const source = grouped.get(key);
+      if (!source) continue;
+      target.records.push(...source.records);
+      if (source.source === 'provider') target.source = 'provider';
+      else if (source.source === 'runtime' && target.source === 'inferred') {
+        target.source = 'runtime';
+      }
+      grouped.delete(key);
+    }
+  }
 }
 
 function canonicalSemanticJson(value: unknown): string {
@@ -690,6 +752,24 @@ function uniqueToolItemCount(
   return ids.size + anonymous;
 }
 
+const RECOVERABLE_WIRE_REASONS = new Set([
+  'wire_template_unparsed',
+  'wire_unknown',
+  'reassembly_idle_expire_incomplete',
+  'reassembly_shutdown_incomplete',
+]);
+
+function hasRecoverableStructuredPayload(interaction: T.AgentInteractionRecord): boolean {
+  const structured = (value: unknown) => Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value as object).length > 0);
+  if (structured(interaction.request?.structured) || structured(interaction.response?.structured)) {
+    return true;
+  }
+  const body = typeof interaction.response?.body === 'string' ? interaction.response.body.trim()
+    : typeof interaction.request?.body === 'string' ? interaction.request.body.trim() : '';
+  return body.startsWith('{') && body.includes('"');
+}
+
 function effectiveInteractionState(
   interaction: T.AgentInteractionRecord,
   resolvedResults: Set<string>,
@@ -697,8 +777,13 @@ function effectiveInteractionState(
 ): { complete: boolean; reasons: string[] } {
   const unresolvedToolCall = interaction.toolCalls.some((call) =>
     !resolvedResults.has(call.toolCallId));
-  const reasons = interaction.partialReasons.filter((reason) =>
-    reason !== 'tool_result_pending' || unresolvedToolCall);
+  const recovered = hasRecoverableStructuredPayload(interaction)
+    && interaction.statusCode > 0;
+  const reasons = interaction.partialReasons.filter((reason) => {
+    if (reason === 'tool_result_pending') return unresolvedToolCall;
+    if (recovered && RECOVERABLE_WIRE_REASONS.has(reason)) return false;
+    return true;
+  });
   const unknownToolResult = interaction.toolCalls.some((call) =>
     unknownResults.has(call.toolCallId));
   if (unknownToolResult && !reasons.includes('tool_result_status_unobserved')) {
@@ -717,9 +802,15 @@ function effectiveInteractionState(
     )
     && interaction.transportCompleteness !== 'partial'
     && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete');
+  const recoveredComplete = recovered
+    && !unresolvedToolCall
+    && reasons.length === 0
+    && interaction.statusCode > 0
+    && interaction.statusCode < 400;
   return {
     complete: !unknownToolResult && ((interaction.completeness === 'complete' && !unresolvedToolCall)
-      || pendingResolved),
+      || pendingResolved
+      || recoveredComplete),
     reasons,
   };
 }
@@ -743,7 +834,8 @@ export function conversationCoverage(
   const partialInteractions = interactions.length - completeInteractions;
   const reasons = [...new Set(states.flatMap((state) => state.reasons))];
   let status: T.AgentConversationCoverageStatus = partialInteractions ? 'partial' : 'complete';
-  if (interactions.every((item) => item.interactionType === 'unparsed')) {
+  if (interactions.every((item) =>
+    item.interactionType === 'unparsed' && !hasRecoverableStructuredPayload(item))) {
     status = interactions.some((item) =>
       ['http/2', 'websocket', 'quic', 'unknown'].includes(
         item.transportProtocol ?? item.protocol,
@@ -902,6 +994,7 @@ function summaryForConversation(
   const failedToolResults = interactions.reduce((count, item) =>
     count + item.toolResults.filter((result) => result.isError === true).length, 0);
   const usage = summarizeAgentUsage(interactions);
+  const coverage = conversationCoverage(interactions);
   const firstLogical = interactions.find((item) => item.logicalAgentId)?.logicalAgentId;
   const firstCandidate = interactions.find((item) => item.logicalAgentCandidateId)?.logicalAgentCandidateId;
   const terminalContextIds = [...new Set(interactions
@@ -979,7 +1072,8 @@ function summaryForConversation(
       .filter((value): value is string => Boolean(value)))],
     usage,
     instanceUsage: summarizeInstanceUsage(interactions),
-    coverage: conversationCoverage(interactions),
+    coverage,
+    coverageLayers: observabilityCoverageLayers(interactions, [], coverage),
   };
 }
 
@@ -987,6 +1081,7 @@ function assetOnlySummary(
   asset: T.AgentInventoryItem,
   evidence: T.AgentInteractionRecord[] = [],
 ): T.AgentConversationSummary {
+  const coverage = conversationCoverage(evidence);
   return {
     conversationId: stableId('asset', `asset-only\u0000${asset.agentAssetId}`),
     idSource: 'inferred',
@@ -1022,7 +1117,8 @@ function assetOnlySummary(
     models: [],
     usage: emptyAgentUsageSummary(),
     instanceUsage: [],
-    coverage: conversationCoverage(evidence),
+    coverage,
+    coverageLayers: observabilityCoverageLayers(evidence, [], coverage),
   };
 }
 
@@ -1177,6 +1273,7 @@ export function projectAgentConversations(
       scopeKey: thread.scope,
     });
   }
+  coalesceScopeRunSessionGroups(grouped);
 
   const interactionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const sourceInteractionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
@@ -1250,11 +1347,11 @@ function parseEndpointPeer(endpoint: string | undefined): { host?: string; port?
 function conversationHopRole(
   records: readonly T.AgentInteractionRecord[],
 ): 'orchestrator' | 'worker' | 'unknown' {
+  // Protocol roles only: outbound Agent RPC vs inbound child. Hop token strings are
+  // opaque fences and must not be compared to product names.
   if (records.some((item) => item.interactionType === 'remote_agent' || item.trafficRole === 'delegation')) {
     return 'orchestrator';
   }
-  if (records.some((item) => normalized(item.hop) === 'worker')) return 'worker';
-  if (records.some((item) => normalized(item.hop) === 'orchestrator')) return 'orchestrator';
   if (records.some((item) => Boolean(item.parentSessionId || item.delegationId))) return 'worker';
   return 'unknown';
 }

@@ -1936,13 +1936,13 @@ export interface ToolEvidenceItem {
   startedAt?: number;
   endedAt?: number;
   status: "linked" | "semantic_only" | "ambiguous";
-  reason: "exact_process_and_resource" | "exact_child_and_command" | "overlapping_exact_claims" | "kernel_read_not_captured" | "no_matching_kernel_evidence";
+  reason: "exact_process_and_resource" | "exact_child_and_command" | "delegated_command" | "network_witness" | "overlapping_exact_claims" | "kernel_read_not_captured" | "no_matching_kernel_evidence" | "no_kernel_event_expected" | "candidates_truncated";
   adapterEventIds: string[];
   kernelEvidence: Array<{
     eventId: string;
     eventKind: string;
     at: number;
-    linkMethod: "same_process_resource" | "direct_child_command";
+    linkMethod: "same_process_resource" | "direct_child_command" | "delegated_command" | "network";
     confidence: number;
   }>;
   ambiguousKernelEventIds?: string[];
@@ -1957,6 +1957,13 @@ export interface ToolEvidenceResponse {
   dataSource: "clickhouse_relation" | "clickhouse+hot_delta" | "memory_hot_ring";
   partial: boolean;
   partialReasons?: Array<"trusted_correlation_off" | "storage_unavailable" | "scan_limit" | "process_scope_limit">;
+  coverageLayers?: {
+    schemaVersion: "anysentry.observability_coverage_layers.v1";
+    plaintext: { status: string; reasons: string[]; count: number };
+    kernel: { status: string; reasons: string[]; count: number; factCount: number };
+    session: { status: string; reasons: string[]; count: number; canonicalSessionIds: string[] };
+    run: { status: string; reasons: string[]; count: number; runIds: string[] };
+  };
   updateTime: string;
 }
 

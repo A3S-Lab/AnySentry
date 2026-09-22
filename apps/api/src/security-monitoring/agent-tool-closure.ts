@@ -137,6 +137,61 @@ export function closeToolCallsAcrossInteractions(
     }
   }
 
+  const closedKeys = new Set(matches.map((match) => `${match.callInteractionId}\0${match.toolCallId}`));
+  const leftover = [...openCalls.values()].filter((open) =>
+    !closedKeys.has(`${open.interaction.interactionId}\0${open.toolCallId}`));
+  for (const open of leftover) {
+    if (open.interaction.interactionType === 'tool') continue;
+    const call = open.interaction.toolCalls.find((item) => item.toolCallId === open.toolCallId);
+    const args = call?.arguments;
+    const backendArg = args && typeof args === 'object' && !Array.isArray(args)
+      ? ['code', 'endpoint', 'url', 'command', 'cmd', 'script']
+        .map((key) => (args as Record<string, unknown>)[key])
+        .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : undefined;
+    if (!backendArg) continue;
+    const callAt = open.interaction.at;
+    const peers = ordered
+      .filter((interaction) => {
+        if (interaction.interactionType !== 'tool' || interaction.toolResults.length === 0) return false;
+        if (isReplayTraffic(interaction)) return false;
+        if ((interaction.runtimeInstanceId
+          ?? interaction.canonicalAgentInstanceId
+          ?? interaction.agentInstanceId)
+          !== (open.interaction.runtimeInstanceId
+            ?? open.interaction.canonicalAgentInstanceId
+            ?? open.interaction.agentInstanceId)) return false;
+        if (interaction.at < callAt - 2_000 || interaction.at > callAt + 60_000) return false;
+        const observedArg = interaction.toolCalls
+          .map((item) => item.arguments)
+          .concat(interaction.toolResults.map((item) => item.content))
+          .map((value) => {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+            return ['code', 'endpoint', 'url', 'command', 'cmd', 'script']
+              .map((key) => (value as Record<string, unknown>)[key])
+              .find((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+          })
+          .find((value): value is string => Boolean(value));
+        return !observedArg || observedArg === backendArg;
+      })
+      .map((interaction) => ({ interaction, distance: Math.abs(interaction.at - callAt) }))
+      .sort((left, right) => left.distance - right.distance
+        || left.interaction.interactionId.localeCompare(right.interaction.interactionId));
+    if (peers.length === 0) continue;
+    if (peers.length > 1 && peers[0]!.distance === peers[1]!.distance) continue;
+    const winner = peers[0]!.interaction;
+    const result = winner.toolResults[0];
+    if (!result) continue;
+    matches.push({
+      toolCallId: open.toolCallId,
+      callInteractionId: open.interaction.interactionId,
+      resultInteractionId: winner.interactionId,
+      callAtUnixNs: callIssuedAt(open.interaction, open.toolCallId),
+      resultAtUnixNs: resultObservedAt(winner, result.toolCallId),
+      firstSeen: true,
+    });
+  }
+
   // Only first-seen results close a call. Drop accidental duplicate match rows.
   const uniqueMatches = [...new Map(
     matches.map((match) => [`${match.callInteractionId}\0${match.toolCallId}`, match]),

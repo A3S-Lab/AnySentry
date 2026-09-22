@@ -64,6 +64,8 @@ const FORBIDDEN_PRODUCT_CORE_FILES = [
   'apps/api/src/security-monitoring/sentry-judge.service.ts',
   'apps/api/src/security-monitoring/tool-evidence-linker.ts',
   'apps/api/src/security-monitoring/agent-semantic-kernel-relation.ts',
+  'apps/api/src/security-monitoring/observed-tool-evidence.ts',
+  'apps/api/src/security-monitoring/observability-coverage.ts',
   'apps/api/src/security-monitoring/agent-conversation-resolution-v2.ts',
   'scripts/observer-forward.js',
 ];
@@ -1014,6 +1016,9 @@ async function runLocalTests() {
     { id: 'agent-metadata-boundaries', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-metadata-boundaries.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'agent-asset-model', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-asset-model.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'semantic-kernel-relation', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-semantic-kernel-relation.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'observed-tool-evidence', cwd: repoRoot, command: 'node', args: ['scripts/verify-observed-tool-evidence.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'observability-coverage', cwd: repoRoot, command: 'node', args: ['scripts/verify-observability-coverage.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'generic-observability-optimization', cwd: repoRoot, command: 'node', args: ['scripts/verify-generic-observability-optimization.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'runtime-state', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-runtime-state.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'agent-templates', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-templates.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'observer-cargo', cwd: observerRoot, command: 'cargo', args: ['test', '--locked', '--offline', '-p', 'a3s-observer', '-p', 'a3s-observer-common', '-p', 'a3s-observer-collector', '--release'], timeout: TEST_TIMEOUT_MS },

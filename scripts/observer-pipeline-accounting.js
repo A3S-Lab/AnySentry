@@ -19,6 +19,7 @@ const STAGE_REASONS = Object.freeze({
   filtered: Object.freeze([
     'deduplicated',
     'non_agent',
+    'platform_infrastructure',
     'routine_noise',
     'unknown',
     'discovery_budget',

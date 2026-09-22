@@ -42,6 +42,14 @@ import {
 } from './canonical-observability';
 import { PolicyConfig } from './policy-config';
 
+// Unfiltered "latest n" reads stay inside one day. Point reads by id are not limited.
+// A BRIN index can skip old pages only when the scan has a time predicate (design §6.4).
+const RECENT_READ_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function recentUnixNsFloor(windowMs = RECENT_READ_WINDOW_MS): string {
+  return (BigInt(Date.now()) * 1_000_000n - BigInt(windowMs) * 1_000_000n).toString();
+}
+
 const AGENT_METADATA_LIMIT = 10_000;
 const WORKSPACE_DIRECTORY_LIMIT = 10_000;
 const AGENT_WORKSPACE_BINDING_LIMIT = 100_000;
@@ -83,6 +91,18 @@ const CONVERSATION_RESOLUTION_V1_MAX_CATEGORY_BYTES = 16 * 1024 * 1024;
 const SEMANTIC_KERNEL_RELATION_MAX_ROWS = 100_000;
 const SEMANTIC_KERNEL_RELATION_MAX_BYTES = 32 * 1024 * 1024;
 const CANONICAL_WRITE_MAX_BYTES = 64 * 1024 * 1024;
+const COVERAGE_GAP_REVISION_KEEP = 32;
+const COVERAGE_GAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const COVERAGE_GAP_TTL_PRUNE_EVERY = 256;
+/** One ingest save must not delete the historic 7-day tail in a single statement.
+ *  An unbounded `DELETE WHERE last_seen_at < ttl` on this table wrote ~1 GiB WAL
+ *  during a 5-minute Observer window while raw_observations only grew by ~500 rows. */
+const COVERAGE_GAP_TTL_PRUNE_BATCH = 256;
+/** Observer-paused hosts still need to retire the historic per-cgroup revision pile.
+ *  Each idle tick deletes at most this many rows so WAL stays comparable to ingest prune. */
+const COVERAGE_GAP_IDLE_PRUNE_BATCH = 8_192;
+const COVERAGE_GAP_IDLE_PRUNE_MS = 20_000;
+const COVERAGE_GAP_IDLE_SAMPLE_ROWS = 8_192;
 
 type ProjectionBatchEntry<T> = {
   rows: readonly T[];
@@ -260,6 +280,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
   private readonly writerOwnershipInFlight = new Map<string, Promise<WriterOwnership>>();
+  private coverageGapPruneCounter = 0;
+  private coverageGapIdleTimer?: NodeJS.Timeout;
+  private coverageGapIdlePruneInFlight = false;
   private writerOwnershipCacheBytes = 0;
   private writerOwnershipCacheExpired = 0;
   private writerOwnershipCacheEvicted = 0;
@@ -285,6 +308,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.coverageGapIdleTimer) clearTimeout(this.coverageGapIdleTimer);
+    this.coverageGapIdleTimer = undefined;
     this.semanticBatchClosed = true;
     this.evidenceBatch.closed = true;
     this.sessionBatch.closed = true;
@@ -828,17 +853,18 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       // their members directly, including after restart when no route alias is in memory.
       if (/^sess_[a-f0-9]{24}$/u.test(normalizedConversationId)) {
         const result = await this.pool.query<{ interaction_id: string }>(
-          `SELECT candidate.record->>'interactionId' AS interaction_id
+          `SELECT COALESCE(NULLIF(candidate.interaction_id, ''), candidate.record->>'interactionId') AS interaction_id
              FROM anysentry_session_memberships_v1 AS candidate
             WHERE candidate.session_id = $1
-              AND NULLIF(candidate.record->>'interactionId', '') IS NOT NULL
+              AND COALESCE(NULLIF(candidate.interaction_id, ''), NULLIF(candidate.record->>'interactionId', '')) IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM anysentry_session_memberships_v1 AS newer
                  WHERE newer.session_id = candidate.session_id
-                   AND newer.record->>'interactionId' = candidate.record->>'interactionId'
+                   AND COALESCE(NULLIF(newer.interaction_id, ''), newer.record->>'interactionId')
+                     = COALESCE(NULLIF(candidate.interaction_id, ''), candidate.record->>'interactionId')
                    AND newer.resolution_revision > candidate.resolution_revision
               )
-            GROUP BY candidate.record->>'interactionId'
+            GROUP BY COALESCE(NULLIF(candidate.interaction_id, ''), candidate.record->>'interactionId')
             ORDER BY MIN(candidate.valid_from), interaction_id
             LIMIT $2`,
           [normalizedConversationId, boundedLimit + 1],
@@ -1178,6 +1204,56 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async latestRawObservationWatermarks(
+    sources: readonly { sourceId: string; collectorId: string }[] = [],
+  ): Promise<Array<{ sourceId: string; collectorId: string; eventAtMs: number }>> {
+    if (!(await this.initialize()) || !this.pool) return [];
+    const pairs = [...sources]
+      .map((item) => ({
+        sourceId: String(item.sourceId ?? '').trim(),
+        collectorId: String(item.collectorId ?? '').trim(),
+      }))
+      .filter((item) => item.sourceId && item.collectorId)
+      .slice(0, 256);
+    if (!pairs.length) return [];
+    try {
+      const result = await this.pool.query<{
+        source_id: string;
+        collector_id: string;
+        event_at: string;
+      }>(
+        `SELECT source_id, collector_id, MAX(event_at) AS event_at
+           FROM anysentry_raw_observations_v1
+          WHERE event_at >= $1::numeric
+            AND (source_id, collector_id) IN (
+              SELECT * FROM UNNEST($2::text[], $3::text[])
+            )
+          GROUP BY source_id, collector_id`,
+        [
+          recentUnixNsFloor(),
+          pairs.map((item) => item.sourceId),
+          pairs.map((item) => item.collectorId),
+        ],
+      );
+      return result.rows.flatMap((row) => {
+        let eventAtNs = 0n;
+        try {
+          eventAtNs = BigInt(String(row.event_at ?? '0'));
+        } catch {
+          return [];
+        }
+        if (eventAtNs <= 0n) return [];
+        return [{
+          sourceId: String(row.source_id ?? ''),
+          collectorId: String(row.collector_id ?? ''),
+          eventAtMs: Number(eventAtNs / 1_000_000n),
+        }];
+      });
+    } catch {
+      return [];
+    }
+  }
+
   async loadRawObservations(
     input: { observationIds?: readonly string[]; revision?: number; limit?: number } = {},
   ): Promise<RawObservation[]> {
@@ -1206,17 +1282,20 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
             : requestedRevision !== undefined
               ? `SELECT record
                    FROM anysentry_raw_observations_v1
-                  WHERE revision = $1
+                  WHERE revision = $1 AND event_at >= $2::numeric
                   ORDER BY event_at DESC, observation_id
-                  LIMIT $2`
+                  LIMIT $3`
               : `SELECT record
                    FROM anysentry_raw_observations_v1
+                  WHERE event_at >= $1::numeric
                   ORDER BY event_at DESC, observation_id, revision DESC
-                  LIMIT $1`,
+                  LIMIT $2`,
         ids.length && requestedRevision !== undefined
           ? [ids, requestedRevision, limit]
           : ids.length ? [ids, limit]
-            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+            : requestedRevision !== undefined
+              ? [requestedRevision, recentUnixNsFloor(), limit]
+              : [recentUnixNsFloor(), limit],
       );
       return result.rows
         .flatMap(({ record }) => {
@@ -1346,9 +1425,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
               LIMIT $${params.length}`
           : `SELECT record
                FROM anysentry_kernel_facts_v1
+              WHERE observed_at >= $1::numeric
               ORDER BY observed_at DESC, fact_id
-              LIMIT $${params.length}`,
-        params,
+              LIMIT $2`,
+        predicates.length ? params : [recentUnixNsFloor(), limit],
       );
       return result.rows.flatMap(({ record }) => {
         const parsed = this.parseRecord<KernelFact>(record);
@@ -1513,17 +1593,20 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
             : requestedRevision !== undefined
               ? `SELECT record
                    FROM anysentry_semantic_records_v1
-                  WHERE revision = $1
+                  WHERE revision = $1 AND observed_at >= $2::numeric
                   ORDER BY observed_at DESC, semantic_record_id
-                  LIMIT $2`
+                  LIMIT $3`
               : `SELECT record
                    FROM anysentry_semantic_records_v1
+                  WHERE observed_at >= $1::numeric
                   ORDER BY observed_at DESC, semantic_record_id, revision DESC
-                  LIMIT $1`,
+                  LIMIT $2`,
         ids.length && requestedRevision !== undefined
           ? [ids, requestedRevision, limit]
           : ids.length ? [ids, limit]
-            : requestedRevision !== undefined ? [requestedRevision, limit] : [limit],
+            : requestedRevision !== undefined
+              ? [requestedRevision, recentUnixNsFloor(), limit]
+              : [recentUnixNsFloor(), limit],
       );
       return result.rows
         .flatMap(({ record }) => {
@@ -1643,7 +1726,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          )
          INSERT INTO anysentry_session_memberships_v1 (
            membership_id, resolution_revision, session_id, session_key,
-           provider_session_id_hash, role, confidence, valid_from, record
+           provider_session_id_hash, role, confidence, valid_from, record, interaction_id
          )
          SELECT
            record->>'membershipId',
@@ -1654,7 +1737,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
            record->>'role',
            record->>'confidence',
            (record->>'validFromUnixNs')::numeric,
-           record
+           record,
+           NULLIF(record->>'interactionId', '')
          FROM incoming
          ON CONFLICT (membership_id, resolution_revision) DO NOTHING`,
         [boundedJson],
@@ -1698,13 +1782,13 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
             : interactionIds.length && requestedRevision !== undefined
           ? `SELECT record
                FROM anysentry_session_memberships_v1
-              WHERE record->>'interactionId' = ANY($1::text[]) AND resolution_revision = $2
+              WHERE COALESCE(NULLIF(interaction_id, ''), record->>'interactionId') = ANY($1::text[]) AND resolution_revision = $2
               ORDER BY valid_from DESC, membership_id
               LIMIT $3`
           : interactionIds.length
             ? `SELECT record
                  FROM anysentry_session_memberships_v1
-                WHERE record->>'interactionId' = ANY($1::text[])
+                WHERE COALESCE(NULLIF(interaction_id, ''), record->>'interactionId') = ANY($1::text[])
                 ORDER BY valid_from DESC, membership_id, resolution_revision DESC
                 LIMIT $2`
             : ids.length && requestedRevision !== undefined
@@ -1805,10 +1889,153 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          ON CONFLICT (gap_id, revision) DO NOTHING`,
         [boundedJson],
       );
+      await this.pruneCoverageGapHistory(boundedJson);
       return true;
     } catch (error) {
       this.markUnavailable('save canonical coverage gaps', error);
       return false;
+    }
+  }
+
+  private async pruneCoverageGapHistory(incomingJson: string): Promise<void> {
+    if (!this.pool) return;
+    await this.pool.query(
+      `WITH incoming AS (
+         SELECT DISTINCT item->>'gapId' AS gap_id
+           FROM jsonb_array_elements($1::jsonb) AS source(item)
+       ),
+       cutoff AS (
+         SELECT gap_id, MAX(revision) - $2::bigint AS min_revision
+           FROM anysentry_coverage_gaps_v1
+          WHERE gap_id IN (SELECT gap_id FROM incoming)
+          GROUP BY gap_id
+       )
+       DELETE FROM anysentry_coverage_gaps_v1 existing
+        USING cutoff
+        WHERE existing.gap_id = cutoff.gap_id
+          AND existing.revision < cutoff.min_revision`,
+      [incomingJson, COVERAGE_GAP_REVISION_KEEP - 1],
+    );
+    this.coverageGapPruneCounter += 1;
+    if (this.coverageGapPruneCounter % COVERAGE_GAP_TTL_PRUNE_EVERY !== 1) return;
+    const ttlNs = String(BigInt(Date.now() - COVERAGE_GAP_TTL_MS) * 1_000_000n);
+    await this.pool.query(
+      `DELETE FROM anysentry_coverage_gaps_v1
+        WHERE (last_seen_at, gap_id, revision) IN (
+          SELECT last_seen_at, gap_id, revision
+            FROM anysentry_coverage_gaps_v1
+           WHERE last_seen_at < $1::numeric
+           ORDER BY last_seen_at, gap_id, revision
+           LIMIT $2
+        )`,
+      [ttlNs, COVERAGE_GAP_TTL_PRUNE_BATCH],
+    );
+  }
+
+  private startCoverageGapIdlePrune(): void {
+    if (this.coverageGapIdleTimer || !this.configured()) return;
+    const tick = () => {
+      void this.pruneCoverageGapsIdle()
+        .catch((error) => {
+          this.logger.warn(
+            `coverage gap idle prune failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
+        .finally(() => {
+          if (!this.ready) return;
+          this.coverageGapIdleTimer = setTimeout(tick, COVERAGE_GAP_IDLE_PRUNE_MS);
+          this.coverageGapIdleTimer.unref();
+        });
+    };
+    this.coverageGapIdleTimer = setTimeout(tick, 8_000);
+    this.coverageGapIdleTimer.unref();
+  }
+
+  private async pruneCoverageGapsIdle(): Promise<void> {
+    if (!this.pool || this.coverageGapIdlePruneInFlight) return;
+    this.coverageGapIdlePruneInFlight = true;
+    try {
+      const excess = await this.pool.query(
+        `WITH recent AS (
+           SELECT gap_id
+             FROM anysentry_coverage_gaps_v1
+            ORDER BY last_seen_at DESC
+            LIMIT $1
+         ),
+         hot AS (
+           SELECT g.gap_id, (MAX(g.revision) - $2::bigint) AS min_keep
+             FROM anysentry_coverage_gaps_v1 g
+            WHERE g.gap_id IN (SELECT DISTINCT gap_id FROM recent)
+            GROUP BY g.gap_id
+           HAVING COUNT(*) > $3::bigint
+         )
+         DELETE FROM anysentry_coverage_gaps_v1 g
+          WHERE g.ctid IN (
+            SELECT g2.ctid
+              FROM anysentry_coverage_gaps_v1 g2
+              JOIN hot ON hot.gap_id = g2.gap_id
+             WHERE g2.revision < hot.min_keep
+             LIMIT $4
+          )`,
+        [
+          COVERAGE_GAP_IDLE_SAMPLE_ROWS,
+          COVERAGE_GAP_REVISION_KEEP - 1,
+          COVERAGE_GAP_REVISION_KEEP,
+          COVERAGE_GAP_IDLE_PRUNE_BATCH,
+        ],
+      );
+      const ttlNs = String(BigInt(Date.now() - COVERAGE_GAP_TTL_MS) * 1_000_000n);
+      const ttl = await this.pool.query(
+        `DELETE FROM anysentry_coverage_gaps_v1
+          WHERE (last_seen_at, gap_id, revision) IN (
+            SELECT last_seen_at, gap_id, revision
+              FROM anysentry_coverage_gaps_v1
+             WHERE last_seen_at < $1::numeric
+             ORDER BY last_seen_at, gap_id, revision
+             LIMIT $2
+          )`,
+        [ttlNs, COVERAGE_GAP_IDLE_PRUNE_BATCH],
+      );
+      const sampled = await this.pool.query(
+        `WITH sample AS (
+           SELECT gap_id
+             FROM anysentry_coverage_gaps_v1 TABLESAMPLE SYSTEM (1)
+         ),
+         freq AS (
+           SELECT gap_id, COUNT(*) AS n
+             FROM sample
+            GROUP BY gap_id
+            ORDER BY n DESC
+            LIMIT 16
+         ),
+         hot AS (
+           SELECT g.gap_id, (MAX(g.revision) - $1::bigint) AS min_keep
+             FROM anysentry_coverage_gaps_v1 g
+             JOIN freq f ON f.gap_id = g.gap_id
+            GROUP BY g.gap_id
+           HAVING COUNT(*) > $2::bigint
+         )
+         DELETE FROM anysentry_coverage_gaps_v1 g
+          WHERE g.ctid IN (
+            SELECT g2.ctid
+              FROM anysentry_coverage_gaps_v1 g2
+              JOIN hot ON hot.gap_id = g2.gap_id
+             WHERE g2.revision < hot.min_keep
+             LIMIT $3
+          )`,
+        [
+          COVERAGE_GAP_REVISION_KEEP - 1,
+          COVERAGE_GAP_REVISION_KEEP,
+          COVERAGE_GAP_IDLE_PRUNE_BATCH,
+        ],
+      );
+      this.logger.log(
+        `coverage gap idle prune recent=${excess.rowCount ?? 0} sample=${sampled.rowCount ?? 0} ttl=${ttl.rowCount ?? 0}`,
+      );
+    } finally {
+      this.coverageGapIdlePruneInFlight = false;
     }
   }
 
@@ -3466,13 +3693,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           ON anysentry_raw_observations_v1 (idempotency_key, revision)
       `);
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_raw_observations_v1_event_idx
-          ON anysentry_raw_observations_v1 (event_at DESC)
+        CREATE INDEX IF NOT EXISTS anysentry_raw_observations_v1_event_brin
+          ON anysentry_raw_observations_v1 USING brin (event_at)
       `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_raw_observations_v1_source_idx
-          ON anysentry_raw_observations_v1 (source_id, collector_id, event_at DESC)
-      `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_raw_observations_v1_event_idx`);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_raw_observations_v1_source_idx`);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS anysentry_kernel_facts_v1 (
           fact_id TEXT PRIMARY KEY,
@@ -3491,17 +3716,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         )
       `);
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_observed_idx
-          ON anysentry_kernel_facts_v1 (observed_at DESC, fact_id)
+        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_observed_brin
+          ON anysentry_kernel_facts_v1 USING brin (observed_at)
       `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_process_idx
-          ON anysentry_kernel_facts_v1 (process_generation_key, observed_at DESC)
-      `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_connection_idx
-          ON anysentry_kernel_facts_v1 (connection_id, observed_at DESC)
-      `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_kernel_facts_v1_observed_idx`);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_kernel_facts_v1_process_idx`);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_kernel_facts_v1_connection_idx`);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_kernel_facts_v1_event_idx
           ON anysentry_kernel_facts_v1 (event_id)
@@ -3550,16 +3770,14 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       await pool.query(`
         ALTER TABLE anysentry_session_memberships_v1
           ADD COLUMN IF NOT EXISTS session_key TEXT,
-          ADD COLUMN IF NOT EXISTS provider_session_id_hash TEXT
+          ADD COLUMN IF NOT EXISTS provider_session_id_hash TEXT,
+          ADD COLUMN IF NOT EXISTS interaction_id TEXT
       `);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_session_idx
           ON anysentry_session_memberships_v1 (session_id, valid_from DESC, resolution_revision DESC)
       `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_session_key_idx
-          ON anysentry_session_memberships_v1 (session_key, valid_from DESC, resolution_revision DESC)
-      `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_session_memberships_v1_session_key_idx`);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_session_memberships_v1_interaction_idx
           ON anysentry_session_memberships_v1 ((record->>'interactionId'), valid_from DESC)
@@ -3801,13 +4019,12 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         )
       `);
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_incidents_status_updated_idx
-          ON anysentry_incidents (status, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS anysentry_incidents_status_idx
+          ON anysentry_incidents (status)
       `);
-      await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_incidents_agent_updated_idx
-          ON anysentry_incidents (agent_id, updated_at DESC)
-      `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_incidents_status_updated_idx`);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_incidents_agent_updated_idx`);
+      await pool.query(`ALTER TABLE anysentry_incidents SET (fillfactor = 70)`);
       await pool.query(`
         CREATE TABLE IF NOT EXISTS anysentry_alerts (
           alert_id TEXT PRIMARY KEY,
@@ -3823,9 +4040,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         )
       `);
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_alerts_status_updated_idx
-          ON anysentry_alerts (status, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS anysentry_alerts_status_idx
+          ON anysentry_alerts (status)
       `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_alerts_status_updated_idx`);
+      await pool.query(`ALTER TABLE anysentry_alerts SET (fillfactor = 70)`);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_alerts_dedupe_key_idx
           ON anysentry_alerts (dedupe_key)
@@ -3880,9 +4099,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         )
       `);
       await pool.query(`
-        CREATE INDEX IF NOT EXISTS anysentry_remediations_status_updated_idx
-          ON anysentry_remediations (status, updated_at DESC)
+        CREATE INDEX IF NOT EXISTS anysentry_remediations_status_idx
+          ON anysentry_remediations (status)
       `);
+      await pool.query(`DROP INDEX IF EXISTS anysentry_remediations_status_updated_idx`);
+      await pool.query(`ALTER TABLE anysentry_remediations SET (fillfactor = 70)`);
       await pool.query(`
         CREATE INDEX IF NOT EXISTS anysentry_remediations_source_idx
           ON anysentry_remediations (source_type, source_id)
@@ -3918,6 +4139,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       `);
       this.pool = pool;
       this.ready = true;
+      this.startCoverageGapIdlePrune();
       this.logger.log('PostgreSQL business-state store is ready');
       return true;
     } catch (error) {
@@ -4004,7 +4226,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          ON CONFLICT (${identityColumn}) DO UPDATE SET
            record = EXCLUDED.record,
            updated_at = EXCLUDED.updated_at
-         WHERE EXCLUDED.updated_at >= ${table}.updated_at`,
+         WHERE EXCLUDED.updated_at >= ${table}.updated_at
+           AND (${table}.record - 'updatedAt') IS DISTINCT FROM (EXCLUDED.record - 'updatedAt')`,
         [JSON.stringify(batch)],
       );
     });
@@ -4053,7 +4276,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          record = EXCLUDED.record,
          opened_at = LEAST(anysentry_incidents.opened_at, EXCLUDED.opened_at),
          updated_at = EXCLUDED.updated_at
-       WHERE EXCLUDED.updated_at >= anysentry_incidents.updated_at`,
+       WHERE EXCLUDED.updated_at >= anysentry_incidents.updated_at
+         AND (anysentry_incidents.record - 'updatedAt') IS DISTINCT FROM (EXCLUDED.record - 'updatedAt')`,
       [JSON.stringify(records)],
     );
   }
@@ -4096,7 +4320,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          last_seen_at,
          updated_at
        FROM incoming
-       ON CONFLICT (alert_id) DO UPDATE SET
+         ON CONFLICT (alert_id) DO UPDATE SET
          dedupe_key = EXCLUDED.dedupe_key,
          status = EXCLUDED.status,
          severity = EXCLUDED.severity,
@@ -4105,7 +4329,8 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          first_seen_at = LEAST(anysentry_alerts.first_seen_at, EXCLUDED.first_seen_at),
          last_seen_at = GREATEST(anysentry_alerts.last_seen_at, EXCLUDED.last_seen_at),
          updated_at = EXCLUDED.updated_at
-       WHERE EXCLUDED.updated_at >= anysentry_alerts.updated_at`,
+       WHERE EXCLUDED.updated_at >= anysentry_alerts.updated_at
+         AND (anysentry_alerts.record - 'updatedAt') IS DISTINCT FROM (EXCLUDED.record - 'updatedAt')`,
       [JSON.stringify(records)],
     );
   }

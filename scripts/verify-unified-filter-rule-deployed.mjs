@@ -106,7 +106,7 @@ if (enforcedInfrastructureCount > 0) {
   assert(rules.filter((rule) => rule.ruleId.startsWith('ifr_')).every((rule) => rule.lifecycleStage !== 'enforced'));
 }
 assert.equal(projectionA.captureProfiles.agent_full.file_access, 'full');
-assert.equal(projectionA.captureProfiles.infrastructure_aggregate.file_access, 'aggregate');
+assert.equal(projectionA.captureProfiles.infrastructure_aggregate.file_access, 'drop');
 assert.match(projectionA.intentHash, /^[a-f0-9]{64}$/u);
 assert.equal(projectionA.intentHash, projectionB.intentHash, 'TTL refresh must keep semantic intent stable');
 assert.notEqual(projectionA.contentHash, projectionB.contentHash, 'transport hash must cover refreshed timestamps');

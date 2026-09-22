@@ -443,4 +443,48 @@ assert.ok(
   'tool_call must cite HTTP interaction as source',
 );
 
+const delegatedCall = {
+  ...baseInteraction,
+  interactionId: `mi_${digest('p2-delegated-call').slice(0, 24)}`,
+  at: now + 30_000,
+  startedAtUnixNs: ns(now + 30_000),
+  requestCompleteAtUnixNs: ns(now + 30_001),
+  firstResponseAtUnixNs: ns(now + 30_002),
+  endedAtUnixNs: ns(now + 30_003),
+  durationNs: '3000000',
+  receivedAt: now + 30_000,
+  conversationCompleteness: 'tool_pending',
+  toolCalls: [{
+    toolCallId: 'call-alias-1',
+    name: 'run_code',
+    arguments: { code: 'print(2)' },
+  }],
+  toolResults: [],
+};
+const delegatedHttp = {
+  ...delegatedCall,
+  interactionId: `mi_${digest('p2-delegated-http').slice(0, 24)}`,
+  interactionType: 'tool',
+  at: now + 30_020,
+  startedAtUnixNs: ns(now + 30_020),
+  conversationCompleteness: 'complete',
+  completeness: 'complete',
+  partialReasons: [],
+  toolCalls: [{
+    toolCallId: 'http-alias-1',
+    name: 'http.code.execute',
+    arguments: { code: 'print(2)' },
+  }],
+  toolResults: [{
+    toolCallId: 'http-alias-1',
+    name: 'http.code.execute',
+    content: { stdout: '2\n' },
+    isError: false,
+    observedAtUnixNs: ns(now + 30_025),
+  }],
+};
+const delegated = closeToolCallsAcrossInteractions([delegatedCall, delegatedHttp]);
+assert.equal(delegated.matches.some((match) => match.toolCallId === 'call-alias-1'), true,
+  'code-bearing model call must close against the nearby same-runtime HTTP tool result');
+
 console.log('verify-agent-tool-closure: ok');

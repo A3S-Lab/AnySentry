@@ -14,7 +14,10 @@ const canonical = require('../apps/api/dist/security-monitoring/canonical-observ
 const resolver = require('../apps/api/dist/security-monitoring/agent-conversation-resolution-v2.js');
 const interactionParser = require('../apps/api/dist/security-monitoring/agent-interaction.js');
 const { AgentMetadataService } = require('../apps/api/dist/security-monitoring/agent-metadata.service.js');
-const { CanonicalObservabilityService } = require('../apps/api/dist/security-monitoring/canonical-observability.service.js');
+const {
+  CanonicalObservabilityService,
+  asyncCommitLostGaps,
+} = require('../apps/api/dist/security-monitoring/canonical-observability.service.js');
 const { captureClassificationDecision } = require('../apps/api/dist/security-monitoring/identity-judgment-routing.js');
 const { semanticProjectionTesting } = require('../apps/api/dist/security-monitoring/security-monitoring.controller.js');
 
@@ -204,6 +207,15 @@ assert.equal(podLike.quality, 'ephemeral', 'pod-looking session IDs must not bec
 const resumed = resolveSessionIdentity({ providerSessionId: 'vendor-session', resume: true, scopeKey: 'scope-fixture' });
 assert.equal(resumed.quality, 'confirmed');
 assert.equal(resumed.lifecycle, 'resume');
+assert.equal(resumed.mode, 'resumable');
+const mintedProvider = resolveSessionIdentity({
+  providerSessionId: '88cdd095-2a34-4bdc-945d-59f3a5ca1697',
+  namespaceHint: 'source-a\0/workspace/a',
+  requestId: 'post-mint-1',
+});
+assert.equal(mintedProvider.mode, 'conversation',
+  'a server-minted provider thread without resume/stateful is not a claimed resume');
+assert.notEqual(mintedProvider.mode, 'resumable');
 const forked = resolveSessionIdentity({ providerSessionId: 'vendor-session', interactionId: 'fork-1', fork: true, scopeKey: 'scope-fixture' });
 assert.equal(forked.parentSessionId, undefined,
   'a fork with only a child provider ID must not self-link its parent');
@@ -376,7 +388,8 @@ const scopedProviderSessionParsed = interactionParser.parseObserverAgentInteract
 assert.equal(scopedProviderSessionParsed?.providerConversationId, 'provider-session-fixture');
 assert.equal(scopedProviderSessionParsed?.sessionIdentityQuality, 'strong',
   'an authenticated source/workspace namespace must upgrade a real provider anchor to strong');
-assert.equal(scopedProviderSessionParsed?.sessionMode, 'resumable');
+assert.equal(scopedProviderSessionParsed?.sessionMode, 'conversation',
+  'Observer-extracted thread_id with a source/workspace namespace is continuity, not a claimed resume');
 assert.equal(scopedProviderSessionParsed?.sessionIdSource, 'provider');
 
 const candidateDecision = captureClassificationDecision('probable_agent');
@@ -413,6 +426,54 @@ degradedService.close();
 // Coverage diagnostics are intentionally metadata-only.  A producer can place a credential in an
 // innocuous key (`endpoint`, `peer`, `target`), so value-level URL/query/userinfo detection must
 // hash it before the gap is exposed to API consumers.
+const scopedGapService = new CanonicalObservabilityService();
+scopedGapService.setSink({
+  saveRawObservations: async () => false,
+});
+const firstStorage = rawObservationFromLine('{"event":{"Exec":{"pid":42}}}', {
+  sourceId: 'source-a', collectorId: 'collector-a', sourceType: 'kernel', eventKind: 'Exec',
+  eventAtUnixNs: '1788000000000000000', receivedAtUnixNs: '1788000000000001000',
+});
+const secondStorage = rawObservationFromLine('{"event":{"Exec":{"pid":43}}}', {
+  sourceId: 'source-a', collectorId: 'collector-a', sourceType: 'kernel', eventKind: 'Exec',
+  eventAtUnixNs: '1788000000000002000', receivedAtUnixNs: '1788000000000003000',
+});
+assert.notEqual(firstStorage.observationId, secondStorage.observationId);
+await scopedGapService.commit(firstStorage);
+await scopedGapService.commit(secondStorage);
+const storageGaps = scopedGapService.listGaps(20).filter((gap) => gap.reason === 'storage_unavailable');
+assert.equal(
+  new Set(storageGaps.map((gap) => gap.gapId)).size,
+  1,
+  'storage gaps must collapse to source/collector, not one row per observationId',
+);
+assert.match(String(storageGaps.at(-1)?.scope), /source-a/);
+scopedGapService.close();
+
+assert.equal(
+  asyncCommitLostGaps([{
+    sourceId: 'source-a',
+    collectorId: 'collector-a',
+    clickhouseEventAtMs: 1_000,
+    postgresEventAtMs: 999,
+    commitBatchId: 'batch-a',
+  }]).length,
+  0,
+  'async-commit slack must ignore sub-second ClickHouse/Postgres skew',
+);
+const lost = asyncCommitLostGaps([{
+  sourceId: 'source-a',
+  collectorId: 'collector-a',
+  clickhouseEventAtMs: 5_000,
+  postgresEventAtMs: 1_000,
+  commitBatchId: 'batch-lost',
+}]);
+assert.equal(lost.length, 1);
+assert.equal(lost[0].reason, 'async_commit_lost');
+assert.equal(lost[0].details.coverage, 'partial');
+assert.equal(lost[0].details.lostMs, 4_000);
+assert.match(lost[0].scope, /source-a\/collector-a/);
+
 const gapService = new CanonicalObservabilityService();
 const sensitiveGap = gapService.recordGap(
   'transport',

@@ -12,6 +12,8 @@ const {
   isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
+  physicalInfrastructureClassification,
+  physicalInfrastructureReason,
 } = require('./observer-behavior-discovery');
 const { behaviorDiscoveryEligible } = require('./observer-workload-filter');
 
@@ -295,7 +297,20 @@ assert.ok(bounded.metrics().evicted > 0);
 const saturated = new BehavioralAgentDetector({ now: () => now, maxWorkloads: 100 });
 const activeScope = { physicalWorkloadId: 'fixture:active', processGenerationKey: 'generation-1' };
 saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }), activeScope);
-assert.equal(saturated.observe(event('LlmCall', {}), activeScope)?.state, 'agent');
+assert.equal(saturated.observe(event('LlmCall', { path: '/v1/messages' }), activeScope)?.state, 'agent');
+assert.equal(isLlmEvent('LlmCall', {}), false, 'a probe label without a protocol route is not a model operation');
+const unlabeledControlPlane = new BehavioralAgentDetector({ now: () => now, threshold: 8, llmHostHints: [] });
+for (let index = 0; index < 8; index++) {
+  unlabeledControlPlane.observe({
+    process: {
+      host_id: 'node-a', boot_id: 'boot-a', pid: 2256, start_time_ticks: '1',
+      cgroup_id: '9002', cgroup: '0::/system.slice/node.service',
+      comm: 'node-agent', exe: '/usr/local/bin/node-agent',
+    },
+    event: { LlmCall: { peer: `10.0.0.${index}` } },
+  });
+}
+assert.equal(unlabeledControlPlane.metrics().candidates, 0, 'host service traffic labeled LlmCall without a protocol route does not become an Agent');
 for (let index = 0; index < 99; index++) {
   saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }, `capacity-${index}`));
 }
@@ -488,5 +503,73 @@ assert.equal(
   'strong infrastructure evidence clears probable TTL before its natural expiry',
 );
 assert.equal(infrastructureDetector.metrics().demoted, 1);
+
+assert.equal(
+  physicalInfrastructureReason('0::/system.slice/k3s.service', {}, {}),
+  'host_control_plane',
+  'k3s.service is host control-plane infrastructure by cgroup, not by process name',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/kubepods/burstable/podabc', { namespace: 'anysentry' }, {}),
+  'self_plane',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/kubepods.slice/kubepods-besteffort.slice', {}, {}),
+  'runtime_ancestor',
+);
+assert.equal(
+  physicalInfrastructureReason(
+    '0::/kubepods/burstable/podaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    { namespace: 'default' },
+    {},
+  ),
+  '',
+  'a leaf pod/container is not the runtime ancestor',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/user.slice/agent.scope', {}, {}),
+  '',
+  'a user-slice Agent must not inherit host-control-plane infrastructure',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/docker/deadbeef', {}, {}),
+  '',
+  'a docker container id is a leaf workload, not a runtime ancestor',
+);
+const k3sClassified = physicalInfrastructureClassification({
+  process: {
+    cgroup: '0::/system.slice/k3s.service',
+    comm: 'k3s-server',
+    exe: '/usr/local/bin/k3s',
+    host_id: 'node-a',
+    boot_id: 'boot-a',
+    pid: 1,
+    cgroup_id: '9',
+  },
+  event: { FileAccess: { path: '/var/lib/rancher/k3s/server/db/state.db' } },
+});
+assert.equal(k3sClassified?.state, 'infrastructure');
+assert.equal(k3sClassified?.attribution.source, 'physical_context');
+assert.ok(k3sClassified.attribution.evidence.includes('f0:physical_infrastructure=host_control_plane'));
+
+let relayNow = now;
+const relayDetector = new BehavioralAgentDetector({
+  now: () => relayNow,
+  threshold: 8,
+  windowMs: 60_000,
+  probableTtlMs: 180_000,
+  negativeMinAgeMs: 1_000,
+});
+for (const peer of ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']) {
+  relayDetector.observe(event('Connect', { pid: 800, peer, port: 443 }, 'relay'));
+}
+relayNow += 1_000;
+const relayResult = relayDetector.observe(event('Connect', { pid: 800, peer: '10.0.0.5', port: 443 }, 'relay'));
+assert.equal(relayResult?.state, 'unknown');
+assert.ok(
+  relayResult.attribution.evidence.includes('behavior:negative=network_relay_shape'),
+  'Connect/Tls-only relays without a tool or workspace cycle must not promote',
+);
+assert.equal(relayDetector.metrics().candidates, 0);
 
 console.log('Behavior discovery verification passed');

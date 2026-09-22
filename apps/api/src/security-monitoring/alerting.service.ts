@@ -43,6 +43,7 @@ const SILENCE_DEFAULT_MINUTES = 60;
 const SILENCE_MAX_MINUTES = 7 * 24 * 60;
 const PERSIST_RETRY_INITIAL_MS = 5_000;
 const PERSIST_RETRY_MAX_MS = 60_000;
+const PERSIST_COALESCE_MS = 1_000;
 
 type AlertInput = Omit<
   AlertRecord,
@@ -1242,14 +1243,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const overdueMinutes = Math.max(1, Math.round((at - (dueAt ?? at)) / 60_000));
     this.upsert({
       dedupeKey,
       ruleId: 'remediation.overdue',
       kind: 'remediation',
       severity: task.severity,
       title: `Remediation 逾期 · ${task.title}`,
-      description: `处置任务 ${task.taskId} 已逾期 ${overdueMinutes} 分钟: ${task.recommendedAction}`,
+      description: `处置任务 ${task.taskId} 已逾期: ${task.recommendedAction}`,
       workspacePath: task.workspacePath,
       agentId: task.agentId,
       collectorId: task.collectorId,
@@ -1267,7 +1267,6 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         actionKind: task.actionKind,
         taskStatus: task.status,
         dueAt: task.dueAt ?? '',
-        overdueMinutes: String(overdueMinutes),
         ...(task.alertId ? { alertId: task.alertId } : {}),
         ...(task.labels?.objectiveId ? { objectiveId: task.labels.objectiveId } : {}),
         ...(task.labels?.issueId ? { issueId: task.labels.issueId } : {}),
@@ -1597,13 +1596,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
           this.resolveWhere((alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId, at, 'suppressed by maintenance window');
           continue;
         }
-        this.upsertCollectorAvailability(heartbeat, 'critical', `Collector 断流 · ${heartbeat.collectorId}`, `last heartbeat ${ageSecs}s ago`, at);
+        this.upsertCollectorAvailability(heartbeat, 'critical', `Collector 断流 · ${heartbeat.collectorId}`, `last heartbeat older than ${this.config.collectorDownAfterSecs}s`, at);
       } else if (ageSecs >= this.config.collectorStaleAfterSecs) {
         if (this.maintenance.activeFor({ collectorId: heartbeat.collectorId, nodeName: heartbeat.nodeName }, at)) {
           this.resolveWhere((alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId, at, 'suppressed by maintenance window');
           continue;
         }
-        this.upsertCollectorAvailability(heartbeat, 'high', `Collector 心跳陈旧 · ${heartbeat.collectorId}`, `last heartbeat ${ageSecs}s ago`, at);
+        this.upsertCollectorAvailability(heartbeat, 'high', `Collector 心跳陈旧 · ${heartbeat.collectorId}`, `last heartbeat older than ${this.config.collectorStaleAfterSecs}s`, at);
       } else {
         this.resolveWhere(
           (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId && alert.ruleId === 'collector.availability',
@@ -1641,9 +1640,9 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       }
 
       if (ageSecs >= this.config.sourceDownAfterSecs) {
-        this.upsertSourceAvailability(source, 'high', `接入源断流 · ${source.sourceId}`, `last accepted signal ${ageSecs}s ago`, signalAt, at, dedupeKey);
+        this.upsertSourceAvailability(source, 'high', `接入源断流 · ${source.sourceId}`, `last accepted signal older than ${this.config.sourceDownAfterSecs}s`, signalAt, at, dedupeKey);
       } else {
-        this.upsertSourceAvailability(source, 'medium', `接入源心跳陈旧 · ${source.sourceId}`, `last accepted signal ${ageSecs}s ago`, signalAt, at, dedupeKey);
+        this.upsertSourceAvailability(source, 'medium', `接入源心跳陈旧 · ${source.sourceId}`, `last accepted signal older than ${this.config.sourceStaleAfterSecs}s`, signalAt, at, dedupeKey);
       }
     }
   }
@@ -1844,16 +1843,24 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     this.persistTimer = setTimeout(() => {
       this.persistTimer = undefined;
       void this.persist();
-    }, 500);
+    }, PERSIST_COALESCE_MS);
+    this.persistTimer.unref?.();
   }
 
   private persist(forceSnapshot = false): Promise<void> {
     if (forceSnapshot) this.persistenceForceSnapshot = true;
     this.persistRequested = true;
+    if (forceSnapshot && this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
     if (!this.persistInFlight) {
       this.persistInFlight = this.drainPersistence().finally(() => {
         this.persistInFlight = undefined;
-        if (this.persistRequested && !this.persistenceRetryTimer) void this.persist();
+        if (this.persistRequested && !this.persistenceRetryTimer) {
+          if (this.persistenceForceSnapshot) void this.persist(true);
+          else this.persistSoon();
+        }
       });
     }
     return this.persistInFlight;
@@ -1914,7 +1921,9 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         }
       }
       this.markPersistenceSuccess();
-      if (!this.persistRequested) break;
+      // Follow-up dirty marks wait for the coalesce window. A forced snapshot may continue
+      // immediately so shutdown and explicit refresh still flush the latest generation.
+      if (!forceSnapshot) break;
     } while (this.persistRequested);
   }
 

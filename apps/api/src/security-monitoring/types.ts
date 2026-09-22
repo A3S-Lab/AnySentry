@@ -107,6 +107,7 @@ export interface QueryCoverage {
   commitProgress?: QueryCommitProgress[];
   commitProgressScope?: 'all_sources' | 'query_sources';
   lateDataPolicy?: 'commit_journal_revision_repair';
+  /** `exact_as_observed`/`exact_current_effective` with `partial=false` is the §11.4 `coverage=complete` claim. */
   completeness?: 'exact_as_observed' | 'exact_current_effective' | 'partial';
   watermark?: string;
   partial: boolean;
@@ -115,6 +116,7 @@ export interface QueryCoverage {
     | 'scan_limit'
     | 'projection_timeout'
     | 'storage_unavailable'
+    | 'async_commit_lost'
     | 'canonical_evidence_link_hot_delta_pending'
     | 'membership_store_unavailable'
     | 'membership_ephemeral'
@@ -1513,6 +1515,7 @@ export interface AgentEventListItem {
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
+  ruleLineage?: UnifiedFilterRuleLineage;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;
@@ -1840,6 +1843,8 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   /** Exact application correlation anchors for canonical point reads. */
   sessionId?: string;
   runId?: string;
+  /** Producer/run header or interaction invocation; used for Tool↔Kernel point reads. */
+  invocationId?: string;
   traceId?: string;
   agentAssetId?: string;
   agentInstanceId?: string;
@@ -1886,6 +1891,47 @@ export interface AgentConversationCoverage {
   completeInteractions: number;
   partialInteractions: number;
   lastEvidenceAt?: string;
+}
+
+export type ObservabilityLayerStatus =
+  | 'complete'
+  | 'partial'
+  | 'missing'
+  | 'unparsed'
+  | 'unlinked';
+
+export interface ObservabilityLayer {
+  status: ObservabilityLayerStatus;
+  reasons: string[];
+  count: number;
+}
+
+/** §11.4: plaintext, KernelFact, Session and Run coverage are reported separately. */
+export interface ObservabilityCoverageLayers {
+  schemaVersion: 'anysentry.observability_coverage_layers.v1';
+  plaintext: ObservabilityLayer;
+  kernel: ObservabilityLayer & { factCount: number };
+  session: ObservabilityLayer & { canonicalSessionIds: string[] };
+  run: ObservabilityLayer & { runIds: string[] };
+}
+
+export type FilterRuleStageId = 'f1' | 'f2' | 'f3';
+
+export interface FilterRuleStageLineage {
+  stage: FilterRuleStageId;
+  ruleId?: string;
+  revision?: number;
+  action?: string;
+  reason?: string;
+  catalogVersion?: string | number;
+  version?: string | number;
+}
+
+/** Shared Observer capture epoch plus F1/F2/F3 stage receipts. */
+export interface UnifiedFilterRuleLineage {
+  schemaVersion: 'anysentry.filter_rule_lineage.v1';
+  epoch?: string;
+  stages: FilterRuleStageLineage[];
 }
 
 export interface AgentConversationThreadRecord {
@@ -2045,6 +2091,7 @@ export interface AgentConversationSummary {
   usage: AgentUsageSummary;
   instanceUsage: AgentInstanceUsageSummary[];
   coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
   /** Cross-agent conversation links within the same observation window. */
   relatedConversations?: AgentRelatedConversation[];
 }
@@ -2376,6 +2423,7 @@ export interface CanonicalSessionResource {
   errorCount: number;
   usage: AgentUsageSummary;
   coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
   sourceRefs: string[];
   resolutionRevision: number;
 }
@@ -2422,6 +2470,18 @@ export interface CanonicalSessionList {
   coverage: CanonicalEntityCoverage;
   dataSource: string;
   updateTime: string;
+}
+
+/** Run is the observed producer/invocation identity projected from a Session. */
+export interface CanonicalRunResource {
+  schemaVersion: 'anysentry.run.v1';
+  runId: string;
+  sessionId: string;
+  conversationId?: string;
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  sourceRefs: string[];
+  resolutionRevision: number;
 }
 
 /**
@@ -2594,6 +2654,7 @@ export interface AgentConversationTimelineV3 extends AgentConversationTimelineV2
   timelineVersion: 3;
   contextReplaySummaries: AgentContextReplaySummary[];
   technicalActivitySummaries: AgentRunTechnicalActivitySummary[];
+  coverageLayers?: ObservabilityCoverageLayers;
   redirectTarget?: {
     type: 'conversation' | 'technical_activity';
     id: string;
@@ -2630,7 +2691,7 @@ export interface AgentSemanticKernelRelation {
    * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
    * Observer KernelFact. */
   authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
-  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
   /** All equally strong Kernel candidates retained when ownership is ambiguous. */
   competingKernelEventIds?: string[];
   resolutionRevision: number;

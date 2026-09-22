@@ -394,6 +394,7 @@ export type CoverageGapReason =
   | 'timeout'
   | 'permission_denied'
   | 'storage_unavailable'
+  | 'async_commit_lost'
   | 'unclassified'
   | string;
 
@@ -3332,7 +3333,19 @@ export function resolveSessionIdentity(input: SessionResolutionInput): SessionRe
         ? (hasStableNamespace ? (hasScope ? 'confirmed' : 'strong') : 'ephemeral')
         : 'inferred',
       source: provider ? 'provider' : 'runtime',
-      mode: provider ? (hasStableNamespace ? 'resumable' : 'ephemeral') : 'conversation',
+      // A scoped provider/thread id is continuity evidence, not a claimed resume.
+      // Only an explicit resume or a serviceStateful contract may label Session
+      // `resumable`. `serviceStateful=false` still keeps a scoped provider
+      // resumable (stateless POSTs must not discard a real provider anchor).
+      mode: provider
+        ? (hasStableNamespace
+          ? (input.resume === true
+            || input.serviceStateful === true
+            || input.serviceStateful === false
+            ? 'resumable'
+            : 'conversation')
+          : 'ephemeral')
+        : 'conversation',
       lifecycle: input.resume === true ? 'resume' : 'new',
       reason: provider ? 'explicit_provider_id' : 'explicit_session_id',
     };

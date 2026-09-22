@@ -26,7 +26,11 @@ const {
   loadSignatureDocument,
 } = require('./observer-agent-runtime-signatures');
 const { DockerDiscovery } = require('./observer-docker-discovery');
-const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
+const {
+  BehavioralAgentDetector,
+  physicalInfrastructureClassification,
+  physicalInfrastructureReason,
+} = require('./observer-behavior-discovery');
 const { DurableSpool, safeId, stableWriterId } = require('./observer-durable-spool');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
@@ -4057,6 +4061,19 @@ function handleLine(raw, fromDeferred = false) {
     catalogClassification = mergeAttributionClassifications(catalogClassification, workloadClassification, candidate)
       ?? catalogClassification;
   }
+  const physicalInfra = physicalInfrastructureClassification(o, {
+    ...(catalogClassification?.attribution && typeof catalogClassification.attribution === 'object'
+      ? catalogClassification.attribution
+      : {}),
+    infrastructureFacts: workloadClassification?.infrastructureFacts,
+  });
+  if (physicalInfra) {
+    catalogClassification = mergeAttributionClassifications(
+      catalogClassification,
+      workloadClassification,
+      physicalInfra,
+    ) ?? physicalInfra;
+  }
   if (
     trustedNonAgentRuleId
     && catalogClassification.state === 'non_agent'
@@ -4071,7 +4088,9 @@ function handleLine(raw, fromDeferred = false) {
   // defeat its exact Infrastructure rule. Existing positive Agent signatures/labels remain in
   // baseClassification and still win during the merge below.
   const authoritativeInfrastructure =
-    infrastructureEvaluation?.classification?.state === 'infrastructure';
+    infrastructureEvaluation?.classification?.state === 'infrastructure'
+    || catalogClassification?.state === 'infrastructure'
+    || catalogClassification?.attribution?.source === 'physical_context';
   const identityClassification =
     (!authoritativeInfrastructure && behaviorDiscoveryEligible(catalogClassification)
       ? behaviorDetector.observe(o, catalogClassification.attribution)
@@ -4202,7 +4221,18 @@ function handleLine(raw, fromDeferred = false) {
   const alwaysKeep = (alwaysKeepEventKind(kind) && !trustedLifecycleSuppression)
     || httpToolLifecycle
     || Boolean(agentCaptureEntry);
-  if (!alwaysKeep && classification.state === 'unknown' && !RETAIN_UNKNOWN) {
+  const physicalReason = physicalInfrastructureReason(
+    text(o?.process?.cgroup),
+    classification?.attribution?.workloadRef,
+    workloadClassification?.infrastructureFacts,
+  );
+  if (
+    !alwaysKeep
+    && physicalReason
+    && (kind === 'FileAccess' || kind === 'FileRead')
+  ) {
+    filterReason = 'platform_infrastructure';
+  } else if (!alwaysKeep && classification.state === 'unknown' && !RETAIN_UNKNOWN) {
     // Unknown events are useful during discovery, but an unbounded host-wide unknown stream can
     // overwhelm the forwarder/WAL before attribution catches up. The setting is deliberately
     // explicit and hot-reloadable through the deployment environment; defaults preserve the
@@ -4243,12 +4273,12 @@ function handleLine(raw, fromDeferred = false) {
   if (filterReason) {
     recordE2eFilterReceipt(o, classification, filterReason, line);
     if (FILTER_MODE === 'shadow') {
-      if (filterReason === 'non_agent') attributionCounts.wouldFilterNonAgent++;
+      if (filterReason === 'non_agent' || filterReason === 'platform_infrastructure') attributionCounts.wouldFilterNonAgent++;
       else if (filterReason === 'unknown') attributionCounts.wouldFilterUnknown++;
       else if (filterReason === 'discovery_budget') attributionCounts.wouldDiscoveryBudgetDrop++;
       else attributionCounts.wouldFilterNoise++;
     } else {
-      if (filterReason === 'non_agent') {
+      if (filterReason === 'non_agent' || filterReason === 'platform_infrastructure') {
         attributionCounts.filteredNonAgent++;
         lastNonAgentSuppressedAt = new Date().toISOString();
       } else if (filterReason === 'unknown') {

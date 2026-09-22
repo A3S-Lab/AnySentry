@@ -1064,6 +1064,8 @@ export interface StoredEventQuery {
   evidenceCommandHashes?: string[];
   runId?: string;
   eventKind?: string;
+  /** Kind IN-list for Tool↔Kernel candidate pages. Combined with eventKind when both are set. */
+  eventKinds?: string[];
   eventCategory?: string;
   activityContext?: string;
   verdict?: string;
@@ -2241,6 +2243,10 @@ function storedToolEvidenceItem(
       "overlapping_exact_claims",
       "kernel_read_not_captured",
       "no_matching_kernel_evidence",
+      "delegated_command",
+      "network_witness",
+      "no_kernel_event_expected",
+      "candidates_truncated",
     ].includes(item.reason ?? "")
   )
     return undefined;
@@ -4233,6 +4239,57 @@ export class ClickHouseStore {
     }
   }
 
+  /** Last `event_commit_facts_v2` batch, grouped by source, for async-commit reconcile. */
+  async lastCommitBatchWatermarks(): Promise<Array<{
+    sourceId: string;
+    collectorId: string;
+    eventAtMs: number;
+    commitBatchId: string;
+    rows: number;
+  }>> {
+    if (!this.client || !this.ready) return [];
+    try {
+      const cursor = await this.latestEventCommitCursor();
+      const commitBatchId = cursor?.commitBatchId?.trim();
+      if (!commitBatchId) return [];
+      const result = await this.client.query({
+        query: `
+          SELECT
+            sourceId,
+            collectorId,
+            max(eventAt) AS eventAtMs,
+            count() AS rows
+          FROM ${EVENT_COMMIT_FACT_TABLE}
+          WHERE commitBatchId = {commitBatchId:String}
+          GROUP BY sourceId, collectorId
+          LIMIT 256`,
+        query_params: { commitBatchId },
+        format: "JSONEachRow",
+      });
+      return ((await result.json()) as Array<Record<string, unknown>>).flatMap((row) => {
+        const sourceId = String(row.sourceId ?? "").trim();
+        const collectorId = String(row.collectorId ?? "").trim();
+        const eventAtMs = Number(row.eventAtMs);
+        if (!sourceId || !collectorId || !Number.isFinite(eventAtMs) || eventAtMs <= 0) {
+          return [];
+        }
+        return [{
+          sourceId,
+          collectorId,
+          eventAtMs,
+          commitBatchId,
+          rows: Math.max(0, Number(row.rows) || 0),
+        }];
+      });
+    } catch (error) {
+      console.error(
+        "[clickhouse] last commit batch watermark query failed:",
+        (error as Error).message,
+      );
+      return [];
+    }
+  }
+
   /**
    * Return the oldest journal row that can still be observed.
    *
@@ -5166,7 +5223,6 @@ export class ClickHouseStore {
       ["invocationId", "invocationId"],
       ["toolCallId", "toolCallId"],
       ["runId", "runId"],
-      ["eventKind", "eventKind"],
       ["eventCategory", "eventCategory"],
     ];
     const mutableFields: Array<[keyof StoredEventQuery, string]> = [
@@ -5178,6 +5234,21 @@ export class ClickHouseStore {
       if (typeof value !== "string" || !value.trim()) continue;
       sampleConditions.push(`${column} = {${String(key)}:String}`);
       queryParams[String(key)] = value.trim();
+    }
+    const eventKinds = [
+      ...(typeof input.eventKind === "string" && input.eventKind.trim()
+        ? [input.eventKind.trim()]
+        : []),
+      ...((input.eventKinds ?? [])
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0 && value.length <= 64)),
+    ].filter((value, index, all) => all.indexOf(value) === index).slice(0, 16);
+    if (eventKinds.length === 1) {
+      sampleConditions.push("eventKind = {eventKind:String}");
+      queryParams.eventKind = eventKinds[0];
+    } else if (eventKinds.length > 1) {
+      sampleConditions.push("eventKind IN {eventKinds:Array(String)}");
+      queryParams.eventKinds = eventKinds;
     }
     const kernelFactId = input.kernelFactId?.trim();
     if (kernelFactId && /^kf_[a-f0-9]{24}$/u.test(kernelFactId)) {
@@ -8070,7 +8141,9 @@ export class ClickHouseStore {
       ),
     ].slice(0, 5_000);
     const exactMembershipRead = interactionIds.length > 0;
-    const correlationPointRead = Boolean(input.sessionId || input.runId || input.traceId);
+    const correlationPointRead = Boolean(
+      input.sessionId || input.runId || input.traceId || input.invocationId,
+    );
     const fairPerAgentLimit =
       exactMembershipRead || input.fairPerAgentLimit === undefined
         ? undefined
@@ -8093,6 +8166,9 @@ export class ClickHouseStore {
       // retain correlation lookup for older parts whose scalar columns have not been stored yet.
       ...(input.sessionId ? ["sessionId = {sessionId:String}"] : []),
       ...(input.runId ? ["(runId = {runId:String} OR producerRunId = {runId:String})"] : []),
+      ...(input.invocationId
+        ? ["(runId = {invocationId:String} OR producerRunId = {invocationId:String} OR sessionId = {invocationId:String} OR JSONExtractString(payload, 'invocationId') = {invocationId:String})"]
+        : []),
       ...(input.traceId ? ["traceId = {traceId:String}"] : []),
       ...(input.interactionId
         ? ["interactionId = {interactionId:String}"]
@@ -8128,6 +8204,7 @@ export class ClickHouseStore {
         : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.runId ? { runId: input.runId } : {}),
+      ...(input.invocationId ? { invocationId: input.invocationId } : {}),
       ...(input.traceId ? { traceId: input.traceId } : {}),
       ...(input.interactionId ? { interactionId: input.interactionId } : {}),
       ...(input.interactionType

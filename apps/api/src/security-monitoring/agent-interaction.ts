@@ -12,6 +12,7 @@ import {
 import { applyAgentAdapter } from './agent-adapter-execution';
 import { serverTrustedCorrelationContext } from './trusted-correlation';
 import { captureClassificationDecision } from './identity-judgment-routing';
+import { observedAgentProduct } from './agent-tool-shape';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_LINE_BYTES = 14 * 1024 * 1024;
@@ -696,7 +697,12 @@ function parsePlaintextEvidence(
     agentInstanceId: runtimeInstanceId,
     ...(canonicalInstance.agentInstanceId ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId } : {}),
     runtimeInstanceId,
-    agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    agentProduct: observedAgentProduct({
+      semanticProduct: semanticIdentity.agentProduct,
+      displayName: meta.attribution?.agentDisplayName,
+      agentId: meta.agentId,
+      process: meta.process,
+    }),
     environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
     ...(meta.rawObservationId ? { rawObservationId: meta.rawObservationId } : {}),
@@ -846,7 +852,9 @@ export function parseObserverAgentInteraction(
   // The wire interaction may contain a producer `runId`, but a collector token alone only
   // authenticates transport.  Keep that value out of the canonical/compatibility record unless
   // the source's server-side application/Adapter claim policy explicitly authorized it.
-  const wireRunId = string(input.runId, 512) ?? providerRunFromStructured(response.structured);
+  const wireRunId = string(input.runId, 512)
+    ?? providerRunFromStructured(response.structured)
+    ?? providerRunFromStructured(request.structured);
   const runId = strictRunIdentity(trustedRunClaim) ?? wireRunId;
   const runIdSource = runId
     ? strictRunIdentity(trustedRunClaim) ? 'producer' as const : 'legacy' as const
@@ -1141,7 +1149,12 @@ export function parseObserverAgentInteraction(
     agentInstanceId: semanticIdentity.agentRuntimeInstanceId,
     ...(canonicalInstance.agentInstanceId ? { canonicalAgentInstanceId: canonicalInstance.agentInstanceId } : {}),
     runtimeInstanceId,
-    agentProduct: semanticIdentity.agentProduct ?? meta.attribution?.agentDisplayName ?? meta.agentId,
+    agentProduct: observedAgentProduct({
+      semanticProduct: semanticIdentity.agentProduct,
+      displayName: meta.attribution?.agentDisplayName,
+      agentId: meta.agentId,
+      process: meta.process,
+    }),
     environment: interactionEnvironment(meta),
     ...(runtimeSessionId ? { runtimeSessionId } : {}),
     ...(rawObservationId ? { rawObservationId, sourceObservationIds: [rawObservationId] } : {}),

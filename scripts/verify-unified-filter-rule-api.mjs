@@ -88,7 +88,7 @@ assert(
   `runtime signature registry unexpectedly shrank: ${projection.payload.runtimeSignatures.runtimes.length}`,
 );
 assert.equal(projection.payload.captureProfiles.agent_full.file_access, 'full');
-assert.equal(projection.payload.captureProfiles.infrastructure_aggregate.file_access, 'aggregate');
+assert.equal(projection.payload.captureProfiles.infrastructure_aggregate.file_access, 'drop');
 
 const runId = `filter-api-${Date.now()}-${process.pid}`;
 const ingested = await request('/ingest/events', {

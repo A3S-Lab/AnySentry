@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/com
 import { createHash } from 'node:crypto';
 import type * as T from './types';
 import { RelationalBusinessStore } from './relational-business-store.service';
+import { ClickHouseStore } from './clickhouse-store';
 import {
   CANONICAL_SCHEMA_VERSIONS,
   RawObservationStore,
@@ -63,6 +64,9 @@ export interface CanonicalRawObservationSink {
   loadSemanticRecords?(input?: { semanticRecordIds?: readonly string[]; revision?: number; limit?: number }): Promise<SemanticRecord[]>;
   saveCoverageGaps?(gaps: readonly CoverageGap[]): Promise<boolean>;
   loadCoverageGaps?(input?: { limit?: number }): Promise<CoverageGap[]>;
+  latestRawObservationWatermarks?(
+    sources: readonly { sourceId: string; collectorId: string }[],
+  ): Promise<Array<{ sourceId: string; collectorId: string; eventAtMs: number }>>;
   saveEvidenceLinks?(links: readonly EvidenceLink[]): Promise<boolean>;
   isEvidenceLinksReadAvailable?(): boolean;
   loadEvidenceLinks?(input?: {
@@ -170,6 +174,21 @@ function safeGapScope(value: unknown): string {
   return normalized.replace(/[^A-Za-z0-9_.:/-]/gu, '_').slice(0, 240) || 'unknown';
 }
 
+function stableCoverageGapScope(
+  observation: {
+    process?: { processGenerationKey?: string };
+    source?: { sourceId?: string; collectorId?: string };
+  },
+  fallback = 'raw_observation',
+): string {
+  const generation = boundedText(observation.process?.processGenerationKey, 128);
+  if (generation) return generation;
+  const sourceId = boundedText(observation.source?.sourceId, 240);
+  const collectorId = boundedText(observation.source?.collectorId, 240);
+  if (sourceId && collectorId) return `${sourceId}/${collectorId}`;
+  return sourceId || collectorId || fallback;
+}
+
 function safeGapDetails(details: Record<string, string | number | boolean>): Record<string, string | number | boolean> {
   return Object.fromEntries(Object.entries(details).slice(0, 32).map(([key, value]) => {
     if (typeof value !== 'string') return [key.slice(0, 80), value];
@@ -238,6 +257,57 @@ function safeDurableSessionMembership(value: unknown): SessionMembership | undef
 function safeDurableCoverageGap(value: unknown): CoverageGap | undefined {
   const checked = validateCoverageGap(value);
   return checked.ok ? checked.value : undefined;
+}
+
+export interface AsyncCommitSourceWatermark {
+  sourceId: string;
+  collectorId: string;
+  clickhouseEventAtMs: number;
+  postgresEventAtMs?: number;
+  commitBatchId: string;
+}
+
+const ASYNC_COMMIT_SLACK_MS = 2_000;
+
+/** Compare the last ClickHouse commit batch with Postgres raw_observations watermarks.
+ *  A ClickHouse-ahead source is the only crash-visible signal for `synchronous_commit=off`.
+ *  This function is the gate: do not flip the session until callers persist these gaps. */
+export function asyncCommitLostGaps(
+  rows: readonly AsyncCommitSourceWatermark[],
+  slackMs = ASYNC_COMMIT_SLACK_MS,
+): Array<{
+  stage: 'raw_commit';
+  reason: 'async_commit_lost';
+  scope: string;
+  details: Record<string, string | number | boolean>;
+}> {
+  const slack = Number.isFinite(slackMs) ? Math.max(0, Math.trunc(slackMs)) : ASYNC_COMMIT_SLACK_MS;
+  return rows.flatMap((row) => {
+    const sourceId = boundedText(row.sourceId, 160);
+    const collectorId = boundedText(row.collectorId, 160);
+    const clickhouseEventAtMs = Number(row.clickhouseEventAtMs);
+    if (!sourceId || !collectorId || !Number.isFinite(clickhouseEventAtMs) || clickhouseEventAtMs <= 0) {
+      return [];
+    }
+    const postgresEventAtMs = Number(row.postgresEventAtMs);
+    const postgresMs = Number.isFinite(postgresEventAtMs) && postgresEventAtMs > 0
+      ? postgresEventAtMs
+      : 0;
+    if (clickhouseEventAtMs <= postgresMs + slack) return [];
+    const commitBatchId = boundedText(row.commitBatchId, 160) ?? 'unknown';
+    return [{
+      stage: 'raw_commit' as const,
+      reason: 'async_commit_lost' as const,
+      scope: `${sourceId}/${collectorId}`,
+      details: {
+        commitBatchId,
+        clickhouseEventAtMs,
+        postgresEventAtMs: postgresMs,
+        lostMs: clickhouseEventAtMs - postgresMs,
+        coverage: 'partial',
+      },
+    }];
+  });
 }
 
 function observerEnvelopeCandidate(line: string): unknown {
@@ -454,7 +524,10 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private derivedEvidenceTimer?: ReturnType<typeof setTimeout>;
   private derivedSessionTimer?: ReturnType<typeof setTimeout>;
 
-  constructor(@Optional() relationalStore?: RelationalBusinessStore) {
+  constructor(
+    @Optional() relationalStore?: RelationalBusinessStore,
+    @Optional() private readonly clickhouseStore?: ClickHouseStore,
+  ) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
     for (const descriptor of DEFAULT_LLM_FORMAT_REGISTRY) this.llmFormats.register(descriptor);
     for (const descriptor of DEFAULT_RUNTIME_REGISTRY) this.runtimes.register(descriptor);
@@ -983,25 +1056,66 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   }
 
   async onModuleInit(): Promise<void> {
-    if (!this.sink?.loadCoverageGaps) return;
-    const loaded = await this.sink.loadCoverageGaps({ limit: this.maxGaps }).catch(() => []);
-    for (const candidate of loaded) {
-      const gap = safeDurableCoverageGap(candidate);
-      if (!gap) continue;
-      const history = this.gapHistory.get(gap.gapId) ?? [];
-      if (!history.some((item) => item.revision === gap.revision)) history.push(structuredClone(gap));
-      history.sort((left, right) => left.revision - right.revision);
-      const retainedHistory = history.slice(-32);
-      this.gapHistory.set(gap.gapId, retainedHistory);
-      const latest = history.at(-1)!;
-      this.gaps.set(gap.gapId, { gap: latest, expiresAt: Date.now() + this.gapTtlMs });
+    if (this.sink?.loadCoverageGaps) {
+      const loaded = await this.sink.loadCoverageGaps({ limit: this.maxGaps }).catch(() => []);
+      for (const candidate of loaded) {
+        const gap = safeDurableCoverageGap(candidate);
+        if (!gap) continue;
+        const history = this.gapHistory.get(gap.gapId) ?? [];
+        if (!history.some((item) => item.revision === gap.revision)) history.push(structuredClone(gap));
+        history.sort((left, right) => left.revision - right.revision);
+        const retainedHistory = history.slice(-32);
+        this.gapHistory.set(gap.gapId, retainedHistory);
+        const latest = history.at(-1)!;
+        this.gaps.set(gap.gapId, { gap: latest, expiresAt: Date.now() + this.gapTtlMs });
+      }
+      this.gapHistoryBytes = [...this.gapHistory.values()]
+        .flat()
+        .reduce((sum, item) => sum + gapBytes(item), 0);
+      this.gapBytes = [...this.gaps.values()]
+        .reduce((sum, item) => sum + gapBytes(item.gap), 0);
+      this.enforceGapBudget();
     }
-    this.gapHistoryBytes = [...this.gapHistory.values()]
-      .flat()
-      .reduce((sum, item) => sum + gapBytes(item), 0);
-    this.gapBytes = [...this.gaps.values()]
-      .reduce((sum, item) => sum + gapBytes(item.gap), 0);
-    this.enforceGapBudget();
+    void this.reconcileAsyncCommitCoverageWhenReady();
+  }
+
+  /** Startup compare of the last ClickHouse commit batch against Postgres raw_observations.
+   *  Missing rows become `raw_commit/async_commit_lost` with coverage=partial. This is the
+   *  required gate for a later canonical-session `synchronous_commit=off`; that flip is not
+   *  performed here. */
+  async reconcileAsyncCommitCoverage(): Promise<number> {
+    if (!this.clickhouseStore || !this.sink?.latestRawObservationWatermarks) return 0;
+    try {
+      const clickhouse = await this.clickhouseStore.lastCommitBatchWatermarks();
+      if (!clickhouse.length) return 0;
+      const postgres = await this.sink.latestRawObservationWatermarks(clickhouse);
+      const postgresByKey = new Map(
+        postgres.map((row) => [`${row.sourceId}\0${row.collectorId}`, row.eventAtMs]),
+      );
+      const lost = asyncCommitLostGaps(clickhouse.map((row) => ({
+        sourceId: row.sourceId,
+        collectorId: row.collectorId,
+        clickhouseEventAtMs: row.eventAtMs,
+        postgresEventAtMs: postgresByKey.get(`${row.sourceId}\0${row.collectorId}`),
+        commitBatchId: row.commitBatchId,
+      })));
+      for (const gap of lost) {
+        this.recordGap(gap.stage, gap.reason, gap.scope, gap.details);
+      }
+      return lost.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async reconcileAsyncCommitCoverageWhenReady(): Promise<void> {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      if (this.closed) return;
+      const counted = await this.reconcileAsyncCommitCoverage();
+      if (counted > 0) return;
+      if (!this.clickhouseStore || this.clickhouseStore.enabled) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5_000));
+    }
   }
 
   /** Commit a supplied canonical envelope after stripping any body from the raw fact lane. */
@@ -1042,24 +1156,34 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
       const failure = () => {
         // Keep processing the machine lane even when the durable raw sink is unavailable. The hot
         // RawObservation and derived KernelFact must remain available for degradation analysis.
-        sideLaneGap = this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+        sideLaneGap = this.recordGap(
+          'raw_commit',
+          'storage_unavailable',
+          stableCoverageGapScope(sanitized),
+        );
       };
       if (this.asyncPersistence) {
         const admitted = this.enqueueRawObservation(sanitized, failure);
         // In async mode a task admitted to the bounded side lane is intentionally hot-only from
         // the request's perspective; its eventual durable result is reflected by metrics/gaps.
-        if (!admitted) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+        if (!admitted) {
+          commitGap = sideLaneGap
+            ?? this.recordGap('raw_commit', 'storage_unavailable', stableCoverageGapScope(sanitized));
+        }
       } else {
         durable = await this.writeCanonicalSideLane(
           () => this.sink!.saveRawObservations!([sanitized]),
           failure,
           'raw',
         );
-        if (!durable) commitGap = sideLaneGap ?? this.recordGap('raw_commit', 'storage_unavailable', sanitized.observationId);
+        if (!durable) {
+          commitGap = sideLaneGap
+            ?? this.recordGap('raw_commit', 'storage_unavailable', stableCoverageGapScope(sanitized));
+        }
       }
     }
     if (!sanitized.process && ['kernel', 'uprobe', 'socket_payload', 'forwarder'].includes(sanitized.source.sourceType)) {
-      this.recordGap('runtime', 'identity_unknown', sanitized.observationId, {
+      this.recordGap('runtime', 'identity_unknown', stableCoverageGapScope(sanitized), {
         processGeneration: 'unavailable',
       }, sanitized.eventAtUnixNs);
     }
@@ -1093,7 +1217,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
           const kernelFailure = () => this.recordGap(
             'raw_commit',
             'storage_unavailable',
-            sanitized.observationId,
+            stableCoverageGapScope(sanitized),
             { kernelFact: 'durability_unavailable' },
           );
           if (this.asyncPersistence) this.enqueueKernelFact(kernelFact, kernelFailure);
@@ -1106,7 +1230,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         }
       }
       if (kernelResult.status === 'rejected' || kernelResult.status === 'conflict') {
-        this.recordGap('runtime', 'dropped', sanitized.observationId, { kernelFact: kernelResult.reason });
+        this.recordGap('runtime', 'dropped', stableCoverageGapScope(sanitized), { kernelFact: kernelResult.reason });
       }
     }
     return {

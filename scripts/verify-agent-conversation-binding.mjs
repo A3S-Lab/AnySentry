@@ -6,7 +6,12 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { AgentConversationBindingService, conversationLogicalScopeKey, trafficRoleForEvent } = require(
+const {
+  AgentConversationBindingService,
+  conversationLogicalScopeKey,
+  threadAcceptsUnboundRecord,
+  trafficRoleForEvent,
+} = require(
   '../apps/api/dist/security-monitoring/agent-conversation-binding.service.js',
 );
 const { conversationLogicalScopeKeyV2 } = require(
@@ -500,11 +505,249 @@ const exactMembershipQuery = exactMembershipQueries.find((query) => Array.isArra
 assert.ok(exactMembershipQuery, 'selected Thread must issue an exact interaction membership read');
 assert.equal(exactMembershipQuery.interactionIds.length, 80);
 assert.equal(exactMembershipQuery.fairPerAgentLimit, undefined);
+assert.equal(exactMembershipQueries.length, 1,
+  'a selected Thread must not add a last_1h fair peer scan after its membership read');
+assert.equal(
+  exactMembershipQueries.filter((query) => query.fairPerAgentLimit).length,
+  0,
+  'selected Thread point-reads must not use fair-per-agent sampling',
+);
 assert.equal(longTimeline.interactionIds.length, 80,
   'a selected Thread with more than 64 Interactions must return every durable member');
 assert.equal(longTimeline.coverage.partial, false);
 assert.equal(longTimeline.coverage.partialReason, undefined,
   'partial inventory decoration must not downgrade exact selected-Thread content');
+
+const emptyMembershipQueries = [];
+const emptyMembershipAggregation = new AggregationService(
+  {
+    storedAgentInteractions: async (queryInput) => {
+      emptyMembershipQueries.push(queryInput);
+      return longRecords;
+    },
+  },
+  {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  },
+  {},
+  {},
+  {},
+  undefined,
+  {
+    resolveRouteAlias: async () => undefined,
+    interactionIdsForConversation: async () => ({
+      interactionIds: [],
+      truncated: false,
+      durable: true,
+    }),
+    applyPersistedBindings: async (records) => records,
+    routeAlias: () => undefined,
+    segmentsForConversation: () => [],
+  },
+);
+emptyMembershipAggregation.agentInventory = exactMembershipAggregation.agentInventory;
+const emptyMembershipTimeline = await emptyMembershipAggregation.agentConversationTimelineV2({
+  timeType: 'custom',
+  startTime: new Date(longRecords.at(-2).at).toISOString(),
+  endTime: new Date(longRecords.at(-1).at + 10).toISOString(),
+  snapshotAsOf: new Date(longRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  classificationView: 'current_effective',
+  conversationId: 'cv_empty_membership_point_read',
+  limit: 100,
+});
+assert.equal(emptyMembershipQueries.length, 0,
+  'an empty durable Thread membership must not fetch unrelated last_1h history');
+assert.equal(emptyMembershipTimeline.turns.length, 0);
+assert.equal(emptyMembershipTimeline.interactionIds.length, 0);
+
+const sessionFallbackQueries = [];
+const sessionFallbackRecords = longRecords.slice(0, 4).map((record) => ({
+  ...record,
+  sessionId: 'thread-session-fallback',
+  conversationId: 'cv_session_fallback_thread',
+}));
+const sessionFallbackAggregation = new AggregationService(
+  {
+    storedAgentInteractions: async (queryInput) => {
+      sessionFallbackQueries.push(queryInput);
+      return queryInput.sessionId === 'thread-session-fallback'
+        || queryInput.runId === 'thread-session-fallback'
+        ? sessionFallbackRecords
+        : [];
+    },
+  },
+  {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  },
+  {},
+  {},
+  {},
+  undefined,
+  {
+    resolveRouteAlias: async () => undefined,
+    interactionIdsForConversation: async () => ({
+      interactionIds: [],
+      truncated: false,
+      durable: true,
+    }),
+    applyPersistedBindings: async (records) => records,
+    routeAlias: () => undefined,
+    segmentsForConversation: () => [],
+  },
+  {
+    configured: () => true,
+    loadAgentConversationThreadsByIds: async () => [{
+      conversationId: 'cv_session_fallback_thread',
+      sessionId: 'thread-session-fallback',
+    }],
+  },
+);
+sessionFallbackAggregation.agentInventory = exactMembershipAggregation.agentInventory;
+const sessionFallbackTimeline = await sessionFallbackAggregation.agentConversationTimelineV2({
+  timeType: 'custom',
+  startTime: new Date(sessionFallbackRecords[0].at).toISOString(),
+  endTime: new Date(sessionFallbackRecords.at(-1).at + 10).toISOString(),
+  snapshotAsOf: new Date(sessionFallbackRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  classificationView: 'current_effective',
+  conversationId: 'cv_session_fallback_thread',
+  limit: 100,
+});
+assert.equal(sessionFallbackQueries.filter((query) => query.fairPerAgentLimit).length, 0,
+  'empty membership plus a durable Thread session must not use a last_1h fair sample');
+assert.ok(
+  sessionFallbackQueries.some((query) =>
+    query.sessionId === 'thread-session-fallback' || query.runId === 'thread-session-fallback'),
+  'empty membership must hydrate the selected Thread from its durable session/run id');
+assert.equal(sessionFallbackTimeline.coverage.partialReason, undefined);
+assert.equal(sessionFallbackTimeline.coverage.partial, false);
+
+// Parent and child hops can share sessionId/runId. Session hydration must not fold the peer
+// hop into the selected Thread, and hop-fenced aliases must still pick the owning summary.
+const hopSession = 'shared-parent-child-session';
+const hopWorkerRecords = [0, 1, 2].map((index) => ({
+  ...interaction({
+    id: `mi_hop_worker_${index}`,
+    at: first.at + index * 1_000,
+    instance: 'host-root:thread:hop-worker',
+    users: [`worker hop ${index}`],
+  }),
+  sessionId: hopSession,
+  runId: hopSession,
+  hop: 'worker',
+  conversationId: 'cv_worker_hop_thread',
+  conversationIdSource: 'provider',
+  conversationBindingVersion: 2,
+  trafficRole: 'conversation',
+}));
+const hopOrchRecords = [0, 1, 2].map((index) => ({
+  ...interaction({
+    id: `mi_hop_orch_${index}`,
+    at: first.at + 4_000 + index * 1_000,
+    instance: 'host-root:thread:hop-orch',
+    users: [`orch hop ${index}`],
+  }),
+  sessionId: hopSession,
+  runId: hopSession,
+  hop: 'orchestrator',
+  conversationId: 'cv_orch_hop_thread',
+  conversationIdSource: 'provider',
+  conversationBindingVersion: 2,
+  trafficRole: 'conversation',
+}));
+const hopAllRecords = [...hopWorkerRecords, ...hopOrchRecords];
+function hopTimelineAggregation(conversationId, membershipIds) {
+  const reads = [];
+  const agg = new AggregationService(
+    {
+      storedAgentInteractions: async (queryInput) => {
+        reads.push(queryInput);
+        if (Array.isArray(queryInput.interactionIds)) {
+          const wanted = new Set(queryInput.interactionIds);
+          return hopAllRecords.filter((record) => wanted.has(record.interactionId));
+        }
+        return queryInput.sessionId === hopSession || queryInput.runId === hopSession
+          ? hopAllRecords
+          : [];
+      },
+    },
+    {
+      identitySnapshotVersion: () => 0,
+      canonicalAgentAssetId: (value) => value,
+    },
+    {},
+    {},
+    {},
+    undefined,
+    {
+      resolveRouteAlias: async () => undefined,
+      interactionIdsForConversation: async () => ({
+        interactionIds: membershipIds,
+        truncated: false,
+        durable: true,
+      }),
+      applyPersistedBindings: async (records) => records.map((record) => ({
+        ...record,
+        conversationId: record.hop === 'worker' ? 'cv_worker_fenced_alias' : 'cv_orch_fenced_alias',
+        conversationIdSource: 'inferred',
+        conversationBindingVersion: 2,
+      })),
+      routeAlias: () => undefined,
+      segmentsForConversation: () => [],
+    },
+    {
+      configured: () => true,
+      loadAgentConversationThreadsByIds: async () => [{
+        conversationId,
+        sessionId: hopSession,
+      }],
+    },
+  );
+  agg.agentInventory = exactMembershipAggregation.agentInventory;
+  return { agg, reads };
+}
+const hopQuery = {
+  timeType: 'custom',
+  startTime: new Date(hopWorkerRecords[0].at).toISOString(),
+  endTime: new Date(hopOrchRecords.at(-1).at + 10).toISOString(),
+  snapshotAsOf: new Date(hopOrchRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  classificationView: 'current_effective',
+  limit: 100,
+};
+const workerHop = hopTimelineAggregation(
+  'cv_worker_hop_thread',
+  hopWorkerRecords.map((record) => record.interactionId),
+);
+const workerHopTimeline = await workerHop.agg.agentConversationTimelineV2({
+  ...hopQuery,
+  conversationId: 'cv_worker_hop_thread',
+});
+assert.deepEqual(
+  [...workerHopTimeline.interactionIds].sort(),
+  hopWorkerRecords.map((record) => record.interactionId).sort(),
+  'selected worker Thread must not include orchestrator hop members from the shared session',
+);
+assert.equal(
+  workerHopTimeline.interactionIds.some((id) => String(id).includes('orch')),
+  false,
+);
+const orchHop = hopTimelineAggregation(
+  'cv_orch_hop_thread',
+  hopOrchRecords.map((record) => record.interactionId),
+);
+const orchHopTimeline = await orchHop.agg.agentConversationTimelineV2({
+  ...hopQuery,
+  conversationId: 'cv_orch_hop_thread',
+});
+assert.deepEqual(
+  [...orchHopTimeline.interactionIds].sort(),
+  hopOrchRecords.map((record) => record.interactionId).sort(),
+  'selected orchestrator Thread must not include worker hop members from the shared session',
+);
 
 // A canonical Session is not a compatibility conversation ID. Its selected records must retain
 // their messages across a cold read, and missing membership must never trigger a history scan.
@@ -557,11 +800,13 @@ controller.agg = canonicalRead.agg;
 controller.agg.agentInteractions = async () => ({ items: canonicalRecords, coverage: { partial: false }, dataSource: 'clickhouse' });
 controller.canonicalCurrentRevision = () => 1;
 controller.canonicalRevisionCoverage = (_query, _revision, coverage) => coverage;
-controller.canonicalObservability = { listDurableSessionMemberships: async () =>
-  canonicalRecords.map((record, i) => ({
-    membershipId: `sm_test_${i}`, sessionId: canonicalSession, sessionKey: canonicalSession,
-    interactionId: record.interactionId, resolutionRevision: 1, sourceRefs: [record.interactionId],
-  })),
+controller.canonicalObservability = {
+  listDurableSessionMemberships: async () =>
+    canonicalRecords.map((record, i) => ({
+      membershipId: `sm_test_${i}`, sessionId: canonicalSession, sessionKey: canonicalSession,
+      interactionId: record.interactionId, resolutionRevision: 1, sourceRefs: [record.interactionId],
+    })),
+  listDurableSemanticRecords: async () => [],
 };
 const sessionQuery = { sessionId: canonicalSession, limit: 20, offset: 0 };
 const sessionProjection = await controller.computeCanonicalSessionResources(sessionQuery, {});
@@ -816,5 +1061,153 @@ for (const [index, [expectedRole, overrides]] of interactionRoleCases.entries())
   assert.equal(persistedInteractionMemberships.at(-1).role, expectedRole,
     `${overrides.trafficRole} commitInteractionMembership role`);
 }
+
+const childThread = {
+  conversationId: 'cv_old_child',
+  logicalScopeKey: 'ls_fixture',
+  sessionId: 'fanout-run-1',
+  sessionMode: 'resumable',
+  sessionIdentityQuality: 'strong',
+  idSource: 'inferred',
+  agentProduct: 'LangGraph',
+  workspacePath: '/workspace/specialist',
+  agentInstanceIds: ['docker:same-specialist'],
+  userLineageHashes: ['abc'],
+  pendingToolCallIds: [],
+  startedAtUnixNs: '1',
+  lastActivityAtUnixNs: '2',
+  resolverVersion: 2,
+  updatedAt: 1,
+};
+assert.equal(
+  threadAcceptsUnboundRecord(childThread, {
+    sessionId: 'fanout-run-2',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  }),
+  false,
+  'same-container child with a new session/run must not reuse the prior Thread',
+);
+assert.equal(
+  threadAcceptsUnboundRecord(childThread, {
+    sessionId: 'fanout-run-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  }),
+  true,
+  'the same Session anchor may continue the Thread',
+);
+assert.equal(
+  threadAcceptsUnboundRecord({
+    ...childThread,
+    sessionId: 's113-stateful-shared',
+    sessionKey: 'sess_stateful',
+  }, {
+    sessionId: 's113-stateful-shared',
+    sessionKey: 'sess_stateful',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  }),
+  true,
+  'stateful Design A keeps one Thread across runs',
+);
+assert.equal(
+  threadAcceptsUnboundRecord({
+    ...childThread,
+    logicalScopeKey: 'ls_fixture|hop:orchestrator',
+    sessionId: 'design-b-shared-run',
+  }, {
+    hop: 'worker',
+    sessionId: 'design-b-shared-run',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  }),
+  false,
+  'shared session/run across hops must not bind the child into the parent Thread',
+);
+assert.notEqual(
+  conversationLogicalScopeKey({ hop: 'orchestrator' }),
+  conversationLogicalScopeKey({ hop: 'worker' }),
+  'Thread logical scope must stay hop-fenced without embedding NUL',
+);
+assert.equal(
+  conversationLogicalScopeKey({ hop: 'orchestrator' }).includes('\0'),
+  false,
+  'hop-fenced logical scope must stay PostgreSQL TEXT safe',
+);
+
+const persistHopSession = 'design-b-persist-shared-run';
+const persistHopService = new AgentConversationBindingService(fakeStore);
+const persistHopOrch = {
+  ...interaction({
+    id: 'mi_persist_hop_orch',
+    at: fixtureNow + 50_000,
+    instance: 'host-root:thread:persist-orch',
+    users: ['persist orch'],
+  }),
+  hop: 'orchestrator',
+  sessionId: persistHopSession,
+  runId: persistHopSession,
+  providerConversationId: persistHopSession,
+  sessionMode: 'resumable',
+  sessionIdentityQuality: 'strong',
+  sessionIdSource: 'provider',
+};
+const persistHopWorker = {
+  ...interaction({
+    id: 'mi_persist_hop_worker',
+    at: fixtureNow + 50_100,
+    instance: 'host-root:thread:persist-worker',
+    users: ['persist worker'],
+  }),
+  hop: 'worker',
+  sessionId: persistHopSession,
+  runId: persistHopSession,
+  providerConversationId: persistHopSession,
+  sessionMode: 'resumable',
+  sessionIdentityQuality: 'strong',
+  sessionIdSource: 'provider',
+};
+const persistHopProjection = await resolveAndPersist(persistHopService, [
+  persistHopOrch,
+  persistHopWorker,
+]);
+const persistHopMembershipIds = [...new Set(
+  [persistHopOrch, persistHopWorker].map((record) =>
+    storedMemberships.get(record.interactionId)?.canonicalConversationId),
+)];
+assert.equal(
+  persistHopMembershipIds.length,
+  2,
+  'persist must keep hop-local memberships instead of one parent stamp',
+);
+assert.notEqual(
+  storedMemberships.get(persistHopOrch.interactionId)?.canonicalConversationId,
+  storedMemberships.get(persistHopWorker.interactionId)?.canonicalConversationId,
+  'worker membership must not reuse the orchestrator stamp',
+);
+assert.notEqual(
+  storedBindings.get(persistHopOrch.interactionId)?.conversationId,
+  storedBindings.get(persistHopWorker.interactionId)?.conversationId,
+  'v1 bindings must follow hop-local memberships',
+);
+const persistHopRestart = new AgentConversationBindingService(fakeStore);
+const persistHopRebound = await persistHopRestart.applyPersistedBindings([
+  structuredClone(persistHopOrch),
+  structuredClone(persistHopWorker),
+]);
+assert.notEqual(
+  persistHopRebound[0].conversationId,
+  persistHopRebound[1].conversationId,
+  'apply must not chase a parent stamp alias onto the worker hop',
+);
+assert.ok(
+  persistHopProjection.projection.summaries.length >= 2,
+  'directory projection of a shared run must keep two hop Threads',
+);
 
 console.log('Agent Conversation durable Thread/Segment binding verification passed');

@@ -827,4 +827,76 @@ assert.equal(
   'a stale unresolved tool call must become an explicit capture gap',
 );
 
+const closedAt = Date.now() - 180_000;
+const closedRows = [
+  {
+    ...projectionInteraction({
+      interactionId: 'mi-run-python-pending-row',
+      at: closedAt,
+      requestBody: 'RUN_PYTHON_REQUEST',
+      responseText: 'WILL_EXECUTE',
+      agentInstanceId: 'docker:fixture:supervisor',
+      toolCalls: [{
+        toolCallId: 'call-run-python-alias',
+        name: 'run_python',
+        arguments: { code: 'print(8 + 9)' },
+        issuedAtUnixNs: String(BigInt(closedAt) * 1_000_000n),
+      }],
+      completeness: 'tool_pending',
+      partialReasons: ['tool_result_pending'],
+    }),
+    interactionType: 'model',
+    canonicalSessionId: 'sess-code-alias',
+    runtimeInstanceId: 'docker:fixture:supervisor',
+    conversationCompleteness: 'tool_pending',
+  },
+  {
+    ...projectionInteraction({
+      interactionId: 'mi-http-execute-result',
+      at: closedAt + 30,
+      requestBody: 'EXECUTE',
+      responseText: '17',
+      agentInstanceId: 'docker:fixture:supervisor',
+      toolCalls: [{
+        toolCallId: 'sandbox-execute-1',
+        name: 'http.code.execute',
+        arguments: { code: 'print(8 + 9)', timeout_ms: 4000 },
+        issuedAtUnixNs: String(BigInt(closedAt + 30) * 1_000_000n),
+      }],
+      toolResults: [{
+        toolCallId: 'sandbox-execute-1',
+        name: 'http.code.execute',
+        content: { stdout: '17\n', exit_code: 0 },
+        isError: false,
+        observedAtUnixNs: String(BigInt(closedAt + 40) * 1_000_000n),
+      }],
+    }),
+    interactionType: 'tool',
+    canonicalSessionId: 'sess-code-alias',
+    runtimeInstanceId: 'docker:fixture:supervisor',
+    conversationCompleteness: 'complete',
+  },
+];
+const closedTimeline = projectSemanticConversationTimeline(
+  {
+    ...unresolvedSummary,
+    conversationId: 'cv-code-alias',
+    agentInstanceIds: ['docker:fixture:supervisor'],
+  },
+  closedRows,
+  [],
+);
+assert.equal(
+  closedTimeline.flatMap((turn) => turn.diagnostics)
+    .some((diagnostic) => diagnostic.message.includes('90 秒')),
+  false,
+  'a code-fingerprint ToolResult on the HTTP lane must close the LLM-named call',
+);
+assert.equal(
+  closedTimeline.flatMap((turn) => turn.events)
+    .find((event) => event.kind === 'tool_call' && event.toolCallId === 'call-run-python-alias')
+    ?.status,
+  'succeeded',
+);
+
 console.log('agent conversation directory verification passed');

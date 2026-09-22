@@ -144,7 +144,7 @@ const projection = compileFilterRuleProjection({ rules: builtins, catalogVersion
 assert.equal(projection.runtimeSignatures.runtimes.length, 8);
 assert.equal(projection.runtimeSignatures.runtimes.find((runtime) => runtime.id === 'codex')?.ruleId, codex.ruleId);
 assert.equal(projection.captureProfiles.agent_full.file_access, 'full');
-assert.equal(projection.captureProfiles.infrastructure_aggregate.file_access, 'aggregate');
+assert.equal(projection.captureProfiles.infrastructure_aggregate.file_access, 'drop');
 assert(projection.semanticRetentionRules.length >= 5);
 assert(projection.persistenceRetentionRules.length >= 5);
 assert(projection.safetyGuardrails.length >= 4);

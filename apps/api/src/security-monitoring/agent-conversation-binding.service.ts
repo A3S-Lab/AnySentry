@@ -12,8 +12,13 @@ import {
   type ConversationRouteAliasV1,
   type TechnicalActivityProjection,
   conversationAnchorsForInteraction,
+  conversationHopScopeSuffix,
   conversationLogicalScopeKeyV2,
   conversationDeploymentScopeKey,
+  durableSessionAnchor,
+  hopAlignedConversationId,
+  hopFromLogicalScopeKey,
+  persistedMembershipConversationId,
   trafficRoleForInteraction,
   resolveAgentConversationsV2,
 } from './agent-conversation-resolution-v2';
@@ -75,12 +80,39 @@ function equalLineage(left: string[], right: string[]): boolean {
     && left.every((value, index) => value === right[index]);
 }
 
+/** Same-container prompt similarity is not a Session resume across distinct anchors. */
+export function threadAcceptsUnboundRecord(
+  thread: T.AgentConversationThreadRecord,
+  record: T.AgentInteractionRecord,
+): boolean {
+  const recordHop = record.hop?.trim().toLowerCase() || undefined;
+  const threadHop = hopFromLogicalScopeKey(thread.logicalScopeKey);
+  if (recordHop && threadHop && recordHop !== threadHop) return false;
+  if (Boolean(recordHop) !== Boolean(threadHop)) return false;
+  const recordAnchor = durableSessionAnchor(record);
+  const threadAnchor = durableSessionAnchor(thread);
+  if (recordAnchor && threadAnchor) return recordAnchor === threadAnchor;
+  if (record.sessionMode === 'per_request'
+    || record.sessionMode === 'ephemeral'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || thread.sessionMode === 'per_request'
+    || thread.sessionMode === 'ephemeral'
+    || thread.sessionIdentityQuality === 'ephemeral') {
+    return false;
+  }
+  if (record.sessionId && thread.sessionId && record.sessionId !== thread.sessionId) {
+    return false;
+  }
+  return true;
+}
+
 export function conversationLogicalScopeKey(record: T.AgentInteractionRecord): string {
   const logical = conversationLogicalScopeKeyV2(record);
   const deployment = conversationDeploymentScopeKey(record);
-  // PostgreSQL TEXT/JSONB cannot contain a NUL byte. Keep the deployment fence opaque and
-  // storage-safe while retaining the base logical scope for compatibility checks below.
-  return deployment ? `${logical}|deployment:${deployment}` : logical;
+  // PostgreSQL TEXT/JSONB cannot contain a NUL byte. Keep the deployment and hop
+  // fences opaque and storage-safe while retaining the base logical scope.
+  const base = deployment ? `${logical}|deployment:${deployment}` : logical;
+  return `${base}${conversationHopScopeSuffix(record.hop)}`;
 }
 
 function compareInteraction(left: T.AgentInteractionRecord, right: T.AgentInteractionRecord): number {
@@ -383,6 +415,11 @@ function anchorScopeCompatible(
   const currentScope = conversationLogicalScopeKey(record);
   const persistedThreadScope = thread.logicalScopeKey.trim();
   const storedScope = storedAnchorScope.trim();
+  const recordHop = record.hop?.trim().toLowerCase()
+    || hopFromLogicalScopeKey(currentScope);
+  const storedHop = hopFromLogicalScopeKey(storedScope)
+    || hopFromLogicalScopeKey(persistedThreadScope);
+  if (recordHop && storedHop && recordHop !== storedHop) return false;
   // The anchor row and the membership's Thread must agree first.  Checking only the incoming
   // scope would allow a corrupt/legacy membership pointer to attach an anchor from definition A
   // to Thread B when both happen to expose the same provider hash.
@@ -463,6 +500,9 @@ function sameThreadDomain(
   record: T.AgentInteractionRecord,
   thread: T.AgentConversationThreadRecord,
 ): boolean {
+  const recordHop = record.hop?.trim().toLowerCase() || undefined;
+  const threadHop = hopFromLogicalScopeKey(thread.logicalScopeKey);
+  if (recordHop && threadHop && recordHop !== threadHop) return false;
   if (normalized(record.tenantId) && normalized(thread.tenantId)
     && normalized(record.tenantId) !== normalized(thread.tenantId)) return false;
 
@@ -944,11 +984,19 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       const membership = this.membershipsV2.get(record.interactionId);
       const boundConversationId = membership?.canonicalConversationId
         ?? binding?.conversationId;
-      const canonicalConversationId = boundConversationId
+      const chasedConversationId = boundConversationId
         ? this.canonicalConversationId(boundConversationId)
         : undefined;
+      const chasedThread = chasedConversationId
+        ? this.threads.get(chasedConversationId)
+        : undefined;
+      const canonicalConversationId = hopAlignedConversationId({
+        conversationId: chasedConversationId,
+        hop: record.hop,
+        threadLogicalScopeKey: chasedThread?.logicalScopeKey,
+      });
       const thread = canonicalConversationId
-        ? this.threads.get(canonicalConversationId)
+        ? this.threads.get(canonicalConversationId) ?? chasedThread
         : undefined;
       return {
         ...record,
@@ -1018,7 +1066,8 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       const lineage = userLineage(record);
       const resultIds = new Set(record.toolResults.map((result) => result.toolCallId));
       const candidates = [...this.threads.values()]
-        .filter((thread) => thread.logicalScopeKey === scope)
+        .filter((thread) => thread.logicalScopeKey === scope
+          && threadAcceptsUnboundRecord(thread, record))
         .map((thread) => {
           const sameInstance = Boolean(record.agentInstanceId
             && thread.agentInstanceIds.includes(record.agentInstanceId));
@@ -1304,6 +1353,79 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * v1 summaries can still share a parent stamp across hops. Keep resolver hop-local
+   * memberships, and persist matching Thread/Segment/Binding rows so a later apply
+   * does not chase the stamp alias back onto the child hop.
+   */
+  private applyHopLocalPersistence(
+    threads: T.AgentConversationThreadRecord[],
+    segments: T.ConversationInstanceSegment[],
+    bindings: T.AgentConversationBindingRecord[],
+  ): void {
+    const pending = this.pendingResolution;
+    if (!pending?.memberships.length) return;
+    const hopLocalByInteraction = new Map<string, string>();
+    for (const membership of pending.memberships) {
+      const hopLocal = membership.canonicalConversationId?.trim();
+      if (hopLocal) hopLocalByInteraction.set(membership.interactionId, hopLocal);
+    }
+    if (hopLocalByInteraction.size === 0) return;
+    const stampByHopLocal = new Map<string, string>();
+    for (const binding of bindings) {
+      const hopLocal = hopLocalByInteraction.get(binding.interactionId);
+      if (!hopLocal || hopLocal === binding.conversationId) continue;
+      stampByHopLocal.set(hopLocal, binding.conversationId);
+      binding.conversationId = hopLocal;
+    }
+    for (const segment of segments) {
+      const owner = bindings.find((binding) => binding.segmentId === segment.segmentId);
+      if (owner) segment.conversationId = owner.conversationId;
+    }
+    const existing = new Set(threads.map((thread) => thread.conversationId));
+    const recordByInteraction = new Map(
+      pending.records.map((record) => [record.interactionId, record]),
+    );
+    for (const [hopLocal, stamp] of stampByHopLocal) {
+      if (existing.has(hopLocal)) continue;
+      const stampThread = threads.find((thread) => thread.conversationId === stamp);
+      const sample = pending.memberships.find((membership) =>
+        membership.canonicalConversationId === hopLocal);
+      const sampleRecord = sample
+        ? recordByInteraction.get(sample.interactionId)
+        : undefined;
+      if (!stampThread && !sampleRecord) continue;
+      const hopThread: T.AgentConversationThreadRecord = stampThread
+        ? {
+            ...stampThread,
+            conversationId: hopLocal,
+            logicalScopeKey: sampleRecord
+              ? conversationLogicalScopeKey(sampleRecord)
+              : stampThread.logicalScopeKey,
+          }
+        : {
+            schemaVersion: 'anysentry.agent_conversation_thread.v1',
+            conversationId: hopLocal,
+            logicalScopeKey: conversationLogicalScopeKey(sampleRecord!),
+            idSource: 'inferred',
+            agentProduct: sampleRecord!.agentProduct ?? 'unknown',
+            workspacePath: sampleRecord!.workspacePath ?? '',
+            agentInstanceIds: sampleRecord!.agentInstanceId
+              ? [sampleRecord!.agentInstanceId]
+              : [],
+            userLineageHashes: userLineage(sampleRecord!),
+            pendingToolCallIds: [],
+            startedAtUnixNs: sampleRecord!.startedAtUnixNs,
+            lastActivityAtUnixNs: sampleRecord!.endedAtUnixNs,
+            resolverVersion: AGENT_CONVERSATION_RESOLVER_VERSION,
+            updatedAt: sampleRecord!.receivedAt,
+          };
+      threads.push(hopThread);
+      this.threads.set(hopLocal, hopThread);
+      existing.add(hopLocal);
+    }
+  }
+
   async persistProjection(projection: AgentConversationProjection): Promise<void> {
     this.pruneHotState();
     const threads: T.AgentConversationThreadRecord[] = [];
@@ -1512,6 +1634,8 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       if (segment) segments.push(segment);
     }
 
+    this.applyHopLocalPersistence(threads, segments, bindings);
+
     for (const segment of segments) this.segments.set(segment.segmentId, segment);
     for (const binding of bindings) this.bindings.set(binding.interactionId, binding);
     // Materialize the versioned canonical SessionMembership projection independently of the
@@ -1659,13 +1783,16 @@ export class AgentConversationBindingService implements OnModuleDestroy {
         ]));
         const memberships = pending.memberships.map((membership) => {
           const binding = bindingByInteraction.get(membership.interactionId);
-          return binding && membership.canonicalConversationId
-            ? {
-                ...membership,
-                canonicalConversationId: binding.conversationId,
-                segmentId: binding.segmentId,
-              }
-            : membership;
+          if (!binding) return membership;
+          const canonicalConversationId = persistedMembershipConversationId({
+            resolverConversationId: membership.canonicalConversationId,
+            bindingConversationId: binding.conversationId,
+          });
+          return {
+            ...membership,
+            ...(canonicalConversationId ? { canonicalConversationId } : {}),
+            segmentId: binding.segmentId,
+          };
         });
         const rawAnchors = pending.records.flatMap((record) =>
           (record.conversationAnchors ?? []).map((anchor) => ({
@@ -1767,6 +1894,24 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     this.pruneHotState();
     const alias = this.routeAliases.get(conversationId);
     return alias ? { ...alias, evidence: [...alias.evidence] } : undefined;
+  }
+
+  rememberHopFenceBoundAlias(aliasConversationId: string, canonicalConversationId: string): void {
+    const alias = aliasConversationId.trim();
+    const canonical = canonicalConversationId.trim();
+    if (!alias || !canonical || alias === canonical) return;
+    this.routeAliases.set(alias, {
+      schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+      aliasConversationId: alias,
+      targetType: 'conversation',
+      targetId: canonical,
+      canonicalConversationId: canonical,
+      reason: 'hop_fence_bound_thread',
+      evidence: ['durable_thread', 'hop_fence'],
+      resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+      resolutionRevision: this.resolutionRevision || 1,
+      createdAt: Date.now(),
+    });
   }
 
   async resolveRouteAlias(conversationId: string): Promise<ConversationRouteAliasV1 | undefined> {

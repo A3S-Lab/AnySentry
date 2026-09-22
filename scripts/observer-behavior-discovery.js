@@ -270,11 +270,61 @@ function isKnownInfrastructureWorkload(ref, attribution) {
   );
 }
 
+const HOST_CONTROL_PLANE_UNIT =
+  /(?:^|\/)system\.slice\/(?:k3s|containerd|docker|crio|kubelet)\.service(?:\/|$)/iu;
+const CONTAINER_LEAF_ID = /(?:^|[-/])(?:[a-f0-9]{64}|docker-[a-f0-9]{8,})(?:\.scope|$|[/.-])/iu;
+const POD_LEAF_ID = /(?:^|\/)pod[a-f0-9a-z_-]+/iu;
+
+function physicalInfrastructureReason(cgroup, workloadRef, facts) {
+  const path = text(cgroup);
+  if (!path) return '';
+  if (HOST_CONTROL_PLANE_UNIT.test(path)) return 'host_control_plane';
+  const namespace = text(workloadRef?.namespace ?? facts?.namespace).toLowerCase();
+  if (/kubepods/iu.test(path) && namespace === 'anysentry') return 'self_plane';
+  // Runtime parents are kubepods QoS/slice roots without a pod or container leaf.
+  // A /docker/<id> path is a container, not the runtime ancestor.
+  if (
+    /(?:^|\/)kubepods(?:\.slice)?(?:\/|$)/iu.test(path)
+    && !CONTAINER_LEAF_ID.test(path)
+    && !POD_LEAF_ID.test(path)
+  ) {
+    return 'runtime_ancestor';
+  }
+  return '';
+}
+
+function physicalInfrastructureClassification(observerEvent, attribution) {
+  const process = processInfo(observerEvent);
+  const ref = workloadRef(observerEvent, attribution);
+  const facts = attribution?.infrastructureFacts && typeof attribution.infrastructureFacts === 'object'
+    ? attribution.infrastructureFacts
+    : {};
+  const reason = physicalInfrastructureReason(process.cgroup, ref, facts);
+  if (!reason) return undefined;
+  return {
+    state: 'infrastructure',
+    attribution: {
+      monitored: false,
+      classification: 'non_agent',
+      confidence: 1,
+      reason: 'platform_infrastructure',
+      source: 'physical_context',
+      evidence: [
+        ...(Array.isArray(attribution?.evidence) ? attribution.evidence : []),
+        `f0:physical_infrastructure=${reason}`,
+      ].slice(-16),
+      physicalWorkloadId: text(attribution?.physicalWorkloadId) || behaviorKey(observerEvent, attribution),
+      workloadRef: ref,
+    },
+  };
+}
+
 function isLlmEvent(kind, payload, llmHostHints = DEFAULT_LLM_HOST_HINTS) {
-  if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return true;
-  // A file path or executable name can contain protocol words. Only transport observations
-  // may supply these optional model hints; otherwise ordinary file activity invents an LLM.
-  if (!['Egress', 'Connect', 'Dns', 'DnsQuery', 'Tls', 'TlsHandshake'].includes(kind)) return false;
+  // A probe may label a flow LlmCall before a protocol shape exists. Counting that label
+  // promotes host control planes and proxies. Model operations come from the route or the
+  // semantic operation, including on LlmCall / LlmInteraction events.
+  const transport = ['Egress', 'Connect', 'Dns', 'DnsQuery', 'Tls', 'TlsHandshake', 'LlmApi', 'LlmCall', 'LlmInteraction'];
+  if (!transport.includes(kind)) return false;
   const route = routeText(payload);
   // These are protocol operation shapes, not provider or framework names. They also cover
   // private gateways where the peer address carries no useful vendor identity.
@@ -287,6 +337,7 @@ function isLlmEvent(kind, payload, llmHostHints = DEFAULT_LLM_HOST_HINTS) {
   if (/(?:llm|language[_ -]?model|model[_ -]?(?:call|request|response|generation)|chat|completion|inference)/u.test(semanticKind)) {
     return true;
   }
+  if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return false;
   const target = targetText(payload);
   return Boolean(target && normalizedHints(llmHostHints).some((hint) => target.includes(hint)));
 }
@@ -422,6 +473,22 @@ function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {
   // must survive a deployment rename (for example an Agent which manages a database).
   if (record.llmEvents === 0 && record.agentSequences === 0 && isKnownInfrastructureWorkload(ref, attribution)) {
     return 'known_infrastructure_workload';
+  }
+  // A host proxy that only forwards Connect/Tls, with no model or tool cycle and no workspace
+  // writes, is a network relay. Wait for the same negative-age fence used by service-data so a
+  // cold Agent that has only opened its first sockets is not demoted.
+  if (
+    now - record.firstSeenAt >= minAgeMs
+    && record.llmEvents === 0
+    && record.agentSequences === 0
+    && record.alternations === 0
+    && record.uniqueTools.size === 0
+    && record.workspaceFiles === 0
+    && record.toolExecs === 0
+    && record.networkTargets.size > 0
+    && record.events >= 4
+  ) {
+    return 'network_relay_shape';
   }
   const fileEvents = record.workspaceFiles + record.serviceDataFiles;
   const serviceDataDominant =
@@ -722,6 +789,8 @@ module.exports = {
   isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
+  physicalInfrastructureReason,
+  physicalInfrastructureClassification,
   DEFAULT_BEHAVIOR_SIGNAL_REGISTRY,
   normalizeSignalRegistry,
   qualifies,

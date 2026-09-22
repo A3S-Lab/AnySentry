@@ -97,7 +97,7 @@ const infrastructureCapture = registry.captureDecision(
   infrastructure,
 );
 assert.equal(infrastructureCapture.captureProfile, 'infrastructure_aggregate');
-assert.equal(infrastructureCapture.desiredProbeActions.file_access, 'aggregate');
+assert.equal(infrastructureCapture.desiredProbeActions.file_access, 'drop');
 
 const securityDecision = registry.semanticDecision(
   { event: { SecurityAction: { kind: 'finding' } }, process: { comm: 'clickhouse' } },

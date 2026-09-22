@@ -60,14 +60,21 @@ import { parseTrustedCorrelation } from './trusted-correlation';
 import {
   buildToolEvidenceBundle,
   toolEvidenceIndexFields,
+  type ToolEvidenceItem,
   ToolEvidenceResponse,
 } from './tool-evidence-linker';
 import {
+  conversationCoverage,
   projectAgentConversations,
   projectConversationTimeline,
 } from './agent-conversation';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
-import { trafficRoleForInteraction, repairEmptyRouteAliasConversationId } from './agent-conversation-resolution-v2';
+import {
+  boundHopRemintConversationId,
+  pointReadCanonicalConversationId,
+  trafficRoleForInteraction,
+  repairEmptyRouteAliasConversationId,
+} from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
 import {
@@ -79,6 +86,18 @@ import {
   toolInvocationId,
   type SemanticKernelRelationInput,
 } from './agent-semantic-kernel-relation';
+import {
+  OBSERVED_KERNEL_EVENT_KINDS,
+  observedKernelSearchWindow,
+  projectObservedToolEvidence,
+} from './observed-tool-evidence';
+import { bindInferredProducerRun } from './agent-run-projection';
+import { inMemoryPlanTool } from './agent-tool-shape';
+import {
+  observabilityCoverageLayers,
+  toolEvidenceForInteractions,
+  unifiedFilterRuleLineage,
+} from './observability-coverage';
 import {
   projectContextReplaySummaries,
   projectSemanticConversationTimeline,
@@ -2040,6 +2059,11 @@ export class AggregationService implements OnModuleDestroy {
       : correlation
         ? { ...e.attribution, correlation }
         : (({ correlation: _hiddenCorrelation, ...legacyAttribution }) => legacyAttribution)(e.attribution);
+    const ruleLineage = unifiedFilterRuleLineage({
+      captureEpoch: e.captureEpoch,
+      attributes: e.attributes,
+      filterRuleDecision: e.judgment?.filterRuleDecision,
+    });
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
@@ -2150,6 +2174,7 @@ export class AggregationService implements OnModuleDestroy {
       process: visibleProcessContext(e.process),
       attribution,
       judgment: e.judgment,
+      ...(ruleLineage ? { ruleLineage } : {}),
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       lastAt: repeatCount > 1 ? iso(lastAt) : undefined,
       rawPreview: e.rawPreview,
@@ -2860,7 +2885,7 @@ export class AggregationService implements OnModuleDestroy {
         this.canonicalObservability?.recordGap(
           'correlation',
           'dropped',
-          record.rawObservationId ?? record.interactionId,
+          record.agentInstanceId?.trim() || record.interactionId,
           { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
         );
         return;
@@ -2886,7 +2911,7 @@ export class AggregationService implements OnModuleDestroy {
         this.canonicalObservability?.recordGap(
           'correlation',
           'dropped',
-          record.rawObservationId ?? record.interactionId,
+          record.agentInstanceId?.trim() || record.interactionId,
           { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
         );
         return;
@@ -2906,7 +2931,7 @@ export class AggregationService implements OnModuleDestroy {
         this.canonicalObservability?.recordGap(
           'correlation',
           'timeout',
-          record.rawObservationId ?? record.interactionId,
+          record.agentInstanceId?.trim() || record.interactionId,
           { projection: 'semantic_kernel_relation' },
         );
       }, RELATION_PROJECTION_TIMEOUT_MS);
@@ -3061,7 +3086,7 @@ export class AggregationService implements OnModuleDestroy {
         this.canonicalObservability.recordGap(
           'projection',
           'dropped',
-          trigger.interactionId,
+          trigger.agentInstanceId?.trim() || trigger.interactionId,
           { projection: 'evidence_link', rejected: commit.rejected },
         );
       }
@@ -3158,8 +3183,7 @@ export class AggregationService implements OnModuleDestroy {
       merged.set(record.interactionId, record);
     }
     const currentView = resolvedClassificationView(filter) === 'current_effective';
-    const items = [...merged.values()]
-      .map((item): T.AgentInteractionRecord => {
+    const classified = [...merged.values()].map((item): T.AgentInteractionRecord => {
         const review = currentView ? this.assetReviews?.current(item.agentAssetId) : undefined;
         const automatic = captureClassificationDecision(item.detectedClassification);
         const currentEffectiveClassification = review?.decision ?? automatic.effective;
@@ -3170,7 +3194,8 @@ export class AggregationService implements OnModuleDestroy {
           currentEffectiveClassification,
           ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
         };
-      })
+      });
+    const items = bindInferredProducerRun(classified)
       .filter((item) =>
         // `interactionId` is the globally unique immutable fact key. Asset and Runtime instance
         // ids are mutable attribution hints: a resumed canonical Thread can legitimately contain
@@ -3233,7 +3258,8 @@ export class AggregationService implements OnModuleDestroy {
       || options.membershipTruncated === true
       || missingMembershipRecords > 0
     );
-    const partial = !durable || Boolean(options.fairPerAgentLimit) || membershipPartial;
+    const fairTruncated = Boolean(options.fairPerAgentLimit) && items.length > visible.length;
+    const partial = !durable || fairTruncated || membershipPartial;
     const partialReason = !durable
       ? 'hot_ring_only'
       : options.membershipDurable === false
@@ -3244,7 +3270,7 @@ export class AggregationService implements OnModuleDestroy {
           ? 'membership_limit'
           : missingMembershipRecords > 0
             ? 'membership_records_missing'
-            : options.fairPerAgentLimit ? 'scan_limit' : undefined;
+            : fairTruncated ? 'scan_limit' : undefined;
     return {
       items: visible,
       total: items.length,
@@ -3396,7 +3422,7 @@ export class AggregationService implements OnModuleDestroy {
       ? await this.conversationBindings?.resolveRouteAlias(requestedConversationId)
       : undefined;
     let initialConversationId = persistedAlias?.targetType === 'conversation'
-      ? persistedAlias.canonicalConversationId
+      ? (persistedAlias.canonicalConversationId || persistedAlias.targetId || requestedConversationId)
       : requestedConversationId;
     let resolveConversationId = Boolean(initialConversationId);
     let membershipSelection = initialConversationId && this.conversationBindings
@@ -3430,10 +3456,50 @@ export class AggregationService implements OnModuleDestroy {
         membershipSelection = requestedMembership;
       }
     }
+    // A hop-fenced remint of a durable Thread id is not stored as its own Thread.
+    // Resolve that key back to the durable id without widening the point-read into a
+    // time-window sample used as the timeline body.
+    if (
+      requestedConversationId
+      && /^cv_[a-f0-9]{24}$/iu.test(requestedConversationId)
+      && this.conversationBindings
+      && !(membershipSelection?.interactionIds.length)
+    ) {
+      const derived = await this.deriveHopFenceBoundConversationId(requestedConversationId);
+      if (derived) {
+        initialConversationId = derived.conversationId;
+        membershipSelection = derived.interactionIds.length
+          ? {
+              interactionIds: derived.interactionIds,
+              truncated: derived.truncated,
+              durable: false,
+            }
+          : await this.conversationBindings.interactionIdsForConversation(
+              derived.conversationId,
+              5_000,
+            );
+      }
+    }
     resolveConversationId = Boolean(initialConversationId);
-    const exactMembershipIds = canonicalSessionRead
-      ? membershipSelection?.interactionIds ?? []
-      : membershipSelection?.interactionIds.length ? membershipSelection.interactionIds : undefined;
+    // A selected Thread id is a point-read, same as a canonical Session id. An empty membership
+    // set must stay empty — never fall through to a last_1h fair sample that marks complete
+    // conversations `scan_limit` or hangs ClickHouse under load.
+    const exactMembershipIds = resolveConversationId
+      ? (membershipSelection?.interactionIds ?? [])
+      : undefined;
+    const pointReadThread = resolveConversationId && this.relationalStore?.configured()
+      ? (await this.relationalStore.loadAgentConversationThreadsByIds([
+          ...new Set([initialConversationId, requestedConversationId].filter((value): value is string => Boolean(value))),
+        ])).find((thread) =>
+          thread.conversationId === initialConversationId
+          || thread.conversationId === requestedConversationId)
+      : undefined;
+    const correlationSessionId = pointReadThread?.sessionId?.trim() ?? '';
+    const keyedSessionRead = Boolean(
+      resolveConversationId
+      && correlationSessionId
+      && !(exactMembershipIds?.length),
+    );
     // Canonical/deep-link reads may explicitly request the raw compatibility lane so that an
     // unknown/candidate physical asset can still be resolved and shown with a CoverageGap. The
     // ordinary Agent dashboard keeps its historical `agent` scope and therefore does not widen
@@ -3452,6 +3518,7 @@ export class AggregationService implements OnModuleDestroy {
       // interaction query performs GROUP BY/argMax before LIMIT, so a large limit still causes a
       // wide merge sort and can exceed the node memory budget before pagination happens.
       limit: CONVERSATION_INTERACTIONS_PER_AGENT,
+      ...(keyedSessionRead ? { runId: correlationSessionId } : {}),
     };
     const inventoryQuery: T.AgentInventoryQuery = {
       timeType: filter.timeType,
@@ -3486,25 +3553,27 @@ export class AggregationService implements OnModuleDestroy {
     // fair-per-agent quota is a presentation safeguard for the ordinary Agent view; applying it
     // to the raw lane marks a small, complete canonical Session read as `scan_limit` merely because
     // the fairness adapter was used. Keep the total interaction cap in both lanes.
-    const fairHistoryRead = filter.scope !== 'raw' && !exactMembershipIds && (resolveConversationId || (
+    const fairHistoryRead = filter.scope !== 'raw' && exactMembershipIds === undefined && (
       !filter.agentAssetId
       && !filter.agentInstanceId
       && !filter.model
-    ));
-    const interactionReadOptions = exactMembershipIds
-      ? {
-          interactionIds: exactMembershipIds,
-          membershipTruncated: membershipSelection?.truncated,
-          membershipDurable: membershipSelection?.durable ?? false,
-          membershipStoreUnavailable: membershipSelection?.storeUnavailable === true,
-          totalLimit: exactMembershipIds.length,
-        }
-      : fairHistoryRead
+    );
+    const interactionReadOptions = keyedSessionRead
+      ? { totalLimit: CONVERSATION_INTERACTIONS_TOTAL }
+      : exactMembershipIds
         ? {
-            fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
-            totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+            interactionIds: exactMembershipIds,
+            membershipTruncated: membershipSelection?.truncated,
+            membershipDurable: membershipSelection?.durable ?? false,
+            membershipStoreUnavailable: membershipSelection?.storeUnavailable === true,
+            totalLimit: exactMembershipIds.length,
           }
-        : undefined;
+        : fairHistoryRead
+          ? {
+              fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
+              totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+            }
+          : undefined;
     const [interactions, inventory] = await Promise.all([
       this.readAgentInteractions(interactionQuery, interactionReadOptions),
       inventoryPromise,
@@ -3514,25 +3583,39 @@ export class AggregationService implements OnModuleDestroy {
     let boundInteractions = this.conversationBindings
       ? await this.conversationBindings.applyPersistedBindings(interactions.items)
       : interactions.items;
-    // Membership-scoped reads are exact for the selected Thread, but cross-hop relatedConversations
-    // need peer Interactions from the same run/session window. Expand with a fair history read.
-    if (exactMembershipIds?.length && filter.scope !== 'raw' && !canonicalSessionRead) {
-      // Raw canonical Session reads already have an exact membership ID set. Expanding them with
-      // a fair historical peer scan defeats point-read semantics and can trigger a wide ClickHouse
-      // merge sort under load. Peer expansion is only needed by the dashboard cross-hop view.
-      const peerWindow = await this.readAgentInteractions(interactionQuery, {
-        fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
-        totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
-      });
-      const peerBound = this.conversationBindings
-        ? await this.conversationBindings.applyPersistedBindings(peerWindow.items)
-        : peerWindow.items;
+    // Membership rows can lag the durable Thread. Expand by the Thread's sessionId — a keyed
+    // correlation read — instead of a last_1h fair sample.
+    if (
+      exactMembershipIds?.length
+      && correlationSessionId
+      && filter.scope !== 'raw'
+    ) {
+      const sessionWindow = await this.readAgentInteractions(
+        { ...interactionQuery, runId: correlationSessionId },
+        { totalLimit: CONVERSATION_INTERACTIONS_TOTAL },
+      );
+      const sessionBound = this.conversationBindings
+        ? await this.conversationBindings.applyPersistedBindings(sessionWindow.items)
+        : sessionWindow.items;
+      const membershipIdSet = new Set(exactMembershipIds);
+      const membershipHops = new Set(
+        boundInteractions
+          .filter((item) => membershipIdSet.has(item.interactionId) && item.hop)
+          .map((item) => item.hop as string),
+      );
       const byId = new Map(boundInteractions.map((item) => [item.interactionId, item]));
-      for (const item of peerBound) {
-        if (!byId.has(item.interactionId)) byId.set(item.interactionId, item);
+      for (const item of sessionBound) {
+        if (byId.has(item.interactionId)) continue;
+        // A parent and child hop can share sessionId/runId. Session hydration fills missing
+        // members of the selected Thread; it must not fold the peer hop into this timeline.
+        if (membershipHops.size && item.hop && !membershipHops.has(item.hop)) continue;
+        byId.set(item.interactionId, item);
       }
       boundInteractions = [...byId.values()];
     }
+    // Cross-hop relatedConversations are expressed by directory + EvidenceLink, not by widening a
+    // selected Thread into a last_1h fair sample. That scan was marking complete point-reads
+    // `scan_limit` and timing out conversation timelines under durable load.
     const routeAlias = requestedConversationId
       ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
       : undefined;
@@ -3542,19 +3625,56 @@ export class AggregationService implements OnModuleDestroy {
       ?? (routeAlias?.targetType === 'conversation'
         ? routeAlias.canonicalConversationId
         : undefined);
-    const projection = projectAgentConversations(boundInteractions, inventory.items, {
+    const projection = projectAgentConversations((
+      resolveConversationId && requestedConversationId
+        ? boundInteractions.map((record) => {
+          const remint = boundHopRemintConversationId(record.conversationId, record.hop);
+          if (!remint || record.conversationId === requestedConversationId) return record;
+          return { ...record, conversationId: remint };
+        })
+        : boundInteractions
+    ), inventory.items, {
       ...filter,
-      ...(canonicalSessionRead ? { conversationId: undefined }
-        : canonicalConversationId ? { conversationId: canonicalConversationId } : {}),
+      // A selected Thread id is a lookup key, not a hop-fence. Binding stamps the durable id,
+      // then projection may derive a scoped/hop-fenced alias; filtering during grouping would
+      // drop every member and return an empty complete timeline.
+      ...(resolveConversationId ? { conversationId: undefined } : {}),
     });
-    if (canonicalSessionRead) {
-      // Session and compatibility conversation IDs use different namespaces. Resolve the display
-      // alias from the selected immutable members, not from a shared runtime or a history scan.
-      projection.summaries = projection.summaries.filter((summary) =>
-        projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
-          (record.canonicalSessionId ?? record.sessionId) === requestedConversationId));
-      if (projection.summaries.length === 1) {
-        canonicalConversationId = projection.summaries[0].conversationId;
+    if (resolveConversationId) {
+      const membershipIdSet = new Set(exactMembershipIds ?? []);
+      const selected = projection.summaries.find((summary) =>
+        summary.conversationId === requestedConversationId
+        || summary.conversationId === initialConversationId)
+        ?? (membershipIdSet.size
+          ? projection.summaries.find((summary) =>
+            (projection.interactionsByConversation.get(summary.conversationId) ?? [])
+              .some((record) => membershipIdSet.has(record.interactionId)))
+          : undefined)
+        ?? (correlationSessionId
+          ? projection.summaries.find((summary) => summary.sessionId === correlationSessionId)
+          : undefined)
+        ?? (canonicalSessionRead
+          ? projection.summaries.find((summary) =>
+            projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
+              (record.canonicalSessionId ?? record.sessionId) === requestedConversationId))
+          : undefined);
+      canonicalConversationId = pointReadCanonicalConversationId({
+        requestedConversationId,
+        initialConversationId,
+        membershipCount: exactMembershipIds?.length ?? 0,
+        selectedConversationId: selected?.conversationId,
+        projectionHasRequested: Boolean(
+          requestedConversationId
+          && projection.interactionsByConversation.has(requestedConversationId),
+        ),
+      }) ?? canonicalConversationId;
+      if (canonicalSessionRead) {
+        projection.summaries = projection.summaries.filter((summary) =>
+          projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
+            (record.canonicalSessionId ?? record.sessionId) === requestedConversationId));
+        if (projection.summaries.length === 1) {
+          canonicalConversationId = projection.summaries[0].conversationId;
+        }
       }
     }
     // Read APIs are pure projections. Durable Thread/Segment/Relation state is updated by the
@@ -3569,10 +3689,86 @@ export class AggregationService implements OnModuleDestroy {
     };
   }
 
+  private async deriveHopFenceBoundConversationId(
+    requestedConversationId: string,
+  ): Promise<{ conversationId: string; interactionIds: string[]; truncated: boolean } | undefined> {
+    const remembered = this.conversationBindings?.routeAlias(requestedConversationId);
+    if (remembered?.targetType === 'conversation') {
+      const conversationId = remembered.canonicalConversationId ?? remembered.targetId;
+      if (!conversationId) return undefined;
+      return { conversationId, interactionIds: [], truncated: false };
+    }
+    const list = await this.readAgentInteractions({
+      timeType: 'last_7d',
+      scope: 'agent',
+      classificationView: 'current_effective',
+      limit: 2_000,
+    }, { totalLimit: 2_000 });
+    if (list.items.length === 0) return undefined;
+    const bound = this.conversationBindings
+      ? await this.conversationBindings.applyPersistedBindings(list.items)
+      : list.items;
+    const projected = projectAgentConversations(bound, [], {
+      timeType: 'last_7d',
+      scope: 'agent',
+      includeBackground: true,
+    });
+    const projectedRecords = projected.interactionsByConversation.get(requestedConversationId) ?? [];
+    if (projectedRecords.length > 0) {
+      return {
+        conversationId: requestedConversationId,
+        interactionIds: [...new Set(projectedRecords
+          .map((record) => record.interactionId)
+          .filter((value): value is string => Boolean(value)))].slice(0, 5_000),
+        truncated: projectedRecords.length > 5_000,
+      };
+    }
+    const matched = bound.filter((record) => {
+      const durable = record.conversationId?.trim();
+      if (!durable) return false;
+      if (durable === requestedConversationId) return true;
+      return boundHopRemintConversationId(durable, record.hop, record.agentIdHeader)
+        === requestedConversationId;
+    });
+    if (matched.length === 0) return undefined;
+    const durable = matched.find((record) =>
+      record.conversationId && record.conversationId !== requestedConversationId)
+      ?.conversationId?.trim() ?? requestedConversationId;
+    if (durable !== requestedConversationId) {
+      this.conversationBindings?.rememberHopFenceBoundAlias(requestedConversationId, durable);
+    }
+    const interactionIds = [...new Set(matched
+      .map((record) => record.interactionId)
+      .filter((value): value is string => Boolean(value)))].slice(0, 5_000);
+    return {
+      conversationId: durable,
+      interactionIds,
+      truncated: matched.length > interactionIds.length,
+    };
+  }
+
   async agentConversations(filter: T.AgentConversationQuery): Promise<T.AgentConversationList> {
     const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 80));
     const items = projection.summaries.slice(0, limit);
+    if (items.length) {
+      const pageRecords = items.flatMap((item) =>
+        projection.interactionsByConversation.get(item.conversationId) ?? []);
+      if (pageRecords.length) {
+        // Kernel search must stay hop/conversation-scoped. A page-wide load over last_1h
+        // truncates later Egress rows, so LLM aliases (run_python) cannot fold onto execute.
+        for (const item of items) {
+          const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
+          if (!records.length) continue;
+          const toolItems = await this.toolEvidenceItemsForInteractions(records);
+          item.coverageLayers = observabilityCoverageLayers(
+            records,
+            toolItems,
+            item.coverage,
+          );
+        }
+      }
+    }
     // Canonical raw Session reads are established by durable semantic interactions plus
     // SessionMembership. Inventory is an auxiliary identity directory and may be incomplete while
     // the selected interaction/session rows are already durable; propagating that unrelated gap
@@ -3616,7 +3812,7 @@ export class AggregationService implements OnModuleDestroy {
     const items = conversation?.hasContent
       ? projectConversationTimeline(conversation, records)
       : [];
-    const inventoryRequired = !conversation?.hasContent;
+    const inventoryRequired = !conversation?.hasContent && !filter.conversationId;
     const partial = interactions.coverage.partial
       || (inventoryRequired && inventory.coverage.partial);
     return {
@@ -3657,7 +3853,7 @@ export class AggregationService implements OnModuleDestroy {
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
-    const inventoryRequired = !thread?.hasContent;
+    const inventoryRequired = !thread?.hasContent && !filter.conversationId;
     const partial = interactions.coverage.partial
       || (inventoryRequired && inventory.coverage.partial);
     return {
@@ -3677,6 +3873,68 @@ export class AggregationService implements OnModuleDestroy {
       ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
+  }
+
+  private async loadObservedKernelCandidates(input: {
+    startMs: number;
+    endMs: number;
+    sourceId?: string;
+    collectorId?: string;
+  }): Promise<{ items: T.AgentEventListItem[]; partial: boolean }> {
+    const kinds = [...OBSERVED_KERNEL_EVENT_KINDS];
+    const durableJudge = this.judge as unknown as {
+      searchStoredEventsPage?: (query: StoredEventQuery) => Promise<StoredEventSearchResult>;
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+    };
+    let durable: StoredEventSearchResult = {
+      events: [],
+      hasMore: false,
+      unavailable: typeof durableJudge.searchStoredEventsPage !== 'function',
+    };
+    if (typeof durableJudge.searchStoredEventsPage === 'function') {
+      durable = await durableJudge.searchStoredEventsPage({
+        sinceMs: input.startMs,
+        untilMs: input.endMs,
+        sourceId: input.sourceId,
+        collectorId: input.collectorId,
+        eventKinds: kinds,
+        monitoredOnly: false,
+        limit: 2_000,
+        candidateLimit: 8_000,
+      });
+    }
+    const hot = (durableJudge.queryRange?.(input.startMs, input.endMs) ?? [])
+      .filter((event) => kinds.includes(event.eventKind as typeof kinds[number]));
+    const folded = foldLatestEventRevisions([...durable.events, ...hot]);
+    return {
+      items: folded.map((event) => this.eventItem(event, 1, event.at, 'as_observed')),
+      partial: Boolean(durable.unavailable || durable.hasMore),
+    };
+  }
+
+  async toolEvidenceItemsForInteractions(
+    records: readonly T.AgentInteractionRecord[],
+  ): Promise<ToolEvidenceItem[]> {
+    const invocationIds = [...new Set(records
+      .flatMap((record) => [record.invocationId, record.runId, record.producerRunId])
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value)))];
+    const search = observedKernelSearchWindow(records);
+    if (invocationIds.length === 0 || !search) return [];
+    const kernel = await this.loadObservedKernelCandidates({
+      startMs: search.startMs,
+      endMs: search.endMs,
+    });
+    const revision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    const items = invocationIds.flatMap((invocationId) =>
+      projectObservedToolEvidence(
+        invocationId,
+        records,
+        kernel.items,
+        revision,
+        kernel.partial,
+      ).items);
+    return toolEvidenceForInteractions(items, records);
   }
 
   async agentConversationTimelineV3(
@@ -3716,9 +3974,20 @@ export class AggregationService implements OnModuleDestroy {
       filter.snapshotAsOf ?? '',
       String(resolutionRevision),
     ].join('\u0000')).digest('hex').slice(0, 32);
-    const inventoryRequired = !thread?.hasContent;
+    const inventoryRequired = !thread?.hasContent && !requestedConversationId;
     const partial = interactions.coverage.partial
       || (inventoryRequired && inventory.coverage.partial);
+    const toolItems = records.length
+      ? await this.toolEvidenceItemsForInteractions(records)
+      : [];
+    const coverageLayers = records.length
+      ? observabilityCoverageLayers(
+        records,
+        toolItems,
+        thread?.coverage ?? conversationCoverage(records),
+      )
+      : undefined;
+    if (coverageLayers && thread) thread.coverageLayers = coverageLayers;
     return {
       apiVersion: 3,
       requestKey,
@@ -3764,6 +4033,7 @@ export class AggregationService implements OnModuleDestroy {
         partialReason: interactions.coverage.partialReason
           ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
       },
+      ...(coverageLayers ? { coverageLayers } : {}),
       dataSource: interactions.dataSource,
       ...this.classificationResponseMeta(filter),
       updateTime: iso(),
@@ -4046,6 +4316,14 @@ export class AggregationService implements OnModuleDestroy {
     const linkedEventIds = new Set(relations
       .map((relation) => relation.kernelEventId)
       .filter((eventId): eventId is string => Boolean(eventId)));
+    if (
+      inMemoryPlanTool([call.toolKind, call.toolName].filter(Boolean).join(' '))
+      && linkedEventIds.size === 0
+    ) {
+      relations = relations.map((relation) => relation.status === 'coverage_gap'
+        ? { ...relation, status: 'semantic_only' }
+        : relation);
+    }
     const relationStatus = relations.some((relation) => relation.status === 'linked_exact')
       ? 'linked_exact'
       : relations.some((relation) => relation.status === 'linked_strong')
@@ -4377,7 +4655,77 @@ export class AggregationService implements OnModuleDestroy {
     const toolCallId = filter.toolCallId?.trim() || undefined;
     const correlationEnabled = correlationCaptureRollout().trustedCorrelation !== 'off';
     const empty = buildToolEvidenceBundle([]);
+    const window = resolveTimeWindow(filter);
+    const observedEvidence = async (): Promise<ToolEvidenceResponse | undefined> => {
+      const interactions = await this.agentInteractions({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        snapshotAsOf: filter.snapshotAsOf,
+        invocationId,
+        runId: invocationId,
+        limit: 200,
+      });
+      if (interactions.items.length === 0) return undefined;
+      const search = observedKernelSearchWindow(interactions.items);
+      const evidenceStart = Math.max(window.startMs, search?.startMs ?? window.startMs);
+      const evidenceEnd = Math.min(window.endMs, search?.endMs ?? window.endMs);
+      const kernel = await this.loadObservedKernelCandidates({
+        startMs: evidenceStart,
+        endMs: evidenceEnd,
+        sourceId: filter.sourceId,
+        collectorId: filter.collectorId,
+      });
+      const projected = projectObservedToolEvidence(
+        invocationId,
+        interactions.items,
+        kernel.items,
+        this.conversationBindings?.currentResolutionRevision() ?? 0,
+        kernel.partial || interactions.coverage.partial,
+        toolCallId,
+      );
+      if (projected.items.length === 0) return undefined;
+      return {
+        schemaVersion: 'anysentry.tool_evidence.v1',
+        items: projected.items,
+        ignoredUntrustedAdapterEvents: 0,
+        truncated: Boolean(kernel.partial || interactions.coverage.partial),
+        invocationId,
+        ...(toolCallId ? { toolCallId } : {}),
+        dataSource: interactions.dataSource === 'hot_ring'
+          ? 'memory_hot_ring'
+          : 'clickhouse+hot_delta',
+        partial: Boolean(kernel.partial || interactions.coverage.partial),
+        ...(kernel.partial || interactions.coverage.partial
+          ? { partialReasons: ['scan_limit'] as ToolEvidenceResponse['partialReasons'] }
+          : {}),
+        coverageLayers: observabilityCoverageLayers(
+          interactions.items,
+          projected.items,
+          conversationCoverage(interactions.items),
+        ),
+        updateTime: iso(),
+      };
+    };
+    const coverageLayersFor = async (items: ToolEvidenceResponse['items']) => {
+      const interactions = await this.agentInteractions({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        snapshotAsOf: filter.snapshotAsOf,
+        invocationId,
+        runId: invocationId,
+        limit: 200,
+      });
+      return observabilityCoverageLayers(
+        interactions.items,
+        items,
+        conversationCoverage(interactions.items),
+      );
+    };
     if (!correlationEnabled) {
+      const observed = await observedEvidence();
+      if (observed) return observed;
       return {
         ...empty,
         invocationId,
@@ -4388,8 +4736,6 @@ export class AggregationService implements OnModuleDestroy {
         updateTime: iso(),
       };
     }
-
-    const window = resolveTimeWindow(filter);
     const storageReady = this.judge.storageStatus().clickhouseReady;
     const partialReasons = new Set<NonNullable<ToolEvidenceResponse['partialReasons']>[number]>();
     const durableEvents: T.JudgedEvent[] = [];
@@ -4425,6 +4771,7 @@ export class AggregationService implements OnModuleDestroy {
           ...(toolCallId ? { toolCallId } : {}),
           dataSource: 'clickhouse_relation',
           partial: false,
+          coverageLayers: await coverageLayersFor(relationItems),
           updateTime: iso(),
         };
       }
@@ -4552,6 +4899,10 @@ export class AggregationService implements OnModuleDestroy {
     const items = toolCallId
       ? bundle.items.filter((item) => item.invocationId === invocationId && item.toolCallId === toolCallId)
       : bundle.items.filter((item) => item.invocationId === invocationId);
+    if (items.length === 0) {
+      const observed = await observedEvidence();
+      if (observed) return observed;
+    }
     // Query paths are read-only. Relation materialization is owned by the bounded ingest projector
     // (`scheduleSemanticRelationProjection`) so opening an Inspector or polling this endpoint can
     // never create a new fact/revision or generate unbounded write amplification.
@@ -4563,6 +4914,7 @@ export class AggregationService implements OnModuleDestroy {
       dataSource: storageReady ? 'clickhouse+hot_delta' : 'memory_hot_ring',
       partial: bundle.truncated || partialReasons.size > 0,
       ...(partialReasons.size ? { partialReasons: [...partialReasons] } : {}),
+      coverageLayers: await coverageLayersFor(items),
       updateTime: iso(),
     };
   }

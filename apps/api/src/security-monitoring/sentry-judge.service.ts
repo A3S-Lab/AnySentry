@@ -8,7 +8,7 @@ import type { ToolEvidenceItem } from './tool-evidence-linker';
 import { DEFAULT_POLICY, PolicyConfig, buildFastAcl, policyConfigError, sanitizePolicy, tierStatus } from './policy-config';
 import { cleanText } from './redaction';
 import { DecisionResultJob, FastJudgeJob } from './async-judgment.types';
-import { JudgmentQueueService } from './judgment-queue.service';
+import { FastEnqueueResult, JudgmentQueueService } from './judgment-queue.service';
 import { RuntimeModelConfigService } from './runtime-model-config';
 import { DistributedCurrentStateService } from './distributed-current-state.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
@@ -37,6 +37,7 @@ import {
 import { AgentInteractionQuery, AgentInteractionRecord, CollectorHeartbeatOrigin, CollectorHeartbeatRecord, CollectorHeartbeatRequest, CollectorRawHeartbeatRequest, EventCategory, EventMeta, IdentityAiReviewRecord, Incident, IncidentStatus, JudgedEvent, JudgmentRouteReason, ProcessContext, RiskType, Severity, Tier, Verdict } from './types';
 import { FilterRuleCatalogService } from './filter-rule-catalog.service';
 import type { FilterRuleDecisionReceipt } from './filter-rule.types';
+import { CanonicalObservabilityService } from './canonical-observability.service';
 
 const SEVERITY_SCORE: Record<Severity, number> = { info: 8, low: 28, medium: 52, high: 76, critical: 95 };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -500,6 +501,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     private readonly currentState: DistributedCurrentStateService,
     private readonly relational: RelationalBusinessStore,
     @Optional() private readonly filterRules?: FilterRuleCatalogService,
+    @Optional() private readonly canonicalObservability?: CanonicalObservabilityService,
   ) {}
 
   private sentry!: Sentry;
@@ -1824,14 +1826,15 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
 
   async enqueuePreparedFastJob(
     prepared: Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>,
-  ): Promise<void> {
-    if (prepared.fastJob) await this.queues.enqueueFast(prepared.fastJob);
+  ): Promise<FastEnqueueResult> {
+    if (!prepared.fastJob) return { accepted: 0, skipped: 0 };
+    return this.queues.enqueueFast(prepared.fastJob);
   }
 
   async enqueuePreparedFastJobs(
     prepared: readonly Extract<PreparedJudgeAcceptOutcome, { disposition: 'retained' }>[],
-  ): Promise<void> {
-    await this.queues.enqueueFastBatch(
+  ): Promise<FastEnqueueResult> {
+    return this.queues.enqueueFastBatch(
       prepared.flatMap((item) => item.fastJob ? [item.fastJob] : []),
     );
   }
@@ -1880,7 +1883,13 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     await this.ch.insertNow(event, idempotencyKey);
     this.upsertMemory(event, false);
     try {
-      await this.queues.enqueueFast(fastJob);
+      const queued = await this.queues.enqueueFast(fastJob);
+      if (queued?.skipped > 0) {
+        this.canonicalObservability?.recordGap('judgment', 'dropped', 'fast_judge', {
+          reason: queued.reason || 'no_workers',
+          count: queued.skipped,
+        });
+      }
       return { disposition: 'retained', event, durability: 'durable' };
     } catch (error) {
       const failed: JudgedEvent = {
