@@ -46,6 +46,41 @@ export function inMemoryPlanTool(label: string): boolean {
   return /(?:^|[\s._-])(?:todos?|todo_list|plan|scratchpad)(?:$|[\s._-])/iu.test(label);
 }
 
+/**
+ * Capability names that imply a kernel or transport effect. Product-neutral: python/http/file,
+ * not LangChain or a lab fixture. `write_todos` is excluded by {@link inMemoryPlanTool} first.
+ */
+const KERNEL_CAPABILITY_PATTERN =
+  /(?:^|[\s._-])(?:bash|exec|shell|sandbox|python|node|code|search|http|fetch|network|mcp|read|write|edit|file|notebook)(?:$|[\s._-])/iu;
+
+/** In-process memory/lookup capabilities. Undeclared custom tools stay on process-lineage. */
+const IN_PROCESS_MEMORY_PATTERN =
+  /(?:^|[\s._-])(?:lookup|remember|recall|scratch|note|memo)(?:$|[\s._-])/iu;
+
+function toolKernelPayload(content?: unknown): boolean {
+  if (toolDelegatedCode(content) || toolContentCode(content)) return true;
+  if (typeof content === 'string') {
+    return /(?:^|[/\s])(?:bin\/|usr\/|tmp\/|etc\/|proc\/)/u.test(content);
+  }
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return false;
+  const record = content as Record<string, unknown>;
+  for (const key of ['path', 'file', 'filename', 'filepath', 'target', 'host', 'port']) {
+    if (typeof record[key] === 'string' && record[key].trim()) return true;
+  }
+  return false;
+}
+
+/**
+ * In-process memory/lookup tools, plus plan/todo even when the name contains "write".
+ * Do not invent FileAccess. Undeclared custom tools still expect process-lineage Kernel.
+ */
+export function expectedNoKernelTool(label: string, content?: unknown): boolean {
+  if (inMemoryPlanTool(label)) return true;
+  if (KERNEL_CAPABILITY_PATTERN.test(label)) return false;
+  if (!IN_PROCESS_MEMORY_PATTERN.test(label)) return false;
+  return !toolKernelPayload(content);
+}
+
 export function toolContentCode(content: unknown): string | undefined {
   if (typeof content === 'string') {
     const trimmed = content.trim();

@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:94482ba81883196ab8e59fcff7dc0859241c752b83263494d410814396047658`
-- Overlay tag: `instance-point-20260922b` (base `run-point-20260922d` / `bff81619…`)
+- API pod image: `127.0.0.1:5000/anysentry@sha256:c18db3772fad2ab73b32a20d4e96ddfc053656f8482b02324503edec07a7e325`
+- Overlay tag: `expected-nokernel-20260922` (base `instance-point-20260922b` / `94482ba8…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -27,7 +27,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 ## Algorithm boundaries (kept)
 
-- In-memory plan tools (`write_todos` and peers) stay `semantic_only` / `no_kernel_event_expected`. No invented FileAccess or kernel edge.
+- In-memory plan/todo tools and in-process memory/lookup capabilities (`lookup` / `remember` / `recall` / `scratch` / `note` / `memo`, no kernel-shaped payload) stay `semantic_only` / `no_kernel_event_expected`. No invented FileAccess. Undeclared custom tools still use process-lineage. Relation algorithm `v10`.
 - LLM tool names (`run_python`, `run_in_sandbox`) fold onto wire/kernel (`http.code.execute` / Egress) by content fingerprint, same runtime, hop-compatible, 60s window. Fold only onto a backend that already owns Kernel.
 - Parent hop (`cv_15e9d9f3`) stays kernel-unlinked. Child hop owns Kernel. Parent view does not import child kernel rows.
 - 90s “no result” is suppressed when leftover fingerprint pairing already closed the call.
@@ -45,7 +45,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 Repeatable gate: `scripts/verify-phase-c-d-live.mjs` (local contracts always; live HTTP when `ANYSENTRY_API_BASE` + token are set).
 
-Live `last_1d` on digest `94482ba8…` (2026-09-22T07:45Z), including the later LangChain sample:
+Live `last_1d` on digest `c18db377…` (2026-09-22T07:54Z), including the LangChain sample:
 
 - 8 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`, `lc_aba557509de9432aa8c8` → `cv_c01225ad`)
 - 4 Run point-reads complete
@@ -105,7 +105,7 @@ Recorded from `/tmp/s125-alias-fold-20260922` on digest `bff81619…`, then re-c
 | 2. Stateful graph Agent — same thread, node loop in one Run | Design A `POST /runs` thread `70141be3-…` | Session/Run `70141be3` → `cv_096f6b1d`; nodes plan/work/verify | same thread kept; in-memory `write_todos` stays `no_kernel_event_expected`; execute hop `cv_23a18a63` owns Kernel | Node names are workflow labels, not a framework registry |
 | 3. Parent → child Agent — views isolated | Design B orch→worker `c5dec736-…`; fanout parent `cv_15e9d9f3` | parent `cv_15e9d9f3` kernel `unlinked`; child `cv_c92a6aff` / B worker `cv_df08886c` kernel complete | parent does not import child KernelFact; delegation id is a hop fence | Child view is hop-scoped `cv_*`, not a merged parent timeline |
 
-LangChain host `:18082` first returned 422 on `{"input":...}`. A later `POST /invoke {"message":...}` without wire anchors landed as ephemeral python Sessions (`cv_8fa36a60` complete, `cv_e1c02865` `tool_result_pending`); fixture-local `lc_*` 404. After the fixture put generic `x-anysentry-run-id` / `x-anysentry-session-id` on outbound LLM HTTP, `lc_aba557509de9432aa8c8` Session+Run point-reads are `complete` → `cv_c01225ad`, `sessionMode=conversation`, Run layer owns `lc_aba557509de9432aa8c8`. Kernel stays `unlinked` / `tool_kernel_unlinked` for in-process `lookup_fixture` (no invented FileAccess, no LangChain product name). Host `:18082` was stopped after the point-reads.
+LangChain host `:18082` first returned 422 on `{"input":...}`. A later `POST /invoke {"message":...}` without wire anchors landed as ephemeral python Sessions (`cv_8fa36a60` complete, `cv_e1c02865` `tool_result_pending`); fixture-local `lc_*` 404. After the fixture put generic `x-anysentry-run-id` / `x-anysentry-session-id` on outbound LLM HTTP, `lc_aba557509de9432aa8c8` Session+Run point-reads are `complete` → `cv_c01225ad`, `sessionMode=conversation`, Run layer owns `lc_aba557509de9432aa8c8`. On digest `c18db377…`, in-process `lookup_fixture` is `semantic_only` / `no_kernel_event_expected` and the Session/Run kernel layer is `complete` (no invented FileAccess, no LangChain product name). Regression on `70141be3…`: `write_todos` stays `no_kernel_event_expected`; `run_in_sandbox` / `http.code.execute` stay `linked` / `delegated_command`. Host `:18082` remains stopped.
 
 ## F0 / F1 / F2 / F3 and process generation
 
@@ -139,7 +139,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 | Plaintext / KernelFact / Session / Run coverage reported separately | Met |
 | Parent/child not double-counted or merged | Met |
 | Canonical point-read `coverage=complete` | Met for Session/Run/EvidenceLink/KernelFact and hydrated AgentInstance |
-| Failure/ambiguity stays partial/ambiguous/unlinked | Met (`semantic_only`, parent `unlinked`, empty runtimes `no_live_runtime_instance`) |
+| Failure/ambiguity stays partial/ambiguous/unlinked | Met (`semantic_only` / `no_kernel_event_expected` for in-process lookup and plan tools, parent `unlinked`, empty runtimes `no_live_runtime_instance`) |
 | Query latency and WAL backlog in budget | One window recorded; not an empty-WAL pressure proof |
 | No product-name / tool-name / fixed-port identity | Met for the accepted algorithms |
 
@@ -147,7 +147,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 
 - Live WAL continues to grow; pressure-window accounting is not a clean empty spool.
 - Classic SSL / HTTPS remains WIP and out of this verification.
-- Five of six §11.2 windows were not run.
+- Four of six §11.2 windows were not run (unknown-host, FileAccess, LLM/TLS burst, many HTTP sessions). Empty-WAL storm was not run; the 32Mi live rewrite is recorded instead.
 - Per-asset `ifr_*` adapters are empty after inventory cleanup; builtin F0–F3 still apply.
 - LangGraph compose remains down. Host LangChain `:18082` was started once for the message-body sample and stopped again. k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
 - Do not push.

@@ -8,6 +8,7 @@ const {
   observedAgentProduct,
   looksLikeSystemdUnit,
   inMemoryPlanTool,
+  expectedNoKernelTool,
   toolDelegatedCode,
   toolContentCode,
 } = require('../apps/api/dist/security-monitoring/agent-tool-shape.js');
@@ -22,6 +23,13 @@ assert.equal(looksLikeSystemdUnit('user@1001.service'), true);
 assert.equal(looksLikeSystemdUnit('python'), false);
 assert.equal(inMemoryPlanTool('write_todos'), true);
 assert.equal(inMemoryPlanTool('http.code.execute'), false);
+assert.equal(expectedNoKernelTool('write_todos', { todos: [{ content: 'plan' }] }), true);
+assert.equal(expectedNoKernelTool('lookup_fixture', { key: 'canary' }), true);
+assert.equal(expectedNoKernelTool('remember', { note: 'in-process' }), true);
+assert.equal(expectedNoKernelTool('inventory_fingerprint', { task: 'undeclared' }), false);
+assert.equal(expectedNoKernelTool('run_python', { code: 'print(1)' }), false);
+assert.equal(expectedNoKernelTool('http.code.execute', { endpoint: 'http://127.0.0.1/execute' }), false);
+assert.equal(expectedNoKernelTool('read_file', { path: '/tmp/x' }), false);
 assert.equal(toolDelegatedCode({ code: 'print(8 + 9)', timeout_ms: 4000 }), 'print(8 + 9)');
 assert.equal(toolDelegatedCode({ command: 'uname -p' }), undefined);
 assert.equal(toolContentCode({ command: 'uname -p' }), 'uname -p');

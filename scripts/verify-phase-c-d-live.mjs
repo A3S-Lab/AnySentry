@@ -21,12 +21,14 @@ const {
   sessionResourceHydrated,
   sessionResourceAliases,
 } = require('../apps/api/dist/security-monitoring/observability-coverage.js');
-const { inMemoryPlanTool } = require('../apps/api/dist/security-monitoring/agent-tool-shape.js');
+const { expectedNoKernelTool, inMemoryPlanTool } = require('../apps/api/dist/security-monitoring/agent-tool-shape.js');
 
 assert.equal(normalizeAgentRouteShape('/runs/thread-abc123/nodes/42?stream=true'), '/runs/:param/nodes/:param');
 assert.equal(normalizeAgentRouteShape('/invoke'), '/invoke');
 assert.equal(inMemoryPlanTool('write_todos'), true);
 assert.equal(inMemoryPlanTool('run_python'), false);
+assert.equal(expectedNoKernelTool('lookup_fixture', { key: 'canary' }), true);
+assert.equal(expectedNoKernelTool('run_python', { code: 'print(1)' }), false);
 
 const parentIx = [{
   schemaVersion: 'anysentry.agent_interaction.v1',

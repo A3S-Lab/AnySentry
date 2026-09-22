@@ -11,7 +11,7 @@ import {
   buildSemanticKernelRelationBatch,
   type SemanticKernelRelationInput,
 } from './agent-semantic-kernel-relation';
-import { inMemoryPlanTool, toolContentCode } from './agent-tool-shape';
+import { expectedNoKernelTool, toolContentCode } from './agent-tool-shape';
 import type { ToolEvidenceItem, ToolEvidenceLinkMethod, ToolEvidenceReason } from './tool-evidence-linker';
 import type * as T from './types';
 
@@ -317,9 +317,10 @@ export function buildObservedToolEvidenceItems(
         : {}),
       status,
       reason: mapReason(status, kernelEvidence.map((item) => item.linkMethod), {
-        expectedNoKernel: inMemoryPlanTool([input.event.toolKind, input.event.toolName]
-          .filter(Boolean)
-          .join(' ')),
+        expectedNoKernel: expectedNoKernelTool(
+          [input.event.toolKind, input.event.toolName].filter(Boolean).join(' '),
+          input.event.content,
+        ),
         candidatesTruncated: coveragePartial,
       }),
       adapterEventIds: [...new Set([

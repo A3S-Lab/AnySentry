@@ -4,9 +4,9 @@ import type * as T from './types';
 import { createEvidenceLink, type EvidenceLink } from './canonical-observability';
 import { matchAgentAdapterManifest, normalizeExecArgv } from './agent-adapter-execution';
 import { agentRuntimeInstanceIdsEquivalent } from './agent-identity';
-import { inMemoryPlanTool, toolContentCode, toolDelegatedCode } from './agent-tool-shape';
+import { expectedNoKernelTool, inMemoryPlanTool, toolContentCode, toolDelegatedCode } from './agent-tool-shape';
 
-export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 9;
+export const AGENT_SEMANTIC_KERNEL_RELATION_VERSION = 10;
 const ALIAS_FOLD_WINDOW_MS = 60_000;
 const CLOCK_SKEW_MS = 2_000;
 /** Open-call fallback when ToolResult is still missing. Keep far shorter than a wall-clock
@@ -937,7 +937,7 @@ function potentialRelation(
       // bash writes do not degrade to semantic-only merely because the shell is not the Agent
       // root process itself.
         : new Set(['ToolExec', 'FileAccess', 'FileDelete']))
-    : inMemoryPlanTool(normalizedTool)
+    : expectedNoKernelTool(normalizedTool, event.content)
       ? new Set<string>()
     : FILE_TOOL_PATTERN.test(normalizedTool)
       ? new Set(['FileAccess', 'FileDelete'])
@@ -1147,7 +1147,7 @@ function unlinkedRelation(
   resolutionRevision: number,
   coveragePartial: boolean,
 ): T.AgentSemanticKernelRelation {
-  const expectedNoKernel = inMemoryPlanTool(normalizedToolLabel(input.event));
+  const expectedNoKernel = expectedNoKernelTool(normalizedToolLabel(input.event), input.event.content);
   const invocationId = toolInvocationId(input.event, input.interaction);
   // Keep the unresolved relation on the exact same canonical-link identity path as linked and
   // ambiguous relations.  The previous `supports`/source-only link differed from
@@ -1523,7 +1523,7 @@ function foldDelegatedContentAliasRelations(
 
   for (const input of inputs) {
     if (input.interaction.interactionType === 'tool') continue;
-    if (inMemoryPlanTool(normalizedToolLabel(input.event))) continue;
+    if (expectedNoKernelTool(normalizedToolLabel(input.event), input.event.content)) continue;
     const current = relationsBySemanticEventId.get(input.event.semanticEventId) ?? [];
     if (linkedKernelRelations(current).length > 0) continue;
     const fingerprint = toolContentCode(input.event.content);

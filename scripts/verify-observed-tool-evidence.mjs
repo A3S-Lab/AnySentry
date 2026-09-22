@@ -165,6 +165,34 @@ const todoProjected = projectObservedToolEvidence(
 assert.equal(todoProjected.items[0]?.status, 'semantic_only');
 assert.equal(todoProjected.items[0]?.reason, 'no_kernel_event_expected');
 
+const lookupInteraction = {
+  ...toolInteraction,
+  interactionId: 'mi_lookup',
+  endpoint: undefined,
+  toolCalls: [{
+    toolCallId: 'lookup-1',
+    name: 'lookup_fixture',
+    arguments: { key: 'canary' },
+    issuedAtUnixNs: String(BigInt(callAt) * 1_000_000n),
+  }],
+  toolResults: [{
+    toolCallId: 'lookup-1',
+    name: 'lookup_fixture',
+    content: { value: 'ok' },
+    isError: false,
+    observedAtUnixNs: String(BigInt(callAt + 5) * 1_000_000n),
+  }],
+};
+const lookupProjected = projectObservedToolEvidence(
+  invocationId,
+  [lookupInteraction],
+  [egress],
+  3,
+  true,
+);
+assert.equal(lookupProjected.items[0]?.status, 'semantic_only');
+assert.equal(lookupProjected.items[0]?.reason, 'no_kernel_event_expected');
+
 const truncated = projectObservedToolEvidence(
   invocationId,
   [toolInteraction],

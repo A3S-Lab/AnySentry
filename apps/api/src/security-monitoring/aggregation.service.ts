@@ -92,7 +92,7 @@ import {
   projectObservedToolEvidence,
 } from './observed-tool-evidence';
 import { bindInferredProducerRun } from './agent-run-projection';
-import { inMemoryPlanTool } from './agent-tool-shape';
+import { expectedNoKernelTool } from './agent-tool-shape';
 import {
   observabilityCoverageLayers,
   toolEvidenceForInteractions,
@@ -4317,7 +4317,7 @@ export class AggregationService implements OnModuleDestroy {
       .map((relation) => relation.kernelEventId)
       .filter((eventId): eventId is string => Boolean(eventId)));
     if (
-      inMemoryPlanTool([call.toolKind, call.toolName].filter(Boolean).join(' '))
+      expectedNoKernelTool([call.toolKind, call.toolName].filter(Boolean).join(' '), call.content)
       && linkedEventIds.size === 0
     ) {
       relations = relations.map((relation) => relation.status === 'coverage_gap'

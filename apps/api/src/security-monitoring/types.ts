@@ -2691,7 +2691,7 @@ export interface AgentSemanticKernelRelation {
    * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
    * Observer KernelFact. */
   authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
-  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
   /** All equally strong Kernel candidates retained when ownership is ambiguous. */
   competingKernelEventIds?: string[];
   resolutionRevision: number;

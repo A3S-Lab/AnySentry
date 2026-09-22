@@ -1382,6 +1382,27 @@ assert.equal(todoUnlinked[0].status, 'semantic_only',
 assert.equal(todoUnlinked[0].kernelEventId, undefined,
   'write_todos must not invent a FileAccess link');
 
+const lookupCall = {
+  ...toolCall,
+  semanticEventId: 'se_lookup_fixture_call',
+  toolCallId: 'call-lookup-fixture',
+  toolName: 'lookup_fixture',
+  toolKind: 'lookup',
+  content: { key: 'canary' },
+};
+const lookupUnlinked = buildSemanticKernelRelations(
+  lookupCall,
+  undefined,
+  interaction,
+  [strayTodoFile],
+  41,
+  true,
+);
+assert.equal(lookupUnlinked[0].status, 'semantic_only',
+  'in-process lookup tools stay semantic_only when no kernel-shaped payload is observed');
+assert.equal(lookupUnlinked[0].kernelEventId, undefined,
+  'lookup_fixture must not invent a FileAccess link');
+
 const codeAt = callAt + 80_000;
 const executeInteraction = {
   ...interaction,
