@@ -135,6 +135,12 @@ const runIds = (process.env.ANYSENTRY_VERIFY_RUN_IDS || '')
   .map((value) => value.trim())
   .filter(Boolean);
 
+const readiness = await get('/v1/observability/readiness');
+assert.equal(readiness.schemaVersion, 'anysentry.observability_readiness.v1');
+assert.equal(readiness.phases.c.ready, true, 'Phase C pollable readiness must be ready');
+assert.equal(readiness.phases.d.ready, true, 'Phase D pollable readiness must be ready');
+assert.equal(readiness.collection.globallyOpened, false);
+
 const list = await get('/v1/sessions?timeType=last_1d&limit=12');
 assert.ok(Array.isArray(list.items), 'session list must return items');
 const discoveredSessions = sessionIds.length > 0

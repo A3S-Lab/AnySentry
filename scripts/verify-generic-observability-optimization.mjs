@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+
+const readinessSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/observability-readiness.ts', import.meta.url),
+  'utf8',
+);
+assert.match(readinessSource, /anysentry\.observability_readiness\.v1/);
+assert.match(readinessSource, /globallyOpened/);
+assert.match(readinessSource, /enforcedInfrastructureRules/);
 
 const require = createRequire(import.meta.url);
 const {

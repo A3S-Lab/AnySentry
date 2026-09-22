@@ -65,6 +65,7 @@ import { OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE } from './clickhouse-st
 import { captureClassificationDecision } from './identity-judgment-routing';
 import { AgentConversationBindingService, trafficRoleForEvent } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
+import { FilterRuleSystemService } from './filter-rule-system.service';
 import { CANONICAL_SESSION_ID_ALGORITHM_V1, SESSION_KEY_ALGORITHM_V1, SESSION_HASH_SECRET_MODE, canonicalParentSessionIdForMembership, canonicalSessionIdForMembership, createEvidenceLink, deriveAgentInstanceIdentity, deriveProcessGenerationKey, resolveSessionIdentity, validateKernelFact } from './canonical-observability';
 import { agentRuntimeInstanceIdForEvent } from './agent-identity';
 import type { EvidenceLink, KernelFact, SemanticRecord } from './canonical-observability';
@@ -7351,6 +7352,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     private readonly users: UserDirectoryService,
     private readonly platformMetrics: PlatformMetricsService,
     private readonly canonicalObservability: CanonicalObservabilityService,
+    private readonly filterRules: FilterRuleSystemService,
     @Optional() private readonly conversationBindings?: AgentConversationBindingService,
   ) {}
 
@@ -14059,6 +14061,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         unconfiguredSecret: 'process_ephemeral',
       },
     };
+  }
+
+  @Get('v1/observability/readiness')
+  @RequireManagementAuth()
+  observabilityReadiness() {
+    return this.filterRules.observabilityReadiness(this.canonicalObservability.gapStats());
   }
 
   /**

@@ -80,12 +80,27 @@ assert.ok(
   'inventory-synced ifr_* drafts must stay candidate/shadow, not enforced',
 );
 
-const stages = await get('/filter-rules/stages/status');
-const byStage = Object.fromEntries((stages.stages ?? []).map((item) => [item.stage, item]));
+const deadline = Date.now() + Number(process.env.ANYSENTRY_READINESS_TIMEOUT_MS || 90_000);
+let stages;
+let byStage = {};
+for (;;) {
+  stages = await get('/filter-rules/stages/status');
+  byStage = Object.fromEntries((stages.stages ?? []).map((item) => [item.stage, item]));
+  if (['f0', 'f1', 'f2', 'f3'].every((stage) => byStage[stage]?.status === 'ready')) break;
+  if (Date.now() >= deadline) {
+    throw new Error(`F0–F3 still ${JSON.stringify(Object.fromEntries(Object.entries(byStage).map(([stage, item]) => [stage, item.status])))}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 3_000));
+}
 assert.equal(byStage.f0?.status, 'ready');
 assert.equal(byStage.f1?.status, 'ready');
 assert.equal(byStage.f2?.status, 'ready');
 assert.equal(byStage.f3?.status, 'ready');
+const readiness = await get('/v1/observability/readiness');
+assert.equal(readiness.schemaVersion, 'anysentry.observability_readiness.v1');
+assert.equal(readiness.ready, true);
+assert.equal(readiness.phases.f0f3.ready, true);
+assert.equal(readiness.collection.enforcedInfrastructureRules, 0);
 const epochs = ['f0', 'f1', 'f2'].map((stage) => byStage[stage].nodes?.[0]?.epoch).filter(Boolean);
 assert.ok(epochs.length === 3 && epochs.every((epoch) => epoch === epochs[0]), 'F0/F1/F2 must share one Observer epoch');
 

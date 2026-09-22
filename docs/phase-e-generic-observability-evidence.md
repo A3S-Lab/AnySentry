@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:02db8e57d0b69bbc4b9afc12c965e0690efb0dec002819b9721455ac16919880`
-- Overlay tag: `ifr-inventory-20260922c` (base `bucket-chunk-20260922c` / `5c0f9481…`)
+- API pod image: `127.0.0.1:5000/anysentry@sha256:a48377fee11041f0612acbec0c8a87ec1f7ab8947e14e378ff78d6e708ffee50`
+- Overlay tag: `readiness-20260922b` (base `ifr-inventory-20260922c` / `02db8e57…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -44,9 +44,9 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 ## Phase C / D
 
-Repeatable gate: `scripts/verify-phase-c-d-live.mjs` (local contracts always; live HTTP when `ANYSENTRY_API_BASE` + token are set).
+Repeatable gates: `GET /v1/observability/readiness` (`anysentry.observability_readiness.v1`) and `scripts/verify-phase-c-d-live.mjs`. The readiness GET is in-process: it does not open collection, does not scan ClickHouse, and does not promote candidate `ifr_*` drafts. After an API roll, poll until F0 realigns.
 
-Live `last_1d` on digest `02db8e57…` (2026-09-22T08:27Z), including the LangChain sample:
+Live `last_1d` on digest `a48377fe…` (2026-09-22T16:35Z), including the LangChain sample:
 
 - 8 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`, `lc_aba557509de9432aa8c8` → `cv_c01225ad`)
 - 4 Run point-reads complete
@@ -110,10 +110,11 @@ LangChain host `:18082` first returned 422 on `{"input":...}`. A later `POST /in
 
 ## F0 / F1 / F2 / F3 and process generation
 
-Repeatable gate: `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `02db8e57…` (2026-09-22T08:27Z):
+Repeatable gates: `GET /v1/observability/readiness` and `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `a48377fe…` (2026-09-22T16:35Z):
 
-- Catalog: 58 rules. Observer node `pjnl261070032` F0/F1/F2 `ready` + `aligned` on shared epoch `1790057274239026`. F3 is API-local `ready`.
-- 13 candidate `ifr_*` drafts were merged from remaining exact/logical non-Agent k8s inventory (`aggregate` only, never drop). They stay `draft` / `candidate` and are **not** in the Forwarder identity projection (`intentHash` unchanged `9c7f97ff…`). `verify-unified-filter-rule-deployed.mjs` PASSes; catalog P95 15ms after a 60s sync TTL.
+- Catalog: 61 rules. Observer node `pjnl261070032` F0/F1/F2 `ready` + `aligned` on shared epoch `1790057274239030`. F3 is API-local `ready`.
+- 16 candidate `ifr_*` drafts were merged from remaining exact/logical non-Agent k8s inventory (`aggregate` only, never drop). They stay `draft` / `candidate` and are **not** in the Forwarder identity projection (`intentHash` unchanged `9c7f97ff…`). `verify-unified-filter-rule-deployed.mjs` PASSes; catalog P95 15ms after a 60s sync TTL.
+- Pollable readiness: `ready=true`, `collection.globallyOpened=false`, `enforcedInfrastructureRules=0`, C/D/E/F0–F3 all ready. Derived-lane drops remain 0.
 - Forwarder projection: `intentHash` stable across TTL refresh; `contentHash` covers transport timestamps.
 - Agent-vs-infrastructure conflict example: F1 and F3 both keep `fr_guardrail_agent_conflict_keep`.
 - Explain on remaining inventory `service:k8s:default-cluster:anysentry:a3s-observer` (`bindingQuality=exact`): stages `f0→f1→f2→f3`, 4 facts.
@@ -136,7 +137,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 | Criterion | Status |
 |---|---|
 | Candidate/Confirmed identity has explainable evidence | Met for remaining Observer service, process-generation keys, and `fr_builtin_behavior_candidate` |
-| F1/F2/F3 share rule lineage / epoch | Met for F0–F2 Observer ACK; F3 is API-local ready |
+| F1/F2/F3 share rule lineage / epoch | Met for F0–F2 Observer ACK; F3 is API-local ready. `GET /v1/observability/readiness` is the pollable surface |
 | No unexplained Ring/Collector/Forwarder/WAL drop | Met on the one mixed 11.2 window; live WAL still grows |
 | Plaintext / KernelFact / Session / Run coverage reported separately | Met |
 | Parent/child not double-counted or merged | Met |
@@ -150,6 +151,6 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 - Live WAL continues to grow; pressure-window accounting is not a clean empty spool.
 - Classic SSL / HTTPS remains WIP and out of this verification.
 - Four of six §11.2 windows were not run (unknown-host, FileAccess, LLM/TLS burst, many HTTP sessions). Empty-WAL storm was not run; the 32Mi live rewrite is recorded instead.
-- Per-asset `ifr_*` adapters are empty after inventory cleanup; builtin F0–F3 still apply.
+- Candidate `ifr_*` drafts are catalog-visible only; they are not enforced and have no materialization reports.
 - LangGraph compose remains down. Host LangChain `:18082` was started once for the message-body sample and stopped again. k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
 - Do not push.

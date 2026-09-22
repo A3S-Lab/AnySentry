@@ -1019,6 +1019,7 @@ async function runLocalTests() {
     { id: 'observed-tool-evidence', cwd: repoRoot, command: 'node', args: ['scripts/verify-observed-tool-evidence.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'observability-coverage', cwd: repoRoot, command: 'node', args: ['scripts/verify-observability-coverage.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'generic-observability-optimization', cwd: repoRoot, command: 'node', args: ['scripts/verify-generic-observability-optimization.mjs'], timeout: TEST_TIMEOUT_MS },
+    { id: 'observability-readiness', cwd: repoRoot, command: 'node', args: ['scripts/verify-observability-readiness-live.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'runtime-state', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-runtime-state.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'agent-templates', cwd: repoRoot, command: 'node', args: ['scripts/verify-agent-templates.mjs'], timeout: TEST_TIMEOUT_MS },
     { id: 'observer-cargo', cwd: observerRoot, command: 'cargo', args: ['test', '--locked', '--offline', '-p', 'a3s-observer', '-p', 'a3s-observer-common', '-p', 'a3s-observer-collector', '--release'], timeout: TEST_TIMEOUT_MS },

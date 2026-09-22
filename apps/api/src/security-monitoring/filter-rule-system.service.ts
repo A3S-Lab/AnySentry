@@ -48,6 +48,11 @@ import {
 } from './filter-rule.types';
 import { InfrastructureAssetSnapshotService } from './infrastructure-asset-snapshot.service';
 import { InfrastructureRuleError, InfrastructureRuleService } from './infrastructure-rule.service';
+import {
+  buildObservabilityReadiness,
+  type ObservabilityReadinessPersistence,
+  type ObservabilityReadinessSnapshot,
+} from './observability-readiness';
 import type {
   InfrastructureAssetDraftRequest,
   InfrastructureRuleHumanDetail,
@@ -332,6 +337,22 @@ export class FilterRuleSystemService {
       stages,
       updateTime: new Date().toISOString(),
     };
+  }
+
+  observabilityReadiness(persistence: ObservabilityReadinessPersistence): ObservabilityReadinessSnapshot {
+    return buildObservabilityReadiness({
+      status: this.status(),
+      infrastructureRules: this.infrastructure.catalogRecords().map((rule) => ({
+        ruleId: rule.ruleId,
+        lifecycleStage: rule.lifecycleStage,
+      })),
+      persistence: {
+        asyncDerivedPersistenceDropped: persistence.asyncDerivedPersistenceDropped,
+        asyncRawPersistenceDropped: persistence.asyncRawPersistenceDropped,
+        asyncKernelPersistenceDropped: persistence.asyncKernelPersistenceDropped,
+      },
+      contractsReady: true,
+    });
   }
 
   materializations() {
