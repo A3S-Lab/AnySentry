@@ -86,7 +86,7 @@ Recorded from `/tmp/s125-alias-fold-20260922` on digest `bff81619…`, then re-c
 | 2. Stateful graph Agent — same thread, node loop in one Run | Design A `POST /runs` thread `70141be3-…` | Session/Run `70141be3` → `cv_096f6b1d`; nodes plan/work/verify | same thread kept; in-memory `write_todos` stays `no_kernel_event_expected`; execute hop `cv_23a18a63` owns Kernel | Node names are workflow labels, not a framework registry |
 | 3. Parent → child Agent — views isolated | Design B orch→worker `c5dec736-…`; fanout parent `cv_15e9d9f3` | parent `cv_15e9d9f3` kernel `unlinked`; child `cv_c92a6aff` / B worker `cv_df08886c` kernel complete | parent does not import child KernelFact; delegation id is a hop fence | Child view is hop-scoped `cv_*`, not a merged parent timeline |
 
-LangChain host `:18082` returned 422 (`message` required) and is not counted as a fixture pass.
+LangChain host `:18082` first returned 422 on `{"input":...}`. A later `POST /invoke {"message":"Please look up the canary now."}` completed (`run_id=lc_421032b61e164e3bb1d4`, tool `lookup_fixture`, canary present). The fixture-local `lc_*` is not a wire Session/Run alias (404). Landed generic HTTP Sessions: `cv_8fa36a60` complete / ephemeral / `agentProduct=python` / kernel `unlinked` (`tool_without_kernel_fact`, in-process tool, no invented FileAccess); `cv_e1c02865` still `tool_result_pending`. Run layer `run_unresolved`. Host `:18082` was stopped after the point-reads. This is a generic `/invoke` sample, not a LangChain-named identity branch.
 
 ## F0 / F1 / F2 / F3 and process generation
 
@@ -114,7 +114,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 
 | Criterion | Status |
 |---|---|
-| Candidate/Confirmed identity has explainable evidence | Met for remaining Observer service + process-generation keys |
+| Candidate/Confirmed identity has explainable evidence | Met for remaining Observer service, process-generation keys, and `fr_builtin_behavior_candidate` |
 | F1/F2/F3 share rule lineage / epoch | Met for F0–F2 Observer ACK; F3 is API-local ready |
 | No unexplained Ring/Collector/Forwarder/WAL drop | Met on the one mixed 11.2 window; live WAL still grows |
 | Plaintext / KernelFact / Session / Run coverage reported separately | Met |
@@ -130,5 +130,5 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 - Classic SSL / HTTPS remains WIP and out of this verification.
 - Five of six §11.2 windows were not run.
 - Per-asset `ifr_*` adapters are empty after inventory cleanup; builtin F0–F3 still apply.
-- LangGraph/LangChain lab compose and host `:18082` were stopped after the window; k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
+- LangGraph compose remains down. Host LangChain `:18082` was started once for the message-body sample and stopped again. k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
 - Do not push.
