@@ -107,6 +107,37 @@ assert.equal(revised?.find((row) => row.bucketStartMs === 40_000)?.eventCount, 3
 // Unaligned custom ranges deliberately use the exact legacy path rather than an approximate cache.
 assert.equal(await cache.read(30_001, 70_000), null);
 
+// A day-scale prefix is loaded in aligned 2h ClickHouse chunks, not one 24h fold that exceeds
+// the 128 MiB bucket-build budget.
+{
+  const wideReads = [];
+  const wide = new CommitAwareFactBucketCache({
+    async latestCursor() {
+      return { committedAtMs: 1, eventId: 'evt_wide', decisionRevision: 1 };
+    },
+    async changes(after) {
+      return { changes: [], cursor: after, hasMore: false };
+    },
+    async facts(startMs, endExclusiveMs) {
+      wideReads.push([startMs, endExclusiveMs]);
+      const rows = [];
+      for (let bucket = startMs; bucket < endExclusiveMs; bucket += BUCKET_MS) {
+        rows.push({ bucketStartMs: bucket, identityKey: `wide-${bucket}`, eventCount: 1 });
+      }
+      return rows;
+    },
+  }, BUCKET_MS);
+  const sixHours = 6 * 3_600_000;
+  const eightHours = 8 * 3_600_000;
+  const firstWide = await wide.read(0, eightHours);
+  assert.equal(firstWide, null, 'one 6h chunk must not pretend a longer prefix is complete');
+  assert.deepEqual(wideReads, [[0, sixHours]]);
+  wideReads.length = 0;
+  const secondWide = await wide.read(0, eightHours);
+  assert.equal(secondWide?.length, eightHours / BUCKET_MS);
+  assert.deepEqual(wideReads, [[sixHours, eightHours]]);
+}
+
 const [aggregation, clickhouse, judge] = await Promise.all([
   read('apps/api/src/security-monitoring/aggregation.service.ts'),
   read('apps/api/src/security-monitoring/clickhouse-store.ts'),
@@ -127,6 +158,19 @@ assert.match(
   'a reusable history failure must not launch a second exact full-window scan',
 );
 assert.match(clickhouse, /async agentWindowBucketFacts\(/);
+assert.match(
+  clickhouse,
+  /BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS[\s\S]*?max_block_size: "1024"/u,
+  'bucket-build scans use small blocks so a 24h fold cannot pin 128 MiB',
+);
+assert.match(
+  await read('apps/api/src/security-monitoring/commit-aware-fact-cache.ts'),
+  /FACT_BUCKET_QUERY_CHUNK_MS = 6 \* 3_600_000/,
+);
+assert.match(
+  await read('apps/api/src/security-monitoring/commit-aware-fact-cache.ts'),
+  /FACT_BUCKET_QUERY_MAX_CHUNKS = 1/,
+);
 const agentBucketQuery = clickhouse.slice(
   clickhouse.indexOf('async agentWindowBucketFacts('),
   clickhouse.indexOf('async workspaceWindowFacts('),

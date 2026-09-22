@@ -821,6 +821,8 @@ const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
   max_bytes_before_external_group_by: String(32 * 1024 * 1024),
   max_bytes_before_external_sort: String(32 * 1024 * 1024),
   min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_block_size: "1024",
+  preferred_block_size_bytes: String(1024 * 1024),
   max_execution_time: 5,
 };
 
