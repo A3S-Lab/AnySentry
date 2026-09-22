@@ -80,4 +80,5 @@ Not executed (would require opening collection or a dedicated storm): unknown-ho
 - Live WAL continues to grow; pressure-window accounting is not a clean empty spool.
 - Classic SSL / HTTPS remains WIP and out of this verification.
 - Five of six §11.2 windows were not run.
+- LangGraph/LangChain lab compose and host `:18082` were stopped after the window; k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
 - Do not push.
