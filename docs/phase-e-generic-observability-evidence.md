@@ -37,7 +37,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 - Derived-lane drops on the digest: `asyncRawPersistenceDropped=0`, `asyncKernelPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`.
 - `persistenceDropped` is the coverage-gap in-flight bound, not a derived-lane drop.
-- Live spool: `FORWARD_SPOOL_PATH=/var/lib/anysentry-forwarder/spool-clean-20260915.wal`. Observer holds two fds on this inode. **Do not truncate.**
+- Live spool: `FORWARD_SPOOL_PATH=/var/lib/anysentry-forwarder/spool-clean-20260915.wal`. Observer holds two fds on this inode. **Do not truncate.** Re-read 2026-09-22T07:45Z: `spoolWalBytes=33538524`, `spoolRecords=5`, `spoolCompactions=8`, `spoolAtCapacity=false`, `droppedEvents=0`, `outputDropped=0`, `queueDepth=0`. Growth is live rewrite, not an unexplained drop.
 - Removed 2026-09-22: orphan compaction leftover `spool-clean-20260915.wal.1632171.1789873356423.tmp` (mtime 2026-09-20, not open, different inode from live WAL).
 - Kept: `spool-clean-20260915.wal.dlq` (5.2Mi, mtime 2026-09-21). Dead-letter of rejected records; not open, but not discardable as live evidence.
 
@@ -45,14 +45,15 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 Repeatable gate: `scripts/verify-phase-c-d-live.mjs` (local contracts always; live HTTP when `ANYSENTRY_API_BASE` + token are set).
 
-Live `last_1d` on digest `bff81619…` (2026-09-22T07:21Z):
+Live `last_1d` on digest `94482ba8…` (2026-09-22T07:45Z), including the later LangChain sample:
 
-- 6 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`)
-- 3 Run point-reads complete
+- 8 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`, `lc_aba557509de9432aa8c8` → `cv_c01225ad`)
+- 4 Run point-reads complete
 - 9 AgentInstance point-reads complete after lab teardown, including docker IDs that now hydrate from Session projection (`state=exited`, `dataSource=conversation_projection`). Live RuntimeInstance list for those IDs is empty and `complete` with `no_live_runtime_instance`.
 - parent hops kernel-unlinked: 4
 - child hops kernel-linked: 2
 - derived-lane drops remain 0
+- EvidenceLink and KernelFact stores remain `coverage=complete`
 
 Local contracts: generic `/runs/:param/nodes/:param` route shape; in-memory plan tools stay unlinked; parent coverage layers do not import child KernelFact.
 
