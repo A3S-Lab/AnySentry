@@ -88,10 +88,36 @@ Recorded from `/tmp/s125-alias-fold-20260922` on digest `bff81619…`, then re-c
 
 LangChain host `:18082` returned 422 (`message` required) and is not counted as a fixture pass.
 
+## F0 / F1 / F2 / F3 and process generation
+
+Repeatable gate: `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `94482ba8…` (2026-09-22T07:36Z):
+
+- Catalog: 45 enforced builtin rules. Observer node `pjnl261070032` F0/F1/F2 `ready` + `aligned` on shared epoch `1790057274238993`. F3 is API-local `ready` (no Observer node list by design).
+- Forwarder projection: `intentHash` stable across TTL refresh; `contentHash` covers transport timestamps. `generatedAt`/`expiresAt` present.
+- Agent-vs-infrastructure conflict example: F1 and F3 both keep `fr_guardrail_agent_conflict_keep`.
+- Explain on remaining inventory `service:k8s:default-cluster:anysentry:a3s-observer` (`bindingQuality=exact`): stages `f0→f1→f2→f3`, 4 facts.
+- Process generation on a RuntimeInstance: `pgk_ac7ab74ac74cfe936e648002`, `physicalWorkloadId=docker:…`, `hostId` + `rootPid` + `rootStartTimeTicks`. Same PID different start time does not inherit AgentInstance (local contract).
+- Durable `infrastructure_rules_v1` in PostgreSQL is a 204-byte empty shell (`ifr_*=0`, materialization reports 0). Builtin catalog still classifies remaining k8s services; per-asset adapter rules were not persisted.
+
+## 11.4 against this digest
+
+| Criterion | Status |
+|---|---|
+| Candidate/Confirmed identity has explainable evidence | Met for remaining Observer service + process-generation keys |
+| F1/F2/F3 share rule lineage / epoch | Met for F0–F2 Observer ACK; F3 is API-local ready |
+| No unexplained Ring/Collector/Forwarder/WAL drop | Met on the one mixed 11.2 window; live WAL still grows |
+| Plaintext / KernelFact / Session / Run coverage reported separately | Met |
+| Parent/child not double-counted or merged | Met |
+| Canonical point-read `coverage=complete` | Met for Session/Run/EvidenceLink/KernelFact and hydrated AgentInstance |
+| Failure/ambiguity stays partial/ambiguous/unlinked | Met (`semantic_only`, parent `unlinked`, empty runtimes `no_live_runtime_instance`) |
+| Query latency and WAL backlog in budget | One window recorded; not an empty-WAL pressure proof |
+| No product-name / tool-name / fixed-port identity | Met for the accepted algorithms |
+
 ## Still open (Goal not closed)
 
 - Live WAL continues to grow; pressure-window accounting is not a clean empty spool.
 - Classic SSL / HTTPS remains WIP and out of this verification.
 - Five of six §11.2 windows were not run.
+- Per-asset `ifr_*` adapters are empty after inventory cleanup; builtin F0–F3 still apply.
 - LangGraph/LangChain lab compose and host `:18082` were stopped after the window; k8s control plane, Observer, Prometheus, and `anysentry-local-registry` were left running.
 - Do not push.
