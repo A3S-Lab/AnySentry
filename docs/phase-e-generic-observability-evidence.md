@@ -77,6 +77,24 @@ Recorded 2026-09-22T07:22Z from `POST /collectors/health timeType=last_1h` on co
 
 Not executed (would require opening collection or a dedicated storm): unknown-host sustained, high-volume FileAccess, LLM/TLS fragment burst, many concurrent HTTP sessions, empty-WAL pressure window.
 
+## 11.2 WAL/spool pressure window (live 32Mi rewrite)
+
+Recorded across 2026-09-22T07:45–07:47Z on the same collector without opening collection. Compaction threshold is `compactMinBytes=32Mi`.
+
+| Field | Peak (pre-rewrite) | After compaction 9 |
+|---|---|---|
+| observed (filter, last_1h) | 105 | 48 |
+| selected / forwarded | 391 | 414 |
+| sampled | `unifiedSampleSuppressed=0` | 0 |
+| aggregated | (prior mixed window 413) | 391 |
+| filtered | — | non-agent 24, unknown 1 |
+| ring / collector / queue drop | 0 | 0 |
+| WAL/spool backlog | ~33Mi, 5 live records, not at capacity | ~2.7–3.9Mi, 0 live records, not at capacity |
+| query latency | — | 871 ms Session `cv_c01225ad?timeType=last_1d`, complete |
+| canonical persistence | derived-lane drops 0 | derived-lane drops 0 |
+
+This is a live-rewrite pressure window, not an empty-spool storm. The file was not truncated.
+
 ## 11.3 three-fixture matrix (generic shapes; LangGraph is a sample)
 
 Recorded from `/tmp/s125-alias-fold-20260922` on digest `bff81619…`, then re-checked after lab teardown on `94482ba8…`.
