@@ -12,6 +12,7 @@ import {
 } from './agent-conversation-directory';
 import { conversationCoverage, projectAgentConversations } from './agent-conversation';
 import {
+  exactScopedCollectionCoverage,
   exactSessionPointReadCoverage,
   observabilityCoverageLayers,
   sessionResourceAliases,
@@ -1020,6 +1021,110 @@ function canonicalLifecycleMatches(
   if (scope === 'running') return state === 'running' || state === 'unobserved';
   if (scope === 'history') return state === 'exited' || state === 'lost';
   return true;
+}
+
+/** Historical AgentInstance after the process/container is gone. No invented Kernel. */
+function canonicalAgentInstanceFromConversations(
+  agentInstanceId: string,
+  conversations: readonly T.AgentConversationSummary[],
+  revision: number,
+): T.CanonicalAgentInstanceResource {
+  const first = conversations[0]!;
+  const sessionIds = [...new Set(conversations.flatMap((conversation) => [
+    conversation.sessionId,
+    conversation.conversationId,
+    conversation.sessionKey,
+  ].filter((value): value is string => Boolean(value))))].slice(0, 512);
+  const startedAtUnixNs = conversations
+    .map((conversation) => conversation.startedAtUnixNs)
+    .filter((value): value is string => Boolean(value))
+    .sort()[0] ?? '0';
+  const lastSeenAtUnixNs = conversations
+    .map((conversation) => conversation.lastActivityAtUnixNs)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? startedAtUnixNs;
+  return {
+    schemaVersion: 'anysentry.agent_instance.v1',
+    agentInstanceId,
+    ...(first.logicalAgentId ? { logicalAgentId: first.logicalAgentId } : {}),
+    ...(first.logicalAgentCandidateId ? { logicalAgentCandidateId: first.logicalAgentCandidateId } : {}),
+    ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+    ...(first.logicalScopeMode ? { logicalScopeMode: first.logicalScopeMode } : {}),
+    ...(first.logicalIdentityAuthority === 'management_registration'
+      ? { logicalIdentityAuthority: first.logicalIdentityAuthority } : {}),
+    ...(first.agentProduct ? { agentProduct: first.agentProduct, displayName: first.displayName } : {}),
+    environment: first.environment,
+    ...(first.tenantId ? { tenantId: first.tenantId } : {}),
+    ...(first.ownerId ? { ownerId: first.ownerId } : {}),
+    ...(first.workspacePath ? { workspacePath: first.workspacePath } : {}),
+    terminalContextIds: [...new Set(conversations.flatMap((conversation) => conversation.terminalContextIds ?? []))].slice(0, 256),
+    runtimeInstanceIds: [agentInstanceId],
+    sessionIds,
+    state: 'exited',
+    startedAtUnixNs,
+    lastSeenAtUnixNs,
+    sourceRefs: conversations.map((conversation) => `conversation:${conversation.conversationId}`).slice(0, 64),
+    coverage: canonicalCoverageFromSummaries(conversations, 'conversation_projection'),
+    ...(first.classification ? {
+      detectedClassification: first.classification,
+      effectiveClassification: first.classification,
+    } : {}),
+    resolutionRevision: revision,
+  };
+}
+
+function canonicalAgentInstanceFromSessions(
+  agentInstanceId: string,
+  sessions: readonly T.CanonicalSessionResource[],
+  revision: number,
+): T.CanonicalAgentInstanceResource {
+  const first = sessions[0]!;
+  const sessionIds = [...new Set(sessions.flatMap((session) => [
+    session.sessionId,
+    session.canonicalSessionId,
+    session.conversationId,
+    session.sessionKey,
+  ].filter((value): value is string => Boolean(value))))].slice(0, 512);
+  const startedAtUnixNs = sessions
+    .map((session) => session.startedAtUnixNs)
+    .filter((value): value is string => Boolean(value))
+    .sort()[0] ?? '0';
+  const lastSeenAtUnixNs = sessions
+    .map((session) => session.lastActivityAtUnixNs)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? startedAtUnixNs;
+  const partial = sessions.some((session) => session.coverage.status !== 'complete');
+  return {
+    schemaVersion: 'anysentry.agent_instance.v1',
+    agentInstanceId,
+    ...(first.logicalAgentId ? { logicalAgentId: first.logicalAgentId } : {}),
+    ...(first.logicalAgentCandidateId ? { logicalAgentCandidateId: first.logicalAgentCandidateId } : {}),
+    ...(first.logicalDefinitionId ? { logicalDefinitionId: first.logicalDefinitionId } : {}),
+    ...(first.logicalScopeMode ? { logicalScopeMode: first.logicalScopeMode } : {}),
+    ...(first.logicalIdentityAuthority === 'management_registration'
+      ? { logicalIdentityAuthority: first.logicalIdentityAuthority } : {}),
+    ...(first.agentProduct ? { agentProduct: first.agentProduct } : {}),
+    environment: first.environment,
+    ...(first.tenantId ? { tenantId: first.tenantId } : {}),
+    ...(first.ownerId ? { ownerId: first.ownerId } : {}),
+    ...(first.workspacePath ? { workspacePath: first.workspacePath } : {}),
+    collectorIds: [...new Set(sessions.flatMap((session) => session.collectorIds ?? []))].slice(0, 64),
+    sourceIds: [...new Set(sessions.flatMap((session) => session.sourceIds ?? []))].slice(0, 64),
+    terminalContextIds: [],
+    runtimeInstanceIds: [agentInstanceId],
+    sessionIds,
+    state: 'exited',
+    startedAtUnixNs,
+    lastSeenAtUnixNs,
+    sourceRefs: sessions.flatMap((session) => [
+      `session:${session.sessionId}`,
+      ...(session.conversationId ? [`conversation:${session.conversationId}`] : []),
+    ]).slice(0, 64),
+    coverage: canonicalCoverage(partial, sessions.flatMap((session) => session.coverage.reasons), 'conversation_projection'),
+    resolutionRevision: revision,
+  };
 }
 
 /**
@@ -11863,6 +11968,56 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         collectorId: resources.every((resource) => resource.collectorIds !== undefined),
       }),
     );
+    if (query.agentInstanceId) {
+      const wanted = query.agentInstanceId;
+      let focused = resources.filter((resource) => (
+        resource.agentInstanceId === wanted || resource.runtimeInstanceIds.includes(wanted)
+      ));
+      if (focused.length === 0) {
+        const matchingConversations = directory.items
+          .flatMap((item) => item.userThreads ?? [])
+          .filter((conversation) => conversation.agentInstanceIds.includes(wanted));
+        if (matchingConversations.length > 0) {
+          focused = [canonicalAgentInstanceFromConversations(
+            wanted,
+            matchingConversations,
+            directory.resolutionRevision,
+          )];
+        } else {
+          try {
+            const narrow = await this.canonicalSessionResources({
+              ...query,
+              offset: 0,
+              limit: 64,
+            }, headers);
+            let matched = narrow.items.filter((session) => session.agentInstanceIds.includes(wanted));
+            if (matched.length === 0) {
+              const broad = await this.canonicalSessionResources({
+                ...query,
+                agentInstanceId: undefined,
+                offset: 0,
+                limit: 500,
+              }, headers);
+              matched = broad.items.filter((session) => session.agentInstanceIds.includes(wanted));
+            }
+            if (matched.length > 0) {
+              focused = [canonicalAgentInstanceFromSessions(wanted, matched, directory.resolutionRevision)];
+            }
+          } catch (error) {
+            if (!isCanonicalProjectionDegradation(error)) throw error;
+          }
+        }
+      }
+      const hydrated = focused.length > 0
+        && !resources.some((item) => item.agentInstanceId === wanted || item.runtimeInstanceIds.includes(wanted));
+      const dataSource = hydrated ? 'conversation_projection' : 'runtime_state+conversation_projection';
+      return {
+        items: focused,
+        coverage: exactSessionPointReadCoverage(focused, dataSource),
+        dataSource,
+        revision: directory.resolutionRevision,
+      };
+    }
     return { items: resources, coverage, dataSource: 'runtime_state+conversation_projection', revision: directory.resolutionRevision };
   }
 
@@ -12944,7 +13099,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const result = await this.canonicalAgentInstanceResources(query, headers);
     const item = result.items.find((candidate) => candidate.agentInstanceId === agentInstanceId || candidate.runtimeInstanceIds.includes(agentInstanceId));
     if (!item) throw new NotFoundException('agent instance not found');
-    return { schemaVersion: 'anysentry.agent_instance.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+    return {
+      schemaVersion: 'anysentry.agent_instance.v1',
+      item,
+      revision: result.revision,
+      coverage: exactSessionPointReadCoverage([item], result.dataSource),
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/agent-instances/:agentInstanceId/runtimes')
@@ -12952,9 +13114,18 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async canonicalAgentInstanceRuntimes(@Param('agentInstanceId') agentInstanceId: string, @Query() rawQuery: Record<string, unknown>, @Headers() headers: HeaderBag): Promise<T.CanonicalRuntimeInstanceList> {
     const query = parseCanonicalEntityQuery({ ...rawQuery, agentInstanceId });
     const result = await this.canonicalRuntimeInstanceResources(query, headers);
-    const filtered = result.items.filter((item) => item.agentInstanceId === agentInstanceId);
+    const filtered = result.items.filter((item) => (
+      item.agentInstanceId === agentInstanceId || item.legacyAgentInstanceId === agentInstanceId
+    ));
     const page = canonicalPage(filtered, query);
-    return { schemaVersion: 'anysentry.runtime_instance.list.v1', ...page, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+    return {
+      schemaVersion: 'anysentry.runtime_instance.list.v1',
+      ...page,
+      revision: result.revision,
+      coverage: exactScopedCollectionCoverage(filtered, result.dataSource),
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/agent-instances/:agentInstanceId/sessions')
@@ -13004,7 +13175,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     const result = await this.canonicalRuntimeInstanceResources(query, headers);
     const item = result.items.find((candidate) => candidate.runtimeInstanceId === runtimeInstanceId || candidate.legacyAgentInstanceId === runtimeInstanceId);
     if (!item) throw new NotFoundException('runtime instance not found');
-    return { schemaVersion: 'anysentry.runtime_instance.v1', item, revision: result.revision, coverage: result.coverage, dataSource: result.dataSource, updateTime: new Date().toISOString() };
+    return {
+      schemaVersion: 'anysentry.runtime_instance.v1',
+      item,
+      revision: result.revision,
+      coverage: exactSessionPointReadCoverage([item], result.dataSource),
+      dataSource: result.dataSource,
+      updateTime: new Date().toISOString(),
+    };
   }
 
   @Get('v1/sessions')

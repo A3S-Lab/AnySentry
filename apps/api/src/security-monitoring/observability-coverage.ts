@@ -244,6 +244,18 @@ export function exactSessionPointReadCoverage(
   };
 }
 
+/** Empty scoped child list is complete, not a directory-window gap. */
+export function exactScopedCollectionCoverage(
+  items: ReadonlyArray<{ coverage?: { status?: string; reasons?: readonly string[] } }>,
+  source: string,
+  emptyReasons: readonly string[] = ['no_live_runtime_instance'],
+): { status: 'complete' | 'partial'; reasons: string[]; source: string } {
+  if (items.length === 0) {
+    return { status: 'complete', reasons: [...emptyReasons], source };
+  }
+  return exactSessionPointReadCoverage(items, source);
+}
+
 export function sessionResourceAliases(item: {
   sessionId?: string;
   canonicalSessionId?: string;

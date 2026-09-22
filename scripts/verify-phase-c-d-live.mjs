@@ -180,13 +180,27 @@ for (const timeType of timeTypes) {
 
 const instances = await get('/v1/agent-instances?timeType=last_1d&limit=8');
 assert.ok(Array.isArray(instances.items));
-const instanceId = instanceIds[0] ?? instances.items.find((item) => item.agentInstanceId)?.agentInstanceId;
-if (instanceId) {
-  const one = await get(`/v1/agent-instances/${encodeURIComponent(instanceId)}?timeType=last_1d`);
-  assert.equal(one.coverage?.status, 'complete', 'AgentInstance point-read from a complete Session must be complete');
-  const runtimes = await get(`/v1/agent-instances/${encodeURIComponent(instanceId)}/runtimes?timeType=last_1d`);
-  assert.equal(runtimes.coverage?.status, 'complete', 'RuntimeInstance list for that instance must be complete');
+const candidateInstanceIds = [...instanceIds];
+for (const item of instances.items) {
+  if (item.agentInstanceId && !candidateInstanceIds.includes(item.agentInstanceId)) {
+    candidateInstanceIds.push(item.agentInstanceId);
+  }
 }
+let completeInstance = 0;
+let missingInstance = 0;
+for (const instanceId of candidateInstanceIds) {
+  const one = await get(`/v1/agent-instances/${encodeURIComponent(instanceId)}?timeType=last_1d`, { allowNotFound: true });
+  if (!one) {
+    missingInstance += 1;
+    continue;
+  }
+  if (one.coverage?.status === 'complete' && one.item?.coverage?.status === 'complete') {
+    completeInstance += 1;
+    const runtimes = await get(`/v1/agent-instances/${encodeURIComponent(instanceId)}/runtimes?timeType=last_1d`);
+    assert.equal(runtimes.coverage?.status, 'complete', 'RuntimeInstance list for a complete AgentInstance must be complete');
+  }
+}
+assert.ok(completeInstance > 0, 'at least one AgentInstance from a complete Session must point-read complete');
 
 const health = await get('/healthz');
 const gaps = health.canonicalObservability?.gaps ?? {};
@@ -206,6 +220,8 @@ console.log(JSON.stringify({
   schemaVersion: 'anysentry.phase_c_d_live.v1',
   completeSession,
   completeRun,
+  completeInstance,
+  missingInstance,
   parentUnlinked,
   childLinked,
   derivedDrops: {

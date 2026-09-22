@@ -8,6 +8,7 @@ const {
   unifiedFilterRuleLineage,
   observabilityCoverageLayers,
   toolEvidenceForInteractions,
+  exactScopedCollectionCoverage,
   exactSessionPointReadCoverage,
   sessionResourceAliases,
   sessionResourceHydrated,
@@ -281,6 +282,10 @@ assert.deepEqual(
 assert.equal(
   exactSessionPointReadCoverage([], 'clickhouse').status,
   'partial',
+);
+assert.deepEqual(
+  exactScopedCollectionCoverage([], 'runtime_state'),
+  { status: 'complete', reasons: ['no_live_runtime_instance'], source: 'runtime_state' },
 );
 assert.equal(sessionResourceHydrated({ coverage: { status: 'partial', completeInteractions: 0 }, interactionIds: ['mi_1'] }), false);
 assert.equal(sessionResourceHydrated({ coverage: { status: 'complete', completeInteractions: 3 }, interactionIds: ['mi_1'] }), true);

@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:bff81619b1fd58ad62b72de71545372959340662e3d9c189402a12c847a11208`
-- Overlay tag: `run-point-20260922d`
+- API pod image: `127.0.0.1:5000/anysentry@sha256:94482ba81883196ab8e59fcff7dc0859241c752b83263494d410814396047658`
+- Overlay tag: `instance-point-20260922b` (base `run-point-20260922d` / `bff81619…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -31,6 +31,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 - LLM tool names (`run_python`, `run_in_sandbox`) fold onto wire/kernel (`http.code.execute` / Egress) by content fingerprint, same runtime, hop-compatible, 60s window. Fold only onto a backend that already owns Kernel.
 - Parent hop (`cv_15e9d9f3`) stays kernel-unlinked. Child hop owns Kernel. Parent view does not import child kernel rows.
 - 90s “no result” is suppressed when leftover fingerprint pairing already closed the call.
+- AgentInstance/RuntimeInstance ID point-reads use the matched row’s own coverage. Directory-window `partial` is not inherited. After a container exits, the instance hydrates from Session/conversation projection; no invented Kernel.
 
 ## Persistence / WAL
 
@@ -48,7 +49,7 @@ Live `last_1d` on digest `bff81619…` (2026-09-22T07:21Z):
 
 - 6 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`)
 - 3 Run point-reads complete
-- AgentInstance + runtimes taken from a complete Session: complete
+- 9 AgentInstance point-reads complete after lab teardown, including docker IDs that now hydrate from Session projection (`state=exited`, `dataSource=conversation_projection`). Live RuntimeInstance list for those IDs is empty and `complete` with `no_live_runtime_instance`.
 - parent hops kernel-unlinked: 4
 - child hops kernel-linked: 2
 - derived-lane drops remain 0
@@ -74,6 +75,18 @@ Recorded 2026-09-22T07:22Z from `POST /collectors/health timeType=last_1h` on co
 | canonical persistence | derived-lane drops 0; `pipeline.window.exact=true` |
 
 Not executed (would require opening collection or a dedicated storm): unknown-host sustained, high-volume FileAccess, LLM/TLS fragment burst, many concurrent HTTP sessions, empty-WAL pressure window.
+
+## 11.3 three-fixture matrix (generic shapes; LangGraph is a sample)
+
+Recorded from `/tmp/s125-alias-fold-20260922` on digest `bff81619…`, then re-checked after lab teardown on `94482ba8…`.
+
+| Fixture (design §11.3) | Sample input | Landed IDs | Observed | Not a product branch |
+|---|---|---|---|---|
+| 1. Stateless HTTP Agent — each POST an ephemeral Session | `POST /invoke` fanout `s125-fanout-r1` | Session/Run `s125-fanout-r1` → `cv_c92a6aff`; child Kernel `factCount=1` | generic `/invoke` route shape; per-request session; tool names `run_python`/`run_in_sandbox` fold onto execute Egress | Route is `/invoke`, not a LangGraph-named identity |
+| 2. Stateful graph Agent — same thread, node loop in one Run | Design A `POST /runs` thread `70141be3-…` | Session/Run `70141be3` → `cv_096f6b1d`; nodes plan/work/verify | same thread kept; in-memory `write_todos` stays `no_kernel_event_expected`; execute hop `cv_23a18a63` owns Kernel | Node names are workflow labels, not a framework registry |
+| 3. Parent → child Agent — views isolated | Design B orch→worker `c5dec736-…`; fanout parent `cv_15e9d9f3` | parent `cv_15e9d9f3` kernel `unlinked`; child `cv_c92a6aff` / B worker `cv_df08886c` kernel complete | parent does not import child KernelFact; delegation id is a hop fence | Child view is hop-scoped `cv_*`, not a merged parent timeline |
+
+LangChain host `:18082` returned 422 (`message` required) and is not counted as a fixture pass.
 
 ## Still open (Goal not closed)
 
