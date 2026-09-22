@@ -50,16 +50,23 @@ def required_environment(name: str) -> str:
     return value
 
 
-model = ChatOpenAI(
-    model=required_environment("LANGCHAIN_LAB_MODEL"),
-    base_url=required_environment("LANGCHAIN_LAB_BASE_URL"),
-    api_key=required_environment("LANGCHAIN_LAB_API_KEY"),
-    streaming=False,
-    temperature=0,
-    max_retries=0,
-    timeout=90,
-)
-agent = create_agent(model=model, tools=[lookup_fixture], system_prompt=SYSTEM_PROMPT)
+def build_agent(run_id: str):
+    model = ChatOpenAI(
+        model=required_environment("LANGCHAIN_LAB_MODEL"),
+        base_url=required_environment("LANGCHAIN_LAB_BASE_URL"),
+        api_key=required_environment("LANGCHAIN_LAB_API_KEY"),
+        streaming=False,
+        temperature=0,
+        max_retries=0,
+        timeout=90,
+        default_headers={
+            "x-anysentry-run-id": run_id,
+            "x-anysentry-session-id": run_id,
+        },
+    )
+    return create_agent(model=model, tools=[lookup_fixture], system_prompt=SYSTEM_PROMPT)
+
+
 app = FastAPI(title="AnySentry LangChain TLS Fixture", docs_url=None, redoc_url=None)
 
 
@@ -74,7 +81,7 @@ async def invoke(request: InvokeRequest) -> InvokeResponse:
     started = time.time_ns()
     try:
         result = await asyncio.to_thread(
-            agent.invoke,
+            build_agent(run_id).invoke,
             {"messages": [{"role": "user", "content": request.message}]},
         )
     except Exception as error:
