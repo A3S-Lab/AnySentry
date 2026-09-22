@@ -40,10 +40,20 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 - Removed 2026-09-22: orphan compaction leftover `spool-clean-20260915.wal.1632171.1789873356423.tmp` (mtime 2026-09-20, not open, different inode from live WAL).
 - Kept: `spool-clean-20260915.wal.dlq` (5.2Mi, mtime 2026-09-21). Dead-letter of rejected records; not open, but not discardable as live evidence.
 
-## Phase C / D (live, not a formal fixture matrix)
+## Phase C / D
 
-- Phase C: `GET /v1/agent-instances/{host-root:…:194202:735969}?timeType=last_2h` and `/runtimes` are `complete`. Directory lists stay `partial` for mixed windows.
-- Phase D: parent `cv_15e9d9f3` complete + kernel unlinked; child `cv_c92a6aff` complete + linked. No double-count of child kernel on the parent.
+Repeatable gate: `scripts/verify-phase-c-d-live.mjs` (local contracts always; live HTTP when `ANYSENTRY_API_BASE` + token are set).
+
+Live `last_1d` on digest `bff81619…` (2026-09-22T07:21Z):
+
+- 6 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`)
+- 3 Run point-reads complete
+- AgentInstance + runtimes taken from a complete Session: complete
+- parent hops kernel-unlinked: 4
+- child hops kernel-linked: 2
+- derived-lane drops remain 0
+
+Local contracts: generic `/runs/:param/nodes/:param` route shape; in-memory plan tools stay unlinked; parent coverage layers do not import child KernelFact.
 
 ## Still open (Goal not closed)
 
