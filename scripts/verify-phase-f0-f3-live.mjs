@@ -4,13 +4,25 @@
  * F0–F3 / process-generation gate. Local contracts always run; live HTTP runs when
  * ANYSENTRY_API_BASE + ANYSENTRY_MANAGEMENT_TOKEN are set.
  *
- * Does not require discarded-lab ifr_* adapters. Builtin catalog + Observer ACK
- * + process generation are the pollable readiness surface after inventory cleanup.
+ * Builtin catalog + Observer ACK + process generation are the pollable readiness
+ * surface. Candidate ifr_* adapters may appear from remaining exact non-Agent inventory;
+ * they stay out of the lossy Forwarder identity projection until promoted.
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import process from 'node:process';
+
+const infraSource = readFileSync(
+  new URL('../apps/api/src/security-monitoring/infrastructure-rule.service.ts', import.meta.url),
+  'utf8',
+);
+assert.match(infraSource, /ensureInventoryCandidates/);
+assert.match(infraSource, /MAX_INVENTORY_CANDIDATES = 32/);
+assert.match(infraSource, /INVENTORY_SYNC_TTL_MS = 60_000/);
+assert.match(infraSource, /intent: 'aggregate'/);
+assert.match(infraSource, /allowStale: true/);
 
 const require = createRequire(import.meta.url);
 const {
@@ -62,7 +74,11 @@ const catalog = await get('/filter-rules/catalog?limit=200');
 assert.ok((catalog.items?.length ?? 0) > 0);
 assert.ok(catalog.items.some((rule) => rule.ruleKind === 'runtime_signature'));
 assert.ok(catalog.items.some((rule) => rule.ruleId === 'fr_guardrail_security_full'));
-const infrastructureAdapters = catalog.items.filter((rule) => String(rule.ruleId).startsWith('ifr_')).length;
+const infrastructureAdapters = catalog.items.filter((rule) => String(rule.ruleId).startsWith('ifr_'));
+assert.ok(
+  infrastructureAdapters.every((rule) => rule.lifecycleStage !== 'enforced'),
+  'inventory-synced ifr_* drafts must stay candidate/shadow, not enforced',
+);
 
 const stages = await get('/filter-rules/stages/status');
 const byStage = Object.fromEntries((stages.stages ?? []).map((item) => [item.stage, item]));
@@ -123,7 +139,7 @@ assert.equal(gaps.asyncDerivedPersistenceDropped ?? 0, 0);
 console.log(JSON.stringify({
   schemaVersion: 'anysentry.phase_f0_f3_live.v1',
   catalogRules: catalog.items.length,
-  infrastructureAdapters,
+  infrastructureAdapters: infrastructureAdapters.length,
   sharedEpoch: epochs[0],
   stages: Object.fromEntries(Object.entries(byStage).map(([stage, item]) => [stage, item.status])),
   intentHash: projectionA.intentHash,

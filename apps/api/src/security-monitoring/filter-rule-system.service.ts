@@ -209,6 +209,11 @@ export class FilterRuleSystemService {
     };
   }
 
+  async readyCatalog(query: FilterRuleCatalogQuery = {}): Promise<FilterRuleCatalogResult> {
+    await this.infrastructure.ensureInventoryCandidates();
+    return this.list(query);
+  }
+
   list(query: FilterRuleCatalogQuery = {}): FilterRuleCatalogResult {
     const version = this.versions();
     const q = text(query.q, 240)?.toLowerCase();

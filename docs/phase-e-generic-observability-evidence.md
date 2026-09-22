@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:5c0f9481580641941fb6924bf27e64770271de2b3ce07fee7e5a973df9e8226f`
-- Overlay tag: `bucket-chunk-20260922c` (base `expected-nokernel-20260922` / `c18db377…`)
+- API pod image: `127.0.0.1:5000/anysentry@sha256:02db8e57d0b69bbc4b9afc12c965e0690efb0dec002819b9721455ac16919880`
+- Overlay tag: `ifr-inventory-20260922c` (base `bucket-chunk-20260922c` / `5c0f9481…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -46,7 +46,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 Repeatable gate: `scripts/verify-phase-c-d-live.mjs` (local contracts always; live HTTP when `ANYSENTRY_API_BASE` + token are set).
 
-Live `last_1d` on digest `5c0f9481…` (2026-09-22T08:16Z), including the LangChain sample:
+Live `last_1d` on digest `02db8e57…` (2026-09-22T08:27Z), including the LangChain sample:
 
 - 8 Session point-reads complete (thread IDs, `cv_*` hops, parent `cv_15e9d9f3`, `lc_aba557509de9432aa8c8` → `cv_c01225ad`)
 - 4 Run point-reads complete
@@ -110,14 +110,15 @@ LangChain host `:18082` first returned 422 on `{"input":...}`. A later `POST /in
 
 ## F0 / F1 / F2 / F3 and process generation
 
-Repeatable gate: `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `94482ba8…` (2026-09-22T07:36Z):
+Repeatable gate: `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `02db8e57…` (2026-09-22T08:27Z):
 
-- Catalog: 45 enforced builtin rules. Observer node `pjnl261070032` F0/F1/F2 `ready` + `aligned` on shared epoch `1790057274238993`. F3 is API-local `ready` (no Observer node list by design).
-- Forwarder projection: `intentHash` stable across TTL refresh; `contentHash` covers transport timestamps. `generatedAt`/`expiresAt` present.
+- Catalog: 58 rules. Observer node `pjnl261070032` F0/F1/F2 `ready` + `aligned` on shared epoch `1790057274239026`. F3 is API-local `ready`.
+- 13 candidate `ifr_*` drafts were merged from remaining exact/logical non-Agent k8s inventory (`aggregate` only, never drop). They stay `draft` / `candidate` and are **not** in the Forwarder identity projection (`intentHash` unchanged `9c7f97ff…`). `verify-unified-filter-rule-deployed.mjs` PASSes; catalog P95 15ms after a 60s sync TTL.
+- Forwarder projection: `intentHash` stable across TTL refresh; `contentHash` covers transport timestamps.
 - Agent-vs-infrastructure conflict example: F1 and F3 both keep `fr_guardrail_agent_conflict_keep`.
 - Explain on remaining inventory `service:k8s:default-cluster:anysentry:a3s-observer` (`bindingQuality=exact`): stages `f0→f1→f2→f3`, 4 facts.
 - Process generation on a RuntimeInstance: `pgk_ac7ab74ac74cfe936e648002`, `physicalWorkloadId=docker:…`, `hostId` + `rootPid` + `rootStartTimeTicks`. Same PID different start time does not inherit AgentInstance (local contract).
-- Durable `infrastructure_rules_v1` in PostgreSQL is a 204-byte empty shell (`ifr_*=0`, materialization reports 0). Builtin catalog still classifies remaining k8s services; per-asset adapter rules were not persisted.
+- Materialization reports remain 0. Candidate drafts are catalog-visible F0 context, not enforced capture.
 
 ## Candidate discovery and cold-start collection bound
 

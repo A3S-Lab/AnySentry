@@ -65,6 +65,13 @@ const MAX_CAPTURE_PROFILE_ENTRIES = 50_000;
 const MAX_VALIDATION_INVENTORY = 2_000;
 const MAX_ENFORCED_MATCHES = 500;
 const MAX_GOVERNANCE_ASSETS = 20_000;
+const MAX_INVENTORY_CANDIDATES = 32;
+const INVENTORY_SYNC_TTL_MS = 60_000;
+const INVENTORY_SYNC_ACTOR: InfrastructureRuleActor = {
+  id: 'anysentry-inventory-sync',
+  displayName: 'F0 inventory merge',
+  type: 'system',
+};
 const MAX_IMPACT_PARTIAL_REASONS = 32;
 const MATERIALIZATION_TTL_MS = 120_000;
 const POLICY_TTL_MS = 120_000;
@@ -618,6 +625,9 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
   private policyVersion = 0;
   private updatedAt = 0;
   private mutationTail: Promise<void> = Promise.resolve();
+  private inventorySync?: Promise<{ created: number; reused: number; skipped: number }>;
+  private inventorySyncVersion?: number;
+  private inventorySyncAt = 0;
   private readonly validations = new Map<string, {
     revision: number;
     at: number;
@@ -649,6 +659,7 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     if (saved?.record.schemaVersion === INFRASTRUCTURE_RULE_STATE_SCHEMA) this.restore(saved.record);
     if (saved) await this.persist();
+    void this.ensureInventoryCandidates().catch(() => undefined);
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -706,6 +717,64 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
    * avoids the public list endpoint's page bound; the unified catalog applies its own cursor after
    * merging every typed rule source.
    */
+  /**
+   * Merge remaining exact/logical non-Agent inventory into candidate (not enforced) ifr_* drafts.
+   * Aggregate only — never drop. Candidates stay out of the lossy Forwarder identity projection.
+   */
+  async ensureInventoryCandidates(): Promise<{ created: number; reused: number; skipped: number }> {
+    if (this.inventorySync) return this.inventorySync;
+    if (this.inventorySyncAt > 0 && Date.now() - this.inventorySyncAt < INVENTORY_SYNC_TTL_MS) {
+      return { created: 0, reused: 0, skipped: 0 };
+    }
+    this.inventorySync = this.syncInventoryCandidates().finally(() => {
+      this.inventorySync = undefined;
+    });
+    return this.inventorySync;
+  }
+
+  private async syncInventoryCandidates(): Promise<{ created: number; reused: number; skipped: number }> {
+    const empty = { created: 0, reused: 0, skipped: 0 };
+    let snapshot: InfrastructureGovernanceAssetSnapshot;
+    try {
+      snapshot = await this.trustedAssetSnapshot({ allowStale: true });
+    } catch {
+      this.inventorySyncAt = Date.now();
+      return empty;
+    }
+    if (this.inventorySyncVersion === snapshot.version) {
+      this.inventorySyncAt = Date.now();
+      return empty;
+    }
+    const eligible = snapshot.assets.filter((asset) =>
+      asset.classification !== 'confirmed_agent'
+      && asset.classification !== 'probable_agent'
+      && (asset.bindingQuality === 'exact' || asset.bindingQuality === 'logical')
+      && asset.conflict !== true
+      && asset.sharedScope !== true
+      && asset.workloadRole !== 'unknown')
+      .slice(0, MAX_INVENTORY_CANDIDATES);
+    let created = 0;
+    let reused = 0;
+    let skipped = 0;
+    for (const asset of eligible) {
+      try {
+        const result = await this.createDraftFromAsset({
+          assetId: asset.assetId,
+          expectedAssetRevision: asset.revision,
+          intent: 'aggregate',
+          reason: 'F0 merge of server-owned inventory as candidate capture context',
+        }, INVENTORY_SYNC_ACTOR);
+        if (result.created) created += 1;
+        else reused += 1;
+      } catch {
+        skipped += 1;
+      }
+    }
+    this.inventorySyncVersion = snapshot.version;
+    this.inventorySyncAt = Date.now();
+    return { created, reused, skipped };
+  }
+
   catalogRecords(): InfrastructureRuleRecord[] {
     return [...this.rules.values()]
       .sort((left, right) => right.updatedAt - left.updatedAt || left.ruleId.localeCompare(right.ruleId))
@@ -749,7 +818,7 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
     request: InfrastructureAssetDraftRequest,
     actor: InfrastructureRuleActor,
   ): Promise<InfrastructureAssetDraftResult> {
-    const snapshot = await this.trustedAssetSnapshot();
+    const snapshot = await this.trustedAssetSnapshot({ allowStale: request.intent !== 'drop' });
     const assetId = text(request.assetId, 240);
     const asset = snapshot.assets.find((item) => item.assetId === assetId);
     if (!asset) throw new InfrastructureRuleError('not_found', 'server-owned asset not found');
@@ -1412,7 +1481,9 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
     };
   }
 
-  private async trustedAssetSnapshot(): Promise<InfrastructureGovernanceAssetSnapshot> {
+  private async trustedAssetSnapshot(
+    options?: { allowStale?: boolean },
+  ): Promise<InfrastructureGovernanceAssetSnapshot> {
     if (!this.assetProvider) {
       throw new InfrastructureRuleError(
         'asset_provider_unavailable',
@@ -1438,7 +1509,7 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
       !Number.isSafeInteger(snapshot.generatedAt) ||
       snapshot.generatedAt <= 0 ||
       snapshot.generatedAt > Date.now() + 30_000 ||
-      Date.now() - snapshot.generatedAt > VALIDATION_TTL_MS ||
+      Date.now() - snapshot.generatedAt > VALIDATION_TTL_MS && options?.allowStale !== true ||
       !Array.isArray(snapshot.assets) ||
       snapshot.assets.length > MAX_GOVERNANCE_ASSETS ||
       (snapshot.partialReasons !== undefined && (

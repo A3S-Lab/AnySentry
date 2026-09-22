@@ -67,7 +67,7 @@ export class FilterRuleController {
   ) {}
 
   @Get('catalog')
-  list(
+  async list(
     @Query('q') q?: string,
     @Query('category') category?: FilterRuleCategory | 'all',
     @Query('kind') kind?: FilterRuleKind | 'all',
@@ -90,7 +90,7 @@ export class FilterRuleController {
         cursor,
         limit: limit ? Number(limit) : undefined,
       };
-      return this.system.list(query);
+      return await this.system.readyCatalog(query);
     } catch (error) {
       this.fail(error);
     }
