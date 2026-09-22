@@ -37,7 +37,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 
 - Derived-lane drops on the digest: `asyncRawPersistenceDropped=0`, `asyncKernelPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`.
 - `persistenceDropped` is the coverage-gap in-flight bound, not a derived-lane drop.
-- Live spool: `FORWARD_SPOOL_PATH=/var/lib/anysentry-forwarder/spool-clean-20260915.wal`. Observer holds two fds on this inode. **Do not truncate.** Re-read 2026-09-22T07:45Z: `spoolWalBytes=33538524`, `spoolRecords=5`, `spoolCompactions=8`, `spoolAtCapacity=false`, `droppedEvents=0`, `outputDropped=0`, `queueDepth=0`. Growth is live rewrite, not an unexplained drop.
+- Live spool: `FORWARD_SPOOL_PATH=/var/lib/anysentry-forwarder/spool-clean-20260915.wal`. Observer holds two fds on this inode. **Do not truncate.** Compaction threshold is `compactMinBytes=32Mi`. The file grew to ~33Mi / 5 records, then self-rewrote (compaction 9) to ~1.4–2.9Mi / 0 live records by 2026-09-22T07:47Z. `droppedEvents=0`, `outputDropped=0`, `spoolAtCapacity=false`. Dead bytes were reclaimed by the designed rewrite, not by truncation. `.dlq` (5.2Mi) is still kept.
 - Removed 2026-09-22: orphan compaction leftover `spool-clean-20260915.wal.1632171.1789873356423.tmp` (mtime 2026-09-20, not open, different inode from live WAL).
 - Kept: `spool-clean-20260915.wal.dlq` (5.2Mi, mtime 2026-09-21). Dead-letter of rejected records; not open, but not discardable as live evidence.
 

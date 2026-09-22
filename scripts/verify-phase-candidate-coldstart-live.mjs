@@ -75,6 +75,11 @@ assert.equal(metrics.retainNonAgent, false);
 assert.notEqual(metrics.captureProfileActivationMode, 'global_full');
 assert.ok(Number.isFinite(metrics.discoveryBudgetDropped));
 assert.ok(metrics.discoveryBudgetDropped >= 0);
+assert.equal(collector.droppedEvents ?? 0, 0);
+assert.equal(collector.outputDropped ?? 0, 0);
+assert.equal(metrics.spoolAtCapacity, false);
+assert.ok(Number.isFinite(metrics.spoolWalBytes));
+assert.ok(metrics.spoolWalBytes >= 0);
 
 const projection = await get('/filter-rules/projections/forwarder');
 const profiles = projection.captureProfiles ?? {};
@@ -98,6 +103,9 @@ console.log(JSON.stringify({
   captureProfileActivationMode: metrics.captureProfileActivationMode,
   captureProfileActivationReason: metrics.captureProfileActivationReason,
   discoveryBudgetDropped: metrics.discoveryBudgetDropped,
+  spoolWalBytes: metrics.spoolWalBytes,
+  spoolRecords: metrics.spoolRecords,
+  spoolCompactions: metrics.spoolCompactions,
   dockerEntries: metrics.dockerEntries,
   identityEntries: snapshot.entries.length,
   infrastructureFileAccess: profiles.infrastructure_aggregate.file_access,
