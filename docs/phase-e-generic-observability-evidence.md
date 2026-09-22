@@ -99,6 +99,17 @@ Repeatable gate: `scripts/verify-phase-f0-f3-live.mjs`. Live on digest `94482ba8
 - Process generation on a RuntimeInstance: `pgk_ac7ab74ac74cfe936e648002`, `physicalWorkloadId=docker:…`, `hostId` + `rootPid` + `rootStartTimeTicks`. Same PID different start time does not inherit AgentInstance (local contract).
 - Durable `infrastructure_rules_v1` in PostgreSQL is a 204-byte empty shell (`ifr_*=0`, materialization reports 0). Builtin catalog still classifies remaining k8s services; per-asset adapter rules were not persisted.
 
+## Candidate discovery and cold-start collection bound
+
+Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `verify-behavior-discovery.mjs` + `verify-filter-rule-snapshot.mjs`). Live on digest `94482ba8…` (2026-09-22T07:38Z). Collection policy was not opened.
+
+- Local: behavior window `behavior-window-v1`; score/threshold; generation-fenced cold-start key; `fr_builtin_behavior_candidate` snapshot lineage.
+- Live plane: `filterMode=enforce`, `captureProfileMode=enforce`, control plane `ready`, unified projection `ready`, `filterRuleEnforceDrops=true`.
+- Grant is not global: `captureProfileActivationMode=preview`, reason `scope_expired`.
+- FileAccess stays layered: `infrastructure_aggregate=drop`, `unknown_discovery=sample`, `agent_full=full`.
+- `discoveryBudgetDropped=0`. Identity snapshot `ready` with 28 entries. `dockerEntries=2` after lab teardown (not a compose-agent inventory).
+- `retainUnknown=false` / `retainNonAgent=false`: unknown is sampled, not retained as a global lossless open.
+
 ## 11.4 against this digest
 
 | Criterion | Status |
