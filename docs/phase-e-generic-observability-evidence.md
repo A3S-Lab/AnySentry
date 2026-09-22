@@ -55,10 +55,29 @@ Live `last_1d` on digest `bff81619…` (2026-09-22T07:21Z):
 
 Local contracts: generic `/runs/:param/nodes/:param` route shape; in-memory plan tools stay unlinked; parent coverage layers do not import child KernelFact.
 
+## 11.2 one live window (mixed Agent + Infrastructure)
+
+Recorded 2026-09-22T07:22Z from `POST /collectors/health timeType=last_1h` on collector `pjnl261070032`. Collection policy was not opened.
+
+| Field | Value |
+|---|---|
+| observed (filter) | 163 |
+| selected / forwarded | 524 |
+| sampled | `unifiedSampleSuppressed=0` |
+| aggregated | `captureAggregateOutputs=413` |
+| filtered | non-agent 34, unknown 18 |
+| ring dropped | 0 (`ringSubmitted=52137`) |
+| collector dropped | 0 (`collectorReceived=collectorEnqueued=52137`) |
+| forwarder / queue dropped | 0 |
+| WAL/spool backlog | live WAL ~14Mi, `spoolRecords=1`, `spoolWalBytes=13562983`, not at capacity |
+| query latency | Session point-read 1445 ms (`cv_23a18a63?timeType=last_1d`, complete) |
+| canonical persistence | derived-lane drops 0; `pipeline.window.exact=true` |
+
+Not executed (would require opening collection or a dedicated storm): unknown-host sustained, high-volume FileAccess, LLM/TLS fragment burst, many concurrent HTTP sessions, empty-WAL pressure window.
+
 ## Still open (Goal not closed)
 
 - Live WAL continues to grow; pressure-window accounting is not a clean empty spool.
 - Classic SSL / HTTPS remains WIP and out of this verification.
-- Formal three-fixture matrix write-up (stateless HTTP, graph loop, parent→child) is sampled by LangGraph labs, not replaced by product-named branches.
-- Old lab processes were left running for the live point-reads.
+- Five of six §11.2 windows were not run.
 - Do not push.
