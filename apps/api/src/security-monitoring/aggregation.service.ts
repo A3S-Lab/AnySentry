@@ -1296,6 +1296,9 @@ export class AggregationService implements OnModuleDestroy {
     this.durableEventSearchInFlight = undefined;
     this.interactionHot.clear();
     this.interactionHotBytes = 0;
+    for (const cache of this.agentHistoryBuckets.values()) cache.close();
+    for (const cache of this.topologyHistoryBuckets.values()) cache.close();
+    for (const cache of this.workspaceHistoryBuckets.values()) cache.close();
     this.agentHistoryBuckets.clear();
     this.topologyHistoryBuckets.clear();
     this.workspaceHistoryBuckets.clear();
@@ -5259,7 +5262,10 @@ export class AggregationService implements OnModuleDestroy {
         this.agentHistoryBuckets.set(scope, cache);
       }
       const [stableFacts, headFacts, tailFacts] = await Promise.all([
-        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).catch((error) => {
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).then((rows) => {
+          if (rows === null) cache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          return rows;
+        }).catch((error) => {
           console.warn(
             `[agents] reusable history unavailable; using bounded hot fallback: ${
               error instanceof Error ? error.message : String(error)
@@ -6208,7 +6214,10 @@ export class AggregationService implements OnModuleDestroy {
         this.workspaceHistoryBuckets.set(scope, cache);
       }
       const [reusableFacts, headFacts, tailFacts] = await Promise.all([
-        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).catch((error) => {
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).then((rows) => {
+          if (rows === null) cache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          return rows;
+        }).catch((error) => {
           console.error('[aggregation] reusable workspace history failed:', (error as Error).message);
           return null;
         }),
@@ -6612,7 +6621,12 @@ export class AggregationService implements OnModuleDestroy {
         topologyCache.read(
           slices.fullStartMs,
           slices.fullEndExclusiveMs,
-        ).catch((error) => {
+        ).then((rows) => {
+          if (rows === null) {
+            topologyCache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          }
+          return rows;
+        }).catch((error) => {
           console.warn(
             `[topology] reusable history unavailable; using bounded hot fallback: ${
               error instanceof Error ? error.message : String(error)

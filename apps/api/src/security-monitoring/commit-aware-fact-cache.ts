@@ -38,6 +38,7 @@ function compareCursor(left: EventCommitCursor, right: EventCommitCursor): numbe
  */
 export const FACT_BUCKET_QUERY_CHUNK_MS = 6 * 3_600_000;
 export const FACT_BUCKET_QUERY_MAX_CHUNKS = 1;
+const FACT_BUCKET_WARMUP_MAX_ATTEMPTS = 4;
 
 export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
   private readonly bucketFacts = new Map<number, T[]>();
@@ -45,6 +46,10 @@ export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
   private readonly queryChunkMs: number;
   private cursor?: EventCommitCursor;
   private operation?: Promise<void>;
+  private warmup?: Promise<void>;
+  private pendingWarmup?: { startMs: number; endExclusiveMs: number };
+  private warmupAttempts = 0;
+  private closed = false;
   private budgetRejected = false;
 
   constructor(
@@ -59,8 +64,37 @@ export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
     this.queryChunkMs = Math.max(this.bucketMs, Math.trunc(queryChunkMs));
   }
 
-  stats(): FactCacheBudgetSnapshot {
-    return this.budget.snapshot();
+  stats(): FactCacheBudgetSnapshot & { warming: boolean } {
+    return {
+      ...this.budget.snapshot(),
+      warming: Boolean(this.pendingWarmup || this.warmup),
+    };
+  }
+
+  /** Fill remaining aligned chunks after the HTTP path already returned a hot fallback. */
+  continueWarmup(startMs: number, endExclusiveMs: number): void {
+    if (this.closed || this.budgetRejected || endExclusiveMs <= startMs) return;
+    if (
+      this.pendingWarmup
+      && this.pendingWarmup.startMs === startMs
+      && this.pendingWarmup.endExclusiveMs === endExclusiveMs
+    ) {
+      this.maybeWarmup();
+      return;
+    }
+    this.warmupAttempts = 0;
+    this.pendingWarmup = { startMs, endExclusiveMs };
+    this.maybeWarmup();
+  }
+
+  close(): void {
+    this.closed = true;
+    this.pendingWarmup = undefined;
+  }
+
+  async drainWarmup(): Promise<void> {
+    this.maybeWarmup();
+    while (this.warmup) await this.warmup;
   }
 
   async read(startMs: number, endExclusiveMs: number): Promise<T[] | null> {
@@ -81,6 +115,7 @@ export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
       await task;
     } finally {
       if (this.operation === task) this.operation = undefined;
+      this.maybeWarmup();
     }
     if (this.budgetRejected) return null;
 
@@ -110,6 +145,49 @@ export class CommitAwareFactBucketCache<T extends TimeBucketFact> {
     await this.applyChanges();
     if (!truncated) await this.loadMissing(startMs, endExclusiveMs);
     this.prune(startMs, endExclusiveMs);
+    if (this.budgetRejected) this.pendingWarmup = undefined;
+  }
+
+  private rangeMissing(startMs: number, endExclusiveMs: number): boolean {
+    for (let bucket = startMs; bucket < endExclusiveMs; bucket += this.bucketMs) {
+      if (!this.bucketFacts.has(bucket)) return true;
+    }
+    return false;
+  }
+
+  private maybeWarmup(): void {
+    if (this.closed || this.warmup || !this.pendingWarmup) return;
+    if (this.budgetRejected) {
+      this.pendingWarmup = undefined;
+      return;
+    }
+    if (this.operation) {
+      this.warmup = this.operation.catch(() => undefined).finally(() => {
+        this.warmup = undefined;
+        this.maybeWarmup();
+      });
+      return;
+    }
+    if (this.warmupAttempts >= FACT_BUCKET_WARMUP_MAX_ATTEMPTS) {
+      this.pendingWarmup = undefined;
+      return;
+    }
+    const range = this.pendingWarmup;
+    this.warmupAttempts += 1;
+    this.warmup = Promise.resolve();
+    const task = this.refresh(range.startMs, range.endExclusiveMs)
+      .catch(() => undefined)
+      .then(() => {
+        if (this.closed || !this.rangeMissing(range.startMs, range.endExclusiveMs)) {
+          this.pendingWarmup = undefined;
+        }
+      });
+    this.operation = task;
+    this.warmup = task.finally(() => {
+      if (this.operation === task) this.operation = undefined;
+      this.warmup = undefined;
+      this.maybeWarmup();
+    });
   }
 
   private async ensureJournalContinuity(): Promise<void> {

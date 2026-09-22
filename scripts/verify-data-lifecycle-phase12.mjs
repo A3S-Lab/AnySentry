@@ -136,6 +136,57 @@ assert.equal(await cache.read(30_001, 70_000), null);
   const secondWide = await wide.read(0, eightHours);
   assert.equal(secondWide?.length, eightHours / BUCKET_MS);
   assert.deepEqual(wideReads, [[sixHours, eightHours]]);
+
+  const warmReads = [];
+  const warm = new CommitAwareFactBucketCache({
+    async latestCursor() {
+      return { committedAtMs: 1, eventId: 'evt_warm', decisionRevision: 1 };
+    },
+    async changes(after) {
+      return { changes: [], cursor: after, hasMore: false };
+    },
+    async facts(startMs, endExclusiveMs) {
+      warmReads.push([startMs, endExclusiveMs]);
+      const rows = [];
+      for (let bucket = startMs; bucket < endExclusiveMs; bucket += BUCKET_MS) {
+        rows.push({ bucketStartMs: bucket, identityKey: `warm-${bucket}`, eventCount: 1 });
+      }
+      return rows;
+    },
+  }, BUCKET_MS);
+  assert.equal(await warm.read(0, eightHours), null);
+  assert.deepEqual(warmReads, [[0, sixHours]]);
+  warm.continueWarmup(0, eightHours);
+  await warm.drainWarmup();
+  assert.deepEqual(warmReads, [[0, sixHours], [sixHours, eightHours]]);
+  warmReads.length = 0;
+  assert.equal((await warm.read(0, eightHours))?.length, eightHours / BUCKET_MS);
+  assert.deepEqual(warmReads, []);
+  warm.close();
+
+  const tightReads = [];
+  const tight = new CommitAwareFactBucketCache({
+    async latestCursor() {
+      return { committedAtMs: 1, eventId: 'evt_tight', decisionRevision: 1 };
+    },
+    async changes(after) {
+      return { changes: [], cursor: after, hasMore: false };
+    },
+    async facts(startMs, endExclusiveMs) {
+      tightReads.push([startMs, endExclusiveMs]);
+      const rows = [];
+      for (let bucket = startMs; bucket < endExclusiveMs; bucket += BUCKET_MS) {
+        rows.push({ bucketStartMs: bucket, identityKey: `tight-${bucket}`, eventCount: 1 });
+      }
+      return rows;
+    },
+  }, BUCKET_MS, 100);
+  assert.equal(await tight.read(0, eightHours), null);
+  assert.equal(tightReads.length, 1);
+  tight.continueWarmup(0, eightHours);
+  await tight.drainWarmup();
+  assert.equal(tightReads.length, 1, 'budget-rejected prefixes must not keep scanning ClickHouse');
+  tight.close();
 }
 
 const [aggregation, clickhouse, judge] = await Promise.all([
@@ -171,6 +222,11 @@ assert.match(
   await read('apps/api/src/security-monitoring/commit-aware-fact-cache.ts'),
   /FACT_BUCKET_QUERY_MAX_CHUNKS = 1/,
 );
+assert.match(
+  await read('apps/api/src/security-monitoring/commit-aware-fact-cache.ts'),
+  /continueWarmup/,
+);
+assert.match(aggregation, /cache\.continueWarmup/);
 const agentBucketQuery = clickhouse.slice(
   clickhouse.indexOf('async agentWindowBucketFacts('),
   clickhouse.indexOf('async workspaceWindowFacts('),

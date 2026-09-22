@@ -4,8 +4,8 @@ Date: 2026-09-22. Branch `fix/langgraph-cross-agent-hop`. Design: `docs/generic-
 
 ## Deployed tip
 
-- API pod image: `127.0.0.1:5000/anysentry@sha256:1b3776a1bc196128b741559d37d25684d90c3a69625aebe65f2b240db7c1ccc0`
-- Overlay tag: `invocation-20260922` (base `readiness-20260922b` / `a48377fe…`)
+- API pod image: `127.0.0.1:5000/anysentry@sha256:bead673085ccfc8b53ee1824df6cb9c4e55610e4fe6846e58aae2a0f47318f6f`
+- Overlay tag: `history-warm-20260922b` (base `invocation-20260922` / `1b3776a1…`)
 - `ANYSENTRY_PROMETHEUS_URL=http://prometheus:9090`
 - Platform metrics: `source=prometheus` `status=ready`
 
@@ -36,7 +36,7 @@ Thread/run IDs that only exist as membership stubs are resolved once through the
 ## Persistence / WAL
 
 - Derived-lane drops on the digest: `asyncRawPersistenceDropped=0`, `asyncKernelPersistenceDropped=0`, `asyncDerivedPersistenceDropped=0`.
-- Agent/topology reusable history no longer folds `last_1d` in one 128 MiB ClickHouse query. `CommitAwareFactBucketCache` builds at most one 6h chunk per refresh (`FACT_BUCKET_QUERY_CHUNK_MS=6h`, `MAX_CHUNKS=1`); later polls resume. Bucket-build settings also use `max_block_size=1024`. Live `POST /agents/directory last_1d` is HTTP 200 (1.0s then 13.6s) with no `MEMORY_LIMIT_EXCEEDED`. The previous 24h fold hit 131.71 MiB and fell back after error.
+- Agent/topology reusable history no longer folds `last_1d` in one 128 MiB ClickHouse query. `CommitAwareFactBucketCache` builds at most one 6h chunk per refresh (`FACT_BUCKET_QUERY_CHUNK_MS=6h`, `MAX_CHUNKS=1`). After a truncated HTTP read, `continueWarmup` fills remaining aligned chunks in the background so later polls do not have to drive every slice. If a prefix exceeds the 96 MiB / 100k-fact in-process budget, warmup stops (`budgetRejects` stays 1) instead of rescanning ClickHouse. Live `POST /agents/directory last_1d` on digest `bead6730…` is HTTP 200 in 29.6s with `partialReason=hot_ring_only` because one 6h `agents:all` chunk still does not fit the reusable budget; Session/Run/AgentInvocation point-reads stay `complete`. The previous 24h fold hit 131.71 MiB and fell back after error.
 - `persistenceDropped` is the coverage-gap in-flight bound, not a derived-lane drop.
 - Live spool: `FORWARD_SPOOL_PATH=/var/lib/anysentry-forwarder/spool-clean-20260915.wal`. Observer holds two fds on this inode. **Do not truncate.** Compaction threshold is `compactMinBytes=32Mi`. The file grew to ~33Mi / 5 records, then self-rewrote (compaction 9) to ~1.4–2.9Mi / 0 live records by 2026-09-22T07:47Z. `droppedEvents=0`, `outputDropped=0`, `spoolAtCapacity=false`. Dead bytes were reclaimed by the designed rewrite, not by truncation. `.dlq` (5.2Mi) is still kept.
 - Removed 2026-09-22: orphan compaction leftover `spool-clean-20260915.wal.1632171.1789873356423.tmp` (mtime 2026-09-20, not open, different inode from live WAL).
@@ -144,7 +144,7 @@ Repeatable gate: `scripts/verify-phase-candidate-coldstart-live.mjs` (wraps `ver
 | Parent/child not double-counted or merged | Met |
 | Canonical point-read `coverage=complete` | Met for Session/Run/AgentInvocation/EvidenceLink/KernelFact and hydrated AgentInstance |
 | Failure/ambiguity stays partial/ambiguous/unlinked | Met (`semantic_only` / `no_kernel_event_expected` for in-process lookup and plan tools, parent `unlinked`, empty runtimes `no_live_runtime_instance`) |
-| Query latency and WAL backlog in budget | Agent directory `last_1d` stays inside the 30s in-flight timeout; not an empty-WAL pressure proof |
+| Query latency and WAL backlog in budget | Agent directory `last_1d` stays inside the 30s in-flight timeout and falls back to the hot ring when a 6h reusable chunk exceeds the in-process budget; not an empty-WAL pressure proof |
 | No product-name / tool-name / fixed-port identity | Met for the accepted algorithms |
 
 ## Still open (Goal not closed)
