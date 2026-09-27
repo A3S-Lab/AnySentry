@@ -72,6 +72,7 @@ function contextValue(
     case 'workload.owner_kind': return context.workload?.ownerKind;
     case 'workload.owner_name': return context.workload?.ownerName;
     case 'workload.container': return context.workload?.container;
+    case 'workload.image': return context.workload?.image;
     case 'workload.service': return context.workload?.service;
     case 'workload.systemd_unit': return context.workload?.systemdUnit;
     case 'workload.label': return condition.key ? context.workload?.labels?.[condition.key] : undefined;
@@ -124,6 +125,7 @@ function contextIndexKeys(context: FilterRuleEvaluationContext): string[] {
     ['workload.owner_kind', context.workload?.ownerKind],
     ['workload.owner_name', context.workload?.ownerName],
     ['workload.container', context.workload?.container],
+    ['workload.image', context.workload?.image],
     ['workload.service', context.workload?.service],
     ['workload.systemd_unit', context.workload?.systemdUnit],
     ['asset.id', context.assetId],
@@ -386,8 +388,12 @@ function customSignature(rule: FilterRuleRecord): AgentRuntimeSignatureProjectio
     if (values.length) variants.push({ [field]: values });
   }
   if (!variants.length) return undefined;
+  // Catalog-created rules carry source.ref 'runtime_signature:fr_…', which is not a registry
+  // reference. Registry-style refs ('runtime-signature:<id>:v<n>') strip to the registry id;
+  // everything else uses the ruleId so the observer-side id validation ([a-z0-9._-]) passes.
+  const registryRef = rule.source.ref?.match(/^runtime-signature:([^:]+):v\d+$/u)?.[1];
   return {
-    id: rule.source.ref?.replace(/^runtime-signature:/u, '').replace(/:v\d+$/u, '') || rule.ruleId,
+    id: registryRef || rule.ruleId,
     displayName: rule.name.replace(/ Runtime Signature$/u, ''),
     enabled: rule.lifecycleStage === 'enforced',
     variants,
@@ -419,6 +425,7 @@ function templateProjection(rule: FilterRuleRecord): AgentTemplateProjection | u
     'workload.namespace': 'namespace',
     'workload.owner_name': 'owner',
     'workload.container': 'container',
+    'workload.image': 'image',
     'workload.service': 'pod',
     'workload.systemd_unit': 'systemdUnit',
     'process.exe_basename': 'executable',
@@ -435,6 +442,9 @@ function templateProjection(rule: FilterRuleRecord): AgentTemplateProjection | u
   if (Object.keys(labels).length) match.labels = labels;
   return {
     id: rule.source.ref?.replace(/^agent-template:/u, '') || rule.ruleId,
+    // The observer registry requires an agentId for agent-classified templates; fall back to the
+    // human rule name so assistant-created templates always load.
+    agentId: text(rule.effect.agentScopeId) || rule.name,
     displayName: rule.name,
     deployment,
     classification: rule.effect.classification,

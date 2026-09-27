@@ -63,6 +63,7 @@ export type FilterRuleConditionField =
   | 'workload.owner_kind'
   | 'workload.owner_name'
   | 'workload.container'
+  | 'workload.image'
   | 'workload.service'
   | 'workload.systemd_unit'
   | 'workload.label'
@@ -121,6 +122,8 @@ export type FilterRuleEffect =
       classification: AgentClassification;
       confidence: number;
       captureProfile?: CaptureProfile;
+      /** Optional product/scope name attached to template-projected identities (observer agentId). */
+      agentScopeId?: string;
     }
   | {
       type: 'assign_role';
@@ -255,6 +258,7 @@ export interface FilterRuleEvaluationContext {
     ownerKind?: string;
     ownerName?: string;
     container?: string;
+    image?: string;
     service?: string;
     systemdUnit?: string;
     labels?: Record<string, string>;

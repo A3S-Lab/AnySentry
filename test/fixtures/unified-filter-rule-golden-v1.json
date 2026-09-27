@@ -12,11 +12,11 @@
     "ttlMs": 120000
   },
   "projection": {
-    "contentHash": "530ec1a881027a6ea11e977ef1a348c2892d321dd61ecfdc85d11e10ebe5b69d",
-    "intentHash": "d951af798ee96af1c18d153b795ed8bc3f02e61b55b4890eab934bb9bdb0cadc",
+    "contentHash": "d78bd53bfd1b4484cc55e8b1074f9722c7b994694ac55183919e1f44d5de74be",
+    "intentHash": "e6dad321e8d8f0abb898c711383c2995cdf01cf5c0c0511adddb09fb54848558",
     "counts": {
       "runtimeSignatures": 8,
-      "agentTemplates": 0,
+      "agentTemplates": 2,
       "identityRules": 11,
       "captureProfileRules": 8,
       "signalEnablementRules": 1,

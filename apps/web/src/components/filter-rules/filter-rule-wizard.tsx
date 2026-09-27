@@ -46,24 +46,32 @@ export function FilterRuleWizard({
   onCreated,
   initialKind,
   initialAssetId,
+  initialMatchField,
+  initialMatchValue,
+  initialName,
+  initialPlacement,
   predecessorRuleId,
 }: {
   onClose: () => void;
   onCreated: (ruleId: string) => void;
   initialKind?: FilterRuleWizardKind;
   initialAssetId?: string;
+  initialMatchField?: string;
+  initialMatchValue?: string;
+  initialName?: string;
+  initialPlacement?: string;
   predecessorRuleId?: string;
 }) {
   const { t } = useI18n();
   const startingKind = initialKind ?? "runtime_signature";
   const startingMatcher = initialMatcher(startingKind, initialAssetId);
   const [kind, setKind] = useState<FilterRuleWizardKind>(startingKind);
-  const [name, setName] = useState("");
+  const [name, setName] = useState(initialName ?? "");
   const [description, setDescription] = useState("");
   const [reason, setReason] = useState("");
-  const [matchField, setMatchField] = useState(startingMatcher.field);
-  const [matchValue, setMatchValue] = useState(startingMatcher.value);
-  const [placement, setPlacement] = useState("kubernetes");
+  const [matchField, setMatchField] = useState(initialMatchField ?? startingMatcher.field);
+  const [matchValue, setMatchValue] = useState(initialMatchValue ?? startingMatcher.value);
+  const [placement, setPlacement] = useState(initialPlacement ?? "kubernetes");
   const [classification, setClassification] = useState("probable_agent");
   const [profile, setProfile] = useState<CaptureProfile>("probable_investigation");
   const [retentionAction, setRetentionAction] = useState("keep");
@@ -231,7 +239,7 @@ export function FilterRuleWizard({
                     <SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {kind === "runtime_signature" ? <><SelectItem value="process.comm">process.comm</SelectItem><SelectItem value="process.exe_basename">process.exe_basename</SelectItem><SelectItem value="process.argv0_basename">process.argv0_basename</SelectItem><SelectItem value="process.argv_prefix">process.argv_prefix</SelectItem></> : null}
-                      {kind === "agent_template" ? <><SelectItem value="workload.namespace">workload.namespace</SelectItem><SelectItem value="workload.owner_name">workload.owner_name</SelectItem><SelectItem value="workload.container">workload.container</SelectItem><SelectItem value="process.exe_basename">process.exe_basename</SelectItem></> : null}
+                      {kind === "agent_template" ? <><SelectItem value="workload.namespace">workload.namespace</SelectItem><SelectItem value="workload.owner_name">workload.owner_name</SelectItem><SelectItem value="workload.container">workload.container</SelectItem><SelectItem value="workload.image">workload.image</SelectItem><SelectItem value="process.exe_basename">process.exe_basename</SelectItem></> : null}
                       {kind === "capture_profile" || kind === "semantic_retention" || kind === "persistence_retention" ? <><SelectItem value="identity.classification">identity.classification</SelectItem><SelectItem value="workload.role">workload.role</SelectItem><SelectItem value="event.kind">event.kind</SelectItem></> : null}
                       {kind === "investigation_override" ? <><SelectItem value="asset.id">asset.id</SelectItem><SelectItem value="runtime.id">runtime.id</SelectItem></> : null}
                     </SelectContent>

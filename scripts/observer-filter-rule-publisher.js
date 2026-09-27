@@ -45,6 +45,10 @@ const AUTHORITATIVE_NON_AGENT_SOURCES = new Set([
   'operator',
   'platform_inventory',
 ]);
+// The Collector remains the authority on what it can run safely. Its self-reported safety
+// adjustments therefore do not invalidate a Preview ACK — rejecting the handshake on them
+// deadlocked Preview -> Grant activation forever. Any other downgrade reason still rejects.
+const SOFT_ACK_DOWNGRADES = new Set(['effective_actions_changed_by_collector_safety']);
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -233,6 +237,16 @@ function implicitDiscoveryDefault(entry) {
   );
 }
 
+// Activation authority is tied to rule-bound or Agent-classified entries. Cold-start / Unknown
+// churn does not change the granted authority set, so its expiry must not bounce a healthy grant.
+function entryCarriesActivationAuthority(entry) {
+  return Boolean(
+    text(entry?.ruleId)
+    || isAgentKeepDecision(entry)
+    || ['confirmed_agent', 'probable_agent'].includes(text(entry?.classification))
+  );
+}
+
 class FilterRulePublisher {
   constructor(options = {}) {
     this.file = text(options.file);
@@ -278,6 +292,7 @@ class FilterRulePublisher {
     this.activationGrant = undefined;
     this.lastPublishedSnapshot = undefined;
     this.lastAck = undefined;
+    this.lastAckSoftDowngrades = [];
     this.pendingPreviewAck = undefined;
     this.pinnedPreviewGeneration = undefined;
     this.lastAckFingerprint = '';
@@ -298,6 +313,7 @@ class FilterRulePublisher {
       ackReads: 0,
       ackAccepted: 0,
       ackRejected: 0,
+      ackSoftDowngrades: 0,
       ackReplayIgnored: 0,
       centralAccepted: 0,
       centralRejected: 0,
@@ -839,11 +855,13 @@ class FilterRulePublisher {
   prune(advanceVersion = true) {
     const now = this.now();
     let removed = 0;
+    let authorityRemoved = false;
     for (const [key, entry] of this.entries) {
       if (Date.parse(entry.expiresAt) <= now) {
         this.entries.delete(key);
         this.pendingExpiryRefreshes.delete(key);
         this.stats.evicted++;
+        if (entryCarriesActivationAuthority(entry)) authorityRemoved = true;
         removed++;
       }
     }
@@ -856,6 +874,7 @@ class FilterRulePublisher {
       this.stats.evicted++;
       this.stats.capacityEvicted++;
       this.stats.probableCapacityEvicted++;
+      if (entryCarriesActivationAuthority(candidate[1])) authorityRemoved = true;
       removed++;
     }
     while (this.entries.size > this.maxEntries) {
@@ -867,16 +886,20 @@ class FilterRulePublisher {
         }))
         .sort((left, right) => left.priority - right.priority || left.insertionOrder - right.insertionOrder)[0];
       if (!candidate) break;
+      const evicted = this.entries.get(candidate.scopeKey);
       this.entries.delete(candidate.scopeKey);
       this.pendingExpiryRefreshes.delete(candidate.scopeKey);
       this.stats.evicted++;
+      if (entryCarriesActivationAuthority(evicted)) authorityRemoved = true;
       removed++;
     }
     if (removed) {
       if (advanceVersion) this.version++;
       this.stats.changed += removed;
       this.dirty = true;
-      this.revokeActivation('scope_expired', false);
+      // Only authority-bearing evictions bounce the grant; cold-start churn revoking activation
+      // kept keep-only nodes in Preview forever (scope_expired on every short-TTL cycle).
+      if (authorityRemoved) this.revokeActivation('scope_expired', false);
     }
     return removed;
   }
@@ -1068,7 +1091,9 @@ class FilterRulePublisher {
     if (!ack || ack.schemaVersion !== CAPTURE_PROFILE_ACK_SCHEMA) return reject('ack_schema_invalid');
     if (ack.status !== 'applied') return reject('ack_not_applied');
     if (!Array.isArray(ack.errors) || ack.errors.length !== 0) return reject('ack_has_errors');
-    if (!Array.isArray(ack.downgrades) || ack.downgrades.length !== 0) return reject('ack_has_downgrades');
+    if (!Array.isArray(ack.downgrades)) return reject('ack_has_downgrades');
+    const softDowngrades = ack.downgrades.map((reason) => text(reason)).filter(Boolean);
+    if (softDowngrades.some((reason) => !SOFT_ACK_DOWNGRADES.has(reason))) return reject('ack_has_downgrades');
     if (!this.nodeId || text(ack.nodeId) !== this.nodeId) return reject('ack_node_mismatch');
     if (!this.collectorId || text(ack.collectorId) !== this.collectorId) return reject('ack_collector_mismatch');
     if (!text(ack.collectorInstanceId)) return reject('ack_collector_instance_missing');
@@ -1087,8 +1112,15 @@ class FilterRulePublisher {
     if (text(ack.capabilitiesHash) && text(ack.capabilitiesHash) !== digest(ack.capabilities)) {
       return reject('ack_capabilities_hash_invalid');
     }
-    if (text(ack.effectiveActionsHash) !== snapshot.effectiveActionsHash) return reject('ack_effective_actions_mismatch');
-    return { ok: true, ack: { ...ack } };
+    // A soft-degraded Collector legitimately runs a safety-adjusted action set, so its effective
+    // hash differs from the published one by design. Only require equality when nothing was
+    // adjusted; the hash itself must always be well-formed.
+    const effectiveHash = text(ack.effectiveActionsHash);
+    if (!/^[a-f0-9]{64}$/u.test(effectiveHash)) return reject('ack_effective_actions_mismatch');
+    if (!softDowngrades.length && effectiveHash !== snapshot.effectiveActionsHash) {
+      return reject('ack_effective_actions_mismatch');
+    }
+    return { ok: true, ack: { ...ack }, softDowngrades };
   }
 
   consumeAckFile() {
@@ -1114,6 +1146,8 @@ class FilterRulePublisher {
       }
       this.lastAck = validated.ack;
       this.stats.ackAccepted++;
+      this.lastAckSoftDowngrades = validated.softDowngrades ?? [];
+      if (this.lastAckSoftDowngrades.length) this.stats.ackSoftDowngrades++;
       if (this.captureProfileMode === 'enforce') {
         const grant = this.activationGrant;
         if (
@@ -1162,9 +1196,16 @@ class FilterRulePublisher {
     const entries = [...this.entries.values()];
     const destructive = entries.filter((entry) =>
       Object.values(safeDesiredProbeActions(entry)).includes('drop'));
-    if (!destructive.length || destructive.some((entry) => !completeMaterializationIdentity(entry))) return undefined;
+    // A keep-only node has nothing destructive to gate behind Central acceptance; the report then
+    // carries an empty binding set so the Preview -> Grant handshake still completes and Central
+    // still observes the node's materialization state.
+    if (destructive.some((entry) => !completeMaterializationIdentity(entry))) return undefined;
+    // Only destructive (drop-bearing) entries need Central's materialization gate. Keep and
+    // investigation entries from the unified filter catalog reference rules the infrastructure
+    // rule store does not track; reporting them as bindings falsely rejected the whole report.
+    const destructiveKeys = new Set(destructive.map((entry) => entry.scopeKey));
     const bindings = entries
-      .filter((entry) => text(entry.ruleId) && text(entry.physicalWorkloadId))
+      .filter((entry) => destructiveKeys.has(entry.scopeKey) && text(entry.ruleId) && text(entry.physicalWorkloadId))
       .map((entry) => ({
         ruleId: entry.ruleId,
         ruleRevision: Number(entry.ruleRevision),
@@ -1225,7 +1266,8 @@ class FilterRulePublisher {
     const destructive = [...this.entries.values()].filter((entry) =>
       Object.values(safeDesiredProbeActions(entry)).includes('drop'));
     const reportedEntries = Array.isArray(report?.filterRuleEntries) ? report.filterRuleEntries : [];
-    const allDestructiveAccepted = destructive.length > 0 && destructive.every((entry) =>
+    // Zero destructive entries is vacuously acceptable: nothing needed Central's drop gate.
+    const allDestructiveAccepted = destructive.every((entry) =>
       completeMaterializationIdentity(entry)
       && reportedEntries.some((reported) =>
         text(reported.scopeKey) === entry.scopeKey
@@ -1312,6 +1354,7 @@ class FilterRulePublisher {
       controlPlaneState: this.controlPlaneState,
       lastAckAt: this.lastAck?.appliedAt,
       lastAckCollectorInstanceId: this.lastAck?.collectorInstanceId,
+      lastAckSoftDowngrades: this.lastAckSoftDowngrades.length ? [...this.lastAckSoftDowngrades] : undefined,
       expectedCapabilitiesHash: CAPTURE_PROFILE_CAPABILITIES_HASH,
       ...this.stats,
     };

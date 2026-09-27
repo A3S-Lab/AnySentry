@@ -76,6 +76,9 @@ const MAX_IMPACT_PARTIAL_REASONS = 32;
 const MATERIALIZATION_TTL_MS = 120_000;
 const POLICY_TTL_MS = 120_000;
 const VALIDATION_TTL_MS = 5 * 60_000;
+// Mirrors observer-filter-rule-publisher.js: the Collector's own safety adjustments do not
+// invalidate a Preview ACK; any other downgrade reason still rejects the report.
+const SOFT_ACK_DOWNGRADES = new Set(['effective_actions_changed_by_collector_safety']);
 const AUTHORITATIVE_SOURCES = new Set<InfrastructureRuleSourceType>([
   'manual_review',
   'platform_inventory',
@@ -1277,7 +1280,8 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
           ack?.schemaVersion !== 'anysentry.capture_profile_ack.v1'
           || ack.status !== 'applied'
           || !Array.isArray(ack.errors) || ack.errors.length !== 0
-          || !Array.isArray(ack.downgrades) || ack.downgrades.length !== 0
+          || !Array.isArray(ack.downgrades)
+          || ack.downgrades.some((reason) => !SOFT_ACK_DOWNGRADES.has(text(reason, 240) ?? ''))
           || text(ack.nodeId, 240) !== nodeId
           || !text(ack.collectorId, 240)
           || !text(ack.collectorInstanceId, 240)
@@ -1314,17 +1318,23 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
         ) {
           reportErrors.push('Capture Profile ACK capabilities are incomplete');
         }
-        if (!Array.isArray(request.errors) || request.errors.length !== 0 || bindings.length === 0) {
-          reportErrors.push('Capture Profile report must contain bindings and no errors');
+        // Keep-only nodes legitimately report zero bindings: nothing destructive needed the
+        // Central drop gate, but the Preview -> Grant handshake must still be able to complete.
+        if (!Array.isArray(request.errors) || request.errors.length !== 0) {
+          reportErrors.push('Capture Profile report must contain no errors');
         }
       }
       const entriesByScope = new Map<string, InfrastructureFilterRuleEntry>();
       let conflicts = 0;
+      let skippedExternalBindings = 0;
       const reportedAt = Date.now();
       for (const binding of bindings) {
         const rule = this.rules.get(binding.ruleId);
         if (!rule || rule.revision !== integer(binding.ruleRevision, -1, -1, Number.MAX_SAFE_INTEGER)) {
-          reportErrors.push(`binding references unknown rule revision: ${binding.ruleId}`);
+          // Unified filter-catalog rules live outside the infrastructure rule store. The publisher
+          // keeps their destructive enforcement gated (no matching reported entry), so skipping
+          // them here must not reject the whole node report.
+          skippedExternalBindings++;
           continue;
         }
         if (rule.lifecycleStage !== 'shadow' && rule.lifecycleStage !== 'enforced') {
@@ -1466,7 +1476,7 @@ export class InfrastructureRuleService implements OnModuleInit, OnModuleDestroy 
         resourceType: 'infrastructure-rule',
         resourceId: report.reportId,
         summary: `Infrastructure materialization accepted for ${nodeId}`,
-        details: { policyVersion, epoch, bindings: bindings.length, entries: report.filterRuleEntries.length, conflicts, persisted },
+        details: { policyVersion, epoch, bindings: bindings.length, entries: report.filterRuleEntries.length, conflicts, skippedExternalBindings, persisted },
       });
       return report;
     });

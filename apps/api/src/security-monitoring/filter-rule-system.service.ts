@@ -339,6 +339,46 @@ export class FilterRuleSystemService {
     };
   }
 
+  /** Compact F0 identity delivery view: did the forwarders actually load the catalog's current
+   * identity domain (and did the collector-side signature registry reject anything)? */
+  ruleDelivery(): {
+    desiredIdentityVersion: number;
+    nodes: Array<{
+      collectorId: string;
+      status: 'aligned' | 'drifted' | 'degraded' | 'stale';
+      observedIdentityVersion?: number;
+      signatureInvalid?: number;
+      signatureError?: string;
+      ackSoftDowngrades?: number;
+    }>;
+  } {
+    const desiredIdentityVersion = this.versions().domainVersions.identity;
+    const now = Date.now();
+    const heads = this.judge.collectorHeartbeatHeads().latestMetrics;
+    return {
+      desiredIdentityVersion,
+      nodes: heads.map((heartbeat) => {
+        const metrics = heartbeat.filterMetrics;
+        const stale = now - (heartbeat.filterMetricsReportedAt ?? heartbeat.at) > 120_000;
+        const status: 'aligned' | 'drifted' | 'degraded' | 'stale' = stale
+          ? 'stale'
+          : metrics?.unifiedProjectionState === 'degraded'
+            ? 'degraded'
+            : metrics?.unifiedIdentityVersion === desiredIdentityVersion
+              ? 'aligned'
+              : 'drifted';
+        return {
+          collectorId: heartbeat.collectorId,
+          status,
+          ...(metrics?.unifiedIdentityVersion !== undefined ? { observedIdentityVersion: metrics.unifiedIdentityVersion } : {}),
+          ...(metrics?.runtimeSignatureRegistryInvalid ? { signatureInvalid: metrics.runtimeSignatureRegistryInvalid } : {}),
+          ...(metrics?.runtimeSignatureRegistryLastError ? { signatureError: metrics.runtimeSignatureRegistryLastError } : {}),
+          ...(metrics?.captureProfileAckSoftDowngrades ? { ackSoftDowngrades: metrics.captureProfileAckSoftDowngrades } : {}),
+        };
+      }),
+    };
+  }
+
   observabilityReadiness(persistence: ObservabilityReadinessPersistence): ObservabilityReadinessSnapshot {
     return buildObservabilityReadiness({
       status: this.status(),
@@ -485,6 +525,15 @@ export class FilterRuleSystemService {
 
   createDraft(input: FilterRuleDraftRequest, actor: FilterRuleActor) {
     return this.catalog.createDraft(input, actor);
+  }
+
+  /** Explain a synthetic workload context (e.g. an inventory entry) through the F0-F3 rule chain. */
+  explainWorkload(
+    subject: FilterRuleExplainResult['subject'],
+    context: FilterRuleEvaluationContext,
+    facts: FilterRuleExplainResult['context']['facts'],
+  ): FilterRuleExplainResult {
+    return this.explainContext(subject, context, facts);
   }
 
   createInfrastructureDraft(input: InfrastructureAssetDraftRequest, actor: FilterRuleActor) {
@@ -731,6 +780,7 @@ export class FilterRuleSystemService {
         ownerKind: workload?.ownerKind,
         ownerName: workload?.ownerName,
         container: workload?.containerName,
+        image: workload?.containerImage,
         service: workload?.name,
         systemdUnit: workload?.systemdUnit,
       },
@@ -830,26 +880,43 @@ export class FilterRuleSystemService {
   ): FilterRuleExplainResult {
     const versions = this.versions();
     const rules = this.catalogRules();
-    const stages = STAGES.map((stage) => evaluateFilterRules({
-      rules,
-      context,
-      stage,
-      catalogVersion: this.catalog.versions().catalogVersion,
-      domainVersions: versions.domainVersions,
-      includeShadow: true,
-    }));
+    // Identity emitted at F0 changes what F1-F3 see at runtime (signature hit → probable_agent
+    // → capture profile/retention). Cascade it here too, otherwise an explain for a workload
+    // whose inventory label is still unknown would wrongly show the unknown-only outcomes.
+    const working: FilterRuleEvaluationContext = { ...context };
+    const identityEmissions: string[] = [];
+    const stages = STAGES.map((stage) => {
+      const receipt = evaluateFilterRules({
+        rules,
+        context: working,
+        stage,
+        catalogVersion: this.catalog.versions().catalogVersion,
+        domainVersions: versions.domainVersions,
+        includeShadow: true,
+      });
+      const effect = receipt.winner?.effect;
+      if (effect?.type === 'emit_identity' && effect.classification !== working.identityClassification) {
+        identityEmissions.push(`${stage}: ${receipt.winner!.ruleId} emits ${effect.classification}`);
+        working.identityClassification = effect.classification;
+        working.identitySourceRule = receipt.winner!.ruleId;
+      }
+      return receipt;
+    });
     const winners = stages.flatMap((stage) => stage.winner ? [stage.winner.ruleId] : []);
     const related = stages.flatMap((stage) => stage.candidates.filter((candidate) => candidate.matched).map((candidate) => candidate.ruleId));
     return {
       schemaVersion: 'anysentry.filter_rule_explain.v1',
       subject,
       context: {
-        identityClassification: context.identityClassification ?? 'unknown',
-        workloadRole: context.workloadRole ?? 'unknown',
+        identityClassification: working.identityClassification ?? 'unknown',
+        workloadRole: working.workloadRole ?? 'unknown',
         eventKind: context.eventKind,
         probe: context.probe,
         conflict: context.conflict === true,
-        facts,
+        facts: [
+          ...facts,
+          ...identityEmissions.map((value) => ({ label: 'Identity cascade', value, source: 'rule evaluation' })),
+        ],
       },
       stages,
       finalOutcome: outcomeText(stages.find((stage) => stage.stage === 'f3')!),

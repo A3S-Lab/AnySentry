@@ -46,7 +46,7 @@ const ALLOWED_FIELDS = new Set<FilterRuleConditionField>([
   'process.comm', 'process.exe_basename', 'process.argv0_basename', 'process.argv_prefix',
   'identity.classification', 'identity.source_rule', 'workload.role', 'workload.placement', 'workload.cluster',
   'workload.namespace', 'workload.owner_kind', 'workload.owner_name', 'workload.container',
-  'workload.service', 'workload.systemd_unit', 'workload.label', 'asset.id', 'runtime.id',
+  'workload.image', 'workload.service', 'workload.systemd_unit', 'workload.label', 'asset.id', 'runtime.id',
   'runtime.state', 'binding.quality', 'signal.name',
   'event.kind', 'event.probe', 'decision.conflict', 'control.stale',
   'decision.structural_risk',

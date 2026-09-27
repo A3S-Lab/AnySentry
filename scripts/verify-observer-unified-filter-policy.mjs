@@ -52,7 +52,19 @@ assert.equal(signatureRegistry.metrics().loaded, signatures.runtimes.length);
 assert.equal(signatureRegistry.match({ comm: 'codex' })?.agentId, 'codex');
 const templates = registry.agentTemplateDocument();
 const templateRegistry = new AgentTemplateRegistry(templates);
-assert.equal(templateRegistry.metrics().loaded, 0);
+assert.equal(templateRegistry.metrics().loaded, templates.templates.length);
+const langchainHit = templateRegistry.classifyFacts({
+  deployment: 'docker',
+  container: 'langchain-glm-agent',
+  image: 'langchain-glm-lab:latest',
+  command: 'python server.py',
+  executable: 'python',
+});
+assert.equal(langchainHit?.attribution?.classification, 'probable_agent',
+  'the builtin docker langchain image template must classify as review-gated candidate');
+assert.equal(templateRegistry.classifyFacts({
+  deployment: 'host', container: '', image: '', command: 'python x.py', executable: 'python',
+}), undefined, 'generic host python must never match the docker image templates');
 
 const baseUnknown = {
   state: 'unknown',

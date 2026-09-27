@@ -274,6 +274,39 @@ export function builtinFilterRules(): FilterRuleRecord[] {
       effect: { type: 'emit_identity', classification: 'confirmed_agent', confidence: 1, captureProfile: 'agent_full' },
       stages: ['f0', 'f1', 'f2', 'f3'], sourceRef: 'docker-label:anysentry.io/workload-kind=agent',
     }),
+    // Scenario pack docker-langchain-stack: framework images identify the workload, not the
+    // (generic interpreter) process. Candidate only — plaintext still requires review-confirmed
+    // identity; glob matching happens in the observer template registry.
+    builtin({
+      ruleId: 'fr_builtin_docker_langchain_image',
+      name: 'Docker LangChain Service Image',
+      description: '镜像名包含 langchain 的 Docker 工作负载建立候选 Agent 身份，需审核确认后进入明文采集。',
+      category: 'agent_identity', ruleKind: 'agent_template', priority: 700,
+      matcher: {
+        all: [
+          { field: 'workload.placement', operator: 'equals', value: 'docker' },
+          { field: 'workload.image', operator: 'equals', value: '*langchain*' },
+        ],
+        description: 'Docker 部署且镜像名匹配 *langchain*',
+      },
+      effect: { type: 'emit_identity', classification: 'probable_agent', confidence: 0.6, captureProfile: 'probable_investigation', agentScopeId: 'langchain' },
+      stages: ['f0', 'f1', 'f2', 'f3'], sourceRef: 'agent-template:docker-langchain-image',
+    }),
+    builtin({
+      ruleId: 'fr_builtin_docker_langgraph_image',
+      name: 'Docker LangGraph Service Image',
+      description: '镜像名包含 langgraph 的 Docker 工作负载建立候选 Agent 身份，需审核确认后进入明文采集。',
+      category: 'agent_identity', ruleKind: 'agent_template', priority: 700,
+      matcher: {
+        all: [
+          { field: 'workload.placement', operator: 'equals', value: 'docker' },
+          { field: 'workload.image', operator: 'equals', value: '*langgraph*' },
+        ],
+        description: 'Docker 部署且镜像名匹配 *langgraph*',
+      },
+      effect: { type: 'emit_identity', classification: 'probable_agent', confidence: 0.6, captureProfile: 'probable_investigation', agentScopeId: 'langgraph' },
+      stages: ['f0', 'f1', 'f2', 'f3'], sourceRef: 'agent-template:docker-langgraph-image',
+    }),
     builtin({
       ruleId: 'fr_builtin_non_agent_workload_label',
       name: 'Explicit Non-Agent Workload Label',
