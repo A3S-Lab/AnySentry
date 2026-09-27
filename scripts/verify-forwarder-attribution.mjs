@@ -1,10 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { createRequire } from 'node:module';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const { AgentAttributor, containerIdFromCgroup } = require('./observer-agent-attribution.js');
@@ -12,12 +9,46 @@ const { ToolExecDeduper } = require('./observer-event-dedup.js');
 const { DiscoveryBudget, WorkloadIdentityCache } = require('./observer-workload-filter.js');
 const { InfrastructureRootResolver, staticRoots } = require('./observer-infrastructure-roots.js');
 
-function observerEvent({ agent = 'process', pid, ppid, comm, exe, startTimeNs, cwd = '/workspace', argv = [] }) {
+{
+  const previousHostId = process.env.A3S_OBSERVER_HOST_ID;
+  const previousNodeName = process.env.A3S_NODE_NAME;
+  delete process.env.A3S_OBSERVER_HOST_ID;
+  process.env.A3S_NODE_NAME = 'node-identity-test';
+  const judge = new AgentAttributor({ readProc: () => undefined, listPids: () => [] });
+  assert.equal(
+    judge.hostId,
+    'node-identity-test',
+    'ProcessKey host identity must follow the collector/node identity before a container machine-id',
+  );
+  if (previousHostId === undefined) delete process.env.A3S_OBSERVER_HOST_ID;
+  else process.env.A3S_OBSERVER_HOST_ID = previousHostId;
+  if (previousNodeName === undefined) delete process.env.A3S_NODE_NAME;
+  else process.env.A3S_NODE_NAME = previousNodeName;
+}
+
+function observerEvent({
+  agent = 'process',
+  pid,
+  ppid,
+  comm,
+  exe,
+  startTimeNs,
+  hostId,
+  bootId,
+  cwd = '/workspace',
+  argv = [],
+}) {
   return {
     identity: { agent, task: String(pid), session: null },
-    process: { pid, ppid, comm, exe, startTimeNs, cwd },
+    process: { pid, ppid, comm, exe, startTimeNs, hostId, bootId, cwd },
     event: { ToolExec: { pid, ppid, uid: 1000, cwd, argv } },
   };
+}
+
+function processExitEvent(options, exitCode = 0, signal = 0) {
+  const event = observerEvent({ ...options, argv: [] });
+  event.event = { ProcessExit: { pid: options.pid, exit_code: exitCode, signal } };
+  return event;
 }
 
 function attributor(procEntries = []) {
@@ -26,6 +57,31 @@ function attributor(procEntries = []) {
     now: () => 1_000_000,
     readProc: (pid) => procs.get(pid),
   });
+}
+
+{
+  const judge = attributor([
+    { pid: 700, ppid: 600, startTime: '70', comm: 'parent', exe: '/opt/parent' },
+    { pid: 701, ppid: 700, startTime: '71', comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh' },
+    { pid: 702, ppid: 701, startTime: '72', comm: 'tr', exe: '/usr/bin/tr' },
+  ]);
+  const root = observerEvent({
+    pid: 701, ppid: 700, comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh',
+    startTimeNs: '71', argv: ['/opt/vscode/cpuUsage.sh'],
+  });
+  assert.equal(judge.classify(root).state, 'unknown');
+  assert.equal(
+    judge.rememberTrustedNonAgent(root, 'fr_builtin_non_agent_runtime_vscode_cpu_sampler'),
+    true,
+  );
+  const child = judge.classify(observerEvent({
+    pid: 702, ppid: 701, comm: 'tr', exe: '/usr/bin/tr', startTimeNs: '72', argv: ['tr', 'a-z', 'A-Z'],
+  }));
+  assert.equal(child.state, 'non_agent');
+  assert(
+    child.attribution.evidence.includes('filter_rule:fr_builtin_non_agent_runtime_vscode_cpu_sampler:r1'),
+    'trusted negative rule provenance must propagate to short-lived descendants',
+  );
 }
 
 {
@@ -56,6 +112,7 @@ function attributor(procEntries = []) {
   }));
   assert.equal(temporaryChild.workspacePath, '/home/user/code');
   assert.equal(temporaryChild.workspaceSource, 'agent_root');
+  assert.equal(temporaryChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const anySentryChild = judge.classify(observerEvent({
     pid: 851,
@@ -69,6 +126,7 @@ function attributor(procEntries = []) {
   assert.equal(anySentryChild.workspacePath, '/home/user/code/AnySentry');
   assert.equal(anySentryChild.workspaceSource, 'event_git_root');
   assert.equal(anySentryChild.workspaceConflict, false);
+  assert.equal(anySentryChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const observerChild = judge.classify(observerEvent({
     pid: 851,
@@ -81,6 +139,7 @@ function attributor(procEntries = []) {
   }));
   assert.equal(observerChild.workspacePath, '/home/user/code/Observer');
   assert.equal(observerChild.workspaceSource, 'event_git_root');
+  assert.equal(observerChild.attribution.agentWorkspacePath, '/home/user/code');
 
   const conflictedChild = judge.classify(observerEvent({
     pid: 851,
@@ -180,6 +239,234 @@ function attributor(procEntries = []) {
   assert.equal(codexChild.workspacePath, '/repos/codex-workspace');
   assert.equal(a3sChild.workspacePath, '/repos/a3s-workspace');
   assert.notEqual(codexChild.workspacePath, a3sChild.workspacePath);
+}
+
+{
+  // npm-installed Codex is one lifecycle even though its Node wrapper, native binary, and sandbox
+  // helper can all independently match the Codex signature. Child-first insertion deliberately
+  // proves that /proc enumeration order cannot turn those implementation layers into three roots.
+  const entries = [
+    [1_203, { pid: 1_203, tgid: 1_203, ppid: 1_202, startTime: '123', comm: 'codex', exe: '/vendor/codex-linux-sandbox', argv: '/vendor/codex run-as-sandbox', cwd: '/workspace/codex' }],
+    [1_202, { pid: 1_202, tgid: 1_202, ppid: 1_201, startTime: '122', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/codex' }],
+    [1_201, { pid: 1_201, tgid: 1_201, ppid: 1_200, startTime: '121', comm: 'node', exe: '/usr/bin/node', argv: '/usr/local/bin/codex exec', cwd: '/workspace/codex' }],
+    [1_200, { pid: 1_200, tgid: 1_200, ppid: 1, startTime: '120', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/workspace/codex' }],
+  ];
+
+  for (const batched of [false, true]) {
+    const procs = new Map(entries);
+    const judge = new AgentAttributor({
+      now: () => 1_000_000,
+      listPids: () => [...procs.keys()],
+      readProc: (pid) => procs.get(pid),
+    });
+    const seeded = batched
+      ? await judge.reconcileFromProcBatched({ batchSize: 2, yieldNow: async () => {} })
+      : judge.seedFromProc();
+    assert.equal(seeded.roots, 1, `${batched ? 'batched' : 'sync'} scan must create one Codex root`);
+    assert.equal(seeded.descendants, 2);
+    assert.equal(judge.runtimeSnapshot().entries.length, 1);
+    assert.equal(judge.runtimeSnapshot().entries[0].rootPid, 1_201);
+    const bindings = [1_201, 1_202, 1_203].map((pid) => judge.procs.get(pid));
+    assert.equal(new Set(bindings.map((record) => record.agentInstanceId)).size, 1);
+    assert.equal(new Set(bindings.map((record) => record.rootKey)).size, 1);
+  }
+}
+
+{
+  // The live path must converge on the same wrapper root even when a grandchild event arrives
+  // before any Agent process event has populated the cache.
+  const procs = new Map([
+    [1_300, { pid: 1_300, tgid: 1_300, ppid: 1, startTime: '130', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/workspace/codex' }],
+    [1_301, { pid: 1_301, tgid: 1_301, ppid: 1_300, startTime: '131', comm: 'node', exe: '/usr/bin/node', argv: '/usr/local/bin/codex exec', cwd: '/workspace/codex' }],
+    [1_302, { pid: 1_302, tgid: 1_302, ppid: 1_301, startTime: '132', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/codex' }],
+    [1_303, { pid: 1_303, tgid: 1_303, ppid: 1_302, startTime: '133', comm: 'codex', exe: '/vendor/codex-linux-sandbox', argv: '/vendor/codex run-as-sandbox', cwd: '/workspace/codex' }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: (pid) => procs.get(pid),
+    listPids: () => [],
+  });
+  const grandchild = judge.classify(observerEvent({
+    pid: 1_304,
+    ppid: 1_303,
+    comm: 'rg',
+    exe: '/usr/bin/rg',
+    startTimeNs: '134',
+    argv: ['rg', 'AnySentry', '/workspace/codex'],
+  }));
+  const native = judge.classify(observerEvent({
+    pid: 1_302,
+    ppid: 1_301,
+    comm: 'codex',
+    exe: '/vendor/codex',
+    startTimeNs: '132',
+    argv: ['/vendor/codex', 'exec'],
+  }));
+  const sandbox = judge.classify(observerEvent({
+    pid: 1_303,
+    ppid: 1_302,
+    comm: 'codex',
+    exe: '/vendor/codex-linux-sandbox',
+    startTimeNs: '133',
+    argv: ['/vendor/codex', 'run-as-sandbox'],
+  }));
+  assert.equal(grandchild.attribution.rootPid, 1_301);
+  assert.equal(native.attribution.agentInstanceId, grandchild.attribution.agentInstanceId);
+  assert.equal(sandbox.attribution.agentInstanceId, grandchild.attribution.agentInstanceId);
+  assert.equal(judge.runtimeSnapshot().entries.length, 1);
+}
+
+{
+  // A genuinely different nested runtime remains an independent lifecycle boundary.
+  const judge = attributor();
+  const codex = judge.classify(observerEvent({
+    pid: 1_400,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '140',
+    argv: ['codex'],
+  }));
+  const pi = judge.classify(observerEvent({
+    pid: 1_401,
+    ppid: 1_400,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '141',
+    argv: ['pi'],
+  }));
+  assert.equal(codex.attribution.agentScopeId, 'codex');
+  assert.equal(pi.attribution.agentScopeId, 'pi');
+  assert.notEqual(pi.attribution.agentInstanceId, codex.attribution.agentInstanceId);
+  assert.equal(judge.runtimeSnapshot().entries.length, 2);
+}
+
+{
+  // A same-product CLI launched through an Agent-owned shell is still a new session/root. Only
+  // the uninterrupted Node-launcher -> native-binary implementation chain may share a root.
+  const judge = attributor([
+    { pid: 1_450, tgid: 1_450, ppid: 1, startTime: '145', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/parent' },
+    { pid: 1_451, tgid: 1_451, ppid: 1_450, startTime: '146', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash -lc codex', cwd: '/workspace/child' },
+    { pid: 1_452, tgid: 1_452, ppid: 1_451, startTime: '147', comm: 'codex', exe: '/vendor/codex', argv: '/vendor/codex exec', cwd: '/workspace/child' },
+  ]);
+  const parent = judge.classify(observerEvent({
+    pid: 1_450, ppid: 1, comm: 'codex', exe: '/vendor/codex', startTimeNs: '145',
+    cwd: '/workspace/parent', argv: ['/vendor/codex', 'exec'],
+  }));
+  judge.classify(observerEvent({
+    pid: 1_451, ppid: 1_450, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '146',
+    cwd: '/workspace/child', argv: ['bash', '-lc', 'codex'],
+  }));
+  const child = judge.classify(observerEvent({
+    pid: 1_452, ppid: 1_451, comm: 'codex', exe: '/vendor/codex', startTimeNs: '147',
+    cwd: '/workspace/child', argv: ['/vendor/codex', 'exec'],
+  }));
+  assert.equal(parent.attribution.agentScopeId, 'codex');
+  assert.equal(child.attribution.agentScopeId, 'codex');
+  assert.notEqual(child.attribution.agentInstanceId, parent.attribution.agentInstanceId);
+  assert.equal(child.attribution.rootPid, 1_452);
+  assert.equal(judge.runtimeSnapshot().entries.length, 2);
+}
+
+{
+  let reads = 0;
+  const cyclic = new Map([
+    [1_501, { pid: 1_501, tgid: 1_501, ppid: 1_502, startTime: '151', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+    [1_502, { pid: 1_502, tgid: 1_502, ppid: 1_501, startTime: '152', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+  ]);
+  const judge = new AgentAttributor({
+    maxAncestors: 2,
+    now: () => 1_000_000,
+    readProc: (pid) => { reads += 1; return cyclic.get(pid); },
+    listPids: () => [],
+  });
+  const result = judge.classify(observerEvent({
+    pid: 1_500,
+    ppid: 1_501,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '150',
+    argv: ['codex'],
+  }));
+  assert.equal(result.state, 'agent');
+  assert.ok(reads <= 2, 'same-scope ancestor resolution must obey the configured depth bound');
+  assert.equal(judge.runtimeSnapshot().entries.length, 1);
+}
+
+{
+  const procs = new Map([
+    [980, {
+      pid: 980,
+      tgid: 980,
+      ppid: 1,
+      startTime: 'agent-root-980',
+      comm: 'codex',
+      exe: '/usr/bin/codex',
+      argv: 'codex',
+      cwd: '/repos/codex-workspace',
+    }],
+    [981, {
+      pid: 981,
+      tgid: 981,
+      ppid: 980,
+      startTime: 'sandbox-child-981',
+      comm: 'bwrap',
+      exe: '/usr/bin/bwrap',
+      argv: 'bwrap --new-session',
+      cwd: '/repos/codex-workspace',
+    }],
+  ]);
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    listPids: () => [...procs.keys()],
+    readProc: (pid) => procs.get(pid),
+  });
+  judge.seedFromProc();
+
+  const incompleteExit = observerEvent({
+    agent: 'codex',
+    pid: 981,
+    ppid: 980,
+    comm: '',
+    exe: '',
+    startTimeNs: 'sandbox-child-981',
+    cwd: '',
+    argv: [],
+  });
+  incompleteExit.event = { ProcessExit: { pid: 981, exit_code: 0, signal: 0 } };
+  const inherited = judge.classify(incompleteExit);
+  assert.equal(inherited.state, 'agent');
+  assert.equal(inherited.attribution.agentScopeId, 'codex');
+  assert.equal(
+    inherited.attribution.rootPid,
+    980,
+    'an inherited Observer identity label must not promote a short child PID to an Agent root',
+  );
+  assert.equal(inherited.attribution.rootStartTime, 'agent-root-980');
+}
+
+{
+  const judge = new AgentAttributor({
+    now: () => 1_000_000,
+    readProc: () => undefined,
+  });
+  const incompleteExit = observerEvent({
+    agent: 'codex',
+    pid: 991,
+    ppid: 1,
+    comm: '',
+    exe: '',
+    startTimeNs: 'short-process-991',
+    cwd: '',
+    argv: [],
+  });
+  incompleteExit.event = { ProcessExit: { pid: 991, exit_code: 0, signal: 0 } };
+  const unresolved = judge.classify(incompleteExit);
+  assert.notEqual(
+    unresolved.state,
+    'agent',
+    'identity.agent is a claimed scope label, not executable evidence for a new Agent root',
+  );
 }
 
 {
@@ -299,11 +586,62 @@ function attributor(procEntries = []) {
   const root = judge.classify(observerEvent({ pid: 100, ppid: 1, comm: 'codex', exe: '/usr/local/bin/codex', startTimeNs: '10', argv: ['codex'] }));
   assert.equal(root.state, 'agent');
   assert.equal(root.attribution.agentScopeId, 'codex');
+  assert.match(root.attribution.processGenerationKey, /^pgk_[a-f0-9]{24}$/u);
+  assert.equal(root.attribution.parentProcessGenerationKey, undefined);
 
   const child = judge.classify(observerEvent({ pid: 101, ppid: 100, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '11', argv: ['bash', '-lc', 'rm /tmp/file'] }));
   assert.equal(child.state, 'agent');
   assert.equal(child.attribution.rootPid, 100);
   assert.equal(child.attribution.reason, 'process_lineage');
+  assert.match(child.attribution.processGenerationKey, /^pgk_[a-f0-9]{24}$/u);
+  assert.equal(child.attribution.parentProcessGenerationKey, root.attribution.processGenerationKey);
+  assert.equal(child.attribution.parentLinkAuthority, 'forwarder_process_graph');
+
+  const helper = judge.classify(observerEvent({
+    pid: 102,
+    ppid: 100,
+    comm: 'codex',
+    exe: '/usr/local/bin/codex',
+    startTimeNs: '12',
+    argv: ['codex', '--codex-run-as-fs-helper'],
+  }));
+  assert.equal(helper.state, 'agent');
+  assert.equal(helper.attribution.rootPid, 100);
+  assert.equal(
+    helper.attribution.reason,
+    'process_lineage',
+    'a Codex filesystem helper inherits its terminal root instead of becoming another Agent',
+  );
+}
+
+{
+  const judge = attributor();
+  const orphanedHelper = judge.classify(observerEvent({
+    pid: 190,
+    ppid: 999_999,
+    comm: 'codex',
+    exe: '/usr/local/bin/codex',
+    startTimeNs: '19',
+    argv: ['codex', '--codex-run-as-fs-helper'],
+  }));
+  assert.notEqual(
+    orphanedHelper.state,
+    'agent',
+    'a helper with unavailable ancestry must not manufacture an independent Agent root',
+  );
+  const orphanedSandbox = judge.classify(observerEvent({
+    pid: 191,
+    ppid: 999_999,
+    comm: 'tokio-rt-worker',
+    exe: '/opt/codex/vendor/bin/codex',
+    startTimeNs: '191',
+    argv: ['/tmp/codex-arg0/codex-linux-sandbox', '--sandbox-policy-cwd', '/workspace'],
+  }));
+  assert.notEqual(
+    orphanedSandbox.state,
+    'agent',
+    'a Codex sandbox executor with unavailable ancestry must not become a separate window',
+  );
 }
 
 {
@@ -409,6 +747,7 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(observerEvent({ pid: 400, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: 'old', argv: ['codex'] })).state, 'agent');
   const reused = judge.classify(observerEvent({ pid: 400, ppid: 1, comm: 'worker', exe: '/usr/bin/worker', startTimeNs: 'new', argv: ['worker'] }));
   assert.equal(reused.state, 'non_agent');
+  assert.notEqual(reused.attribution.processGenerationKey, undefined);
 }
 
 {
@@ -487,12 +826,452 @@ function attributor(procEntries = []) {
   exitEvent.event = { ProcessExit: { pid: 600, exit_code: 0, signal: 0 } };
   assert.equal(judge.classify(exitEvent).state, 'agent');
   assert.equal(judge.metrics().tombstones, 1);
-  const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
-  assert.equal(judge.classify(late).state, 'agent', 'a late event reuses the matching process tombstone');
+  const lateSameProcess = observerEvent({
+    pid: 600, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '60', argv: ['codex', 'exec'],
+  });
+  assert.equal(
+    judge.classify(lateSameProcess).state,
+    'agent',
+    'late ToolExec/LlmInteraction for an exited short-lived CLI root must reuse the ProcessKey tombstone',
+  );
+  const lateForeign = observerEvent({
+    pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '61', argv: ['bash', '-c', 'echo late'],
+  });
+  assert.notEqual(
+    judge.classify(lateForeign).state,
+    'agent',
+    'a different startTime (PID reuse) must not inherit the exited root tombstone',
+  );
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
   now += 5_001;
   assert.equal(judge.metrics().tombstones, 0);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-a',
+    bootId: 'boot-a',
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const base = { hostId: 'host-a', bootId: 'boot-a', pid: 2_000, startTime: '200' };
+  const processKeys = new Set([
+    judge.processKey(base),
+    judge.processKey({ ...base, hostId: 'host-b' }),
+    judge.processKey({ ...base, bootId: 'boot-b' }),
+    judge.processKey({ ...base, pid: 2_001 }),
+    judge.processKey({ ...base, startTime: '201' }),
+  ]);
+  assert.equal(
+    processKeys.size,
+    5,
+    'host, boot, pid, and start time must each isolate a ProcessKey',
+  );
+  assert.equal(judge.processKey({ ...base, startTime: '' }), undefined);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-two-roots',
+    bootId: 'boot-two-roots',
+    now: () => 2_000_000,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const first = judge.classify(observerEvent({
+    pid: 2_100,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '210',
+    cwd: '/workspace/first',
+    argv: ['codex'],
+  }));
+  const second = judge.classify(observerEvent({
+    pid: 2_200,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '220',
+    cwd: '/workspace/second',
+    argv: ['codex'],
+  }));
+  assert.equal(first.state, 'agent');
+  assert.equal(second.state, 'agent');
+  assert.equal(first.attribution.agentScopeId, 'codex');
+  assert.equal(second.attribution.agentScopeId, 'codex');
+  assert.ok(first.attribution.agentInstanceId, 'a discovered root must expose an instance ID');
+  assert.ok(second.attribution.agentInstanceId, 'a discovered root must expose an instance ID');
+  assert.notEqual(
+    first.attribution.agentInstanceId,
+    second.attribution.agentInstanceId,
+    'two roots of the same Agent scope must remain separate instances',
+  );
+  assert.notEqual(first.attribution.rootKey, second.attribution.rootKey);
+  assert.equal(judge.runtimeSnapshot().entries.filter((entry) => entry.agentScopeId === 'codex').length, 2);
+}
+
+{
+  let now = 3_000_000;
+  const judge = new AgentAttributor({
+    hostId: 'host-generation',
+    bootId: 'boot-generation',
+    now: () => now,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const rootAEvent = {
+    pid: 2_300,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '230',
+    cwd: '/workspace/root-a',
+  };
+  const rootBEvent = {
+    pid: 2_400,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '240',
+    cwd: '/workspace/root-b',
+  };
+  const rootA = judge.classify(observerEvent({ ...rootAEvent, argv: ['codex'] }));
+  const rootB = judge.classify(observerEvent({ ...rootBEvent, argv: ['codex'] }));
+  const childAEvent = {
+    pid: 2_301,
+    ppid: 2_300,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '231',
+    cwd: '/workspace/root-a',
+    argv: ['bash', '-lc', 'echo first'],
+  };
+  const childBEvent = {
+    pid: 2_401,
+    ppid: 2_400,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '241',
+    cwd: '/workspace/root-b',
+    argv: ['bash', '-lc', 'echo second'],
+  };
+  const childA = judge.classify(observerEvent(childAEvent));
+  const childB = judge.classify(observerEvent(childBEvent));
+  assert.equal(childA.attribution.agentInstanceId, rootA.attribution.agentInstanceId);
+  assert.equal(childB.attribution.agentInstanceId, rootB.attribution.agentInstanceId);
+
+  const childABinding = judge.procs.get(2_301);
+  const rootABeforeExit = judge.rootsByKey.get(rootA.attribution.rootKey);
+  assert.equal(childABinding.rootGeneration, rootABeforeExit.generation);
+
+  now += 10;
+  const exited = judge.classify(processExitEvent(rootAEvent, 17, 0));
+  assert.equal(exited.attribution.agentInstanceId, rootA.attribution.agentInstanceId);
+  const rootAAfterExit = judge.rootsByKey.get(rootA.attribution.rootKey);
+  assert.equal(rootAAfterExit.runtimeState, 'exited');
+  assert.ok(rootAAfterExit.generation > childABinding.rootGeneration);
+
+  const staleMissesBefore = judge.metrics().staleGenerationMisses;
+  const orphanedChild = judge.classify(observerEvent({
+    ...childAEvent,
+    argv: ['bash', '-lc', 'echo after-root-exit'],
+  }));
+  assert.notEqual(
+    orphanedChild.attribution?.agentInstanceId,
+    rootA.attribution.agentInstanceId,
+    'a descendant must not hit an exited root generation',
+  );
+  assert.ok(judge.metrics().staleGenerationMisses > staleMissesBefore);
+
+  const unaffectedChild = judge.classify(observerEvent({
+    ...childBEvent,
+    argv: ['bash', '-lc', 'echo root-b-still-running'],
+  }));
+  assert.equal(unaffectedChild.state, 'agent');
+  assert.equal(unaffectedChild.attribution.agentInstanceId, rootB.attribution.agentInstanceId);
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === rootB.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+  );
+}
+
+{
+  let now = 4_000_000;
+  const liveStartTimes = new Map([[2_500, '250']]);
+  const judge = new AgentAttributor({
+    hostId: 'host-lost',
+    bootId: 'boot-lost',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: (pid) => liveStartTimes.get(pid),
+    livenessMissThreshold: 2,
+    listPids: () => [],
+  });
+  const root = judge.classify(observerEvent({
+    pid: 2_500,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '250',
+    argv: ['pi'],
+  }));
+  const initialGeneration = root.attribution.rootGeneration;
+  liveStartTimes.delete(2_500);
+
+  now += 5_000;
+  assert.deepEqual(judge.checkRootLiveness(), { checked: 1, lost: 0, checkedAt: now });
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+    'one missing liveness read is only suspect, not lost',
+  );
+
+  now += 5_000;
+  assert.deepEqual(judge.checkRootLiveness(), { checked: 1, lost: 1, checkedAt: now });
+  const lost = judge.runtimeSnapshot().entries.find(
+    (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+  );
+  assert.equal(lost.runtimeState, 'lost');
+  assert.equal(lost.activityState, undefined);
+  assert.ok(lost.rootGeneration > initialGeneration);
+  assert.equal(judge.metrics().rootsLost, 1);
+
+  liveStartTimes.set(2_500, '250');
+  now += 1;
+  const recovered = judge.classify(observerEvent({
+    pid: 2_500,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '250',
+    argv: ['pi'],
+  }));
+  assert.equal(recovered.state, 'agent');
+  assert.equal(recovered.attribution.agentInstanceId, root.attribution.agentInstanceId);
+  assert.ok(recovered.attribution.rootGeneration > lost.rootGeneration);
+  assert.equal(
+    judge.runtimeSnapshot().entries.find(
+      (entry) => entry.agentInstanceId === root.attribution.agentInstanceId,
+    )?.runtimeState,
+    'running',
+    'a lost root may recover only when the same complete ProcessKey is observed again',
+  );
+  assert.equal(judge.metrics().rootsRecovered, 1);
+}
+
+{
+  let now = 5_000_000;
+  let observedStart = '260';
+  const judge = new AgentAttributor({
+    hostId: 'host-pid-reuse',
+    bootId: 'boot-pid-reuse',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: () => observedStart,
+    livenessMissThreshold: 2,
+    listPids: () => [],
+  });
+  const oldRoot = judge.classify(observerEvent({
+    pid: 2_600,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '260',
+    argv: ['codex'],
+  }));
+  observedStart = '261';
+  now += 1;
+  const reusedRoot = judge.classify(observerEvent({
+    pid: 2_600,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '261',
+    argv: ['codex'],
+  }));
+  assert.notEqual(reusedRoot.attribution.rootKey, oldRoot.attribution.rootKey);
+  assert.notEqual(reusedRoot.attribution.agentInstanceId, oldRoot.attribution.agentInstanceId);
+  assert.equal(judge.checkRootLiveness().lost, 1, 'a reused PID invalidates the old root immediately');
+  const snapshot = judge.runtimeSnapshot().entries;
+  assert.equal(
+    snapshot.find((entry) => entry.agentInstanceId === oldRoot.attribution.agentInstanceId)?.runtimeState,
+    'lost',
+  );
+  assert.equal(
+    snapshot.find((entry) => entry.agentInstanceId === reusedRoot.attribution.agentInstanceId)?.runtimeState,
+    'running',
+  );
+}
+
+{
+  let now = 6_000_000;
+  const liveStartTimes = new Map([
+    [2_700, '270'],
+    [2_800, '280'],
+  ]);
+  const judge = new AgentAttributor({
+    hostId: 'host-runtime-snapshot',
+    bootId: 'boot-runtime-snapshot',
+    now: () => now,
+    readProc: () => undefined,
+    readStartTime: (pid) => liveStartTimes.get(pid),
+    livenessMissThreshold: 2,
+    activityIdleMs: 1_000,
+    listPids: () => [],
+  });
+  const exitedRootEvent = {
+    pid: 2_700,
+    ppid: 1,
+    comm: 'Kimi Code',
+    exe: '/usr/bin/python3',
+    startTimeNs: '270',
+    argv: ['Kimi Code'],
+  };
+  const exitedRoot = judge.classify(observerEvent(exitedRootEvent));
+  const lostRoot = judge.classify(observerEvent({
+    pid: 2_800,
+    ppid: 1,
+    comm: 'pi',
+    exe: '/usr/bin/node',
+    startTimeNs: '280',
+    argv: ['pi'],
+  }));
+
+  let snapshot = judge.runtimeSnapshot();
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId)?.activityState,
+    'active',
+  );
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId)?.activityState,
+    'active',
+  );
+
+  now += 1_001;
+  snapshot = judge.runtimeSnapshot();
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId)?.activityState,
+    'idle',
+  );
+  assert.equal(
+    snapshot.entries.find((entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId)?.activityState,
+    'idle',
+  );
+
+  now += 1;
+  judge.classify(processExitEvent(exitedRootEvent, 0, 15));
+  liveStartTimes.delete(2_800);
+  judge.checkRootLiveness();
+  now += 5_000;
+  judge.checkRootLiveness();
+  snapshot = judge.runtimeSnapshot();
+  const exited = snapshot.entries.find(
+    (entry) => entry.agentInstanceId === exitedRoot.attribution.agentInstanceId,
+  );
+  const lost = snapshot.entries.find(
+    (entry) => entry.agentInstanceId === lostRoot.attribution.agentInstanceId,
+  );
+  assert.equal(exited.runtimeState, 'exited');
+  assert.equal(exited.activityState, undefined);
+  assert.equal(exited.exitCode, 0);
+  assert.equal(exited.signal, 15);
+  assert.ok(exited.endedAt);
+  assert.equal(lost.runtimeState, 'lost');
+  assert.equal(lost.activityState, undefined);
+  assert.ok(lost.endedAt);
+}
+
+{
+  const judge = new AgentAttributor({
+    hostId: 'host-runtime-placement',
+    bootId: 'boot-runtime-placement',
+    now: () => 6_500_000,
+    readProc: () => undefined,
+    listPids: () => [],
+  });
+  const processResult = judge.classify(observerEvent({
+    pid: 2_900,
+    ppid: 1,
+    comm: 'codex',
+    exe: '/usr/bin/codex',
+    startTimeNs: '290',
+    argv: ['codex'],
+  }));
+  assert.equal(judge.enrichRuntimeRoot(processResult, {
+    state: 'agent',
+    attribution: {
+      monitored: true,
+      classification: 'confirmed_agent',
+      agentScopeId: 'workload-codex',
+      agentInstanceId: 'pod-a/container-a',
+      physicalWorkloadId: 'k8s:cluster-a:pod-a:container-a',
+      workloadRef: {
+        environment: 'kubernetes',
+        kind: 'pod',
+        namespace: 'agents',
+        podName: 'codex-a',
+      },
+      confidence: 1,
+      source: 'kubernetes',
+      conflict: true,
+      evidence: ['identity_conflict:agentScopeId'],
+    },
+  }), true);
+  const runtime = judge.runtimeSnapshot().entries[0];
+  assert.equal(
+    runtime.agentInstanceId,
+    processResult.attribution.agentInstanceId,
+    'workload enrichment must not replace the ProcessKey-derived runtime instance ID',
+  );
+  assert.equal(runtime.agentScopeId, 'codex');
+  assert.equal(runtime.classification, 'confirmed_agent');
+  assert.equal(runtime.physicalWorkloadId, 'k8s:cluster-a:pod-a:container-a');
+  assert.equal(runtime.source, 'kubernetes');
+  assert.deepEqual(runtime.workloadRef, {
+    environment: 'kubernetes',
+    kind: 'pod',
+    namespace: 'agents',
+    podName: 'codex-a',
+  });
+  assert.ok(runtime.evidence.includes('identity_conflict:agentScopeId'));
+}
+
+{
+  const procs = new Map(Array.from({ length: 260 }, (_, index) => {
+    const pid = 3_000 + index;
+    return [pid, {
+      pid,
+      tgid: pid,
+      ppid: 1,
+      startTime: String(pid * 10),
+      comm: index === 259 ? 'codex' : 'worker',
+      exe: index === 259 ? '/usr/bin/codex' : '/usr/bin/worker',
+      argv: index === 259 ? 'codex' : 'worker',
+      cwd: '/workspace',
+    }];
+  }));
+  let yields = 0;
+  const judge = new AgentAttributor({
+    hostId: 'host-batched-reconcile',
+    bootId: 'boot-batched-reconcile',
+    now: () => 7_000_000,
+    listPids: () => [...procs.keys()],
+    readProc: (pid) => procs.get(pid),
+  });
+  const result = await judge.reconcileFromProcBatched({
+    batchSize: 64,
+    yieldNow: async () => { yields += 1; },
+  });
+  assert.equal(result.scanned, 260);
+  assert.equal(result.roots, 1);
+  assert.ok(yields >= 8, 'large reconciliation must yield between read and attribution batches');
+  assert.equal(judge.runtimeSnapshot().entries[0]?.agentScopeId, 'codex');
 }
 
 {
@@ -639,6 +1418,23 @@ function attributor(procEntries = []) {
 }
 
 {
+  let now = 2_000;
+  const budget = new DiscoveryBudget({ limit: 10, globalLimit: 2, windowMs: 1_000, now: () => now });
+  const first = observerEvent({ pid: 921, ppid: 1, comm: 'worker', exe: '/usr/bin/worker' });
+  first.identity.session = 'container-global-a';
+  first.event = { FileAccess: { pid: 921, path: '/tmp/a', write: true } };
+  const second = structuredClone(first);
+  second.identity.session = 'container-global-b';
+  second.process.cgroup = '/docker/container-global-b';
+  assert.equal(budget.allow(first), true);
+  assert.equal(budget.allow(second), true);
+  assert.equal(budget.allow(structuredClone(second)), false, 'node-global discovery budget must bound aggregate unknown load');
+  assert.equal(budget.metrics().suppressed, 1);
+  now += 1_001;
+  assert.equal(budget.allow(first, 1), true, 'pressure-adjusted budget must recover in the next window');
+}
+
+{
   let now = 1000;
   const deduper = new ToolExecDeduper({ windowMs: 5000, now: () => now });
   const event = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo one'] });
@@ -655,56 +1451,159 @@ function attributor(procEntries = []) {
 }
 
 {
-  const requests = [];
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.setEncoding('utf8');
-    req.on('data', (chunk) => { raw += chunk; });
-    req.on('end', () => {
-      requests.push({ path: req.url, body: JSON.parse(raw) });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{"accepted":true}');
-    });
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  assert(address && typeof address === 'object');
-
-  const child = spawn(process.execPath, [fileURLToPath(new URL('./observer-forward.js', import.meta.url))], {
-    stdio: ['pipe', 'ignore', 'pipe'],
-    env: {
-      ...process.env,
-      ANYSENTRY_INGEST_URL: `http://127.0.0.1:${address.port}/security-center/ingest`,
-      ANYSENTRY_HEARTBEAT_SECS: '30',
-      ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
-      A3S_OBSERVER_COLLECTOR_ID: 'observer-test',
-      FORWARD_SCOPE: 'all',
-    },
-  });
-  let childError = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk) => { childError += chunk; });
-  child.stdin.end(`${JSON.stringify({
-    event: {
-      CollectorHeartbeat: {
-        attached_probes: 8,
-        enabled_features: ['exec', 'files', 'network'],
-      },
-    },
-  })}\n`);
-  const exitCode = await Promise.race([
-    new Promise((resolve) => child.once('exit', resolve)),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('forwarder test timed out')), 5000)),
+  const processTable = new Map([
+    [1, { pid: 1, ppid: 0, startTime: '1', comm: 'systemd', exe: '/usr/lib/systemd/systemd', argv: 'systemd' }],
+    [200, { pid: 200, ppid: 1, startTime: '200', comm: 'sshd', exe: '/usr/sbin/sshd', argv: 'sshd: user@pts/1' }],
+    [300, { pid: 300, ppid: 200, startTime: '300', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash' }],
+    [400, { pid: 400, ppid: 300, startTime: '400', comm: 'codex', exe: '/usr/bin/codex', argv: 'codex' }],
+    [500, { pid: 500, ppid: 400, startTime: '500', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash -lc id' }],
   ]);
-  server.close();
-  assert.equal(exitCode, 0, childError);
+  const judge = new AgentAttributor({
+    hostId: 'host-launch-context',
+    bootId: 'boot-launch-context',
+    now: () => 10_000,
+    readProc: (pid) => processTable.get(pid),
+    listPids: () => [],
+  });
+  const child = judge.classify(observerEvent({
+    pid: 500,
+    ppid: 400,
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    startTimeNs: '500',
+    argv: ['bash', '-lc', 'id'],
+  }));
+  assert.equal(child.state, 'agent');
+  const runtime = judge.runtimeSnapshot().entries[0];
+  assert.deepEqual(
+    runtime.launchContext.path.map((node) => node.command),
+    ['systemd', 'sshd', 'bash', 'codex'],
+    'Root launch context must retain the service/session/shell path above the Agent root',
+  );
+  assert.deepEqual(
+    runtime.launchContext.origins.map((origin) => origin.type),
+    ['service_manager', 'ssh_session', 'shell'],
+  );
+  assert.equal(runtime.launchContext.completeness, 'complete');
+  assert.match(runtime.launchContext.rootProcessGenerationKey, /^pgk_[a-f0-9]{24}$/u);
+}
 
-  const heartbeat = requests
-    .filter((request) => request.path === '/security-center/collectors/heartbeat')
-    .map((request) => request.body)
-    .find((body) => body.attachedProbes === 8);
-  assert(heartbeat, 'forwarder heartbeat did not retain attachedProbes=8');
-  assert.deepEqual(heartbeat.enabledFeatures, ['exec', 'files', 'network']);
+{
+  const containerId = '9'.repeat(64);
+  const podUid = 'pod-langgraph-fixture';
+  const cgroup = `0::/kubepods.slice/pod-fixture/cri-containerd-${containerId}.scope`;
+  const processTable = new Map([
+    [3_000, {
+      pid: 3_000,
+      ppid: 1,
+      startTime: '30000',
+      namespacePid: 1,
+      comm: 'python',
+      exe: '/usr/bin/python3',
+      argv: 'python -m uvicorn agent.service:app',
+      cwd: '/srv/agent',
+      cgroup,
+    }],
+    [3_001, {
+      pid: 3_001,
+      ppid: 3_000,
+      startTime: '30001',
+      namespacePid: 8,
+      comm: 'python',
+      exe: '/usr/bin/python3',
+      argv: 'python worker',
+      cwd: '/srv/agent',
+      cgroup,
+    }],
+  ]);
+  const judge = new AgentAttributor({
+    hostId: 'host-kubernetes-runtime',
+    bootId: 'boot-kubernetes-runtime',
+    now: () => 20_000,
+    readProc: (pid) => processTable.get(pid),
+    readStartTime: (pid) => processTable.get(pid)?.startTime,
+    listPids: () => [...processTable.keys()],
+  });
+  judge.seedFromProc();
+  assert.equal(judge.runtimeSnapshot().entries.length, 0,
+    'a generic uvicorn command must not become an Agent from process naming alone');
+
+  const inventoryEntry = {
+    ids: [containerId, containerId.slice(0, 12)],
+    classification: 'confirmed_agent',
+    environment: 'kubernetes',
+    source: 'kubernetes',
+    physicalWorkloadId: `k8s:test-cluster:${podUid}:${containerId}`,
+    agentScopeId: 'langgraph-workflow-sandbox-agent',
+    agentDisplayName: 'langgraph-workflow-sandbox-agent',
+    agentInstanceId: `${podUid}/${containerId}`,
+    namespace: 'agent-lab',
+    podName: 'langgraph-workflow-agent-fixture',
+    podUid,
+    nodeName: 'node-fixture',
+    containerName: 'agent',
+    containerImage: 'fixture/langgraph-agent:1',
+    ownerKind: 'Deployment',
+    ownerName: 'langgraph-workflow-agent',
+    evidence: [
+      'label:anysentry.io/workload-kind=agent',
+      'label:anysentry.io/agent-id=langgraph-workflow-sandbox-agent',
+    ],
+  };
+  const resolvedRoot = judge.resolveWorkloadRuntimeProcess(inventoryEntry);
+  assert.equal(resolvedRoot?.pid, 3_000);
+  assert.equal(resolvedRoot?.namespacePid, 1);
+
+  const cache = new WorkloadIdentityCache({
+    now: () => 20_000,
+    hostId: judge.hostId,
+    bootId: judge.bootId,
+    resolveRuntimeProcess: (entry) => judge.resolveWorkloadRuntimeProcess(entry),
+  });
+  assert.equal(cache.replace({
+    schemaVersion: 'anysentry.workload_identity_snapshot.v1',
+    version: 1,
+    generatedAt: new Date(20_000).toISOString(),
+    ready: true,
+    entries: [inventoryEntry],
+    errors: 0,
+  }), true);
+  const runtime = cache.agentRuntimeInventory();
+  assert.equal(runtime.length, 1);
+  assert.deepEqual(runtime[0], {
+    agentScopeId: 'langgraph-workflow-sandbox-agent',
+    agentDisplayName: 'langgraph-workflow-sandbox-agent',
+    agentInstanceId: `${podUid}/${containerId}`,
+    physicalWorkloadId: `k8s:test-cluster:${podUid}:${containerId}`,
+    classification: 'confirmed_agent',
+    runtimeState: 'running',
+    rootPid: 3_000,
+    rootStartTimeTicks: '30000',
+    rootGeneration: 1,
+    hostId: 'host-kubernetes-runtime',
+    bootId: 'boot-kubernetes-runtime',
+    comm: 'python',
+    exe: '/usr/bin/python3',
+    workspacePath: '/srv/agent',
+    discoveredAt: new Date(20_000).toISOString(),
+    lastSeenAt: new Date(20_000).toISOString(),
+    confidence: 1,
+    source: 'kubernetes',
+    evidence: inventoryEntry.evidence,
+    workloadRef: {
+      environment: 'kubernetes',
+      kind: 'container',
+      name: 'langgraph-workflow-agent-fixture',
+      namespace: 'agent-lab',
+      podName: 'langgraph-workflow-agent-fixture',
+      podUid,
+      nodeName: 'node-fixture',
+      containerName: 'agent',
+      containerImage: 'fixture/langgraph-agent:1',
+      ownerKind: 'Deployment',
+      ownerName: 'langgraph-workflow-agent',
+    },
+  });
 }
 
 console.log('Forwarder attribution and deduplication verification passed.');

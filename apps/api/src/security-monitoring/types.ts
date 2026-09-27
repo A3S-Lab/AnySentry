@@ -2,11 +2,128 @@
 // Response shapes match the dashboard's API contract; every value is computed from live
 // @a3s-lab/sentry judgments.
 
+import type { TrustedCorrelationV1 } from './trusted-correlation';
+import type { ConnectionIdentity, EvidenceLink } from './canonical-observability';
+
+export type {
+  AgentInstance,
+  AgentAdapter,
+  AgentAdapterManifest,
+  ConnectionIdentity,
+  CoverageGap,
+  EvidenceLink,
+  LogicalAgentDefinition,
+  ProcessGeneration,
+  ProcessGenerationKey,
+  RawObservation,
+  RelationRevision,
+  RuntimeContext,
+  RuntimeInstance,
+  SemanticRecord,
+  SessionMembership,
+  TransportDecoderContract,
+  LlmFormatAdapterContract,
+  RuntimeAdapterContract,
+  KernelFact,
+  KernelFactStoreOptions,
+  KernelFactStoreStats,
+  SemanticRecordStoreOptions,
+  SemanticRecordStoreStats,
+  EvidenceLinkStoreOptions,
+  EvidenceLinkStoreStats,
+  SessionMembershipStoreOptions,
+  SessionMembershipStoreStats,
+} from './canonical-observability';
+
+export {
+  AgentAdapterRegistry,
+  CANONICAL_SCHEMA_VERSIONS,
+  RawObservationStore,
+  KernelFactStore,
+  SemanticRecordStore,
+  EvidenceLinkStore,
+  SessionMembershipStore,
+  deriveConnectionIdentity,
+  deriveProcessGenerationKey,
+  normalizeKernelFact,
+  rawObservationFromLine,
+  resolveLogicalAgentDefinition,
+  resolveSessionIdentity,
+  validateCanonicalContract,
+  validateRawObservation,
+  validateKernelFact,
+  validateRelationRevision,
+} from './canonical-observability';
+
+export type {
+  TrustedCorrelationAuthority,
+  TrustedCorrelationClaimReceipt,
+  TrustedCorrelationMethod,
+  TrustedCorrelationScope,
+  TrustedCorrelationTraceOrigin,
+  TrustedCorrelationV1,
+} from './trusted-correlation';
+
 export interface SecurityTimeFilter {
-  timeType?: 'last_3h' | 'last_1d' | 'last_7d' | 'last_30d' | 'custom';
+  timeType?: 'last_30m' | 'last_1h' | 'last_2h' | 'last_3h' | 'last_1d' | 'last_7d' | 'last_30d' | 'custom';
   startTime?: string;
   endTime?: string;
+  /**
+   * Freeze all related queries at one instant. The browser reuses this value for every card and
+   * drill-down until the operator refreshes, so a page never mixes several moving "now" values.
+   */
+  snapshotAsOf?: string;
   scope?: 'agent' | 'raw';
+  /** Historical audit facts or the latest asset/review overlay. Defaults to as_observed. */
+  classificationView?: ClassificationView;
+}
+export type ClassificationView = 'as_observed' | 'current_effective';
+export type QueryTotalMode = 'exact' | 'estimated' | 'omitted';
+export type QueryDataSource = 'clickhouse' | 'clickhouse+hot_delta' | 'clickhouse+redis_current' | 'memory_hot_ring';
+export interface QueryCommitProgress {
+  sourceId?: string;
+  collectorId?: string;
+  /** Greatest event time observed in a successful ClickHouse insert; not a completeness claim. */
+  committedEventTime: string;
+  /** Wall-clock time when that insert completed. */
+  committedAt: string;
+}
+export interface QueryCoverage {
+  requestedFrom: string;
+  requestedTo: string;
+  snapshotAsOf: string;
+  /** Logical read snapshot used by this response; equal across one dashboard refresh. */
+  asOf: string;
+  dataFrom?: string;
+  dataTo?: string;
+  /**
+   * Greatest event time observed in a successful relevant ClickHouse insert.
+   * This is not an event-time watermark and does not prove that older events cannot arrive later.
+   */
+  observedDurableThrough?: string;
+  /** @deprecated Compatibility alias for observedDurableThrough. */
+  committedCutoff?: string;
+  commitBoundaryKind?: 'observed_durable_high_water';
+  commitProgress?: QueryCommitProgress[];
+  commitProgressScope?: 'all_sources' | 'query_sources';
+  lateDataPolicy?: 'commit_journal_revision_repair';
+  /** `exact_as_observed`/`exact_current_effective` with `partial=false` is the §11.4 `coverage=complete` claim. */
+  completeness?: 'exact_as_observed' | 'exact_current_effective' | 'partial';
+  watermark?: string;
+  partial: boolean;
+  partialReason?:
+    | 'hot_ring_only'
+    | 'scan_limit'
+    | 'projection_timeout'
+    | 'storage_unavailable'
+    | 'async_commit_lost'
+    | 'canonical_evidence_link_hot_delta_pending'
+    | 'membership_store_unavailable'
+    | 'membership_ephemeral'
+    | 'membership_limit'
+    | 'membership_records_missing';
+  source: QueryDataSource;
+  totalMode: QueryTotalMode;
 }
 export interface ExplainabilityScanRequest extends SecurityTimeFilter {
   seriesPoints?: number;
@@ -19,14 +136,61 @@ export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 export type RiskType = 'system' | 'communication' | 'atomic';
 export type EventSource = 'observer' | 'synthetic' | 'api';
 export type EventCategory = 'tool' | 'network' | 'file' | 'llm' | 'security' | 'process' | 'runtime' | 'unknown';
+export type ActivityContext = 'agent_action' | 'platform_healthcheck' | 'collector_heartbeat';
+export type ActivitySubtype =
+  | 'docker_healthcheck'
+  | 'k8s_exec_probe'
+  | 'k8s_liveness_probe'
+  | 'k8s_readiness_probe'
+  | 'k8s_startup_probe'
+  | 'observer_heartbeat';
+export type PlatformHealthcheckSubtype = Exclude<ActivitySubtype, 'observer_heartbeat'>;
+export interface PlatformHealthcheckSpec {
+  activitySubtype: PlatformHealthcheckSubtype;
+  argv: string[];
+}
 export type EventAttributeValue = string | number | boolean;
 export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
 export type AgentHealthState = 'active' | 'idle' | 'stale' | 'risky';
+/** Event-history lifecycle used by inventory views; separate from root-process runtime state. */
+export type AgentLifecycleState = 'current' | 'historical' | 'terminated';
+/** Root-process lifecycle. This is intentionally separate from event-derived AgentHealthState. */
+export type AgentRuntimeReportedState = 'running' | 'exited' | 'lost';
+/** `unobserved` is derived by the API when a previously live forwarder stops reporting. */
+export type AgentRuntimeState = AgentRuntimeReportedState | 'unobserved';
+export type AgentActivityState = 'active' | 'idle';
+/** Stable machine-readable outcomes for the runtime lease/snapshot control plane. */
+export type AgentRuntimeAckReasonCode =
+  | 'lease_not_found'
+  | 'lease_epoch_stale'
+  | 'lease_owner_mismatch'
+  | 'stale_forwarder'
+  | 'collector_conflict'
+  | 'capacity_exceeded'
+  | 'validation_error'
+  | 'source_rejected'
+  | 'service_unavailable'
+  | 'snapshot_version_stale'
+  | 'snapshot_version_conflict'
+  | 'ready_regression'
+  | 'identity_conflict'
+  | 'generation_regression'
+  | 'terminal_state_conflict'
+  | 'awaiting_ready';
 export type AgentCriticality = 'low' | 'medium' | 'high' | 'critical';
 export type CollectorHealthState = 'healthy' | 'quiet' | 'degraded' | 'stale' | 'down';
+export type CollectorHealthChannelState = 'healthy' | 'warning' | 'degraded' | 'unknown';
+export interface CollectorHealthChannel {
+  state: CollectorHealthChannelState;
+  stateText: string;
+  reasons: string[];
+  consecutiveBad: number;
+  consecutiveClean: number;
+}
 export type CollectorReportedStatus = 'ok' | 'degraded' | 'error';
 export type AlertStatus = 'open' | 'acknowledged' | 'resolved' | 'silenced';
-export type AlertKind = 'incident' | 'collector' | 'agent' | 'event' | 'source' | 'coverage' | 'objective' | 'remediation';
+export type AlertKind = 'incident' | 'collector' | 'agent' | 'event' | 'judgment' | 'source' | 'coverage' | 'objective' | 'remediation';
+export type AlertTimeMode = 'window' | 'backlog' | 'combined';
 export type TopologyNodeType = 'agent' | 'workspace' | 'collector' | 'tool' | 'network' | 'file' | 'llm' | 'security';
 export type TopologyEdgeType = 'runs_in' | 'observed_by' | 'executes' | 'connects' | 'resolves' | 'accesses' | 'calls_llm' | 'triggers';
 export type MaintenanceTargetType = 'all' | 'workspace' | 'agent' | 'collector' | 'source';
@@ -41,11 +205,100 @@ export type IngestionSourceType = 'observer' | 'forwarder' | 'webhook' | 'otel' 
 export type IngestionSourceStatus = 'active' | 'stale' | 'unused' | 'disabled';
 export type SourceTokenRotationStatus = 'untracked' | 'fresh' | 'overdue';
 export type AgentClassification = 'confirmed_agent' | 'probable_agent' | 'unknown' | 'non_agent';
+export type SessionIdentityQuality =
+  | 'confirmed'
+  | 'strong'
+  | 'inferred'
+  | 'unresolved'
+  | 'ephemeral'
+  | 'unknown'
+  | 'conflict';
+export type SessionIdSource =
+  | 'provider'
+  | 'authenticated_adapter'
+  | 'legacy_observer_session'
+  | 'legacy_agent_fallback'
+  | 'legacy_task_fallback'
+  | 'per_request'
+  | 'unresolved';
+export type WorkloadRole =
+  | 'agent'
+  | 'anysentry_internal'
+  | 'platform_infrastructure'
+  | 'business_service'
+  | 'ordinary_process'
+  | 'unknown';
+export type CaptureProfile =
+  | 'agent_full'
+  | 'probable_investigation'
+  | 'security_full'
+  | 'investigation_full'
+  | 'business_context'
+  | 'infrastructure_aggregate'
+  | 'unknown_discovery'
+  | 'self_health';
+export type UnknownReason =
+  | 'snapshot_not_ready'
+  | 'snapshot_miss'
+  | 'container_identity_missing'
+  | 'container_name_missing'
+  | 'parent_missing'
+  | 'process_exited_before_enrichment'
+  | 'ancestry_incomplete'
+  | 'pid_reuse_ambiguous'
+  | 'signature_miss'
+  | 'template_conflict'
+  | 'policy_expired'
+  | 'shared_scope_ambiguous'
+  | 'unsupported_agent_adapter';
+
+export interface ClassificationSemanticsV1 {
+  schemaVersion: 'anysentry.classification_semantics.v1';
+  identityClassification: AgentClassification;
+  /**
+   * Effective capture/judgment classification.  A probable candidate may use the same full
+   * capture path as a confirmed Agent without changing the observed identity fact above.
+   */
+  effectiveIdentityClassification?: AgentClassification;
+  /** Why the effective classification differs from the observed classification, if it does. */
+  classificationSource?: 'observed' | 'candidate_auto_promoted' | 'policy';
+  workloadRole: WorkloadRole;
+  captureProfile: CaptureProfile;
+  unknownReason?: UnknownReason;
+}
+export type ProcessLifecycleSource = 'exec_process_key' | 'exec_tombstone';
+export type ProcessGenerationLinkAuthority = 'forwarder_process_graph';
 export type AgentReviewDecision = 'confirmed_agent' | 'unknown' | 'non_agent';
+export interface AgentReviewRevisionRecord {
+  revision: number;
+  decision: AgentReviewDecision | 'clear';
+  effectiveAt: number;
+  reviewedBy?: string;
+  note?: string;
+  /** Keys on which this revision applies. A clear revision carries the keys it closes. */
+  identityKeys: string[];
+  /** Keys removed while another decision remains active on a narrower replacement scope. */
+  clearedIdentityKeys?: string[];
+  physicalWorkloadId?: string;
+  agentInstanceId?: string;
+  workloadRef?: AgentWorkloadRef;
+}
 export type JudgmentProfile = 'full' | 'l1_only' | 'discard';
-export type JudgmentRouteReason = 'confirmed_agent_full' | 'candidate_agent_full' | 'candidate_agent_l1_only' | 'unknown_l1_only' | 'non_agent_discarded';
+export type JudgmentRouteReason =
+  | 'confirmed_agent_full'
+  | 'candidate_agent_full'
+  | 'candidate_agent_l1_only'
+  | 'unknown_l1_only'
+  | 'non_agent_discarded'
+  | 'non_agent_security_full'
+  | 'non_agent_agent_conflict_full'
+  | 'non_agent_structural_fallback';
 export interface JudgmentRoutingSnapshot {
   classification: AgentClassification;
+  /** Effective route class; `classification` remains the observed/provenance value. */
+  effectiveClassification?: AgentClassification;
+  /** True when a probable candidate intentionally receives the confirmed full route. */
+  candidateAutoPromoted?: boolean;
   profile: JudgmentProfile;
   maxTier: 'L1' | 'L2' | 'L3';
   reason: JudgmentRouteReason;
@@ -56,6 +309,17 @@ export interface EventJudgmentMetadata extends JudgmentRoutingSnapshot {
   l1Verdict?: Verdict;
   nextTierEligible?: boolean;
   stopReason?: string;
+  /** Unified F3 rule lineage. Additive and never accepted from an untrusted producer. */
+  filterRuleDecision?: {
+    schemaVersion: 'anysentry.filter_rule_decision_lineage.v1';
+    stage: 'f3';
+    catalogVersion: number;
+    domainVersion: number;
+    ruleId?: string;
+    revision?: number;
+    reason: string;
+    failOpen: boolean;
+  };
 }
 export type AgentAttributionSource = 'none' | 'process_graph' | 'cgroup' | 'systemd' | 'argv' | 'env' | 'self_register' | 'workspace_hint' | 'kubernetes' | 'docker' | 'behavior' | 'process_signature' | 'manual_review';
 export type AgentAttributionReason = 'not_evaluated' | 'not_agent' | 'process_lineage' | 'authoritative_anchor' | 'hint_only' | 'conflict' | 'human_confirmed' | 'human_deferred' | 'human_rejected';
@@ -65,8 +329,18 @@ export interface ProcessContext {
   bootId?: string;
   pid?: number;
   ppid?: number;
+  /** PID namespace inode. String-encoded so identity comparison never loses u64 precision. */
+  pidNamespace?: string;
+  /** PID as observed inside pidNamespace (the last NSpid value). */
+  namespacePid?: number;
+  /** Parent PID inside pidNamespace; additive companion used for exact direct-child evidence. */
+  namespacePpid?: number;
   startTimeTicks?: string;
   startTimeNs?: string;
+  /** Canonical PID-reuse-safe identity emitted by a trusted Observer/Forwarder. */
+  processGenerationKey?: string;
+  parentProcessGenerationKey?: string;
+  mountNamespace?: number;
   eventTimeNs?: string;
   comm?: string;
   exe?: string;
@@ -75,6 +349,13 @@ export interface ProcessContext {
   cgroup?: string;
   cgroupId?: string;
   systemdUnit?: string;
+  /** Runtime/Segment evidence. It is not a LogicalAgent key unless policy explicitly says so. */
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  /** Collector-resolved lifecycle provenance for short-lived ProcessExit facts. */
+  lifecycleSource?: ProcessLifecycleSource;
+  /** Closed reason when lifecycle ancestry deliberately remained unresolved. */
+  lifecycleReason?: UnknownReason;
 }
 
 export interface AgentWorkloadRef {
@@ -101,23 +382,41 @@ export interface AgentAttribution {
   agentDisplayName?: string;
   agentSessionId?: string;
   agentInstanceId?: string;
+  /** Forwarder-observed root ProcessKey. It remains additive and does not redefine agentInstanceId. */
+  rootKey?: string;
+  /** Stable Workspace of the Agent root process; distinct from an individual event's cwd. */
+  agentWorkspacePath?: string;
   physicalWorkloadId?: string;
   workloadRef?: AgentWorkloadRef;
   rootPid?: number;
+  rootStartTime?: string;
+  /** Forwarder-observed concrete Process generation; trusted only after Source authentication. */
+  processGenerationKey?: string;
+  /** Exact parent generation observed by the Forwarder process graph. */
+  parentProcessGenerationKey?: string;
+  parentLinkAuthority?: ProcessGenerationLinkAuthority;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
   conflict?: boolean;
   degraded?: boolean;
   evidence?: string[];
+  /** Server-resolved additive identity view; never accepted as producer authority. */
+  correlation?: TrustedCorrelationV1;
 }
 
 export interface WorkloadIdentitySnapshotEntry {
   ids: string[];
   classification: AgentClassification;
+  /** Explicit deployment/inventory role, independent from Agent identity classification. */
+  workloadRole?: WorkloadRole;
   physicalWorkloadId: string;
   source?: 'kubernetes' | 'docker' | 'systemd' | 'host';
   attributionSource?: AgentAttributionSource;
+  /** Persistent human-review generation; additive and ignored by legacy Forwarders. */
+  reviewRevision?: number;
+  /** Wall-clock boundary at which the human review became effective. */
+  effectiveAt?: string;
   environment?: 'kubernetes' | 'docker' | 'host';
   agentScopeId?: string;
   agentDisplayName?: string;
@@ -132,6 +431,10 @@ export interface WorkloadIdentitySnapshotEntry {
   ownerName?: string;
   labels?: Record<string, string>;
   systemdUnit?: string;
+  /** Exact, platform-declared exec probes for this physical container only. */
+  platformHealthchecks?: PlatformHealthcheckSpec[];
+  /** Observer-reported main-process signatures (comm/exe basename only; argv and env never leave the observer). */
+  processes?: Array<{ comm?: string; exeBasename?: string }>;
   evidence: string[];
 }
 
@@ -143,6 +446,218 @@ export interface WorkloadIdentitySnapshot {
   nodeName?: string;
   entries: WorkloadIdentitySnapshotEntry[];
   errors: number;
+}
+
+export type AgentLaunchOriginType =
+  | 'service_manager'
+  | 'systemd_unit'
+  | 'ssh_session'
+  | 'shell'
+  | 'supervisor'
+  | 'cron'
+  | 'container';
+
+export interface AgentLaunchPathNode {
+  processGenerationKey?: string;
+  pid: number;
+  ppid: number;
+  command: string;
+  exe?: string;
+  systemdUnit?: string;
+}
+
+export interface AgentLaunchOrigin {
+  type: AgentLaunchOriginType;
+  processGenerationKey?: string;
+  pid: number;
+  name: string;
+  description?: string;
+  unitFile?: string;
+  restartCount?: number;
+  schedule?: string;
+  /** SSH allowlist projection only; the Forwarder never transmits the complete environment. */
+  remoteAddress?: string;
+  remotePort?: number;
+  localAddress?: string;
+  localPort?: number;
+  tty?: string;
+  terminalSession?: 'tmux' | 'screen';
+}
+
+export interface AgentLaunchContext {
+  schemaVersion: 'anysentry.agent_launch_context.v1';
+  rootProcessGenerationKey: string;
+  observedAt: string;
+  completeness: 'complete' | 'missing_parent' | 'cycle' | 'depth_limit' | 'process_domain_conflict';
+  path: AgentLaunchPathNode[];
+  origins: AgentLaunchOrigin[];
+}
+
+/**
+ * One root-process instance reported by an observer forwarder.
+ *
+ * `agentScopeId` is a display/type label (for example, "codex"). Runtime identity is always
+ * `agentInstanceId`, optionally joined to the existing asset model through `physicalWorkloadId`.
+ */
+export interface AgentRuntimeSnapshotEntry {
+  agentScopeId: string;
+  agentDisplayName?: string;
+  agentInstanceId: string;
+  /** Additive canonical definition identity; absent for unresolved runtime candidates. */
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  /** Runtime identity authority; producer snapshots are candidates until management binding. */
+  logicalIdentityAuthority?: 'management_registration' | 'candidate' | 'legacy';
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  /** Application deployment/revision boundary; distinct from LogicalAgent definition identity. */
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  physicalWorkloadId?: string;
+  classification?: AgentClassification;
+  runtimeState: AgentRuntimeReportedState;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  rootGeneration: number;
+  hostId: string;
+  bootId: string;
+  comm?: string;
+  exe?: string;
+  workspacePath?: string;
+  discoveredAt: string;
+  lastSeenAt: string;
+  lastActivityAt?: string;
+  endedAt?: string;
+  exitCode?: number;
+  signal?: number;
+  confidence?: number;
+  source?: AgentAttributionSource;
+  evidence?: string[];
+  workloadRef?: AgentWorkloadRef;
+  launchContext?: AgentLaunchContext;
+}
+
+export interface AgentRuntimeLeaseRequest {
+  collectorId: string;
+  forwarderInstanceId: string;
+  hostId: string;
+  bootId: string;
+  forwarderPid: number;
+  forwarderStartTimeTicks: string;
+}
+
+export interface AgentRuntimeLeaseAck {
+  accepted: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  issuedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** A complete, monotonically-versioned view produced by one forwarder process. */
+export interface AgentRuntimeSnapshotRequest {
+  schemaVersion: 'anysentry.agent_runtime_snapshot.v1';
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  generatedAt: string;
+  ready: boolean;
+  intervalSecs: number;
+  filterMode?: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  entries: AgentRuntimeSnapshotEntry[];
+}
+
+export interface AgentRuntimeSnapshotAck {
+  accepted: boolean;
+  applied: boolean;
+  duplicate: boolean;
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  leaseEpoch?: number;
+  snapshotVersion?: number;
+  snapshotHash?: string;
+  ready: boolean;
+  instanceCount: number;
+  receivedAt: string;
+  reasonCode?: AgentRuntimeAckReasonCode;
+  reason?: string;
+}
+
+/** Sanitized in-memory record returned to aggregation/query consumers. Epoch values are millis. */
+export interface AgentRuntimeInstanceRecord
+  extends Omit<AgentRuntimeSnapshotEntry, 'runtimeState' | 'discoveredAt' | 'lastSeenAt' | 'lastActivityAt' | 'endedAt'> {
+  /** Canonical exact root-process generation; V1 keeps `agentInstanceId` for wire compatibility. */
+  canonicalAgentInstanceId?: string;
+  /** Authenticated Source provenance attached by the API; never accepted from the snapshot body. */
+  sourceId?: string;
+  /** Strong equivalent producer identifiers only; physical workload IDs are not runtime aliases. */
+  agentInstanceAliases?: string[];
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  snapshotHash: string;
+  filterMode: 'shadow' | 'enforce';
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  runtimeState: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  discoveredAt: number;
+  lastSeenAt: number;
+  lastActivityAt?: number;
+  endedAt?: number;
+  receivedAt: number;
+}
+
+export interface AgentRuntimeStateQuery {
+  collectorId?: string;
+  /** Optional authenticated Source scope for canonical reads; not part of the legacy wire snapshot. */
+  sourceId?: string;
+  forwarderInstanceId?: string;
+  agentScopeId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  runtimeState?: AgentRuntimeState | 'all';
+  activityState?: AgentActivityState | 'all';
+  includeShadow?: boolean;
+  limit?: number;
+}
+
+export interface AgentRuntimeStateSummary {
+  totalInstances: number;
+  runningInstances: number;
+  activeInstances: number;
+  idleInstances: number;
+  exitedInstances: number;
+  lostInstances: number;
+  unobservedInstances: number;
+  shadowInstances: number;
+}
+
+export interface AgentRuntimeStateList {
+  items: AgentRuntimeInstanceRecord[];
+  total: number;
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
+}
+
+export interface AgentRuntimeStateSummaryResponse {
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
 }
 export type CoverageIssueType =
   | 'collector_down'
@@ -164,24 +679,92 @@ export interface JudgedEvent {
   eventId: string;
   sourceEventId?: string;
   at: number; // epoch ms
+  /** Exact source event time when an authenticated Collector supplied calibrated Unix nanoseconds. */
+  eventAtUnixNs?: string;
+  /** Exact Collector ring-receipt time; distinct from API/ClickHouse ingestion time. */
+  receivedAtUnixNs?: string;
+  receivedAt?: number;
+  eventTimeQuality?: 'collector_calibrated' | 'producer_supplied' | 'api_received';
+  /** Exact Ring-before decision generation. String encoded because the kernel value is u64. */
+  captureEpoch?: string;
+  captureProfileCode?: number;
+  captureActionCode?: number;
+  captureAuthorityCode?: number;
+  captureDispositionCode?: number;
+  captureSelected?: boolean;
+  captureFlags?: number;
+  capturePolicyVersion?: number;
   eventKind: string; // ToolExec | Egress | FileAccess | Dns | SslContent | SecurityAction
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string; // human summary of the event
   workspacePath: string;
   agentId: string;
+  subjectAssetId?: string;
+  subjectAssetType?: 'agent' | 'service' | 'infrastructure' | 'workload' | 'ephemeral_process';
+  assetBindingQuality?: 'exact' | 'logical' | 'ephemeral' | 'weak' | 'conflict' | 'unassigned';
+  assetBindingRevision?: number;
+  assetBindingReason?: string;
+  identityRevision?: number;
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
+  /** Additive migration metadata: old required sessionId remains byte-compatible. */
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  /** Canonical machine-side fact derived from the immutable raw observation, when applicable. */
+  kernelFactId?: string;
+  /** Functional/deployment generation.  This is distinct from the physical runtime process. */
+  canonicalAgentInstanceId?: string;
+  /** Physical process/container/Pod generation used for Kernel correlation. */
+  runtimeInstanceId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  sessionKey?: string;
+  /** Opaque canonical Session ID used by the new evidence lane. */
+  canonicalSessionId?: string;
+  /** Opaque namespace used to keep parent/fork references stable without exposing tenant data. */
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  logicalDefinitionFingerprint?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   userId: string;
   traceId: string;
+  /** Additive trusted invocation identity; never aliases or replaces traceId. */
+  invocationId?: string;
+  toolCallId?: string;
   spanId: string;
   parentSpanId?: string;
   runId: string;
+  turnId?: string;
+  /** Additive provenance for the required legacy runId field; Session is never used as a fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  /** Strictly increasing within one eventId. Timestamp is only a tie-breaker, never the revision. */
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
@@ -196,6 +779,8 @@ export interface JudgedEvent {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, EventAttributeValue>;
+  /** Additive S3 identity/role/capture view. It is never a filtering authority. */
+  classificationSemantics?: ClassificationSemanticsV1;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
@@ -206,15 +791,58 @@ export interface EventMeta {
   workspacePath: string;
   agentId: string;
   sessionId: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  sessionKey?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  logicalDefinitionFingerprint?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  terminalContextId?: string;
   userId: string;
   source?: EventSource;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   traceId?: string;
+  /** Producer claims. They are trusted only after server-side Source policy authorization. */
+  invocationId?: string;
+  toolCallId?: string;
   spanId?: string;
   parentSpanId?: string;
   runId?: string;
+  /** Producer-supplied run anchor retained alongside the canonical run identity. */
+  producerRunId?: string;
+  turnId?: string;
+  /** Distinguishes an Adapter-provided Run from the compatibility event-local fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   attributes?: Record<string, EventAttributeValue>;
+  /** Forwarder-resolved S3 view; the server validates its closed schema before persistence. */
+  classificationSemantics?: ClassificationSemanticsV1;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   rawPreview?: string;
@@ -223,6 +851,24 @@ export interface EventMeta {
   subject?: string;
   eventKind?: string;
   sourceEventId?: string;
+  subjectAssetId?: string;
+  subjectAssetType?: JudgedEvent['subjectAssetType'];
+  assetBindingQuality?: JudgedEvent['assetBindingQuality'];
+  assetBindingRevision?: number;
+  assetBindingReason?: string;
+  identityRevision?: number;
+  eventAtUnixNs?: string;
+  receivedAtUnixNs?: string;
+  receivedAt?: number;
+  eventTimeQuality?: 'collector_calibrated' | 'producer_supplied' | 'api_received';
+  captureEpoch?: string;
+  captureProfileCode?: number;
+  captureActionCode?: number;
+  captureAuthorityCode?: number;
+  captureDispositionCode?: number;
+  captureSelected?: boolean;
+  captureFlags?: number;
+  capturePolicyVersion?: number;
 }
 
 export interface UniversalIngestEvent extends Partial<EventMeta> {
@@ -249,8 +895,18 @@ export interface UniversalIngestEvent extends Partial<EventMeta> {
   promptTokens?: string | number;
   completionTokens?: string | number;
   status?: string | number;
+  exit_code?: string | number;
+  exitCode?: string | number;
+  signal?: string | number;
   runtimeKind?: string;
   raw?: unknown;
+  /** Product-neutral provider/session anchors; never treated as an OS/runtime identity. */
+  providerSessionId?: string;
+  conversationId?: string;
+  threadId?: string;
+  serviceStateful?: boolean;
+  resume?: boolean;
+  fork?: boolean;
 }
 export interface UniversalIngestRequest extends Partial<EventMeta> {
   event?: UniversalIngestEvent;
@@ -269,14 +925,28 @@ export interface UniversalIngestRequest extends Partial<EventMeta> {
   sourceName?: string;
   sourceType?: IngestionSourceType;
   token?: string;
+  providerSessionId?: string;
+  conversationId?: string;
+  threadId?: string;
+  serviceStateful?: boolean;
+  resume?: boolean;
+  fork?: boolean;
 }
 export type UniversalIngestBody = UniversalIngestRequest | Array<UniversalIngestRequest & Record<string, unknown>>;
 export interface UniversalIngestResultItem {
   index: number;
   accepted: boolean;
+  /** Exact authenticated external-id replay; no new event revision or side effect was created. */
+  duplicate?: boolean;
+  disposition?: 'retained' | 'discarded' | 'rejected' | 'retryable';
+  /** True when the raw payload was omitted only after its compact lifecycle fact was durable. */
+  structuralConsumed?: boolean;
+  reasonCode?: string;
   reason?: string;
   eventId?: string;
   traceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
   spanId?: string;
   runId?: string;
   verdict?: Verdict;
@@ -292,6 +962,38 @@ export interface UniversalIngestResult {
   acceptedEvents: number;
   rejectedEvents: number;
   items: UniversalIngestResultItem[];
+}
+
+export type ObserverBatchIngestDisposition = 'retained' | 'discarded' | 'rejected' | 'retryable';
+export interface ObserverBatchIngestResultItem extends UniversalIngestResultItem {
+  disposition: ObserverBatchIngestDisposition;
+  reasonCode?: string;
+  /** The event is durable, but at least one idempotent post-commit delivery still needs retry. */
+  deliveryIncomplete?: boolean;
+  /**
+   * The immutable event was accepted, but one or more rebuildable projections were unavailable.
+   * This is an additive degradation marker; unlike `disposition=retryable` it never asks the
+  * Forwarder to replay an already durable fact.
+  */
+  projectionIncomplete?: boolean;
+  /** Bounded opaque CoverageGap identifiers for the failed projections. */
+  projectionGapIds?: string[];
+}
+export interface ObserverBatchIngestResult {
+  accepted: boolean;
+  batchId?: string;
+  payloadDigest?: string;
+  acceptedEvents: number;
+  retainedEvents: number;
+  structuralEvents?: number;
+  discardedEvents: number;
+  rejectedEvents: number;
+  retryableEvents: number;
+  deliveryIncompleteEvents?: number;
+  /** Number of accepted events whose post-commit projections recorded a CoverageGap. */
+  projectionIncompleteEvents?: number;
+  retryAfterMs?: number;
+  items: ObserverBatchIngestResultItem[];
 }
 
 export type SecurityCapabilityAction = 'list' | 'search' | 'describe' | 'execute';
@@ -533,7 +1235,14 @@ export interface SecurityCapabilityResponse {
 
 // ---- Response DTOs (identical field names to the frontend) ----
 
-export interface SecurityHealthCard {
+export interface ClassifiedResponseMeta {
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
+  coverage?: QueryCoverage;
+}
+
+export interface SecurityHealthCard extends ClassifiedResponseMeta {
   healthScore: number;
   healthStatusText: string;
   tokenConsumptionTotal: number;
@@ -544,19 +1253,19 @@ export interface WaveSeriesPoint {
   value: number;
   activationCount: number;
 }
-export interface SecurityExplainabilityScan {
+export interface SecurityExplainabilityScan extends ClassifiedResponseMeta {
   waveSeries: Array<{ safeSeries: WaveSeriesPoint[]; riskSeries: WaveSeriesPoint[] }>;
   threatInterception: string;
   sessionActiveCount: string;
   updateTime: string;
 }
-export interface SecurityPerformanceCard {
+export interface SecurityPerformanceCard extends ClassifiedResponseMeta {
   componentRequestCount: { current: number; peak: number; avg: number };
   tps: { current: number; peak: number; avg: number };
   avgLatency: { value: number; unit: string };
   updateTime: string;
 }
-export interface SecurityRiskSummary {
+export interface SecurityRiskSummary extends ClassifiedResponseMeta {
   summaryCards: Array<{ riskTypeCode: string; riskTypeName: string; eventCount: number }>;
   updateTime: string;
 }
@@ -565,13 +1274,13 @@ export interface RiskCategory {
   displayColor?: string;
   items: Array<{ riskCode: string; riskName: string; eventCount: number; changeRate: number }>;
 }
-export interface SecurityRiskBreakdown {
+export interface SecurityRiskBreakdown extends ClassifiedResponseMeta {
   systemRisks: RiskCategory;
   communicationRisks: RiskCategory;
   singleAgentRisks: RiskCategory;
   updateTime: string;
 }
-export interface SecurityHighestRiskSession {
+export interface SecurityHighestRiskSession extends ClassifiedResponseMeta {
   sessionId: string;
   userId: string;
   workspacePath: string;
@@ -582,18 +1291,85 @@ export interface SecurityHighestRiskSession {
   riskDimensions: Array<{ dimensionCode: string; dimensionName: string; score: number }>;
   updateTime: string;
 }
-export interface SecurityDecisionFunnel {
+export interface SecurityDecisionFunnel extends ClassifiedResponseMeta {
   tiers: Array<{ tierCode: string; tierName: string; count: number; percentage: number; slaDesc: string }>;
   finalBlock: { count: number; percentage: number };
   updateTime: string;
 }
-export interface AgentObservability {
+export interface AgentObservability extends ClassifiedResponseMeta {
   health: { heartbeatOk: boolean; resourceUtil: number; errorRate: number; decisionLatencyMs: number };
   behavioral: { actionRate: number; decisionPattern: 'baseline' | 'drift'; stateTransitions: number; goalProgress: number };
   system: { agentCount: number; commThroughput: number; infraHealthy: boolean };
+  coverage?: QueryCoverage;
   updateTime: string;
 }
-export interface SecurityWorkspaceRiskDistribution {
+export type PlatformMetricStatus = 'healthy' | 'warning' | 'critical' | 'unknown';
+export type PlatformMetricSource = 'prometheus' | 'runtime_fallback';
+
+export interface PlatformMetricPoint {
+  at: string;
+  value: number;
+}
+
+export interface PlatformMetricSeries {
+  key: 'cpu' | 'memory' | 'disk' | 'network_rx' | 'network_tx' | 'api_p95' | 'api_error_rate';
+  label: string;
+  unit: '%' | 'B/s' | 'ms';
+  points: PlatformMetricPoint[];
+}
+
+export interface PlatformComponentMetric {
+  id: string;
+  name: string;
+  kind: 'service' | 'node' | 'scrape_target';
+  status: PlatformMetricStatus;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  memoryLimitBytes?: number;
+  memoryPercent?: number;
+  lastSeen?: string;
+  message?: string;
+}
+
+export interface PlatformMetricAnomaly {
+  id: string;
+  severity: 'warning' | 'critical';
+  metric: string;
+  subject: string;
+  value: number;
+  unit: '%' | 'ms';
+  threshold: number;
+  message: string;
+}
+
+export interface PlatformMetricsOverview {
+  schemaVersion: 'anysentry.platform_metrics.v1';
+  status: 'ready' | 'partial' | 'unavailable';
+  source: PlatformMetricSource;
+  from: string;
+  to: string;
+  stepSeconds: number;
+  updatedAt: string;
+  summary: {
+    nodeReady?: number;
+    nodeTotal?: number;
+    cpuPercent?: number;
+    memoryPercent?: number;
+    diskPercent?: number;
+    networkRxBytesPerSecond?: number;
+    networkTxBytesPerSecond?: number;
+    apiP95Ms?: number;
+    apiErrorRatePercent?: number;
+    apiRequestRate?: number;
+    componentAnomalies: number;
+  };
+  series: PlatformMetricSeries[];
+  components: PlatformComponentMetric[];
+  anomalies: PlatformMetricAnomaly[];
+  message?: string;
+}
+
+export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
   list: Array<{ workspacePath: string; sessionCount: number; totalRiskScore: number; riskLevel: string; riskLevelText: string }>;
   updateTime: string;
 }
@@ -602,6 +1378,8 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: 'agent' | 'raw';
   /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
   includeUnknown?: boolean;
+  /** Bounded hot-ring preview for dashboard first paint; full history remains separately available. */
+  preview?: boolean;
   /** Query the durable ClickHouse history instead of only the hot dashboard window. */
   durable?: boolean;
   noise?: 'hide' | 'include';
@@ -610,47 +1388,119 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   collectorId?: string;
   agentId?: string;
   agentAssetId?: string;
+  subjectAssetId?: string;
+  agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
+  /** Independent trusted-invocation predicate; traceId keeps its legacy meaning. */
+  invocationId?: string;
+  /** Independent authenticated ToolCall predicate; it never aliases taskId. */
+  toolCallId?: string;
   runId?: string;
   eventKind?: string;
   eventCategory?: EventCategory;
+  activityContext?: ActivityContext;
   verdict?: Verdict;
   tier?: Tier;
   q?: string;
   limit?: number;
+  totalMode?: QueryTotalMode;
 }
 export interface AgentEventListItem {
   schemaVersion: 'anysentry.agent_event.v1';
   eventId: string;
   sourceEventId?: string;
   at: string;
+  eventAtUnixNs?: string;
+  receivedAtUnixNs?: string;
+  receivedAt?: string;
+  eventTimeQuality?: JudgedEvent['eventTimeQuality'];
+  captureEpoch?: string;
+  captureProfileCode?: number;
+  captureActionCode?: number;
+  captureAuthorityCode?: number;
+  captureDispositionCode?: number;
+  captureSelected?: boolean;
+  captureFlags?: number;
+  capturePolicyVersion?: number;
   eventKind: string;
   eventCategory: EventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: EventSource;
   subject: string;
   workspacePath: string;
   agentId: string;
   agentAssetId: string;
+  agentAssetAliases?: string[];
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  agentRuntimeInstanceAliases?: string[];
+  identityBindingQuality?: 'exact' | 'weak';
+  identityReasonCode?: string;
+  subjectAssetId?: string;
+  subjectAssetType?: 'agent' | 'service' | 'infrastructure' | 'workload' | 'ephemeral_process';
+  assetBindingQuality?: 'exact' | 'logical' | 'ephemeral' | 'weak' | 'conflict' | 'unassigned';
+  assetBindingRevision?: number;
+  assetBindingReason?: string;
+  asObservedIdentityRevision?: number;
   displayName?: string;
   detectedName?: string;
   detectedClassification: AgentClassification;
+  /** Immutable identity decision recorded when this event occurred. */
+  asObservedClassification: AgentClassification;
+  /** Latest asset/review overlay; it never changes verdict/tier/reason. */
+  currentEffectiveClassification: AgentClassification;
+  /** Candidate capture policy provenance; does not assert a confirmed business identity. */
+  candidateAutoPromoted?: boolean;
   effectiveClassification: AgentClassification;
+  currentReviewRevision?: number;
+  currentReviewEffectiveAt?: string;
   runtime: 'kubernetes' | 'docker' | 'host' | 'unknown';
   locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalDefinitionFingerprint?: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
   sessionId: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  legacySessionId?: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  sessionResolutionRevision?: number;
   userId: string;
   traceId: string;
+  invocationId?: string;
+  toolCallId?: string;
+  correlation?: TrustedCorrelationV1;
   spanId: string;
   parentSpanId?: string;
   runId: string;
+  /** Additive provenance for the required legacy runId field; Session is never used as a fallback. */
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
   taskId?: string;
   decisionStatus?: DecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: Verdict;
   tier: Tier;
@@ -663,23 +1513,1273 @@ export interface AgentEventListItem {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, EventAttributeValue>;
+  classificationSemantics?: ClassificationSemanticsV1;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
+  ruleLineage?: UnifiedFilterRuleLineage;
   repeatCount?: number;
   lastAt?: string;
   rawPreview?: string;
 }
-export interface AgentEventList {
+export interface AgentEventList extends ClassifiedResponseMeta {
   items: AgentEventListItem[];
   total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  totalApproximate?: boolean;
+  storageFallback?: 'hot_ring';
   updateTime: string;
 }
-export interface AgentTimeline {
+export interface AgentTimeline extends ClassifiedResponseMeta {
   traceId: string;
   runId?: string;
   sessionId?: string;
   items: AgentEventListItem[];
+  total: number;
+  hasMore: boolean;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export type AgentActionOrigin = 'semantic' | 'kernel_inferred';
+export type AgentActionStatus = 'running' | 'succeeded' | 'failed' | 'incomplete';
+export interface AgentActionItem {
+  actionId: string;
+  origin: AgentActionOrigin;
+  status: AgentActionStatus;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
+  sourceId?: string;
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  toolName: string;
+  operation: 'execute_tool' | 'kernel_exec' | 'file_access' | 'file_read' | 'file_write' | 'file_delete' | 'network_connect';
+  targetSummary?: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  semanticEventIds: string[];
+  fallbackEventId?: string;
+  evidenceState: 'available_on_demand' | 'runtime_level';
+  evidenceHref?: string;
+}
+export interface AgentActionList extends ClassifiedResponseMeta {
+  items: AgentActionItem[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export type AgentInteractionCompleteness =
+  | 'complete'
+  | 'partial'
+  | 'truncated'
+  | 'redacted'
+  | 'reference_only'
+  | 'unavailable'
+  | 'unsupported';
+
+export interface AgentInteractionMessage {
+  role: string;
+  content: unknown;
+  name?: string;
+  toolCallId?: string;
+  sourceItemId?: string;
+  turnId?: string;
+  contentItemKinds?: string[];
+  messageOrigin?: 'human_input' | 'agent_context' | 'developer_instruction' | 'assistant_history' | 'tool_history';
+}
+
+export type AgentConversationAnchorKind =
+  | 'provider_conversation'
+  | 'response_id'
+  | 'previous_response_id'
+  | 'continuity_key'
+  | 'message_item_id'
+  | 'turn_id'
+  | 'tool_call_id';
+
+export interface AgentConversationAnchor {
+  kind: AgentConversationAnchorKind;
+  namespace: string;
+  valueHash: string;
+  strength: 'exact' | 'strong' | 'supporting';
+  sourcePath: string;
+}
+
+export interface AgentInteractionToolCall {
+  toolCallId: string;
+  name: string;
+  /** Adapter-declared canonical tool kind; `name` remains the wire raw name. */
+  canonicalKind?: 'shell' | 'file_read' | 'file_write' | 'file_edit' | 'search'
+    | 'browser' | 'mcp' | 'subagent' | 'unknown';
+  arguments: unknown;
+  issuedAtUnixNs?: string;
+}
+
+export interface AgentInteractionToolResult {
+  toolCallId: string;
+  name?: string;
+  content: unknown;
+  /** Optional because older adapters may emit a result without an error bit; absence is
+   * `unknown`, never an implicit success. */
+  isError?: boolean;
+  observedAtUnixNs?: string;
+}
+
+export type AgentInteractionSemanticActor = 'user' | 'model' | 'tool';
+export type AgentInteractionSemanticKind =
+  | 'user_message'
+  | 'model_progress'
+  | 'model_final'
+  | 'tool_call'
+  | 'tool_result';
+
+export interface AgentInteractionSemanticItem {
+  semanticItemId: string;
+  actor: AgentInteractionSemanticActor;
+  kind: AgentInteractionSemanticKind;
+  phase?: 'progress' | 'final';
+  origin: 'request' | 'response';
+  atUnixNs: string;
+  content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  sourceItemId?: string;
+  turnId?: string;
+  contentItemKinds?: string[];
+  messageOrigin?: AgentInteractionMessage['messageOrigin'];
+  outputIndex?: number;
+  contentIndex?: number;
+  sequenceNumber?: number;
+  completeness: 'complete' | 'partial' | 'missing';
+  partialReasons: string[];
+}
+
+export interface AgentInteractionContent {
+  body: string;
+  encoding: 'utf8' | 'base64';
+  contentType: string;
+  capturedBytes: number;
+  decodedBytes: number;
+  sha256: string;
+  completeness: AgentInteractionCompleteness;
+  messages?: AgentInteractionMessage[];
+  text?: string;
+  structured?: unknown;
+}
+
+export interface AgentInteractionTokenUsage {
+  source: 'provider_reported';
+  completeness: 'complete' | 'partial';
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokensDerived: boolean;
+}
+
+export interface AgentUsageSummary {
+  modelCallCount: number;
+  successfulModelCallCount: number;
+  failedModelCallCount: number;
+  tokenReportedModelCallCount: number;
+  tokenCoverage: 'complete' | 'partial' | 'unavailable';
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  totalDurationMs: number;
+  averageDurationMs?: number;
+}
+
+export interface AgentInstanceUsageSummary extends AgentUsageSummary {
+  agentInstanceId: string;
+}
+
+export interface AgentInteractionRecord {
+  schemaVersion: 'anysentry.agent_interaction.v1';
+  interactionId: string;
+  interactionType: 'model' | 'tool' | 'remote_agent' | 'unparsed';
+  /** True for an application/OTLP semantic projection synthesized without a transport body. */
+  semanticOnly?: boolean;
+  at: number;
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  workspacePath: string;
+  sourceId?: string;
+  collectorId?: string;
+  agentAssetId: string;
+  /** Legacy compatibility field; existing readers use this as the physical runtime alias. */
+  agentInstanceId?: string;
+  /** Canonical functional AgentInstance (deployment/root-start generation). */
+  canonicalAgentInstanceId?: string;
+  /** Canonical physical RuntimeInstance used for Kernel correlation. */
+  runtimeInstanceId?: string;
+  agentProduct?: string;
+  /** Matched AgentAdapterManifest id when applyAgentAdapter ran at ingest. */
+  agentAdapterId?: string;
+  environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  runtimeSessionId?: string;
+  rawObservationId?: string;
+  sourceObservationIds?: string[];
+  kernelFactId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  terminalContextId?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionIdSource?: SessionIdSource;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+  /** Cross-agent hop from `x-anysentry-hop` (orchestrator / worker). */
+  hop?: string;
+  /** Workflow node from `x-anysentry-workflow-node` (plan / work / verify). */
+  workflowNode?: string;
+  /** Per-delegation UUID from `x-anysentry-delegation-id`. */
+  delegationId?: string;
+  /** Wire `x-anysentry-agent-id` (metadata only; does not override cgroup identity). */
+  agentIdHeader?: string;
+  traceId?: string;
+  runId?: string;
+  /** Producer-supplied run anchor retained alongside the canonical run identity. */
+  producerRunId?: string;
+  runIdSource?: 'producer' | 'derived_ephemeral' | 'legacy';
+  sessionId?: string;
+  /** Canonical scope-qualified Session key; native IDs remain compatibility aliases. */
+  sessionKey?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  providerSessionIdHash?: string;
+  invocationId?: string;
+  providerConversationId?: string;
+  providerResponseId?: string;
+  providerPreviousResponseId?: string;
+  trafficRole?: 'conversation' | 'bootstrap' | 'control' | 'context_replay'
+    | 'tool_backend' | 'derived_metadata' | 'retry' | 'background' | 'delegation' | 'unclassified';
+  conversationAnchors?: AgentConversationAnchor[];
+  evidenceEventIds?: string[];
+  conversationId?: string;
+  conversationIdSource?: 'provider' | 'runtime' | 'inferred';
+  conversationBindingVersion?: number;
+  turnId?: string;
+  modelCallId?: string;
+  attemptId?: string;
+  runtimeRole?: 'agent_root' | 'network_runtime' | 'tool_runtime';
+  correlationQuality?: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
+  detectedClassification: AgentClassification;
+  currentEffectiveClassification: AgentClassification;
+  /** Candidate provenance is retained even when capture uses the confirmed full path. */
+  candidateAutoPromoted?: boolean;
+  process?: ProcessContext;
+  connectionId: string;
+  /** Observer tls_ctx↔socket bind quality when present (`cookie` / `fd`). */
+  bindQuality?: 'cookie' | 'fd' | 'unbound';
+  socketFd?: number;
+  socketCookie?: string;
+  fdGeneration?: string;
+  /** Canonical connection identity derived at ingest from Observer bind + process generation. */
+  connectionIdentity?: ConnectionIdentity;
+  transport: 'http' | 'tls';
+  protocol: string;
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: 'parsed' | 'partial' | 'unparsed' | 'ambiguous';
+  llmLikelihood?: 'confirmed' | 'likely' | 'unknown' | 'unlikely';
+  schemaFingerprint?: string;
+  transportCompleteness?: 'complete' | 'partial';
+  wireCompleteness?: 'complete' | 'error' | 'unknown' | 'partial';
+  conversationCompleteness?: 'complete' | 'tool_pending' | 'response_pending' | 'partial';
+  endpoint: string;
+  method: string;
+  path: string;
+  /** Normalized HTTP route shape; preserves the raw path separately and is never an identity key. */
+  routeShape?: string;
+  statusCode: number;
+  model?: string;
+  startedAtUnixNs: string;
+  requestCompleteAtUnixNs: string;
+  firstResponseAtUnixNs: string;
+  endedAtUnixNs: string;
+  durationNs: string;
+  timeQuality: string;
+  request: AgentInteractionContent;
+  response: AgentInteractionContent;
+  usage?: AgentInteractionTokenUsage;
+  toolCalls: AgentInteractionToolCall[];
+  toolResults: AgentInteractionToolResult[];
+  semanticParserId?: string;
+  semanticParserVersion?: number;
+  semanticItems?: AgentInteractionSemanticItem[];
+  completeness: AgentInteractionCompleteness;
+  partialReasons: string[];
+  captureSource: string;
+  receivedAt: number;
+}
+
+export interface AgentInteractionQuery extends SecurityTimeFilter {
+  /** Internal canonical timeline hint; does not alter ordinary interaction filtering. */
+  includeBackground?: boolean;
+  /** Immutable member IDs for bounded canonical Session reads. */
+  interactionIds?: readonly string[];
+  /** Exact application correlation anchors for canonical point reads. */
+  sessionId?: string;
+  runId?: string;
+  /** Producer/run header or interaction invocation; used for Tool↔Kernel point reads. */
+  invocationId?: string;
+  traceId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  interactionId?: string;
+  interactionType?: 'model' | 'tool' | 'remote_agent' | 'unparsed';
+  routeShape?: string;
+  model?: string;
+  transport?: 'http' | 'tls';
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: 'parsed' | 'partial' | 'unparsed' | 'ambiguous';
+  completeness?: AgentInteractionCompleteness;
+  limit?: number;
+}
+
+export interface AgentInteractionList extends ClassifiedResponseMeta {
+  items: AgentInteractionRecord[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export type AgentConversationCoverageStatus =
+  | 'complete'
+  | 'partial'
+  | 'attach_pending'
+  | 'unsupported_tls_profile'
+  | 'unsupported_protocol'
+  | 'discovery_pending'
+  | 'metadata_only'
+  | 'transport_unparsed'
+  | 'template_unparsed'
+  | 'budget_limited'
+  | 'no_final_response'
+  | 'asset_only'
+  | 'no_activity';
+
+export interface AgentConversationCoverage {
+  status: AgentConversationCoverageStatus;
+  reasons: string[];
+  completeInteractions: number;
+  partialInteractions: number;
+  lastEvidenceAt?: string;
+}
+
+export type ObservabilityLayerStatus =
+  | 'complete'
+  | 'partial'
+  | 'missing'
+  | 'unparsed'
+  | 'unlinked';
+
+export interface ObservabilityLayer {
+  status: ObservabilityLayerStatus;
+  reasons: string[];
+  count: number;
+}
+
+/** §11.4: plaintext, KernelFact, Session and Run coverage are reported separately. */
+export interface ObservabilityCoverageLayers {
+  schemaVersion: 'anysentry.observability_coverage_layers.v1';
+  plaintext: ObservabilityLayer;
+  kernel: ObservabilityLayer & { factCount: number };
+  session: ObservabilityLayer & { canonicalSessionIds: string[] };
+  run: ObservabilityLayer & { runIds: string[] };
+}
+
+export type FilterRuleStageId = 'f1' | 'f2' | 'f3';
+
+export interface FilterRuleStageLineage {
+  stage: FilterRuleStageId;
+  ruleId?: string;
+  revision?: number;
+  action?: string;
+  reason?: string;
+  catalogVersion?: string | number;
+  version?: string | number;
+}
+
+/** Shared Observer capture epoch plus F1/F2/F3 stage receipts. */
+export interface UnifiedFilterRuleLineage {
+  schemaVersion: 'anysentry.filter_rule_lineage.v1';
+  epoch?: string;
+  stages: FilterRuleStageLineage[];
+}
+
+export interface AgentConversationThreadRecord {
+  schemaVersion: 'anysentry.agent_conversation_thread.v1';
+  conversationId: string;
+  logicalScopeKey: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  definitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  /** Opaque canonical parent for fork lineage; the native parent remains source evidence. */
+  canonicalParentSessionId?: string;
+  terminalContextId?: string;
+  idSource: 'provider' | 'runtime' | 'inferred';
+  tenantId?: string;
+  environmentId?: string;
+  environment?: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  agentProduct: string;
+  workspacePath: string;
+  hostId?: string;
+  agentInstanceIds: string[];
+  userLineageHashes: string[];
+  pendingToolCallIds: string[];
+  lastRequestSha256?: string;
+  startedAtUnixNs: string;
+  lastActivityAtUnixNs: string;
+  resolverVersion: number;
+  updatedAt: number;
+}
+
+export interface ConversationInstanceSegment {
+  schemaVersion: 'anysentry.agent_conversation_segment.v1';
+  segmentId: string;
+  conversationId: string;
+  agentInstanceId: string;
+  /** Functional AgentInstance when available; agentInstanceId remains the legacy runtime key. */
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  terminalContextId?: string;
+  ordinal: number;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  firstInteractionId: string;
+  lastInteractionId: string;
+  interactionCount: number;
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
+  resolverVersion: number;
+  updatedAt: number;
+}
+
+export interface AgentConversationBindingRecord {
+  schemaVersion: 'anysentry.agent_conversation_binding.v1';
+  interactionId: string;
+  conversationId: string;
+  segmentId: string;
+  agentInstanceId: string;
+  canonicalAgentInstanceId?: string;
+  runtimeInstanceId?: string;
+  logicalScopeKey: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  evidence: string[];
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap';
+  resolverVersion: number;
+  decidedAt: number;
+  updatedAt: number;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  canonicalSessionId?: string;
+  sessionNamespaceKey?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionResolutionRevision?: number;
+}
+
+export interface AgentConversationQuery extends SecurityTimeFilter {
+  /** Internal exact-member projection hint; never broadens an ordinary dashboard read. */
+  includeBackground?: boolean;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  conversationId?: string;
+  product?: string;
+  classification?: AgentClassification;
+  coverageStatus?: AgentConversationCoverageStatus;
+  model?: string;
+  q?: string;
+  limit?: number;
+}
+
+export interface AgentConversationSummary {
+  conversationId: string;
+  idSource: 'provider' | 'runtime' | 'inferred';
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  logicalDefinitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  terminalContextIds?: string[];
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: 'resumable' | 'conversation' | 'per_request' | 'ephemeral' | 'unknown';
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionLifecycle?: 'new' | 'resume' | 'fork';
+  hasContent: boolean;
+  agentAssetId: string;
+  /** All compatibility asset aliases participating in this conversation group. */
+  agentAssetIds?: string[];
+  agentInstanceIds: string[];
+  agentProduct: string;
+  displayName: string;
+  environment: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  classification: AgentClassification;
+  workspacePath: string;
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  firstPromptPreview?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  models: string[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  /** Cross-agent conversation links within the same observation window. */
+  relatedConversations?: AgentRelatedConversation[];
+}
+
+export interface AgentRelatedConversation {
+  conversationId: string;
+  relation: 'delegates_to' | 'delegated_from' | 'same_run';
+  runId: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  peer?: { host?: string; port?: number; agentAssetId?: string };
+  strength: 'exact' | 'strong';
+}
+
+export interface AgentConversationList extends ClassifiedResponseMeta {
+  items: AgentConversationSummary[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export interface AgentConversationDirectoryQuery extends AgentConversationQuery {
+  lifecycleScope?: 'running' | 'history' | 'all';
+  /**
+   * Internal read-model hint.  Canonical entity pages hydrate RuntimeInstance separately and can
+   * omit thousands of runtime-only directory rows from the compatibility projection.  Legacy
+   * callers keep the historical default (`true`).
+   */
+  includeRuntimeOnly?: boolean;
+}
+
+export interface LogicalAgentConversationDirectoryItem {
+  logicalAgentId: string;
+  groupingQuality: 'exact' | 'strong' | 'inferred' | 'unresolved';
+  logicalDefinitionId?: string;
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  definitionFingerprint?: string;
+  candidateId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  terminalContextIds?: string[];
+  product: string;
+  displayName: string;
+  environment: 'kubernetes' | 'docker' | 'host' | 'unknown';
+  workspacePath: string;
+  lifecycleState: 'running' | 'unobserved' | 'historical';
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  lastActivityAtUnixNs?: string;
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  conversations: AgentConversationSummary[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
+  coverage: AgentConversationCoverage;
+}
+
+export interface AgentConversationDirectoryList extends ClassifiedResponseMeta {
+  items: LogicalAgentConversationDirectoryItem[];
+  runningCount: number;
+  historicalCount: number;
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export interface LogicalAgentConversationDirectoryItemV2
+  extends LogicalAgentConversationDirectoryItem {
+  instanceCounts: {
+    active: number;
+    idle: number;
+    unobserved: number;
+    exited: number;
+    lost: number;
+    total: number;
+  };
+  conversationCounts: {
+    active: number;
+    dormant: number;
+    incomplete: number;
+    total: number;
+  };
+  recentInstances: AgentRuntimeInstanceRecord[];
+}
+
+export interface AgentConversationDirectoryListV2
+  extends Omit<AgentConversationDirectoryList, 'items'> {
+  apiVersion: 2;
+  items: LogicalAgentConversationDirectoryItemV2[];
+}
+
+export interface AgentRunTechnicalActivitySummary {
+  technicalActivityId: string;
+  agentAssetId: string;
+  agentInstanceId?: string;
+  role: 'bootstrap' | 'control' | 'tool_backend' | 'derived_metadata'
+    | 'retry' | 'background' | 'unclassified';
+  interactionIds: string[];
+  startedAtUnixNs: string;
+  endedAtUnixNs: string;
+  methods: string[];
+  paths: string[];
+  status: 'complete' | 'partial' | 'failed';
+}
+
+export interface LogicalAgentConversationDirectoryItemV3
+  extends LogicalAgentConversationDirectoryItemV2 {
+  userThreads: AgentConversationSummary[];
+  technicalActivities: AgentRunTechnicalActivitySummary[];
+  technicalActivityCount: number;
+}
+
+export interface AgentConversationDirectoryListV3
+  extends Omit<AgentConversationDirectoryListV2, 'apiVersion' | 'items'> {
+  apiVersion: 3;
+  resolutionRevision: number;
+  items: LogicalAgentConversationDirectoryItemV3[];
+}
+
+export type AgentRuntimeDirectoryInstance = Pick<
+  AgentRuntimeInstanceRecord,
+  | 'agentInstanceId'
+  | 'canonicalAgentInstanceId'
+  | 'agentInstanceAliases'
+  | 'runtimeState'
+  | 'activityState'
+  | 'rootPid'
+  | 'rootStartTimeTicks'
+  | 'lastSeenAt'
+  | 'lastActivityAt'
+  | 'workspacePath'
+  | 'workloadRef'
+> & Pick<AgentRuntimeInstanceRecord, 'logicalAgentId' | 'logicalDefinitionId' | 'logicalScopeMode' | 'terminalContextId' | 'sshConnectionId'>;
+
+export type LogicalAgentConversationDirectoryItemV4 = Omit<
+  LogicalAgentConversationDirectoryItemV3,
+  'conversations' | 'recentInstances'
+> & {
+  recentInstances: AgentRuntimeDirectoryInstance[];
+};
+
+export interface AgentConversationDirectoryListV4
+  extends Omit<AgentConversationDirectoryListV3, 'apiVersion' | 'items'> {
+  apiVersion: 4;
+  items: LogicalAgentConversationDirectoryItemV4[];
+}
+
+/**
+ * Versioned, metadata-only resources exposed by the additive Canonical GET API.  These are
+ * deliberately separate from the legacy dashboard records above: the latter may contain
+ * compatibility aliases and read-time aggregates, while Canonical resources always carry an
+ * explicit resolution revision, bounded pagination and coverage information.
+ */
+export interface CanonicalEntityCoverage {
+  status: 'complete' | 'partial' | 'unknown';
+  reasons: string[];
+  source: string;
+}
+
+export interface CanonicalEntityPagination {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+export interface CanonicalLogicalAgentResource {
+  schemaVersion: 'anysentry.logical_agent.v1';
+  logicalAgentId: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  definitionFingerprint?: string;
+  identityQuality: 'confirmed' | 'strong' | 'inferred' | 'candidate' | 'unresolved';
+  family: string;
+  product: string;
+  displayName: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath: string;
+  environment: LogicalAgentConversationDirectoryItem['environment'];
+  /** Source/collector provenance aggregated from the observed runtime instances. */
+  collectorIds?: string[];
+  sourceIds?: string[];
+  lifecycleState: LogicalAgentConversationDirectoryItem['lifecycleState'];
+  terminalContextIds: string[];
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  sessionIds: string[];
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+export interface CanonicalAgentInstanceResource {
+  schemaVersion: 'anysentry.agent_instance.v1';
+  agentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  agentProduct?: string;
+  displayName?: string;
+  environment?: LogicalAgentConversationDirectoryItem['environment'];
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  /** Collector provenance is a runtime fact; sourceId is optional until source binding is durable. */
+  collectorId?: string;
+  sourceId?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
+  terminalContextIds: string[];
+  runtimeInstanceIds: string[];
+  sessionIds: string[];
+  state: AgentRuntimeState;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+
+export interface CanonicalRuntimeInstanceResource {
+  schemaVersion: 'anysentry.runtime_instance.v1';
+  runtimeInstanceId: string;
+  agentInstanceId?: string;
+  legacyAgentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  agentProduct?: string;
+  displayName?: string;
+  environment: LogicalAgentConversationDirectoryItem['environment'];
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  collectorId: string;
+  sourceId?: string;
+  hostId: string;
+  bootId: string;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  processGenerationKeys: string[];
+  workspacePath?: string;
+  physicalWorkloadId?: string;
+  workloadRef?: AgentWorkloadRef;
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  state: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+
+export interface CanonicalSessionResource {
+  schemaVersion: 'anysentry.session.v1';
+  sessionId: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  conversationId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: LogicalAgentConversationDirectoryItem['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  tenantId?: string;
+  ownerId?: string;
+  agentProduct?: string;
+  environment?: LogicalAgentConversationDirectoryItem['environment'];
+  workspacePath?: string;
+  /** Compatibility asset aliases observed for the session's semantic interactions. */
+  agentAssetIds?: string[];
+  collectorIds?: string[];
+  sourceIds?: string[];
+  agentInstanceIds: string[];
+  segmentIds: string[];
+  interactionIds: string[];
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionIdentityQuality?: SessionIdentityQuality;
+  sessionMode?: AgentConversationSummary['sessionMode'];
+  sessionLifecycle?: AgentConversationSummary['sessionLifecycle'];
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+export interface CanonicalLogicalAgentList {
+  schemaVersion: 'anysentry.logical_agent.list.v1';
+  items: CanonicalLogicalAgentResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalAgentInstanceList {
+  schemaVersion: 'anysentry.agent_instance.list.v1';
+  items: CanonicalAgentInstanceResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalRuntimeInstanceList {
+  schemaVersion: 'anysentry.runtime_instance.list.v1';
+  items: CanonicalRuntimeInstanceResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+export interface CanonicalSessionList {
+  schemaVersion: 'anysentry.session.list.v1';
+  items: CanonicalSessionResource[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+
+/** Run is the observed producer/invocation identity projected from a Session. */
+export interface CanonicalRunResource {
+  schemaVersion: 'anysentry.run.v1';
+  runId: string;
+  sessionId: string;
+  conversationId?: string;
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+export type AgentInvocationView = 'parent' | 'child' | 'local';
+export type AgentInvocationKernelOwnership = 'owned' | 'unlinked' | 'not_expected';
+
+/**
+ * Hop-fenced AgentInvocation. A parent view is a summary plus deep link; it must not
+ * import the child's KernelFact rows. A child view keeps its own kernel coverage.
+ */
+export interface CanonicalAgentInvocationResource {
+  schemaVersion: 'anysentry.agent_invocation.v1';
+  invocationId: string;
+  sessionId: string;
+  conversationId?: string;
+  runId?: string;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  view: AgentInvocationView;
+  kernelOwnership: AgentInvocationKernelOwnership;
+  childDeepLink?: { runId: string };
+  coverage: AgentConversationCoverage;
+  coverageLayers?: ObservabilityCoverageLayers;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+
+/**
+ * Additive response envelope for the semantic-event evidence deep link.  The legacy evidence
+ * response remains unchanged inside `evidence`; the envelope records which identifier the caller
+ * supplied and, when a timeline (`se_`) and durable semantic (`sr_`) identifier are bridged,
+ * preserves both sides of that alias.  A missing/ambiguous projection is represented by coverage
+ * metadata instead of a misleading 404.
+ */
+export interface CanonicalSemanticEventEvidenceResponse {
+  schemaVersion: 'anysentry.evidence_link.semantic_event.v1';
+  requestedSemanticEventId: string;
+  resolvedSemanticEventId?: string;
+  aliasOf?: string;
+  aliasCandidates?: string[];
+  semanticRecord?: unknown;
+  evidence?: AgentSemanticEvidenceResponse;
+  relationStatus: AgentSemanticKernelRelationStatus | 'coverage_gap' | 'ambiguous';
+  coverage: CanonicalEntityCoverage;
+  revision: number;
+  dataSource: string;
+  updateTime: string;
+}
+
+export type AgentConversationEventKind =
+  | 'tool_result'
+  | 'model_request'
+  | 'model_response'
+  | 'tool_call'
+  | 'external_tool'
+  | 'retry'
+  | 'error';
+
+export interface AgentConversationEvent {
+  eventId: string;
+  kind: AgentConversationEventKind;
+  sequence: number;
+  atUnixNs: string;
+  turnId: string;
+  modelCallId?: string;
+  attemptId?: string;
+  attemptNumber?: number;
+  interactionId?: string;
+  parentEventId?: string;
+  toolCallId?: string;
+  title: string;
+  contentPreview?: string;
+  model?: string;
+  toolName?: string;
+  arguments?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  statusCode?: number;
+  durationNs?: string;
+  completeness: AgentInteractionCompleteness;
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
+  evidenceEventIds: string[];
+}
+
+export interface AgentConversationTimeline extends ClassifiedResponseMeta {
+  conversation?: AgentConversationSummary;
+  items: AgentConversationEvent[];
+  interactionIds: string[];
+  total: number;
+  coverage: QueryCoverage;
+  dataSource: 'clickhouse' | 'hot_ring';
+  updateTime: string;
+}
+
+export type AgentConversationActor = 'user' | 'model' | 'tool' | 'agent';
+export type AgentSemanticEventKind =
+  | 'user_message'
+  | 'model_progress'
+  | 'model_final'
+  | 'tool_call'
+  | 'tool_result'
+  | 'delegation_send'
+  | 'delegation_reply';
+export type AgentToolKind =
+  | 'bash'
+  | 'read'
+  | 'write'
+  | 'search'
+  | 'mcp'
+  | 'skill'
+  | 'http'
+  | 'code'
+  | 'other';
+
+export interface AgentSemanticEvent {
+  semanticEventId: string;
+  conversationId: string;
+  segmentId: string;
+  turnId: string;
+  actor: AgentConversationActor;
+  kind: AgentSemanticEventKind;
+  phase?: 'progress' | 'final';
+  atUnixNs: string;
+  endedAtUnixNs?: string;
+  content?: unknown;
+  contentPreview?: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolKind?: AgentToolKind;
+  status?: 'pending' | 'running' | 'succeeded' | 'failed' | 'unknown';
+  sourceInteractionIds: string[];
+  sourceItemIds?: string[];
+  sequenceNumber?: number;
+  evidenceEventIds: string[];
+  parserId: string;
+  parserVersion: number;
+  correlationQuality: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
+  completeness: 'complete' | 'partial' | 'missing';
+  partialReasons: string[];
+  workflowNode?: string;
+  hop?: string;
+  delegationId?: string;
+  relatedConversationId?: string;
+  peer?: { host?: string; port?: number };
+}
+
+export interface AgentTimelineDiagnostic {
+  diagnosticId: string;
+  type: 'retry' | 'capture_gap' | 'parse_gap' | 'correlation_gap';
+  severity: 'info' | 'warning' | 'error';
+  message: string;
+  attachedToEventId?: string;
+  interactionId?: string;
+}
+
+export interface AgentConversationTurnV2 {
+  turnId: string;
+  ordinal: number;
+  state: 'active' | 'complete' | 'incomplete';
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  events: AgentSemanticEvent[];
+  diagnostics: AgentTimelineDiagnostic[];
+}
+
+export interface AgentConversationTimelineV2 extends ClassifiedResponseMeta {
+  thread?: AgentConversationSummary;
+  segments: ConversationInstanceSegment[];
+  turns: AgentConversationTurnV2[];
+  interactionIds: string[];
+  parserId: string;
+  parserVersion: number;
+  dataSource: 'clickhouse' | 'hot_ring';
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export interface AgentContextReplaySummary {
+  interactionId: string;
+  segmentId?: string;
+  atUnixNs: string;
+  replayedUserMessages: number;
+  replayedToolCalls: number;
+  replayedToolResults: number;
+  newUserMessages: number;
+}
+
+export interface AgentConversationTimelineV3 extends AgentConversationTimelineV2 {
+  apiVersion: 3;
+  requestKey: string;
+  requestedConversationId: string;
+  canonicalConversationId?: string;
+  aliasFrom?: string;
+  resolutionRevision: number;
+  timelineVersion: 3;
+  contextReplaySummaries: AgentContextReplaySummary[];
+  technicalActivitySummaries: AgentRunTechnicalActivitySummary[];
+  coverageLayers?: ObservabilityCoverageLayers;
+  redirectTarget?: {
+    type: 'conversation' | 'technical_activity';
+    id: string;
+  };
+}
+
+export type AgentSemanticKernelRelationStatus =
+  | 'linked_exact'
+  | 'linked_strong'
+  | 'semantic_only'
+  | 'ambiguous'
+  | 'coverage_gap';
+
+export interface AgentSemanticKernelRelation {
+  schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1';
+  relationId: string;
+  stableSemanticEventId: string;
+  conversationId: string;
+  turnId: string;
+  toolInvocationId: string;
+  kernelEventId?: string;
+  /** Canonical KernelFact identity; kernelEventId remains the legacy event projection alias. */
+  kernelFactId?: string;
+  kernelEventAt?: string;
+  kernelEventKind?: string;
+  kernelEventDecisionRevision?: number;
+  status: AgentSemanticKernelRelationStatus;
+  linkMethod?: 'command' | 'resource' | 'network' | 'network_endpoint' | 'shell_bootstrap' | 'process_lineage';
+  lineageMethod?: 'direct_runtime' | 'generation_parent' | 'legacy_pid_parent' | 'delegated_runtime';
+  competingToolInvocationIds?: string[];
+  timeQuality?: 'exact' | 'bounded';
+  confidence: number;
+  /** Provenance of the semantic lane that selected the relation.  Application/OTLP spans are
+   * authenticated adapter evidence, not TLS plaintext, even when they are correlated with an
+   * Observer KernelFact. */
+  authority: 'attested_tls_plaintext' | 'authenticated_adapter' | 'inferred';
+  relationVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+  /** All equally strong Kernel candidates retained when ownership is ambiguous. */
+  competingKernelEventIds?: string[];
+  resolutionRevision: number;
+  /** Additive canonical EvidenceLink projection; legacy relation fields remain authoritative. */
+  evidenceLinkId?: string;
+  algorithmVersion?: string;
+  sourceRefs?: string[];
+  validFromUnixNs?: string;
+  validToUnixNs?: string;
+  relationRevision?: number;
+  risk?: {
+    verdict: Verdict;
+    tier: Tier;
+    severity: Severity;
+    riskScore: number;
+    riskName: string;
+    riskCategory: string;
+    reason: string;
+  };
+}
+
+export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
+  schemaVersion: 'anysentry.agent_semantic_evidence.v1';
+  semanticEventId: string;
+  conversationId: string;
+  toolInvocationId?: string;
+  interactionIds: string[];
+  interactionEvidenceEventIds: string[];
+  relations: AgentSemanticKernelRelation[];
+  kernelEvents: AgentEventListItem[];
+  relationStatus: AgentSemanticKernelRelationStatus;
+  evidenceBundleEventIds: string[];
+  /** Canonical append-only links read directly from the EvidenceLink side lane.  This additive
+   * field keeps semantic→Kernel navigation available when the legacy relation projector is
+   * delayed or unavailable. */
+  canonicalEvidenceLinks?: EvidenceLink[];
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'canonical_store+hot_delta' | 'memory_hot_ring' | 'computed_compatibility';
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+
+export interface AgentSemanticEvidenceQuery extends AgentConversationQuery {
+  conversationId: string;
+  semanticEventId: string;
+}
+
+export interface AgentKernelSemanticContextResponse {
+  schemaVersion: 'anysentry.agent_kernel_semantic_context.v1';
+  eventId: string;
+  relations: AgentSemanticKernelRelation[];
+  conversationLinks: Array<{
+    conversationId: string;
+    turnId: string;
+    semanticEventId: string;
+  }>;
+  /** Reverse lookup result from the canonical EvidenceLink store.  Legacy `relations` remains
+   * authoritative when available; links are retained even when that compatibility projection is
+   * missing. */
+  canonicalEvidenceLinks?: EvidenceLink[];
+  canonicalEvidenceLinksSource?: 'canonical_store' | 'canonical_store+hot_delta' | 'memory_hot_ring' | 'computed_compatibility';
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
   updateTime: string;
 }
 
@@ -697,6 +2797,7 @@ export interface EvidenceBundleQuery extends SecurityTimeFilter {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -719,6 +2820,7 @@ export interface EvidenceBundleScope {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -749,7 +2851,7 @@ export interface EvidenceBundleSummary {
   maxSeverity?: Severity;
   riskCategories: EvidenceBundleRiskCategory[];
 }
-export interface EvidenceBundle {
+export interface EvidenceBundle extends ClassifiedResponseMeta {
   schemaVersion: 'anysentry.evidence_bundle.v1';
   bundleId: string;
   generatedAt: string;
@@ -787,7 +2889,7 @@ export type EvidenceBundleExportFormat = 'markdown';
 export interface EvidenceBundleExportQuery extends EvidenceBundleQuery {
   format?: EvidenceBundleExportFormat;
 }
-export interface EvidenceBundleExport {
+export interface EvidenceBundleExport extends ClassifiedResponseMeta {
   schemaVersion: 'anysentry.evidence_export.v1';
   bundleId: string;
   generatedAt: string;
@@ -828,6 +2930,8 @@ export interface Incident {
   lastEventAt: number;
   lastEventSubject: string;
   maxRiskScore: number;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 export interface IncidentListItem extends Omit<Incident, 'openedAt' | 'updatedAt' | 'acknowledgedAt' | 'resolvedAt'> {
   openedAt: string;
@@ -860,6 +2964,7 @@ export interface IncidentUpdateRequest {
 }
 
 export interface AgentInventoryQuery extends SecurityTimeFilter {
+  assetRange?: 'current' | 'recent' | 'historical' | 'archived' | 'all';
   healthState?: AgentHealthState | 'all';
   criticality?: AgentCriticality | 'all';
   owner?: string;
@@ -868,6 +2973,7 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   q?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   workspacePath?: string;
   userId?: string;
   includeUnclassified?: boolean;
@@ -877,6 +2983,23 @@ export interface AgentMetadataRecord {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  /** Stable management-plane definition identity (never inferred from PID/Pod). */
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: 'registered' | 'workflow' | 'service' | 'graph' | 'application' | 'candidate';
+  logicalScopeMode?: 'registered_definition' | 'workflow_definition' | 'service_definition' | 'terminal' | 'unresolved';
+  logicalIdentityAuthority?: 'management_registration';
+  registrationRef?: string;
+  /** Optional management binding: only this authenticated Source may claim the definition. */
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   workspacePath: string;
   displayName?: string;
   owner?: string;
@@ -897,16 +3020,40 @@ export interface AgentMetadataRecord {
   reviewPhysicalWorkloadId?: string;
   reviewAgentInstanceId?: string;
   reviewWorkloadRef?: AgentWorkloadRef;
+  /** Monotonic per-asset human-review revision, retained after a clear. */
+  reviewRevision?: number;
+  /** Effective wall-clock time of the latest review revision, including clear. */
+  reviewEffectiveAt?: number;
+  /** Bounded append-only history used to resolve late events against the review valid at event time. */
+  reviewHistory?: AgentReviewRevisionRecord[];
   updatedAt: number;
 }
-export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt' | 'reviewedAt'> {
+export interface AgentMetadataListItem extends Omit<AgentMetadataRecord, 'updatedAt' | 'reviewedAt' | 'reviewEffectiveAt'> {
   updatedAt: string;
   reviewedAt?: string;
+  reviewEffectiveAt?: string;
 }
 export interface AgentInventoryItem {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: AgentMetadataRecord['logicalDefinitionType'];
+  logicalScopeMode?: AgentMetadataRecord['logicalScopeMode'];
+  logicalIdentityAuthority?: 'management_registration' | 'authenticated_adapter' | 'inferred' | 'unknown';
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
+  /** Product/runtime family such as codex or pi; never a unique Asset key. */
+  agentProduct?: string;
   workspacePath: string;
   userId: string;
   displayName?: string;
@@ -928,6 +3075,14 @@ export interface AgentInventoryItem {
   attributionEvidence: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;
+  agentInstanceAliases?: string[];
+  identityBindingQuality?: 'exact' | 'weak';
+  identityReasonCode?: string;
+  logicalInstanceCount?: number;
+  hostId?: string;
+  bootId?: string;
+  rootPid?: number;
+  rootStartTime?: string;
   workloadRef?: AgentWorkloadRef;
   reviewDecision?: AgentReviewDecision;
   reviewedBy?: string;
@@ -936,6 +3091,8 @@ export interface AgentInventoryItem {
   reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
+  lifecycleState: AgentLifecycleState;
+  terminatedAt?: string;
   healthState: AgentHealthState;
   riskLevel: string;
   riskLevelText: string;
@@ -950,6 +3107,9 @@ export interface AgentInventoryItem {
   topRiskCategory?: string;
   topRiskName?: string;
   lastEventSubject: string;
+  lastEventId?: string;
+  collectorIds?: string[];
+  eventsWithoutCollector?: number;
   eventCategoryCounts: Record<EventCategory, number>;
   sourceCounts: Record<EventSource, number>;
 }
@@ -970,6 +3130,57 @@ export interface AgentInventory {
   items: AgentInventoryItem[];
   total: number;
   summary: AgentInventorySummary;
+  coverage: QueryCoverage;
+  directory?: {
+    source: 'observed_asset_lifecycle';
+    snapshotRevision: number;
+    totalAssets: number;
+    partial: boolean;
+    reasons: string[];
+    reconciledAt: string;
+  };
+  updateTime: string;
+}
+
+export interface AgentInstanceMetricsQuery extends SecurityTimeFilter {
+  agentAssetId: string;
+  agentInstanceId?: string;
+  seriesPoints?: number;
+}
+
+export interface AgentInstanceMetricPoint {
+  statTime: string;
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  toolCount: number;
+  fileCount: number;
+  networkCount: number;
+  processCount: number;
+  llmCount: number;
+  l1Count: number;
+  l2Count: number;
+  l3Count: number;
+  failedCount: number;
+  timeoutCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  maxRiskScore: number;
+}
+
+export interface AgentInstanceMetrics {
+  agentAssetId: string;
+  points: AgentInstanceMetricPoint[];
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  failedCount: number;
+  timeoutCount: number;
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -984,6 +3195,8 @@ export interface IdentityAiReviewRequest extends SecurityTimeFilter {
 export interface IdentityAiReviewRecord {
   schemaVersion: 'anysentry.identity_ai_review.v1';
   reviewId: string;
+  /** Monotonic lifecycle revision within one reviewId. */
+  revision?: number;
   targetType: IdentityAiReviewTargetType;
   eventId?: string;
   agentAssetId: string;
@@ -995,9 +3208,16 @@ export interface IdentityAiReviewRecord {
   evidenceRefs: string[];
   evidenceDigest: string;
   model?: string;
-  provider: 'a3s-code-sdk';
+  provider: 'direct-llm' | 'a3s-code-sdk';
+  /** Automatic reviews are keyed by a stable logical identity, not by a transient PID instance. */
+  automatic?: boolean;
+  logicalIdentityKey?: string;
+  appliedDecision?: AgentReviewDecision;
+  appliedAt?: string;
   error?: string;
   createdAt: string;
+  /** Time this lifecycle revision was produced. */
+  updatedAt?: string;
   completedAt?: string;
 }
 
@@ -1010,7 +3230,31 @@ export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
   q?: string;
   limit?: number;
 }
+export interface WorkspaceDirectoryRecord {
+  workspaceId: string;
+  workspacePath: string;
+  workspacePathFingerprint: string;
+  displayName: string;
+  repositoryId?: string;
+  sourceId?: string;
+  environmentId?: string;
+  nodeScope?: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  updatedAt: number;
+}
+export interface AgentWorkspaceBindingRecord {
+  bindingId: string;
+  agentAssetId: string;
+  workspaceId: string;
+  workspacePath: string;
+  validFrom: number;
+  validTo?: number;
+  lastObservedAt: number;
+  updatedAt: number;
+}
 export interface WorkspaceInventoryItem {
+  workspaceId?: string;
   workspacePath: string;
   owner?: string;
   team?: string;
@@ -1062,11 +3306,27 @@ export interface WorkspaceInventory {
   items: WorkspaceInventoryItem[];
   total: number;
   summary: WorkspaceInventorySummary;
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 export interface AgentMetadataUpdateRequest {
   workspacePath: string;
   agentAssetId?: string;
+  logicalAgentId?: string;
+  logicalDefinitionId?: string;
+  logicalDefinitionType?: AgentMetadataRecord['logicalDefinitionType'];
+  logicalScopeMode?: AgentMetadataRecord['logicalScopeMode'];
+  registrationRef?: string;
+  /** Bind a registered definition to one managed ingestion Source when multiple definitions share a workspace. */
+  ingestionSourceId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  terminalContextId?: string;
   displayName?: string;
   owner?: string;
   team?: string;
@@ -1083,6 +3343,8 @@ export interface AgentMetadataUpdateRequest {
 export interface AgentReviewRequest {
   workspacePath: string;
   decision: AgentReviewDecision | 'clear';
+  /** Optional during the compatibility rollout; when supplied it is a strict compare-and-set. */
+  expectedRevision?: number;
   currentClassification?: AgentClassification;
   agentAssetId?: string;
   identityKeys?: string[];
@@ -1093,8 +3355,12 @@ export interface AgentReviewRequest {
 }
 
 export interface AgentTopologyQuery extends SecurityTimeFilter {
+  scope?: 'agent' | 'raw';
   edgeId?: string;
   eventId?: string;
+  agentAssetId?: string;
+  /** Select one concrete runtime while retaining the shared logical Agent identity. */
+  agentInstanceId?: string;
   agentId?: string;
   workspacePath?: string;
   collectorId?: string;
@@ -1108,7 +3374,10 @@ export interface AgentTopologyNode {
   type: TopologyNodeType;
   label: string;
   subtitle?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
+  classification?: AgentClassification;
   workspacePath?: string;
   collectorId?: string;
   riskLevel: string;
@@ -1153,9 +3422,147 @@ export interface AgentTopology {
   nodes: AgentTopologyNode[];
   edges: AgentTopologyEdge[];
   summary: AgentTopologySummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
+export interface CollectorExecEvidenceMetrics {
+  /** ToolExec events reported by the raw collector during this heartbeat interval. */
+  exec: number;
+  /** ToolExec events whose final argv evidence remained truncated. */
+  execTruncated: number;
+  /** ToolExec events whose final argv evidence remained incomplete. */
+  execIncomplete: number;
+  /** ToolExec reassemblies that timed out, including events later supplemented from /proc. */
+  execReassemblyTimeout: number;
+}
+export interface CollectorExecEvidenceReport extends CollectorExecEvidenceMetrics {
+  /** True only for the partial-window raw heartbeat flushed during graceful collector shutdown. */
+  shutdownFinal: boolean;
+}
+export interface CollectorExecEvidenceHealth {
+  /** Distinguishes a reported all-zero interval from a collector that does not expose the metrics. */
+  reported: boolean;
+  lastReportedAt?: string;
+  latest?: CollectorExecEvidenceReport & { intervalSecs: number };
+  /** Sums non-overlapping raw collector intervals whose heartbeat records fall in the query window. */
+  window: CollectorExecEvidenceMetrics & {
+    heartbeatCount: number;
+    intervalSecs: number;
+    shutdownFinalCount: number;
+  };
+}
+export type CollectorHeartbeatOrigin = 'raw_collector' | 'forwarder';
+
+/**
+ * An independently versioned, additive accounting envelope. Its counters never change the
+ * semantics of the legacy heartbeat fields above or below it.
+ */
+export type CollectorPipelineTemporality = 'delta' | 'cumulative';
+export interface CollectorPipelineWindow {
+  startedAtUnixMs: number;
+  endedAtUnixMs: number;
+}
+export interface CollectorPipelineUnit {
+  /** Observer ring records are physical records; absent on Forwarder-only envelopes. */
+  ring?: 'physical_record';
+  /** Forwarder input is a logical event; absent on Observer-only envelopes. */
+  input?: 'logical_event';
+  queue: 'logical_event';
+}
+export interface CollectorPipelineRingAccounting {
+  ring: string;
+  ringSubmitted: number;
+  ringDropped: number;
+  collectorReceived: number;
+  /** Physical records admitted to the bounded Collector processing inbox (S4+). */
+  collectorEnqueued?: number;
+  /** Physical records deliberately dropped because that class-specific inbox was full (S4+). */
+  collectorDropped?: number;
+  logicalEvents: number;
+  queueAdmitted: number;
+  queueDropped: number;
+}
+export interface CollectorPipelineStageReasonAccounting {
+  reason: string;
+  count: number;
+}
+export interface CollectorPipelineStageAccounting {
+  stage: string;
+  count: number;
+  reasons: CollectorPipelineStageReasonAccounting[];
+}
+export interface CollectorPipelineBacklog {
+  queueEvents: number;
+  queueBytes: number;
+  inflightEvents: number;
+  inflightBytes: number;
+  retryEvents: number;
+  retryBytes: number;
+  outstandingEvents: number;
+  outstandingBytes: number;
+}
+export interface CollectorPipelineAccounting {
+  schemaVersion: 'anysentry.pipeline_accounting.v1';
+  /** Optional during the Observer compatibility window; new writers identify their component. */
+  producer?: string;
+  /** Changes whenever a producer process starts, so sequence 1 cannot collide after restart. */
+  producerInstanceId: string;
+  sequence: number;
+  window: CollectorPipelineWindow;
+  temporality: CollectorPipelineTemporality;
+  unit: CollectorPipelineUnit;
+  rings?: CollectorPipelineRingAccounting[];
+  stages?: CollectorPipelineStageAccounting[];
+  /** A point-in-time gauge. Backlog values must never be summed as delta counters. */
+  backlog?: CollectorPipelineBacklog;
+}
+export type CollectorPipelineContinuity =
+  | 'initial'
+  | 'continuous'
+  | 'restart'
+  | 'sequence_gap'
+  | 'duplicate'
+  | 'out_of_order'
+  | 'temporality_change'
+  | 'counter_reset';
+export interface CollectorPipelineAccountingHealth {
+  reported: true;
+  lastReportedAt: string;
+  latest: {
+    producerInstanceId: string;
+    sequence: number;
+    temporality: CollectorPipelineTemporality;
+    continuity: CollectorPipelineContinuity;
+    backlog?: CollectorPipelineBacklog;
+  };
+  window: {
+    heartbeatCount: number;
+    acceptedWindowCount: number;
+    producerCount: number;
+    restartCount: number;
+    sequenceGapCount: number;
+    duplicateCount: number;
+    outOfOrderCount: number;
+    counterResetCount: number;
+    ringSubmitted: number;
+    ringDropped: number;
+    collectorReceived: number;
+    collectorEnqueued?: number;
+    collectorDropped?: number;
+    /** Received minus enqueued and explicitly dropped raw records; zero means handoff conservation. */
+    collectorHandoffResidual?: number;
+    logicalEvents: number;
+    queueAdmitted: number;
+    queueDropped: number;
+    /** Submitted minus received physical records; an async backlog delta, not implicit loss. */
+    physicalBacklogDelta: number;
+    /** Logical events minus admitted and explicitly dropped events; zero means local conservation. */
+    logicalResidual: number;
+    stageCountResidual: number;
+    exact: boolean;
+  };
+}
 export interface CollectorHeartbeatRequest {
   collectorId?: string;
   sourceId?: string;
@@ -1176,14 +3583,82 @@ export interface CollectorHeartbeatRequest {
   queueDepth?: number;
   droppedEvents?: number;
   outputDropped?: number;
+  /** Process-lifetime userspace interaction reassembly counters from the raw Collector. */
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount?: number;
+  /** Optional explicit semantics for the three legacy operational counters. */
+  legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents?: number;
+  pipelineAccounting?: CollectorPipelineAccounting;
   filterMetrics?: CollectorFilterMetrics;
+  fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
 }
+
+export interface CollectorInteractionReassemblyMetrics {
+  temporality: 'cumulative';
+  connectionEvictions: number;
+  connectionExpirations: number;
+  aliasEvictions: number;
+  evidenceEvictions: number;
+  fragmentTrackerEvictions: number;
+  orphanChunks: number;
+  sequenceGaps: number;
+  parserFailures: number;
+  bodyLimitDrops: number;
+  truncatedChunks: number;
+  ambiguousStreamBindings: number;
+  streamBindingGaps: number;
+}
+export interface CollectorRawHeartbeatRequest extends CollectorHeartbeatRequest {
+  /** Raw collector-only argv/reassembly evidence quality; never an operational error counter. */
+  execEvidence?: Partial<CollectorExecEvidenceReport>;
+  /** Raw Collector-only S5 pre-ring accounting; Forwarder claims are ignored server-side. */
+  captureProfileMetrics?: CollectorCaptureProfileMetrics;
+}
+export type CollectorCaptureProfileMode = 'legacy' | 'shadow' | 'enforce';
+export type CollectorCaptureProfileActivationMode = 'shadow' | 'preview' | 'enforce';
+export type CollectorCaptureProfileControlState = 'ready' | 'lkg_degraded';
+export type CollectorCaptureProfileActivationReason =
+  | 'rollout_mode'
+  | 'awaiting_preview_ack'
+  | 'local_ack_and_central_acceptance'
+  | 'intent_changed'
+  | 'ttl_refresh_requires_preview'
+  | 'policy_scope_changed'
+  | 'control_plane_unavailable'
+  | 'activation_grant_expired'
+  | 'scope_expired'
+  | 'snapshot_capacity'
+  | 'collector_generation_changed'
+  | 'preview_generation_changed'
+  | 'capture_profile_legacy'
+  | 'snapshot_not_published'
+  | 'snapshot_hash_invalid'
+  | 'ack_schema_invalid'
+  | 'ack_not_applied'
+  | 'ack_has_errors'
+  | 'ack_has_downgrades'
+  | 'ack_node_mismatch'
+  | 'ack_collector_mismatch'
+  | 'ack_collector_instance_missing'
+  | 'ack_boot_mismatch'
+  | 'ack_publisher_mismatch'
+  | 'ack_epoch_mismatch'
+  | 'ack_policy_mismatch'
+  | 'ack_content_hash_mismatch'
+  | 'ack_intent_hash_mismatch'
+  | 'ack_entry_count_mismatch'
+  | 'ack_stale'
+  | 'ack_capabilities_mismatch'
+  | 'ack_capabilities_hash_invalid'
+  | 'ack_effective_actions_mismatch'
+  | 'other';
 export interface CollectorFilterMetrics {
   /** @deprecated Compatibility marker for pre-decoupling forwarders. */
   scope: 'all' | 'shadow' | 'agent' | 'decoupled';
+  /** True only for the Forwarder heartbeat emitted after its final snapshot and event drain. */
+  shutdownFinal?: boolean;
   filterMode?: 'enforce' | 'shadow';
   retainUnknown?: boolean;
   retainNonAgent?: boolean;
@@ -1192,20 +3667,225 @@ export interface CollectorFilterMetrics {
   forwarded: number;
   confirmedAgent: number;
   probableAgent: number;
+  /** Forwarder diagnostics for protocol-level cold-start Agent discovery. */
+  correlatedLlmCandidates?: number;
+  correlatedLlmRejectedInfrastructure?: number;
+  llmWithoutCorrelationTuple?: number;
   unknown: number;
+  /** Closed, low-cardinality S3 reason counts for this Forwarder delta window. */
+  unknownReasonCounts?: Partial<Record<UnknownReason, number>>;
   nonAgent: number;
   filteredNonAgent: number;
   wouldFilterNonAgent: number;
+  /** Unknown events suppressed by the broad retainUnknown policy (not discovery-budget pressure). */
+  filteredUnknown: number;
+  wouldFilterUnknown: number;
   filteredNoise: number;
   wouldFilterNoise: number;
   discoveryBudgetDropped: number;
   wouldDiscoveryBudgetDrop: number;
+  /** Effective Collector pre-ring state: false when the explicit Unknown sample profile is active. */
+  unknownFileLossless?: boolean;
+  fileAggregationEnabled?: boolean;
+  fileAggregationWindowMs?: number;
+  fileAggregationPendingKeys?: number;
+  fileAggregationCoalesced?: number;
+  aggregatedFileEvents?: number;
+  aggregationOutputs?: number;
+  /** Trusted Collector summaries that traversed the Forwarder in this delta window. */
+  captureAggregateOutputs?: number;
+  /** Decision-op units represented by those summaries; never a physical event count. */
+  captureAggregateDecisionAttempts?: number;
+  captureProfileMode?: CollectorCaptureProfileMode;
+  captureProfileActivationMode?: CollectorCaptureProfileActivationMode;
+  captureProfileActivationReason?: CollectorCaptureProfileActivationReason;
+  captureProfileControlPlaneState?: CollectorCaptureProfileControlState;
+  captureProfileAckEnabled?: boolean;
+  captureProfileAckAccepted?: number;
+  captureProfileAckRejected?: number;
+  captureProfileAckReplayIgnored?: number;
+  captureProfileCentralAccepted?: number;
+  captureProfileCentralRejected?: number;
+  captureProfileActivationGrants?: number;
+  captureProfileActivationRevoked?: number;
+  captureProfileIntentChanges?: number;
+  captureProfileTtlRefreshes?: number;
+  captureProfileCoalescedTtlRefreshes?: number;
+  captureProfileSemanticNoops?: number;
+  captureProfileLkgDegraded?: number;
+  captureProfileCapacityEvicted?: number;
+  captureProfileCapacityAgentEvicted?: number;
+  captureProfileOversizeSnapshots?: number;
+  captureProfileReportInFlight?: boolean;
+  captureProfileReportPosts?: number;
+  captureProfileReportErrors?: number;
+  captureProfileReportAccepted?: number;
+  captureProfileReportRejected?: number;
+  filterRulePublisherEnabled?: boolean;
+  filterRuleEnforceDrops?: boolean;
+  filterRuleVersion?: number;
+  filterRuleEntries?: number;
+  filterRuleWrites?: number;
+  filterRuleErrors?: number;
+  filterRuleConflicts?: number;
+  unifiedCatalogVersion?: number;
+  unifiedIdentityVersion?: number;
+  unifiedCaptureVersion?: number;
+  unifiedForwarderVersion?: number;
+  unifiedRetentionVersion?: number;
+  unifiedProjectionState?: 'bootstrap' | 'ready' | 'degraded';
+  unifiedProjectionHash?: string;
+  unifiedProjectionIntentHash?: string;
+  unifiedProjectionLoads?: number;
+  unifiedProjectionLoadErrors?: number;
+  unifiedProjectionDegraded?: number;
+  unifiedIdentityRules?: number;
+  unifiedCaptureRules?: number;
+  unifiedSemanticRules?: number;
+  unifiedRuntimeSignatures?: number;
+  unifiedAgentTemplates?: number;
+  /** Loaded-state of the observer-side runtime signature registry; diverges from the projection
+   * counts when the collector rejects a document (for example generic-launcher signatures). */
+  runtimeSignatureRegistryVersion?: number;
+  runtimeSignatureRegistryLoaded?: number;
+  runtimeSignatureRegistryInvalid?: number;
+  runtimeSignatureRegistryLastError?: string;
+  captureProfileAckSoftDowngrades?: number;
+  captureProfileLastAckSoftDowngrades?: string;
+  unifiedIdentityIndexBuckets?: number;
+  unifiedCaptureIndexBuckets?: number;
+  unifiedSemanticIndexBuckets?: number;
+  unifiedMaxIndexBucketSize?: number;
+  unifiedIdentityMatches?: number;
+  unifiedCaptureMatches?: number;
+  unifiedSemanticMatches?: number;
+  unifiedSampleSuppressed?: number;
+  infrastructure?: number;
+  workspaceConflict?: number;
+  infrastructurePolicyReady?: boolean;
+  infrastructurePolicyVersion?: number;
+  infrastructurePolicyRules?: number;
+  infrastructurePolicyLoads?: number;
+  infrastructurePolicyLoadErrors?: number;
+  infrastructurePolicyMatches?: number;
+  infrastructurePolicyWouldDrop?: number;
+  infrastructurePolicyEnforced?: number;
+  infrastructurePolicyAgentConflicts?: number;
+  infrastructurePolicyMaterialized?: number;
+  infrastructurePolicyExpiresInSeconds?: number;
+  /** Test-only, bounded suppression receipts; absent outside explicitly armed lifecycle E2E. */
+  e2eFilterReceipts?: Array<{
+    schema: 'anysentry.e2e_filter_receipt.v1';
+    eventKind: 'ToolExec';
+    markerSha256: string;
+    lineSha256: string;
+    physicalWorkloadId?: string;
+    classification: string;
+    filterReason: string;
+    filteredAt: string;
+  }>;
   deduplicated: number;
+  /** Live queue admissions that could not proceed but remain recoverable in the durable spool. */
   queueDropped: number;
+  /** Queue-pressure records parked durably instead of being counted as permanent output loss. */
+  queueParked?: number;
+  /** Protected Agent/lifecycle/security evidence that could not enter the live queue. */
+  protectedQueueDropped?: number;
+  /** Closed, low-cardinality queue-loss classes; never contains an asset, path, PID or rule ID. */
+  queueDroppedByClass?: Partial<Record<
+    'tool_exec' | 'process_exit' | 'security' | 'collector_heartbeat' | 'capture_aggregate' | 'agent' | 'other',
+    number
+  >>;
+  /** Bounded delivery outcome counters keyed only by stage/reason or HTTP status. */
+  batchDeliveryOutcomes?: Record<string, number>;
   batches: number;
   batchEvents: number;
+  /** Events first queued for an API-authorized backpressure retry in this heartbeat interval. */
+  retryQueued?: number;
+  /** Backpressure retry delivery attempts made in this heartbeat interval. */
+  retryAttempts?: number;
+  /** Retried events accepted or policy-discarded by the API in this heartbeat interval. */
+  retryRecovered?: number;
+  /** Retried events that reached a terminal outcome or exhausted their current online retry cycle. */
+  retryExhausted?: number;
+  /** Retry-exhausted events retained in the spool for a later bounded replay cycle. */
+  retryParked?: number;
+  /** Durable replay records examined/admitted/deferred during this heartbeat delta. */
+  spoolReplayAttempts?: number;
+  spoolReplayAdmitted?: number;
+  spoolReplayDeferred?: number;
+  /** Heartbeat delivery failures; intentionally separate from event output loss. */
+  heartbeatDeliveryFailures?: number;
+  /** Current independent control-plane lane state; counters remain cumulative diagnostics only. */
+  controlPlaneState?: 'starting' | 'healthy' | 'degraded';
+  controlPlaneFailedLanes?: Array<'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot'>;
+  controlPlaneStartingLanes?: Array<'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot'>;
+  controlPlaneLanes?: Partial<Record<
+    'identity' | 'filter_rules' | 'infrastructure_policy' | 'runtime_snapshot',
+    { lastSuccessAt?: string; lastFailureAt?: string; lastFailure?: string }
+  >>;
+  /** Current durable ownership state, including live and parked records. */
+  spoolRecords?: number;
+  spoolActiveRecords?: number;
+  spoolParkedRecords?: number;
+  spoolBytes?: number;
+  spoolWalBytes?: number;
+  spoolOldestAgeMs?: number;
+  spoolAtCapacity?: boolean;
+  /** Physical journal hard ceiling; ACK admission remains available until this is true. */
+  spoolWalAtCapacity?: boolean;
+  /** PUT admission has reached the reserved ACK headroom (preemptive backpressure). */
+  spoolWalPutAtCapacity?: boolean;
+  spoolMaxWalBytes?: number;
+  spoolAckHeadroomBytes?: number;
+  spoolPendingWriteBytes?: number;
+  spoolWalCapacityRejects?: number;
+  spoolWalAckErrors?: number;
+  spoolFsyncMode?: 'always' | 'periodic';
+  spoolCompactionDeferred?: number;
+  spoolCompactions?: number;
+  spoolCompactMaxLiveRecords?: number;
+  spoolPendingPutRecords?: number;
+  spoolPendingPutBytes?: number;
+  spoolPendingOperations?: number;
+  spoolMaxRecordBytes?: number;
+  spoolLazyRecords?: number;
+  spoolLazyReads?: number;
+  spoolLazyReadErrors?: number;
+  spoolLazyBodyReleases?: number;
+  spoolResidentBodies?: number;
+  spoolReadBlockedRecords?: number;
+  spoolReplayReadErrors?: number;
+  spoolProtectedReserveRecords?: number;
+  spoolProtectedReserveBytes?: number;
+  /** Serialized bytes currently waiting in the ordinary priority queue. */
+  queueBytes?: number;
+  /** Events currently owned by active event-delivery requests. */
+  inflightEvents?: number;
+  inflightBytes?: number;
+  inflightOldestAgeMs?: number;
+  /** Events waiting for their next API-authorized retry attempt. */
+  retryQueueDepth?: number;
+  retryQueueBytes?: number;
+  /** All retry-owned events, including retry requests currently in flight. */
+  retryOutstandingEvents?: number;
+  retryOutstandingBytes?: number;
+  retryOldestAgeMs?: number;
+  /** Total forwarder-owned events across pending, in-flight, and retry states. */
+  outstandingEvents?: number;
+  outstandingBytes?: number;
+  outstandingOldestAgeMs?: number;
+  outstandingEventLimit?: number;
+  outstandingByteLimit?: number;
+  protectedReserveEvents?: number;
+  protectedReserveBytes?: number;
   identitySnapshotReady: boolean;
+  /** Combined local discovery generation retained for compatibility (Kubernetes + Docker). */
   identitySnapshotVersion: number;
+  /** Central API identity/snapshot generation; this is the version comparable with server intent. */
+  identityKubernetesVersion?: number;
+  /** Node-local Docker discovery generation; never compared to the central Kubernetes snapshot. */
+  identityDockerVersion?: number;
   identitySnapshotAgeSeconds: number;
   identityCacheEntries: number;
   identityCacheHits: number;
@@ -1237,9 +3917,168 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  processLaunchContextProcReads?: number;
+  processLaunchContextEnvironmentReads?: number;
+  launchSystemdQueries?: number;
+  launchSystemdCacheHits?: number;
+  launchSystemdErrors?: number;
+  launchSystemdCacheEntries?: number;
+  processRootsDiscovered?: number;
+  processRootsExited?: number;
+  processRootsLost?: number;
+  processRootsRecovered?: number;
+  processRootLivenessChecks?: number;
+  processRootLivenessMisses?: number;
+  processStaleGenerationMisses?: number;
+  runtimeSignatureVersion?: number;
+  runtimeSignatureHash?: string;
+  runtimeSignatureMatcherHash?: string;
+  runtimeSignatureLoaded?: number;
+  runtimeSignatureMatches?: number;
+  runtimeSignatureMisses?: number;
+  runtimeSignatureAmbiguous?: number;
+  runtimeSignatureInvalid?: number;
+  runtimeSignatureReloadAttempts?: number;
+  runtimeSignatureReloadSuccesses?: number;
+  runtimeSignatureReloadErrors?: number;
+  runtimeSignatureLastGoodHash?: string;
+  runtimeReconcileRequested?: number;
+  runtimeReconcileRuns?: number;
+  runtimeReconcileCoalesced?: number;
+  runtimeReconcileErrors?: number;
+  runtimeReconcileScanned?: number;
+  runtimeReconcileInvalidated?: number;
+  runtimeReconcileLastDurationMs?: number;
+  runtimeSnapshotPosts?: number;
+  runtimeSnapshotErrors?: number;
+  /** Runtime snapshot attempts retried after a transient transport failure. */
+  runtimeSnapshotRetries?: number;
+  /** Transient runtime snapshot failures followed by a successful retry. */
+  runtimeSnapshotRecovered?: number;
+  runtimeLeaseEpoch?: number;
+  runtimeLeaseAttempts?: number;
+  runtimeLeaseErrors?: number;
+  runtimeLeaseFenced?: boolean;
+  runtimeSnapshotRejected?: number;
+  runtimeSnapshotDuplicates?: number;
+  /** Runtime entries withheld because a process/workload alias would violate snapshot identity. */
+  runtimeSnapshotEntryDuplicates?: number;
+  /** Runtime entries retained as distinct generations while a duplicate identity candidate was observed. */
+  runtimeSnapshotEntryConflicts?: number;
+  lastRuntimeSnapshotAt?: string;
+  lastRuntimeSnapshotError?: string;
+  /** Sticky timestamp for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailureAt?: string;
+  /** Sticky bounded reason for the most recent terminal or exhausted snapshot failure. */
+  lastRuntimeSnapshotFailure?: string;
+  /** Snapshot version associated with the most recent failure. */
+  lastRuntimeSnapshotFailureVersion?: number;
+  /** Sticky timestamp for the most recent transient snapshot retry. */
+  lastRuntimeSnapshotRetryAt?: string;
+  /** Sticky bounded reason that triggered the most recent retry. */
+  lastRuntimeSnapshotRetryReason?: string;
 }
-export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbeatRequest, 'collectorId' | 'status'>> {
+
+/** Raw Observer ring-before filtering and per-ring loss counters; never merge with Forwarder metrics. */
+export interface CollectorFileFilterMetrics {
+  fileAccess: number;
+  fileDelete: number;
+  accessKept: number;
+  accessUnknownKept?: number;
+  accessSampled: number;
+  accessDropped: number;
+  accessSuppressed: number;
+  deleteKept: number;
+  deleteUnknownKept?: number;
+  deleteDropped: number;
+  ruleHits: number;
+  ruleMisses: number;
+  staleRules: number;
+  accessRingDropped: number;
+  deleteRingDropped: number;
+  enabled: boolean;
+  epoch: number;
+  unknownPolicy?: 'keep' | 'sample';
+}
+export type CollectorCaptureProbeName =
+  | 'exec'
+  | 'exit'
+  | 'tls'
+  | 'connect'
+  | 'dns'
+  | 'file_access'
+  | 'file_delete'
+  | 'llm'
+  | 'ssl'
+  | 'security'
+  | 'file_read';
+export interface CollectorCaptureProbeMetrics {
+  probe: CollectorCaptureProbeName;
+  attempted: number;
+  fullSelected: number;
+  aggregateSelected: number;
+  sampleSelected: number;
+  sampleRejected: number;
+  dropSelected: number;
+  notEnabled: number;
+  decisionError: number;
+  /** Quality overlays; not terminal decision outcomes. */
+  probeError: number;
+  promotionError: number;
+  aggregateError: number;
+  /** True when at least one producer number could not be represented as an exact safe integer. */
+  countersClamped: boolean;
+  payloadSelected: number;
+  payloadError: number;
+  ringSubmitted: number;
+  ringDropped: number;
+  wouldFull: number;
+  wouldAggregate: number;
+  wouldSample: number;
+  wouldDrop: number;
+  ruleHit: number;
+  ruleMiss: number;
+  staleRule: number;
+  promotionHit: number;
+  /** Server-derived conservation checks over decision-op units. */
+  decisionResidual: number;
+  decisionConserved: boolean;
+  /** Exec emits multiple physical records, so its payload/ring residual is intentionally absent. */
+  payloadResidual?: number;
+  payloadConserved?: boolean;
+}
+export interface CollectorCaptureProfileMetrics {
+  mode: CollectorCaptureProfileMode;
+  activeEpoch: number;
+  destructiveEnabled: boolean;
+  decisionUnit: 'decision_op';
+  payloadUnit: 'single_record_candidate';
+  deliveryUnit: 'physical_record';
+  sampleNodeLimitPerWindow: number;
+  aggregateKeys: number;
+  aggregateEmitted: number;
+  aggregateOutputRetried: number;
+  aggregateCleaned: number;
+  aggregateReadErrors: number;
+  aggregateLedgerDegraded: boolean;
+  countersClamped: boolean;
+  decisionConserved: boolean;
+  payloadConserved: boolean;
+  probes: CollectorCaptureProbeMetrics[];
+}
+export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHeartbeatRequest, 'collectorId' | 'status'>> {
   at: number;
+  /** Server-filled on new records; optional only for persisted pre-classification history. */
+  activityContext?: 'collector_heartbeat';
+  activitySubtype?: 'observer_heartbeat';
+  /** Server-assigned ingress provenance; absent only on records persisted before provenance existed. */
+  origin?: CollectorHeartbeatOrigin;
+  /** Set only when this record carried Forwarder-enriched filter metrics. */
+  filterMetricsReportedAt?: number;
+  /** Set only when a raw Observer heartbeat carried ring-before file-filter metrics. */
+  fileFilterMetricsReportedAt?: number;
+  /** Set only when a raw Observer heartbeat carried validated S5 pre-ring accounting. */
+  captureProfileMetricsReportedAt?: number;
   nodeName?: string;
   namespace?: string;
   podName?: string;
@@ -1252,9 +4091,16 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorHeartbe
   queueDepth: number;
   droppedEvents: number;
   outputDropped: number;
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount: number;
+  legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents: number;
+  pipelineAccounting?: CollectorPipelineAccounting;
+  /** Present only when this record originated from a raw CollectorHeartbeat with quality fields. */
+  execEvidence?: CollectorExecEvidenceReport;
   filterMetrics: CollectorFilterMetrics;
+  fileFilterMetrics?: CollectorFileFilterMetrics;
+  captureProfileMetrics?: CollectorCaptureProfileMetrics;
   message?: string;
 }
 export interface CollectorHeartbeatAck {
@@ -1280,6 +4126,12 @@ export interface CollectorHealthItem {
   mode?: string;
   state: CollectorHealthState;
   stateText: string;
+  /** Current channel health; requested-window maxima remain independent historical evidence. */
+  healthChannels: {
+    capture: CollectorHealthChannel;
+    delivery: CollectorHealthChannel;
+    control: CollectorHealthChannel;
+  };
   firstSeen?: string;
   lastEventAt?: string;
   lastHeartbeatAt?: string;
@@ -1294,8 +4146,26 @@ export interface CollectorHealthItem {
   queueDepth: number;
   droppedEvents: number;
   outputDropped: number;
+  interactionReassembly?: CollectorInteractionReassemblyMetrics;
   errorCount: number;
+  /** Maximum counter readings reported by heartbeat records in the requested health window. */
+  windowErrorMaxima: {
+    droppedEvents: number;
+    outputDropped: number;
+    errorCount: number;
+  };
+  execEvidence: CollectorExecEvidenceHealth;
+  /** Absent for legacy heartbeats, preserving the old response contract byte-for-byte. */
+  pipelineAccounting?: CollectorPipelineAccountingHealth;
+  /** True only when filterMetrics came from a fresh Forwarder heartbeat, not the decoupled fallback. */
+  filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
+  /** True only when fileFilterMetrics came from a fresh raw Observer heartbeat. */
+  fileFilterMetricsReported: boolean;
+  fileFilterMetrics: CollectorFileFilterMetrics;
+  /** Independent raw Collector S5 channel; never sourced from Forwarder filter metrics. */
+  captureProfileMetricsReported: boolean;
+  captureProfileMetrics?: CollectorCaptureProfileMetrics;
   message?: string;
   eventCategoryCounts: Record<EventCategory, number>;
 }
@@ -1303,6 +4173,7 @@ export interface CollectorHealthSummary {
   totalCollectors: number;
   healthyCollectors: number;
   quietCollectors: number;
+  warningCollectors: number;
   degradedCollectors: number;
   staleCollectors: number;
   downCollectors: number;
@@ -1314,6 +4185,7 @@ export interface CollectorHealth {
   items: CollectorHealthItem[];
   total: number;
   summary: CollectorHealthSummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1375,6 +4247,7 @@ export interface CoverageSummary {
 export interface CoverageOverview {
   summary: CoverageSummary;
   issues: CoverageIssue[];
+  coverage?: QueryCoverage;
   updateTime: string;
 }
 
@@ -1476,8 +4349,14 @@ export interface AlertRecord {
   riskName?: string;
   sourceSummary: string;
   occurrenceCount: number;
+  /** Distinct evidence events retained for this alert. Platform-only alerts can legitimately be 0. */
+  evidenceEventCount?: number;
+  /** Bounded evidence identity set used to avoid counting the same event revision twice. */
+  evidenceEventIds?: string[];
   lastNotificationAt?: number;
   labels: Record<string, string>;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 export interface AlertListItem extends Omit<AlertRecord, 'firstSeenAt' | 'lastSeenAt' | 'updatedAt' | 'acknowledgedAt' | 'resolvedAt' | 'silencedUntil' | 'lastNotificationAt'> {
   firstSeenAt: string;
@@ -1490,7 +4369,7 @@ export interface AlertListItem extends Omit<AlertRecord, 'firstSeenAt' | 'lastSe
 }
 export interface AlertListQuery extends SecurityTimeFilter {
   alertId?: string;
-  status?: AlertStatus | 'all';
+  status?: AlertStatus | 'active' | 'all';
   severity?: Severity | 'all';
   kind?: AlertKind | 'all';
   q?: string;
@@ -1503,6 +4382,12 @@ export interface AlertListQuery extends SecurityTimeFilter {
   taskId?: string;
   objectiveId?: string;
   issueId?: string;
+  /**
+   * window: alerts observed/updated in the selected time range;
+   * backlog: currently active alerts regardless of age;
+   * combined: legacy behavior that returns both.
+   */
+  timeMode?: AlertTimeMode;
   limit?: number;
 }
 export interface AlertListSummary {
@@ -1514,10 +4399,13 @@ export interface AlertListSummary {
   resolvedAlerts: number;
   criticalAlerts: number;
   highAlerts: number;
+  urgentActiveAlerts: number;
+  unassignedActiveAlerts: number;
   incidentAlerts: number;
   collectorAlerts: number;
   agentAlerts: number;
   eventAlerts: number;
+  judgmentAlerts: number;
   sourceAlerts: number;
   coverageAlerts: number;
   objectiveAlerts: number;
@@ -1752,6 +4640,63 @@ export interface ObjectiveList {
   updateTime: string;
 }
 
+export type CorrelationClaimAuthority = 'application' | 'agent_adapter' | 'observer_runtime';
+
+/**
+ * Trust bindings are deliberately separate from the source's learned display identity
+ * (`collectorId` / `workspacePath`). Runtime check-ins must never widen this allow-list.
+ */
+export interface IngestionSourceCorrelationClaimBindings {
+  tenantIds: string[];
+  environmentIds: string[];
+  workspaceIds: string[];
+  workspacePaths: string[];
+  collectorIds: string[];
+  physicalWorkloadIds: string[];
+  agentScopeIds: string[];
+}
+
+export interface IngestionSourceCorrelationClaimsPolicy {
+  enabled: boolean;
+  authority?: CorrelationClaimAuthority;
+  bindings: IngestionSourceCorrelationClaimBindings;
+}
+
+export interface IngestionSourceCorrelationClaimsPolicyInput {
+  enabled?: boolean;
+  authority?: CorrelationClaimAuthority;
+  bindings?: Partial<IngestionSourceCorrelationClaimBindings>;
+}
+
+export type CorrelationClaimAuthorizationReason =
+  | 'authorized'
+  | 'source_unresolved'
+  | 'source_disabled'
+  | 'source_discovered'
+  | 'policy_disabled'
+  | 'policy_invalid'
+  | 'protected_source_required'
+  | 'token_missing'
+  | 'token_invalid'
+  | 'source_id_mismatch'
+  | 'authority_missing'
+  | 'authority_mismatch'
+  | 'source_type_not_allowed'
+  | 'claim_scope_missing'
+  | 'required_scope_missing'
+  | 'tenant_binding_missing'
+  | 'tenant_binding_mismatch'
+  | 'environment_binding_missing'
+  | 'environment_binding_mismatch'
+  | 'workspace_binding_missing'
+  | 'workspace_binding_mismatch'
+  | 'collector_binding_missing'
+  | 'collector_binding_mismatch'
+  | 'workload_binding_missing'
+  | 'workload_binding_mismatch'
+  | 'agent_binding_missing'
+  | 'agent_binding_mismatch';
+
 export interface IngestionSourceRecord {
   sourceId: string;
   name: string;
@@ -1762,6 +4707,7 @@ export interface IngestionSourceRecord {
   tokenPreview?: string;
   tokenIssuedAt?: number;
   tokenRotationDays?: number;
+  correlationClaims?: IngestionSourceCorrelationClaimsPolicy;
   collectorId?: string;
   workspacePath?: string;
   owner?: string;
@@ -1780,6 +4726,14 @@ export interface IngestionSourceRecord {
   rejectedEvents: number;
   lastResult?: 'accepted' | 'rejected';
   lastError?: string;
+}
+export interface IngestionSourceCurrentActivity {
+  sourceId: string;
+  lastSeenAt: number;
+  lastEventAt?: number;
+  lastHeartbeatAt?: number;
+  collectorId?: string;
+  workspacePath?: string;
 }
 export interface IngestionSourceItem extends Omit<IngestionSourceRecord, 'createdAt' | 'updatedAt' | 'lastSeenAt' | 'lastEventAt' | 'lastHeartbeatAt' | 'tokenHash' | 'tokenIssuedAt'> {
   createdAt: string;
@@ -1802,6 +4756,7 @@ export interface IngestionSourceQuery {
   workspacePath?: string;
   status?: IngestionSourceStatus | 'all';
   type?: IngestionSourceType | 'all';
+  includeVerification?: boolean;
   q?: string;
   limit?: number;
 }
@@ -1818,6 +4773,7 @@ export interface IngestionSourceUpdateRequest {
   tags?: string[];
   note?: string;
   tokenRotationDays?: number;
+  correlationClaims?: IngestionSourceCorrelationClaimsPolicyInput;
 }
 export interface IngestionSourceMutationResult {
   source: IngestionSourceItem;
@@ -1872,6 +4828,8 @@ export type RemediationActionKind = 'investigate' | 'collector' | 'source' | 'po
 export interface PolicySimulationRequest extends SecurityTimeFilter {
   policy?: unknown;
   limit?: number;
+  /** Maximum latest event facts replayed. The simulator is intentionally sampled, never full scan. */
+  sampleLimit?: number;
 }
 export interface PolicySimulationDecision {
   verdict: Verdict;
@@ -1914,11 +4872,18 @@ export interface PolicySimulationSummary {
   affectedAgents: number;
   affectedWorkspaces: number;
 }
-export interface PolicySimulationResult {
+export interface PolicySimulationResult extends ClassifiedResponseMeta {
   summary: PolicySimulationSummary;
   diffs: PolicySimulationDiff[];
   byAgent: PolicySimulationGroup[];
   byWorkspace: PolicySimulationGroup[];
+  sampling: {
+    strategy: 'latest_event_sample';
+    sampleLimit: number;
+    sampledEvents: number;
+    truncated: boolean;
+  };
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1963,6 +4928,7 @@ export interface RemediationListItem extends Omit<RemediationRecord, 'createdAt'
   completedAt?: string;
 }
 export interface RemediationQuery extends SecurityTimeFilter {
+  includeBacklog?: boolean;
   taskId?: string;
   incidentId?: string;
   alertId?: string;
@@ -2008,25 +4974,110 @@ export interface RemediationUpdateRequest {
   completedStepIds?: string[];
 }
 
+export type PlatformUserRole = 'administrator' | 'security_analyst' | 'operator' | 'viewer';
+export type PlatformUserStatus = 'active' | 'disabled';
+export type PlatformUserSource = 'local';
+export interface PlatformUserRecord {
+  schemaVersion: 'anysentry.platform_user.v1';
+  userId: string;
+  username: string;
+  displayName: string;
+  email?: string;
+  team?: string;
+  role: PlatformUserRole;
+  status: PlatformUserStatus;
+  source: PlatformUserSource;
+  note?: string;
+  createdAt: number;
+  updatedAt: number;
+  updatedBy: string;
+}
+export interface PlatformUserItem extends Omit<PlatformUserRecord, 'createdAt' | 'updatedAt'> {
+  createdAt: string;
+  updatedAt: string;
+}
+export interface PlatformRoleDefinition {
+  role: PlatformUserRole;
+  label: string;
+  description: string;
+  permissions: string[];
+  userCount: number;
+}
+export interface PlatformUserQuery {
+  q?: string;
+  role?: PlatformUserRole | 'all';
+  status?: PlatformUserStatus | 'all';
+  limit?: number;
+}
+export interface PlatformUserSummary {
+  totalUsers: number;
+  activeUsers: number;
+  disabledUsers: number;
+  administratorUsers: number;
+}
+export interface PlatformUserList {
+  items: PlatformUserItem[];
+  roles: PlatformRoleDefinition[];
+  total: number;
+  summary: PlatformUserSummary;
+  authenticationRequired: false;
+  authorizationEnforced: false;
+  updateTime: string;
+}
+export interface PlatformUserUpdateRequest {
+  username?: string;
+  displayName?: string;
+  email?: string;
+  team?: string;
+  role?: PlatformUserRole;
+  status?: PlatformUserStatus;
+  note?: string;
+}
+
 export type AuditActorType = 'system' | 'operator' | 'api';
 export type AuditAction =
   | 'policy.updated'
   | 'policy.simulated'
+  | 'supply-chain.config.updated'
   | 'incident.updated'
   | 'alert.updated'
   | 'remediation.updated'
   | 'agent.metadata.updated'
   | 'agent.review.updated'
   | 'agent.review.cleared'
+  | 'asset.review.updated'
+  | 'asset.review.cleared'
   | 'agent.identity_ai_review.completed'
+  | 'agent.interaction.content.read'
+  | 'agent.conversation.content.list'
+  | 'agent.conversation.content.read'
+  | 'agent.semantic_evidence.read'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'
   | 'notification.route.updated'
   | 'notification.delivery_failed'
   | 'objective.updated'
   | 'source.updated'
-  | 'source.token_rotated';
-export type AuditResourceType = 'policy' | 'incident' | 'alert' | 'remediation' | 'agent' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source';
+  | 'source.token_rotated'
+  | 'user.updated'
+  | 'infrastructure_rule.created'
+  | 'infrastructure_rule.shadowed'
+  | 'infrastructure_rule.promoted'
+  | 'infrastructure_rule.revoked'
+  | 'infrastructure_rule.validated'
+  | 'infrastructure_rule.materialization_reported'
+  | 'filter_rule.created'
+  | 'filter_rule.shadowed'
+  | 'filter_rule.promoted'
+  | 'filter_rule.revoked'
+  | 'filter_rule.previewed'
+  | 'unknown_learning.reviewed'
+  | 'unknown_learning.policy_updated'
+  | 'unknown_learning.infrastructure_draft_created'
+  | 'unknown_learning.infrastructure_draft_reused'
+  | 'unknown_learning.infrastructure_draft_rejected'
+  | 'unknown_learning.config_updated';
+export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;
@@ -2067,6 +5118,7 @@ export interface AuditSummary {
   notificationActions: number;
   objectiveActions: number;
   sourceActions: number;
+  userActions: number;
   incidentActions: number;
   alertActions: number;
   remediationActions: number;
@@ -2077,4 +5129,90 @@ export interface AuditList {
   total: number;
   summary: AuditSummary;
   updateTime: string;
+}
+
+export type SecurityAssistantLocale = 'en' | 'zh-CN';
+export type SecurityAssistantMessageRole = 'user' | 'assistant';
+
+export interface SecurityAssistantMessage {
+  role: SecurityAssistantMessageRole;
+  content: string;
+}
+
+export interface SecurityAssistantContext {
+  path?: string;
+  view?: string;
+  timeType?: SecurityTimeFilter['timeType'];
+  startTime?: string;
+  endTime?: string;
+  agentId?: string;
+  workspacePath?: string;
+  eventId?: string;
+  traceId?: string;
+  /** Additive trusted-correlation selectors; legacy Trace/Session semantics remain unchanged. */
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  incidentId?: string;
+  alertId?: string;
+}
+
+export interface SecurityAssistantQuery {
+  sessionId?: string;
+  question: string;
+  locale?: SecurityAssistantLocale;
+  history?: SecurityAssistantMessage[];
+  context?: SecurityAssistantContext;
+}
+
+export interface SecurityAssistantReference {
+  kind: 'event' | 'alert' | 'incident' | 'episode' | 'vulnerability' | 'view';
+  id: string;
+  label: string;
+  href: string;
+}
+
+export interface SecurityAssistantSystemContextSummary {
+  status: 'complete' | 'partial';
+  requested: boolean;
+  agentAssetId?: string;
+  bundleId?: string;
+  confidence?: number;
+  estimatedBytes?: number;
+  reasonCodes: string[];
+}
+
+export interface SecurityAssistantToolCall {
+  name: 'inspect_workloads' | 'propose_identity_rule' | 'apply_identity_rule' | 'explain_rule_decision';
+  arguments: Record<string, unknown>;
+  persisted: boolean;
+  /** true only when the rule was actually enforced (apply_identity_rule approved by the chat user). */
+  enforced?: boolean;
+  ruleId?: string;
+  summary?: string;
+  /** Compact workload rows from inspect_workloads so the chat UI can offer per-entry actions. */
+  workloads?: Array<{
+    containerName?: string;
+    podName?: string;
+    classification: string;
+    physicalWorkloadId: string;
+    comm?: string;
+    exeBasename?: string;
+  }>;
+}
+
+export interface SecurityAssistantAnswer {
+  sessionId: string;
+  answer: string;
+  model: string;
+  elapsedMs: number;
+  totalTokens: number;
+  evidenceSummary: string;
+  /** Quality summary for the bounded System Context actually supplied to the risk assistant. */
+  systemContext?: SecurityAssistantSystemContextSummary;
+  references: SecurityAssistantReference[];
+  /** The assistant still cannot open collection or run a host shell. A tool may only save a draft. */
+  readOnly: true;
+  toolCalls?: SecurityAssistantToolCall[];
 }

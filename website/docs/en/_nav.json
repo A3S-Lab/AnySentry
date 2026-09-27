@@ -1,0 +1,47 @@
+[
+  {
+    "text": "Safety loop",
+    "link": "/safety-loop/"
+  },
+  {
+    "text": "Architecture",
+    "link": "/architecture/"
+  },
+  {
+    "text": "Scenarios",
+    "link": "/scenarios/"
+  },
+  {
+    "text": "Quick start",
+    "link": "/guide/"
+  },
+  {
+    "text": "Resources",
+    "items": [
+      {
+        "text": "AI-Native agents",
+        "link": "/ai-native/"
+      },
+      {
+        "text": "Tiered judgment",
+        "link": "/judgment/"
+      },
+      {
+        "text": "Events and evidence",
+        "link": "/evidence/"
+      },
+      {
+        "text": "GitHub",
+        "link": "https://github.com/A3S-Lab/AnySentry"
+      },
+      {
+        "text": "Deployment runbook",
+        "link": "https://github.com/A3S-Lab/AnySentry/blob/main/deploy/README.md"
+      },
+      {
+        "text": "Agent API Skill",
+        "link": "https://github.com/A3S-Lab/AnySentry/tree/main/integrations/skills/anysentry-api"
+      }
+    ]
+  }
+]

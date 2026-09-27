@@ -1,0 +1,75 @@
+services:
+  fake-llm:
+    image: ${PI_LAB_IMAGE:-anysentry-pi-tls-observability-lab:0.1.0}
+    build:
+      context: .
+    command: ["fake-llm"]
+    user: "${PI_LAB_CONTAINER_UID:-1000}:${PI_LAB_CONTAINER_GID:-1000}"
+    environment:
+      FIXTURE_API_KEY: ${PI_LAB_FAKE_API_KEY:-fixture-key-not-secret}
+      FIXTURE_HTTP_HOST: 0.0.0.0
+      FIXTURE_HTTP_PORT: "18080"
+      FIXTURE_HTTPS_PORT: "18443"
+      FIXTURE_TLS_DIR: /tls
+      FIXTURE_TRANSCRIPT_PATH: /results/fake-llm.ndjson
+      FIXTURE_WORKSPACE: /workspace
+    healthcheck:
+      test: ["CMD", "node", "/opt/pi-tls-lab/app/healthcheck.mjs", "https://localhost:18443/healthz", "/tls/ca.crt"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    labels:
+      io.anysentry.observe: "false"
+      anysentry.io/workload-role: test_fixture
+    volumes:
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/tls:/tls
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/results:/results
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/workspace:/workspace
+
+  pi-agent:
+    image: ${PI_LAB_IMAGE:-anysentry-pi-tls-observability-lab:0.1.0}
+    build:
+      context: .
+    command: ["pi"]
+    user: "${PI_LAB_CONTAINER_UID:-1000}:${PI_LAB_CONTAINER_GID:-1000}"
+    depends_on:
+      fake-llm:
+        condition: service_healthy
+    environment:
+      AGENT_ID: docker-pi-tls-fixture
+      PI_LAB_BASE_URL: ${PI_LAB_BASE_URL:-https://fake-llm:18443/v1}
+      PI_LAB_API_KEY: ${PI_LAB_API_KEY:-fixture-key-not-secret}
+      PI_LAB_MODEL: ${PI_LAB_MODEL:-fixture-tool-model}
+      PI_LAB_WORKSPACE: /workspace
+      PI_LAB_RESULTS_DIR: /results
+      PI_LAB_AGENT_DIR: /pi-state
+      PI_LAB_EXPECT_FIXTURE: ${PI_LAB_EXPECT_FIXTURE:-1}
+      PI_LAB_TURN_TIMEOUT_SECONDS: ${PI_LAB_TURN_TIMEOUT_SECONDS:-45}
+      PI_LAB_ATTACH_GRACE_SECONDS: ${PI_LAB_ATTACH_GRACE_SECONDS:-8}
+      PI_LAB_READY_FILE: /results/pi-attach-ready.json
+      NODE_EXTRA_CA_CERTS: /tls/ca.crt
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: docker-pi-tls-fixture
+      anysentry.io/agent-runtime: pi
+      anysentry.io/test-protocol: tls-http
+    volumes:
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/tls:/tls:ro
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/results:/results
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/workspace:/workspace
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/pi-state:/pi-state
+
+  verifier:
+    image: ${PI_LAB_IMAGE:-anysentry-pi-tls-observability-lab:0.1.0}
+    build:
+      context: .
+    command: ["verify"]
+    user: "${PI_LAB_CONTAINER_UID:-1000}:${PI_LAB_CONTAINER_GID:-1000}"
+    environment:
+      PI_LAB_RESULTS_DIR: /results
+      PI_LAB_WORKSPACE: /workspace
+      PI_LAB_EXPECT_FIXTURE: ${PI_LAB_EXPECT_FIXTURE:-1}
+    volumes:
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/results:/results
+      - ${PI_LAB_RUNTIME_DIR:-./.runtime/docker}/workspace:/workspace:ro

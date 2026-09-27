@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
 
 const baseUrl = (process.env.ANYSENTRY_API_BASE ?? process.env.API_BASE ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/, '');
@@ -324,13 +325,15 @@ async function createObjective(agentId) {
   return objective;
 }
 
-async function createAgentMetadata(agentId, workspacePath, suffix) {
-  const physicalWorkloadId = `evidence:${workspacePath}:${agentId}`;
+async function createAgentMetadata(agentId, workspacePath, suffix, { review = true } = {}) {
+  const containerId = createHash('sha256').update(`${workspacePath}\0${agentId}`).digest('hex');
+  const physicalWorkloadId = review ? `container:${containerId}` : `evidence:${workspacePath}:${agentId}`;
+  const agentInstanceId = review ? `docker:${containerId}` : `evidence:${agentId}`;
   const metadata = await request(`/agents/${encodeURIComponent(agentId)}/metadata`, 'PUT', {
     workspacePath,
-    identityKeys: [agentId, physicalWorkloadId],
+    identityKeys: review ? [containerId, physicalWorkloadId] : [agentId, physicalWorkloadId],
     physicalWorkloadId,
-    agentInstanceId: `evidence:${agentId}`,
+    agentInstanceId,
     displayName: bearerProbe(`${runId} ${suffix} agent`),
     owner: bearerProbe(`${runId}-${suffix}-owner`),
     team: apiKeyProbe(`${runId}-${suffix}-team`),
@@ -344,19 +347,21 @@ async function createAgentMetadata(agentId, workspacePath, suffix) {
     metadata.agentId === agentId && metadata.workspacePath === workspacePath && hasRedactedProbe(metadata.owner, `${runId}-${suffix}-owner`),
     metadata,
   );
+  if (!review) return metadata;
   const reviewed = await request(`/agents/${encodeURIComponent(agentId)}/review`, 'PUT', {
     workspacePath,
     agentAssetId: metadata.agentAssetId,
     decision: 'confirmed_agent',
     currentClassification: 'unknown',
-    identityKeys: [agentId],
-    agentInstanceId: `evidence:${agentId}`,
+    identityKeys: [containerId],
+    agentInstanceId,
     physicalWorkloadId,
     workloadRef: {
-      environment: 'host',
-      kind: 'process',
+      environment: 'docker',
+      kind: 'container',
       name: agentId,
-      processName: agentId,
+      containerName: agentId,
+      containerImage: 'anysentry/evidence-fixture:local',
     },
     note: `confirmed by ${runId} evidence verifier`,
   }, actorHeaders);
@@ -746,6 +751,9 @@ async function verifyEvidenceExport(source, token, incident, alert, task, object
       exported.content?.includes('Workspaces') &&
       exported.content?.includes('Notification Deliveries') &&
       exported.content?.includes('Maintenance Windows') &&
+      exported.content?.includes('Evidence Data Source') &&
+      exported.content?.includes('Evidence Completeness') &&
+      exported.content?.includes('Evidence Partial Reason') &&
       exported.content?.includes('command_danger'),
     exported,
   );
@@ -769,6 +777,25 @@ async function verifyAlternatePrimaries(eventId, taskId, incidentId, objectiveId
       listed: eventIdentitySnapshot(listedEvent),
     },
   );
+  if (listedEvent?.subjectAssetId) {
+    const assetBundle = await request('/evidence/bundle', 'POST', {
+      timeType: 'last_30d',
+      subjectAssetId: listedEvent.subjectAssetId,
+      classificationView: 'current_effective',
+      limit: 30,
+    });
+    assert(
+      'Asset-scoped evidence bundle preserves current-effective classification and durable coverage',
+      assetBundle.classificationView === 'current_effective' &&
+        assetBundle.scope?.subjectAssetId === listedEvent.subjectAssetId &&
+        assetBundle.events?.some((item) => item.eventId === eventId) &&
+        assetBundle.events?.every((item) => item.subjectAssetId === listedEvent.subjectAssetId) &&
+        assetBundle.timeline?.items?.every((item) => item.subjectAssetId === listedEvent.subjectAssetId) &&
+        typeof assetBundle.timeline?.coverage?.partial === 'boolean' &&
+        Boolean(assetBundle.timeline?.coverage?.source),
+      assetBundle,
+    );
+  }
 
   const topologyEdge = eventBundle.topology?.edges?.find((edge) => edge.sampleEventId === eventId) ?? eventBundle.topology?.edges?.[0];
   const topologyEdgeId = topologyEdge?.edgeId ?? '__missing_topology_edge__';
@@ -940,7 +967,9 @@ async function main() {
     const objective = await createObjective(risk.agentId);
     const overdueObjectiveRemediation = await triggerObjectiveRemediationOverdue(objective.objectiveId);
     const updated = await mutateCase(incident, alert, task);
-    const agentMetadata = await createAgentMetadata(risk.agentId, source.workspacePath, 'risk');
+    // This generic webhook event has no attested Runtime binding. Keep useful ownership metadata,
+    // but do not manufacture a stable review key merely to force an Agent classification.
+    const agentMetadata = await createAgentMetadata(risk.agentId, source.workspacePath, 'risk', { review: false });
     const neighborMetadata = await createAgentMetadata(`${runId}-neighbor-agent`, source.workspacePath, 'neighbor');
     const maintenance = {
       source: await createMaintenanceWindow('source', source.sourceId, 'source'),

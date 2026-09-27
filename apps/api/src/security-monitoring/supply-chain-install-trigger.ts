@@ -1,6 +1,7 @@
 export interface RuntimeInstallEvent {
   phase: 'started' | 'exited';
   pid: number;
+  startTimeTicks?: string;
   startTimeNs?: string;
   packageManager?: string;
   command?: string;
@@ -37,6 +38,14 @@ function positiveInteger(value: unknown): number | undefined {
 
 function text(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function identityText(value: unknown): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') {
+    const normalized = String(value).trim();
+    return normalized || undefined;
+  }
+  return undefined;
 }
 
 function commandFromArgv(argv: unknown): string | undefined {
@@ -79,7 +88,14 @@ export function parseRuntimeInstallEvent(line: string): RuntimeInstallEvent | un
   const process = envelope.process ?? {};
   const pid = positiveInteger(payload.pid) ?? positiveInteger(process.pid);
   if (!pid) return undefined;
-  const startTimeNs = text(process.startTimeNs) ?? text(payload.startTimeNs);
+  const startTimeTicks = identityText(process.startTimeTicks)
+    ?? identityText(process.start_time_ticks)
+    ?? identityText(payload.startTimeTicks)
+    ?? identityText(payload.start_time_ticks);
+  const startTimeNs = identityText(process.startTimeNs)
+    ?? identityText(process.start_time_ns)
+    ?? identityText(payload.startTimeNs)
+    ?? identityText(payload.start_time_ns);
 
   if (kind === 'ToolExec') {
     const command = commandFromArgv(payload.argv);
@@ -89,6 +105,7 @@ export function parseRuntimeInstallEvent(line: string): RuntimeInstallEvent | un
     return {
       phase: 'started',
       pid,
+      startTimeTicks,
       startTimeNs,
       packageManager,
       command: command.slice(0, 1_000),
@@ -101,6 +118,7 @@ export function parseRuntimeInstallEvent(line: string): RuntimeInstallEvent | un
   return {
     phase: 'exited',
     pid,
+    startTimeTicks,
     startTimeNs,
     succeeded: Number.isFinite(exitCode) && exitCode === 0
       && (!Number.isFinite(signal) || signal === 0),

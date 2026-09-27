@@ -349,8 +349,10 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
     'agent review persists a stable human confirmation',
     reviewed.reviewDecision === 'confirmed_agent' &&
       reviewed.reviewedBy?.includes(actorId) &&
-      reviewed.reviewIdentityKeys?.includes(`${runId}-reviewed`) &&
-      reviewed.reviewPhysicalWorkloadId === `docker:test:${runId}`,
+      reviewed.reviewIdentityKeys?.includes(`docker:test:${runId}`) &&
+      !reviewed.reviewIdentityKeys?.includes(`${runId}-reviewed`) &&
+      reviewed.reviewPhysicalWorkloadId === `docker:test:${runId}` &&
+      reviewed.reviewRevision === 1,
     reviewed,
   );
   await auditFor({
@@ -359,7 +361,8 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
     resourceId: metadata.agentAssetId,
     check: (audit) =>
       audit.details?.decision === 'confirmed_agent' &&
-      audit.details?.identityKeyCount === 3,
+      audit.details?.identityKeyCount === 2 &&
+      audit.details?.reviewRevision === 1,
   });
   const identitySnapshot = await request(`/identity/snapshot?nodeName=${encodeURIComponent(`${runId}-node`)}`);
   assert(
@@ -367,7 +370,8 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
     identitySnapshot.entries?.some((entry) =>
       entry.classification === 'confirmed_agent' &&
       entry.attributionSource === 'manual_review' &&
-      entry.ids?.includes(`${runId}-reviewed`)
+      entry.ids?.includes(`docker:test:${runId}`) &&
+      entry.reviewRevision === 1
     ),
     identitySnapshot,
   );
@@ -375,13 +379,21 @@ async function verifyOtherControlPlaneObjects(sourceId, channelSecret) {
     workspacePath,
     agentAssetId: metadata.agentAssetId,
     decision: 'clear',
+    expectedRevision: 1,
   }, actorHeaders);
-  assert('agent review can be cleared without deleting metadata', !clearedReview.reviewDecision && clearedReview.owner === `${runId}-agent-owner`, clearedReview);
+  assert(
+    'agent review can be cleared without deleting metadata',
+    !clearedReview.reviewDecision &&
+      clearedReview.owner === `${runId}-agent-owner` &&
+      clearedReview.reviewRevision === 2 &&
+      clearedReview.reviewHistory?.at(-1)?.decision === 'clear',
+    clearedReview,
+  );
   await auditFor({
     action: 'agent.review.cleared',
     resourceType: 'agent',
     resourceId: metadata.agentAssetId,
-    check: (audit) => audit.details?.decision === 'clear',
+    check: (audit) => audit.details?.decision === 'clear' && audit.details?.reviewRevision === 2,
   });
 
   const startAt = new Date(Date.now() - 60_000).toISOString();

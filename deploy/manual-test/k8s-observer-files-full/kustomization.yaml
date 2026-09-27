@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Final single-node full-probe profile. Apply only after the stable Observer, the independent
+# FileAccess canary, and a separate FileDelete capacity run have each completed without loss.
+# The stable parent remains file-disabled and is suitable for ordinary manual interaction.
+resources:
+  - ../k8s-observer
+
+patches:
+  - path: full-file-probe-patch.yaml

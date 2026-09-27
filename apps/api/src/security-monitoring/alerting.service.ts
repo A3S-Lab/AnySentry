@@ -2,10 +2,13 @@ import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { AgentMetadataService } from './agent-metadata.service';
 import { ClickHouseStore } from './clickhouse-store';
-import { IngestionSourceService } from './ingestion-source.service';
+import { IngestionSourceService, isVerificationSource } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { NotificationService } from './notification.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import { cleanText } from './redaction';
+import { collectorHeartbeatFailureDelta } from './pipeline-accounting';
+import type { DecisionResultJob } from './async-judgment.types';
 import {
   AlertConfig,
   AlertKind,
@@ -31,8 +34,16 @@ const HOUR = 3_600_000;
 const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const ALERT_HISTORY_LIMIT = 2_000;
+// A dirty queue is intentionally no larger than the compatibility retention window.  Alert
+// history beyond this bound is already omitted from the legacy snapshot, so retaining more keys
+// would only create an unbounded retry backlog under a database outage.
+const ALERT_DIRTY_MAX_ENTRIES = ALERT_HISTORY_LIMIT;
+const RELATIONAL_REFRESH_MS = 15_000;
 const SILENCE_DEFAULT_MINUTES = 60;
 const SILENCE_MAX_MINUTES = 7 * 24 * 60;
+const PERSIST_RETRY_INITIAL_MS = 5_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
+const PERSIST_COALESCE_MS = 1_000;
 
 type AlertInput = Omit<
   AlertRecord,
@@ -83,6 +94,14 @@ interface CoverageAlertScope {
   agentId?: string;
   collectorId?: string;
   sourceId?: string;
+}
+
+type AlertNotificationAction = 'opened' | 'reopened' | 'resolved';
+
+export interface DurableAlertMutation {
+  records: AlertRecord[];
+  commit(): void;
+  rollback(): void;
 }
 
 function hashId(prefix: string, parts: Array<string | number | undefined>): string {
@@ -149,6 +168,16 @@ function cleanAlertLabels(labels: Record<string, string>): Record<string, string
   return out;
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(',')}}`;
+}
+
 function attrText(event: JudgedEvent, key: string, limit: number): string | undefined {
   const promoted = key === 'collectorId' ? event.collectorId : key === 'sourceId' ? event.sourceId : undefined;
   const value = promoted?.trim() || event.attributes[key];
@@ -178,16 +207,94 @@ function sourceCheckInSeverity(message: string | undefined): Severity {
   return normalized.includes('drop') || normalized.includes('fail') || normalized.includes('error') ? 'high' : 'medium';
 }
 
+function isIncompleteToolEvidence(value: string | undefined): boolean {
+  return (value ?? '').toLowerCase().includes('incomplete toolexec evidence: argv was truncated or could not be fully reassembled');
+}
+
+type JudgmentFailureType = 'timeout' | 'invalid_output' | 'model_service' | 'agent_runtime' | 'internal';
+
+function judgmentFailureType(result: DecisionResultJob): JudgmentFailureType {
+  const detail = `${result.stageStopReason ?? ''} ${result.error ?? ''}`.toLowerCase();
+  if (
+    result.status === 'timeout' ||
+    detail.includes('timeout') ||
+    detail.includes('timed out') ||
+    detail.includes('exceeded')
+  ) return 'timeout';
+  if (
+    detail.includes('no valid json') ||
+    detail.includes('invalid verdict') ||
+    detail.includes('invalid severity') ||
+    detail.includes('empty reason') ||
+    detail.includes('unexpected token') ||
+    detail.includes('unexpected end') ||
+    detail.includes('json') ||
+    detail.includes('schema') ||
+    detail.includes('structured output')
+  ) return 'invalid_output';
+  if (
+    /\b(401|403|408|429|500|502|503|504)\b/.test(detail) ||
+    detail.includes('unauthorized') ||
+    detail.includes('api key') ||
+    detail.includes('credential') ||
+    detail.includes('econn') ||
+    detail.includes('enotfound') ||
+    detail.includes('network') ||
+    detail.includes('socket') ||
+    detail.includes('connection') ||
+    detail.includes('model service') ||
+    detail.includes('model unavailable')
+  ) return 'model_service';
+  if (
+    detail.includes('agent') ||
+    detail.includes('session') ||
+    detail.includes('pool') ||
+    detail.includes('tool round') ||
+    detail.includes('quarantin') ||
+    detail.includes('spawn') ||
+    detail.includes('judge is closed')
+  ) return 'agent_runtime';
+  return 'internal';
+}
+
+const JUDGMENT_FAILURE_TEXT: Record<JudgmentFailureType, { title: string; description: string; severity: Severity }> = {
+  timeout: { title: '请求超时', description: '模型或 Agent 在时间预算内没有完成研判。', severity: 'high' },
+  invalid_output: { title: '输出格式无效', description: '研判已返回，但没有得到可验证的结构化结论。', severity: 'medium' },
+  model_service: { title: '模型服务异常', description: '模型端点、认证、限流或网络连接发生异常。', severity: 'high' },
+  agent_runtime: { title: 'Agent 运行异常', description: '研判 Agent、Session 或执行池发生运行错误。', severity: 'high' },
+  internal: { title: '研判内部错误', description: '研判失败，且未匹配到已知故障类型。', severity: 'high' },
+};
+
 @Injectable()
 export class AlertingService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly alerts = new Map<string, AlertRecord>();
   private readonly incidents = new Map<string, Incident>();
   private readonly latestCollectorHeartbeat = new Map<string, CollectorHeartbeatRecord>();
+  /** Cumulative quality counters belong to one producer channel, not merely one collector ID. */
+  private readonly latestCollectorQualityHeartbeat = new Map<string, CollectorHeartbeatRecord>();
+  private readonly collectorQualityStreak = new Map<string, { bad: number; clean: number }>();
+  /** IDs and mutation generations that have not crossed the relational durability fence. */
+  private readonly dirtyAlertIds = new Map<string, number>();
+  private dirtyAlertGeneration = 0;
+  private dirtyAlertDropped = 0;
+  private persistenceFailures = 0;
+  private persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+  private persistenceRetryTimer?: NodeJS.Timeout;
+  private persistenceForceSnapshot = false;
+  private closing = false;
+  /** Captures dirty-state transitions while one durable business mutation is being prepared. */
+  private durableMutationDirtyBefore?: Map<string, number | undefined>;
   private persistTimer?: NodeJS.Timeout;
   private collectorTimer?: NodeJS.Timeout;
   private sourceTimer?: NodeJS.Timeout;
+  private relationalRefreshTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
   private initialized = false;
+  private durableMutationHolds = 0;
+  private effectCapture?: {
+    notifications: Array<{ alert: AlertRecord; action: AlertNotificationAction }>;
+  };
 
   private readonly config: AlertConfig = {
     enabled: process.env.ANYSENTRY_ALERTS !== 'off',
@@ -203,32 +310,137 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   };
 
   constructor(
+    private readonly ch: ClickHouseStore,
     private readonly maintenance: MaintenanceWindowService,
     private readonly notifications: NotificationService,
     private readonly sources: IngestionSourceService,
     private readonly agentMetadata: AgentMetadataService,
+    private readonly relational: RelationalBusinessStore,
   ) {}
+
+  private markAlertDirty(alertId: string): void {
+    const id = alertId.trim();
+    if (!id) return;
+    if (this.durableMutationDirtyBefore && !this.durableMutationDirtyBefore.has(id)) {
+      this.durableMutationDirtyBefore.set(id, this.dirtyAlertIds.get(id));
+    }
+    const generation = ++this.dirtyAlertGeneration;
+    if (this.dirtyAlertIds.has(id)) {
+      this.dirtyAlertIds.set(id, generation);
+      return;
+    }
+    if (this.dirtyAlertIds.size >= ALERT_DIRTY_MAX_ENTRIES) {
+      const oldest = this.dirtyAlertIds.keys().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.dirtyAlertIds.delete(oldest);
+        this.dirtyAlertDropped += 1;
+      }
+    }
+    this.dirtyAlertIds.set(id, generation);
+  }
+
+  private relationalPersistenceEnabled(): boolean {
+    const configured = (this.relational as unknown as { configured?: () => boolean }).configured;
+    return typeof configured !== 'function' || configured.call(this.relational);
+  }
+
+  private schedulePersistenceRetry(): void {
+    if (this.closing || !this.initialized || this.persistenceRetryTimer || this.dirtyAlertIds.size === 0) return;
+    const delay = this.persistenceRetryDelayMs;
+    this.persistenceRetryDelayMs = Math.min(PERSIST_RETRY_MAX_MS, delay * 2);
+    this.persistenceRetryTimer = setTimeout(() => {
+      this.persistenceRetryTimer = undefined;
+      void this.persist();
+    }, delay);
+    this.persistenceRetryTimer.unref?.();
+  }
+
+  private markPersistenceSuccess(): void {
+    this.persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+    if (this.persistenceRetryTimer) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+  }
+
+  private alertPersistenceStatus(): {
+    dirty: number;
+    maxDirty: number;
+    dropped: number;
+    failures: number;
+    inFlight: boolean;
+    retryScheduled: boolean;
+  } {
+    return {
+      dirty: this.dirtyAlertIds.size,
+      maxDirty: ALERT_DIRTY_MAX_ENTRIES,
+      dropped: this.dirtyAlertDropped,
+      failures: this.persistenceFailures,
+      inFlight: Boolean(this.persistInFlight),
+      retryScheduled: Boolean(this.persistenceRetryTimer),
+    };
+  }
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       const persisted = await this.ch.loadAlertState();
       for (const rec of persisted) this.mergePersisted(rec);
     }
+    for (const rec of await this.relational.loadAlerts()) this.mergePersisted(rec);
+    const retiredAt = Date.now();
+    const verificationSourceIds = new Set(
+      this.sources.snapshot().filter((source) => isVerificationSource(source)).map((source) => source.sourceId),
+    );
+    this.resolveWhere(
+      (alert) =>
+        (alert.ruleId === 'incident.high_or_critical' && isIncompleteToolEvidence(alert.description)) ||
+        (alert.ruleId === 'source.availability' && Boolean(alert.sourceId && verificationSourceIds.has(alert.sourceId))),
+      retiredAt,
+      'retired legacy alert noise',
+      false,
+    );
     this.initialized = true;
+    await this.persist(true);
     this.collectorTimer = setInterval(() => this.checkCollectorAvailability(), 30_000);
     this.sourceTimer = setInterval(() => this.checkSourceAvailability(), 30_000);
+    this.relationalRefreshTimer = setInterval(() => void this.refreshRelational(), RELATIONAL_REFRESH_MS);
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.collectorTimer) clearInterval(this.collectorTimer);
     if (this.sourceTimer) clearInterval(this.sourceTimer);
-    await this.persist();
-    await this.ch.close();
+    if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
+    if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
+    this.persistenceRetryTimer = undefined;
+    await this.persist(true);
   }
 
   getConfig(): AlertConfig {
     return { ...this.config, webhookConfigured: this.notifications.config().summary.enabledChannels > 0 };
+  }
+
+  stateStatus(): {
+    recordCount: number;
+    postgresqlBacked: boolean;
+    persistence: ReturnType<AlertingService['alertPersistenceStatus']>;
+  } {
+    return {
+      recordCount: this.alerts.size,
+      postgresqlBacked: this.relational.isReady(),
+      persistence: this.alertPersistenceStatus(),
+    };
+  }
+
+  isActiveAlert(alertId: string): boolean {
+    const alert = this.alerts.get(alertId);
+    return Boolean(alert && active(alert.status));
+  }
+
+  isVerificationSourceId(sourceId: string): boolean {
+    const source = this.sources.snapshot().find((candidate) => candidate.sourceId === sourceId);
+    return Boolean(source && isVerificationSource(source));
   }
 
   getRules(): AlertRule[] {
@@ -278,6 +490,15 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         severity: this.config.eventMinSeverity,
         cooldownSecs,
         description: '高危/严重阻断事件会生成证据级告警。',
+      },
+      {
+        ruleId: 'judgment.failure',
+        name: 'L2/L3 研判失败',
+        kind: 'judgment',
+        enabled: this.config.enabled,
+        severity: 'high',
+        cooldownSecs,
+        description: 'L2/L3 超时、无效输出、模型服务异常和 Agent 运行错误会分类生成平台告警。',
       },
       {
         ruleId: 'source.rejected_ingest',
@@ -336,33 +557,37 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     ];
   }
 
-  observeEvent(event: JudgedEvent): void {
+  observeEvent(event: JudgedEvent, incidentId?: string): void {
     if (!this.config.enabled) return;
     if (event.verdict !== 'block' || SEVERITY_RANK[event.severity] < SEVERITY_RANK[this.config.eventMinSeverity]) return;
+    const canonicalAgentId = event.attribution?.agentScopeId?.trim() || event.agentId;
     const collectorId = attrText(event, 'collectorId', 180);
     const sourceId = attrText(event, 'sourceId', 160);
-    if (this.maintenance.activeFor({ workspacePath: event.workspacePath, agentId: event.agentId, collectorId, sourceId }, event.at)) return;
+    if (this.maintenance.activeFor({ workspacePath: event.workspacePath, agentId: canonicalAgentId, collectorId, sourceId }, event.at)) return;
     this.upsert({
-      dedupeKey: ['event', event.workspacePath, event.agentId, event.traceId, event.riskCategory].join(':'),
+      dedupeKey: ['event', event.workspacePath, canonicalAgentId, event.traceId, event.riskCategory].join(':'),
       ruleId: 'event.critical_block',
       kind: 'event',
       severity: event.severity,
-      title: `${event.riskName} 阻断 · ${event.agentId}`,
+      title: `${event.riskName} 阻断 · ${canonicalAgentId}`,
       description: `${event.subject} (${event.reason})`,
       workspacePath: event.workspacePath,
-      agentId: event.agentId,
+      agentId: canonicalAgentId,
       collectorId,
       sourceId,
       sessionId: event.sessionId,
       userId: event.userId,
       traceId: event.traceId,
       runId: event.runId,
+      incidentId,
       eventId: event.eventId,
+      monitored: event.attribution?.monitored === true,
+      agentScopeId: event.attribution?.agentScopeId,
       riskCategory: event.riskCategory,
       riskName: event.riskName,
       sourceSummary: event.subject,
-      owner: this.ownerFor({ workspacePath: event.workspacePath, agentId: event.agentId, sourceId }),
-      team: this.teamFor({ workspacePath: event.workspacePath, agentId: event.agentId, sourceId }),
+      owner: this.ownerFor({ workspacePath: event.workspacePath, agentId: canonicalAgentId, sourceId }),
+      team: this.teamFor({ workspacePath: event.workspacePath, agentId: canonicalAgentId, sourceId }),
       labels: {
         verdict: event.verdict,
         tier: event.tier,
@@ -374,9 +599,60 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  backfillEventScopes(entries: Array<{ event: JudgedEvent; incidentId: string }>): void {
+    if (entries.length === 0 || this.alerts.size === 0) return;
+    const eventScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    const incidentScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    const agentScopes = new Map<string, { monitored: boolean; agentScopeId?: string }>();
+    for (const { event, incidentId } of entries) {
+      const scope = {
+        monitored: event.attribution?.monitored === true,
+        agentScopeId: event.attribution?.agentScopeId,
+      };
+      eventScopes.set(event.eventId, scope);
+      const previousIncident = incidentScopes.get(incidentId);
+      incidentScopes.set(incidentId, {
+        monitored: previousIncident?.monitored === true || scope.monitored,
+        agentScopeId: scope.agentScopeId ?? previousIncident?.agentScopeId,
+      });
+      const agentKey = `${event.workspacePath}\0${event.agentId}`;
+      const previousAgent = agentScopes.get(agentKey);
+      agentScopes.set(agentKey, {
+        monitored: previousAgent?.monitored === true || scope.monitored,
+        agentScopeId: scope.agentScopeId ?? previousAgent?.agentScopeId,
+      });
+    }
+
+    let changed = false;
+    for (const [alertId, alert] of this.alerts) {
+      if (alert.monitored !== undefined) continue;
+      const scope =
+        (alert.eventId ? eventScopes.get(alert.eventId) : undefined) ??
+        (alert.incidentId ? incidentScopes.get(alert.incidentId) : undefined) ??
+        (alert.kind === 'agent' && alert.workspacePath && alert.agentId
+          ? agentScopes.get(`${alert.workspacePath}\0${alert.agentId}`)
+          : undefined);
+      if (!scope) continue;
+      this.alerts.set(alertId, { ...alert, ...scope });
+      this.markAlertDirty(alertId);
+      changed = true;
+    }
+    if (changed) this.persistSoon();
+  }
+
   observeIncident(incident: Incident): void {
     this.incidents.set(incident.incidentId, incident);
     if (!this.config.enabled) return;
+
+    if (isIncompleteToolEvidence(incident.description)) {
+      this.resolveWhere(
+        (alert) => alert.incidentId === incident.incidentId,
+        incident.updatedAt,
+        'incomplete telemetry is not a security incident',
+      );
+      this.recomputeAgentIncidentAlert(incident.workspacePath, incident.agentId, incident.updatedAt);
+      return;
+    }
 
     if (incident.status === 'resolved') {
       this.resolveWhere((alert) => alert.incidentId === incident.incidentId, incident.updatedAt, 'linked incident resolved');
@@ -409,6 +685,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         runId: incident.runId,
         incidentId: incident.incidentId,
         eventId: incident.lastEventId,
+        monitored: incident.monitored,
+        agentScopeId: incident.agentScopeId,
         riskCategory: incident.riskCategory,
         riskName: incident.riskName,
         sourceSummary: incident.lastEventSubject,
@@ -427,8 +705,112 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     this.recomputeAgentIncidentAlert(incident.workspacePath, incident.agentId, incident.updatedAt);
   }
 
+  /**
+   * Apply one event's alert mutations synchronously, but hold persistence and notifications until
+   * the caller atomically commits the Incident, Alerts and business-effect ledger in PostgreSQL.
+   */
+  prepareDurableBusinessEffects(event: JudgedEvent, incident: Incident | null): DurableAlertMutation {
+    if (this.effectCapture) throw new Error('nested durable alert mutation is not supported');
+    const beforeAlerts = new Map(this.alerts);
+    const beforeIncident = incident ? this.incidents.get(incident.incidentId) : undefined;
+    const dirtyBefore = new Map<string, number | undefined>();
+    this.durableMutationDirtyBefore = dirtyBefore;
+    if (this.durableMutationHolds === 0 && this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+      this.persistRequested = true;
+    }
+    this.durableMutationHolds += 1;
+    const capture = { notifications: [] as Array<{ alert: AlertRecord; action: AlertNotificationAction }> };
+    this.effectCapture = capture;
+    try {
+      this.observeEvent(event, incident?.incidentId);
+      if (incident) this.observeIncident(incident);
+    } catch (error) {
+      this.effectCapture = undefined;
+      this.durableMutationDirtyBefore = undefined;
+      for (const alertId of this.alerts.keys()) {
+        if (!beforeAlerts.has(alertId)) this.alerts.delete(alertId);
+      }
+      for (const [alertId, alert] of beforeAlerts) this.alerts.set(alertId, alert);
+      for (const [alertId, previousGeneration] of dirtyBefore) {
+        if (previousGeneration !== undefined) this.dirtyAlertIds.set(alertId, previousGeneration);
+        else this.dirtyAlertIds.delete(alertId);
+      }
+      if (incident) {
+        if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
+        else this.incidents.delete(incident.incidentId);
+      }
+      this.durableMutationHolds -= 1;
+      if (this.durableMutationHolds === 0) this.persistSoon();
+      throw error;
+    }
+    this.effectCapture = undefined;
+    this.durableMutationDirtyBefore = undefined;
+
+    const changes = [...this.alerts.entries()]
+      .filter(([alertId, alert]) => beforeAlerts.get(alertId) !== alert)
+      .map(([alertId, after]) => ({
+        alertId,
+        before: beforeAlerts.get(alertId),
+        after,
+        dirtyGeneration: this.dirtyAlertIds.get(alertId),
+      }));
+    let settled = false;
+    const release = (): void => {
+      this.durableMutationHolds = Math.max(0, this.durableMutationHolds - 1);
+      if (this.durableMutationHolds === 0) this.persistSoon();
+    };
+    return {
+      records: changes.map(({ after }) => after),
+      commit: () => {
+        if (settled) return;
+        settled = true;
+        for (const { alertId, after, dirtyGeneration } of changes) {
+          if (this.alerts.get(alertId) === after
+            && this.dirtyAlertIds.get(alertId) === dirtyGeneration) {
+            this.dirtyAlertIds.delete(alertId);
+          }
+        }
+        release();
+        for (const notification of capture.notifications) {
+          if (this.alerts.get(notification.alert.alertId) === notification.alert) {
+            void this.notify(notification.alert, notification.action);
+          }
+        }
+      },
+      rollback: () => {
+        if (settled) return;
+        settled = true;
+        for (const { alertId, before, after, dirtyGeneration } of changes) {
+          if (this.alerts.get(alertId) !== after
+            || this.dirtyAlertIds.get(alertId) !== dirtyGeneration) continue;
+          if (before) this.alerts.set(alertId, before);
+          else this.alerts.delete(alertId);
+          const previousGeneration = dirtyBefore.get(alertId);
+          if (previousGeneration !== undefined) this.dirtyAlertIds.set(alertId, previousGeneration);
+          else this.dirtyAlertIds.delete(alertId);
+        }
+        if (incident && this.incidents.get(incident.incidentId) === incident) {
+          if (beforeIncident) this.incidents.set(incident.incidentId, beforeIncident);
+          else this.incidents.delete(incident.incidentId);
+        }
+        release();
+      },
+    };
+  }
+
   observeCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
-    this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const previousQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!previousQuality || heartbeat.at >= previousQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
+    const latest = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!latest || heartbeat.at >= latest.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
     if (!this.config.enabled) return;
 
     this.resolveWhere(
@@ -437,18 +819,64 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       'collector heartbeat recovered',
     );
 
-    const dropped = heartbeat.droppedEvents + heartbeat.outputDropped;
-    const degraded = heartbeat.status !== 'ok' || dropped > 0 || heartbeat.errorCount > 0;
-    if (!degraded) {
-      this.resolveWhere(
-        (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId && alert.ruleId === 'collector.quality',
-        heartbeat.at,
-        'collector quality recovered',
+    const matchesQualityOrigin = (alert: AlertRecord) =>
+      alert.kind === 'collector' &&
+      alert.collectorId === heartbeat.collectorId &&
+      alert.ruleId === 'collector.quality' &&
+      (
+        alert.labels?.heartbeatOrigin === qualityOrigin ||
+        (qualityOrigin === 'forwarder' && !alert.labels?.heartbeatOrigin)
       );
+    // The raw collector reports cumulative kernel/exporter counters. The Forwarder resets its
+    // output/error counters after every heartbeat snapshot. Keep the public fields and alert IDs,
+    // but use their source/explicit temporality so equal adjacent interval values are not erased.
+    const { droppedDelta, errorDelta } = collectorHeartbeatFailureDelta(
+      heartbeat,
+      previousQuality,
+    );
+    const metrics = heartbeat.filterMetrics;
+    const hardFailure = qualityOrigin === 'raw_collector'
+      ? heartbeat.status !== 'ok' || droppedDelta > 0
+      : droppedDelta > 0 ||
+        (metrics?.protectedQueueDropped ?? 0) > 0 ||
+        metrics?.spoolAtCapacity === true ||
+        metrics?.spoolWalAtCapacity === true ||
+        ((metrics?.spoolRecords ?? 0) > 0 && (metrics?.spoolOldestAgeMs ?? 0) >= 60_000);
+    const softFailure = !hardFailure && qualityOrigin === 'forwarder' && (
+      heartbeat.status !== 'ok' ||
+      errorDelta > 0 ||
+      metrics?.controlPlaneState === 'degraded' ||
+      (metrics?.queueParked ?? 0) > 0 ||
+      (metrics?.retryParked ?? 0) > 0 ||
+      (metrics?.heartbeatDeliveryFailures ?? 0) > 0 ||
+      (metrics?.spoolParkedRecords ?? 0) > 0 ||
+      metrics?.spoolWalPutAtCapacity === true
+    );
+    const streak = this.collectorQualityStreak.get(qualityKey) ?? { bad: 0, clean: 0 };
+    if (hardFailure) {
+      streak.bad = Math.max(2, streak.bad + 1);
+      streak.clean = 0;
+    } else if (softFailure) {
+      streak.bad += 1;
+      streak.clean = 0;
+    } else {
+      streak.bad = 0;
+      streak.clean += 1;
+    }
+    this.collectorQualityStreak.set(qualityKey, streak);
+    const degraded = hardFailure || streak.bad >= 2;
+    if (!degraded) {
+      if (streak.clean >= 2) {
+        this.resolveWhere(
+          matchesQualityOrigin,
+          heartbeat.at,
+          'collector quality recovered after two clean heartbeats',
+        );
+      }
       return;
     }
 
-    const severity: Severity = heartbeat.status === 'error' || heartbeat.errorCount > 0 || dropped > 0 ? 'high' : 'medium';
+    const severity: Severity = hardFailure ? 'high' : 'medium';
     if (this.maintenance.activeFor({ collectorId: heartbeat.collectorId, nodeName: heartbeat.nodeName }, heartbeat.at)) {
       this.resolveWhere(
         (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId,
@@ -459,12 +887,16 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     }
     const reason = [
       heartbeat.status !== 'ok' ? `status=${heartbeat.status}` : '',
-      dropped > 0 ? `dropped=${dropped}` : '',
-      heartbeat.errorCount > 0 ? `errors=${heartbeat.errorCount}` : '',
+      droppedDelta > 0 ? `dropped_delta=${droppedDelta}` : '',
+      errorDelta > 0 ? `error_delta=${errorDelta}` : '',
       heartbeat.queueDepth > 0 ? `queue=${heartbeat.queueDepth}` : '',
     ].filter(Boolean).join(', ');
     this.upsert({
-      dedupeKey: ['collector', heartbeat.collectorId, 'quality'].join(':'),
+      // Preserve the historical Forwarder alert ID for compatibility with external references;
+      // only the newly separated raw-Collector quality channel needs an origin suffix.
+      dedupeKey: qualityOrigin === 'forwarder'
+        ? ['collector', heartbeat.collectorId, 'quality'].join(':')
+        : ['collector', heartbeat.collectorId, 'quality', qualityOrigin].join(':'),
       ruleId: 'collector.quality',
       kind: 'collector',
       severity,
@@ -474,12 +906,87 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       nodeName: heartbeat.nodeName,
       sourceSummary: heartbeat.message || reason || heartbeat.status,
       labels: {
+        heartbeatOrigin: qualityOrigin,
         status: heartbeat.status,
         droppedEvents: String(heartbeat.droppedEvents),
         outputDropped: String(heartbeat.outputDropped),
         errorCount: String(heartbeat.errorCount),
+        droppedDelta: String(droppedDelta),
+        errorDelta: String(errorDelta),
       },
       at: heartbeat.at,
+    });
+  }
+
+  /** Restore liveness heads without replaying historical resolve/open notifications. */
+  seedCollectorHeartbeat(heartbeat: CollectorHeartbeatRecord): void {
+    const current = this.latestCollectorHeartbeat.get(heartbeat.collectorId);
+    if (!current || heartbeat.at >= current.at) {
+      this.latestCollectorHeartbeat.set(heartbeat.collectorId, heartbeat);
+    }
+    const qualityOrigin = heartbeat.origin === 'raw_collector' ? 'raw_collector' : 'forwarder';
+    const qualityKey = `${heartbeat.collectorId}\0${qualityOrigin}`;
+    const currentQuality = this.latestCollectorQualityHeartbeat.get(qualityKey);
+    if (!currentQuality || heartbeat.at >= currentQuality.at) {
+      this.latestCollectorQualityHeartbeat.set(qualityKey, heartbeat);
+    }
+  }
+
+  observeJudgmentResult(result: DecisionResultJob): void {
+    if (!this.config.enabled || result.status === 'succeeded') return;
+    const event = result.event;
+    const failureType = judgmentFailureType(result);
+    const text = JUDGMENT_FAILURE_TEXT[failureType];
+    const canonicalAgentId = event.attribution?.agentScopeId?.trim() || event.agentId;
+    const collectorId = attrText(event, 'collectorId', 180);
+    const sourceId = attrText(event, 'sourceId', 160);
+    if (this.maintenance.activeFor({
+      workspacePath: event.workspacePath,
+      agentId: canonicalAgentId,
+      collectorId,
+      sourceId,
+    }, result.completedAt)) return;
+    const detail = cleanText(result.error, 1_000) ?? result.stageStopReason ?? 'unknown error';
+    this.upsert({
+      dedupeKey: [
+        'judgment',
+        result.stage,
+        failureType,
+        result.policyVersion,
+        event.workspacePath,
+        canonicalAgentId,
+      ].join(':'),
+      ruleId: `judgment.${failureType}`,
+      kind: 'judgment',
+      severity: text.severity,
+      title: `${result.stage} ${text.title} · ${canonicalAgentId}`,
+      description: `${text.description} ${detail}`,
+      workspacePath: event.workspacePath,
+      agentId: canonicalAgentId,
+      sessionId: event.sessionId,
+      userId: event.userId,
+      traceId: event.traceId,
+      runId: event.runId,
+      eventId: event.eventId,
+      collectorId,
+      sourceId,
+      monitored: event.attribution?.monitored,
+      agentScopeId: event.attribution?.agentScopeId,
+      riskCategory: event.riskCategory,
+      riskName: event.riskName,
+      sourceSummary: detail,
+      owner: this.ownerFor({ workspacePath: event.workspacePath, agentId: canonicalAgentId, sourceId }),
+      team: this.teamFor({ workspacePath: event.workspacePath, agentId: canonicalAgentId, sourceId }),
+      labels: {
+        stage: result.stage,
+        failureType,
+        resultStatus: result.status,
+        evaluationId: result.evaluationId,
+        policyVersion: result.policyVersion,
+        attempt: String(result.attempt),
+        stageStopReason: result.stageStopReason ?? '',
+      },
+      at: result.completedAt,
     });
   }
 
@@ -736,14 +1243,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const overdueMinutes = Math.max(1, Math.round((at - (dueAt ?? at)) / 60_000));
     this.upsert({
       dedupeKey,
       ruleId: 'remediation.overdue',
       kind: 'remediation',
       severity: task.severity,
       title: `Remediation 逾期 · ${task.title}`,
-      description: `处置任务 ${task.taskId} 已逾期 ${overdueMinutes} 分钟: ${task.recommendedAction}`,
+      description: `处置任务 ${task.taskId} 已逾期: ${task.recommendedAction}`,
       workspacePath: task.workspacePath,
       agentId: task.agentId,
       collectorId: task.collectorId,
@@ -761,7 +1267,6 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         actionKind: task.actionKind,
         taskStatus: task.status,
         dueAt: task.dueAt ?? '',
-        overdueMinutes: String(overdueMinutes),
         ...(task.alertId ? { alertId: task.alertId } : {}),
         ...(task.labels?.objectiveId ? { objectiveId: task.labels.objectiveId } : {}),
         ...(task.labels?.issueId ? { issueId: task.labels.issueId } : {}),
@@ -769,6 +1274,27 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       at,
       increment: false,
     });
+  }
+
+  reconcileRemediationOverdue(tasks: RemediationListItem[], at = Date.now()): void {
+    const activeOverdueKeys = new Set(
+      tasks
+        .filter((task) => {
+          const dueAt = parseTime(task.dueAt);
+          return Boolean(
+            dueAt &&
+            dueAt < at &&
+            (task.status === 'open' || task.status === 'in_progress' || task.status === 'blocked'),
+          );
+        })
+        .map((task) => ['remediation', task.taskId, 'overdue'].join(':')),
+    );
+    this.resolveWhere(
+      (alert) => alert.ruleId === 'remediation.overdue' && !activeOverdueKeys.has(alert.dedupeKey),
+      at,
+      'remediation task is no longer overdue',
+      false,
+    );
   }
 
   list(query: AlertListQuery): AlertList {
@@ -786,6 +1312,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     const taskId = query.taskId?.trim();
     const objectiveId = query.objectiveId?.trim();
     const issueId = query.issueId?.trim();
+    const agentScoped = query.scope === 'agent';
     const hasRelatedId = Boolean(eventId || taskId || objectiveId || issueId);
     const hasContextFilter = Boolean(
       (query.status && query.status !== 'all') ||
@@ -798,8 +1325,22 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       sourceId ||
       incidentId,
     );
+    const incidentCoverageKeys = new Set(
+      [...this.alerts.values()]
+        .filter((alert) => alert.kind === 'incident' && active(alert.status))
+        .map((alert) => [alert.workspacePath, alert.agentId, alert.traceId, alert.riskCategory].join('\0')),
+    );
+    const explicitlyRequestsEvents = query.kind === 'event' || Boolean(pinnedAlertId || eventId);
     const items = [...this.alerts.values()]
       .filter((alert) => {
+        if (agentScoped && !this.isAgentAlert(alert)) return false;
+        if (
+          !explicitlyRequestsEvents &&
+          alert.kind === 'event' &&
+          incidentCoverageKeys.has([alert.workspacePath, alert.agentId, alert.traceId, alert.riskCategory].join('\0'))
+        ) {
+          return false;
+        }
         const matchesAlertId = Boolean(pinnedAlertId && alert.alertId === pinnedAlertId);
         const matchesRelatedId = Boolean(
           (eventId && alert.eventId === eventId) ||
@@ -807,9 +1348,18 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
           (objectiveId && alert.labels?.objectiveId === objectiveId) ||
           (issueId && alert.labels?.issueId === issueId),
         );
+        const matchesWindow = alert.lastSeenAt >= sinceMs || alert.updatedAt >= sinceMs;
+        const matchesTimeMode =
+          query.timeMode === 'window'
+            ? matchesWindow
+            : query.timeMode === 'backlog'
+              ? active(alert.status)
+              : active(alert.status) || matchesWindow;
         const matchesFilter =
-          (active(alert.status) || alert.lastSeenAt >= sinceMs || alert.updatedAt >= sinceMs) &&
-          (!query.status || query.status === 'all' || alert.status === query.status) &&
+          matchesTimeMode &&
+          (!query.status ||
+            query.status === 'all' ||
+            (query.status === 'active' ? active(alert.status) : alert.status === query.status)) &&
           (!query.severity || query.severity === 'all' || alert.severity === query.severity) &&
           (!query.kind || query.kind === 'all' || alert.kind === query.kind) &&
           (!workspacePath || alert.workspacePath === workspacePath) &&
@@ -845,10 +1395,15 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       resolvedAlerts: items.filter((alert) => alert.status === 'resolved').length,
       criticalAlerts: items.filter((alert) => alert.severity === 'critical').length,
       highAlerts: items.filter((alert) => alert.severity === 'high').length,
+      urgentActiveAlerts: items.filter(
+        (alert) => active(alert.status) && (alert.severity === 'critical' || alert.severity === 'high'),
+      ).length,
+      unassignedActiveAlerts: items.filter((alert) => active(alert.status) && !alert.owner).length,
       incidentAlerts: items.filter((alert) => alert.kind === 'incident').length,
       collectorAlerts: items.filter((alert) => alert.kind === 'collector').length,
       agentAlerts: items.filter((alert) => alert.kind === 'agent').length,
       eventAlerts: items.filter((alert) => alert.kind === 'event').length,
+      judgmentAlerts: items.filter((alert) => alert.kind === 'judgment').length,
       sourceAlerts: items.filter((alert) => alert.kind === 'source').length,
       coverageAlerts: items.filter((alert) => alert.kind === 'coverage').length,
       objectiveAlerts: items.filter((alert) => alert.kind === 'objective').length,
@@ -885,9 +1440,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       silencedUntil: status === 'silenced' ? (statusProvided || body.silenceMinutes !== undefined ? at + this.silenceMinutes(body.silenceMinutes) * 60_000 : cur.silencedUntil) : status === 'open' || status === 'resolved' ? undefined : cur.silencedUntil,
     };
     this.alerts.set(alertId, next);
+    this.markAlertDirty(alertId);
     this.persistSoon();
-    if (shouldNotifyResolved) void this.notify(next, 'resolved');
-    if (shouldNotifyReopened) void this.notify(next, 'reopened');
+    if (shouldNotifyResolved) this.scheduleNotification(next, 'resolved');
+    if (shouldNotifyReopened) this.scheduleNotification(next, 'reopened');
     return this.item(next);
   }
 
@@ -925,8 +1481,28 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     const silenceExpired = prev?.status === 'silenced' && (prev.silencedUntil ?? 0) <= at;
     const reopened = !prev || prev.status === 'resolved' || silenceExpired;
     const status: AlertStatus = silenceActive ? 'silenced' : prev?.status === 'acknowledged' ? 'acknowledged' : 'open';
+    const previousEvidenceIds = prev?.evidenceEventIds?.length
+      ? prev.evidenceEventIds
+      : prev?.eventId
+        ? [prev.eventId]
+        : [];
+    const newEvidence = Boolean(input.eventId && !previousEvidenceIds.includes(input.eventId));
+    const evidenceEventIds = input.eventId
+      ? [...previousEvidenceIds, ...(newEvidence ? [input.eventId] : [])].slice(-256)
+      : previousEvidenceIds.slice(-256);
+    const declaredEvidenceCount = Number(input.labels.eventCount);
+    const accumulatedEvidenceCount =
+      (prev?.evidenceEventCount ?? previousEvidenceIds.length) + (newEvidence ? 1 : 0);
+    const evidenceEventCount = Number.isFinite(declaredEvidenceCount) && declaredEvidenceCount >= 0
+      ? Math.max(accumulatedEvidenceCount, Math.trunc(declaredEvidenceCount))
+      : accumulatedEvidenceCount;
+    const {
+      at: _inputAt,
+      increment: _inputIncrement,
+      ...recordInput
+    } = input;
     const next: AlertRecord = {
-      ...input,
+      ...recordInput,
       alertId,
       status,
       severity: prev ? maxSeverity(prev.severity, input.severity) : input.severity,
@@ -943,13 +1519,29 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       owner: prev?.owner ?? cleanText(input.owner, 160),
       team: cleanText(input.team, 160) ?? prev?.team,
       note: prev?.note,
-      occurrenceCount: (prev?.occurrenceCount ?? 0) + (input.increment === false ? 0 : 1),
+      occurrenceCount: prev
+        ? prev.occurrenceCount + (input.increment === false ? 0 : 1)
+        : 1,
+      evidenceEventCount,
+      evidenceEventIds,
       lastNotificationAt: prev?.lastNotificationAt,
     };
+    if (prev && input.increment === false) {
+      // Periodic availability/remediation reconciliation often observes the same logical state
+      // with a newer wall-clock `at`. Do not turn that timestamp-only observation into another
+      // relational UPDATE; semantic fields (including labels/evidence/scope/description) remain
+      // in the comparison so a real transition still persists.
+      const comparable = (record: AlertRecord): Record<string, unknown> => {
+        const { updatedAt: _updatedAt, lastSeenAt: _lastSeenAt, ...stable } = record;
+        return stable;
+      };
+      if (canonicalJson(comparable(prev)) === canonicalJson(comparable(next))) return prev;
+    }
     this.alerts.set(alertId, next);
+    this.markAlertDirty(alertId);
     this.persistSoon();
     if (status === 'open' && (reopened || !prev || SEVERITY_RANK[next.severity] > SEVERITY_RANK[prev.severity])) {
-      void this.notify(next, prev ? 'reopened' : 'opened');
+      this.scheduleNotification(next, prev ? 'reopened' : 'opened');
     }
     return next;
   }
@@ -982,6 +1574,9 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       traceId: top?.traceId,
       runId: top?.runId,
       incidentId: top?.incidentId,
+      eventId: top?.lastEventId,
+      monitored: top?.monitored,
+      agentScopeId: top?.agentScopeId,
       riskCategory: top?.riskCategory,
       riskName: top?.riskName,
       sourceSummary: top?.lastEventSubject ?? `${open.length} open incidents`,
@@ -1001,13 +1596,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
           this.resolveWhere((alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId, at, 'suppressed by maintenance window');
           continue;
         }
-        this.upsertCollectorAvailability(heartbeat, 'critical', `Collector 断流 · ${heartbeat.collectorId}`, `last heartbeat ${ageSecs}s ago`, at);
+        this.upsertCollectorAvailability(heartbeat, 'critical', `Collector 断流 · ${heartbeat.collectorId}`, `last heartbeat older than ${this.config.collectorDownAfterSecs}s`, at);
       } else if (ageSecs >= this.config.collectorStaleAfterSecs) {
         if (this.maintenance.activeFor({ collectorId: heartbeat.collectorId, nodeName: heartbeat.nodeName }, at)) {
           this.resolveWhere((alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId, at, 'suppressed by maintenance window');
           continue;
         }
-        this.upsertCollectorAvailability(heartbeat, 'high', `Collector 心跳陈旧 · ${heartbeat.collectorId}`, `last heartbeat ${ageSecs}s ago`, at);
+        this.upsertCollectorAvailability(heartbeat, 'high', `Collector 心跳陈旧 · ${heartbeat.collectorId}`, `last heartbeat older than ${this.config.collectorStaleAfterSecs}s`, at);
       } else {
         this.resolveWhere(
           (alert) => alert.kind === 'collector' && alert.collectorId === heartbeat.collectorId && alert.ruleId === 'collector.availability',
@@ -1024,6 +1619,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       const dedupeKey = ['source', source.sourceId, 'availability'].join(':');
       const signalAt = sourceSignalAt(source);
       const match = (alert: AlertRecord) => alert.kind === 'source' && alert.ruleId === 'source.availability' && alert.sourceId === source.sourceId;
+      if (isVerificationSource(source)) {
+        this.resolveWhere(match, at, 'verification source excluded from availability monitoring');
+        continue;
+      }
       if (!source.enabled || !signalAt) {
         this.resolveWhere(match, at, source.enabled ? 'source has not emitted accepted signals yet' : 'source disabled');
         continue;
@@ -1041,9 +1640,9 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       }
 
       if (ageSecs >= this.config.sourceDownAfterSecs) {
-        this.upsertSourceAvailability(source, 'high', `接入源断流 · ${source.sourceId}`, `last accepted signal ${ageSecs}s ago`, signalAt, at, dedupeKey);
+        this.upsertSourceAvailability(source, 'high', `接入源断流 · ${source.sourceId}`, `last accepted signal older than ${this.config.sourceDownAfterSecs}s`, signalAt, at, dedupeKey);
       } else {
-        this.upsertSourceAvailability(source, 'medium', `接入源心跳陈旧 · ${source.sourceId}`, `last accepted signal ${ageSecs}s ago`, signalAt, at, dedupeKey);
+        this.upsertSourceAvailability(source, 'medium', `接入源心跳陈旧 · ${source.sourceId}`, `last accepted signal older than ${this.config.sourceStaleAfterSecs}s`, signalAt, at, dedupeKey);
       }
     }
   }
@@ -1094,7 +1693,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private resolveWhere(match: (alert: AlertRecord) => boolean, at: number, reason: string): void {
+  private resolveWhere(match: (alert: AlertRecord) => boolean, at: number, reason: string, notify = true): void {
     let changed = false;
     for (const alert of this.alerts.values()) {
       if (!active(alert.status) || !match(alert)) continue;
@@ -1107,7 +1706,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         note: alert.note ?? reason,
       };
       this.alerts.set(alert.alertId, resolved);
-      void this.notify(resolved, 'resolved');
+      this.markAlertDirty(alert.alertId);
+      if (notify) this.scheduleNotification(resolved, 'resolved');
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1118,6 +1718,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     for (const alert of this.alerts.values()) {
       if (alert.status !== 'open' || !match(alert)) continue;
       this.alerts.set(alert.alertId, { ...alert, status: 'acknowledged', acknowledgedAt: at, updatedAt: at });
+      this.markAlertDirty(alert.alertId);
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1128,6 +1729,7 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     for (const alert of this.alerts.values()) {
       if (alert.status !== 'silenced' || !alert.silencedUntil || alert.silencedUntil > at) continue;
       this.alerts.set(alert.alertId, { ...alert, status: 'open', silencedUntil: undefined, updatedAt: at });
+      this.markAlertDirty(alert.alertId);
       changed = true;
     }
     if (changed) this.persistSoon();
@@ -1154,6 +1756,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     ].some((value) => (value ?? '').toLowerCase().includes(q));
   }
 
+  private isAgentAlert(alert: AlertRecord): boolean {
+    if (alert.monitored !== undefined) return alert.monitored;
+    if (alert.labels?.monitored === 'true' || Boolean(alert.agentScopeId ?? alert.labels?.agentScopeId)) return true;
+    if (!alert.workspacePath || !alert.agentId) return false;
+    return Boolean(this.agentMetadata.get(alert.workspacePath, alert.agentId));
+  }
+
   private since(query: AlertListQuery): number {
     const end = Date.now();
     if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - 3 * HOUR;
@@ -1167,8 +1776,13 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   }
 
   private item(alert: AlertRecord): AlertListItem {
+    const {
+      at: _legacyAt,
+      increment: _legacyIncrement,
+      ...publicAlert
+    } = alert as AlertRecord & { at?: number; increment?: boolean };
     return {
-      ...alert,
+      ...publicAlert,
       firstSeenAt: iso(alert.firstSeenAt),
       lastSeenAt: iso(alert.lastSeenAt),
       updatedAt: iso(alert.updatedAt),
@@ -1179,21 +1793,32 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private async notify(alert: AlertRecord, action: 'opened' | 'reopened' | 'resolved'): Promise<void> {
+  private scheduleNotification(alert: AlertRecord, action: AlertNotificationAction): void {
+    if (this.effectCapture) {
+      this.effectCapture.notifications.push({ alert, action });
+      return;
+    }
+    void this.notify(alert, action);
+  }
+
+  private async notify(alert: AlertRecord, action: AlertNotificationAction): Promise<void> {
     if (action === 'resolved' ? alert.status !== 'resolved' : alert.status !== 'open') return;
     const at = Date.now();
     if (action === 'opened' && alert.lastNotificationAt && at - alert.lastNotificationAt < this.config.webhookCooldownSecs * 1000) return;
     const sent = await this.notifications.dispatch(this.item(alert), action, at);
     if (sent > 0) {
       const cur = this.alerts.get(alert.alertId);
-      if (cur) this.alerts.set(alert.alertId, { ...cur, lastNotificationAt: at });
+      if (cur) {
+        this.alerts.set(alert.alertId, { ...cur, lastNotificationAt: at });
+        this.markAlertDirty(alert.alertId);
+      }
       this.persistSoon();
     }
   }
 
   private mergePersisted(rec: AlertRecord): void {
     const cur = this.alerts.get(rec.alertId);
-    if (!cur) {
+    if (!cur || rec.updatedAt >= cur.updatedAt) {
       this.alerts.set(rec.alertId, {
         ...rec,
         title: cleanText(rec.title, 240) ?? 'Alert',
@@ -1203,36 +1828,106 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
         team: cleanText(rec.team, 160),
         note: cleanText(rec.note, 2_000),
         labels: cleanAlertLabels(rec.labels ?? {}),
+        occurrenceCount: Math.max(1, Math.trunc(rec.occurrenceCount ?? 1)),
       });
-      return;
     }
-    this.alerts.set(rec.alertId, {
-      ...cur,
-      status: rec.status,
-      owner: cleanText(rec.owner, 160),
-      team: cleanText(rec.team, 160),
-      note: cleanText(rec.note, 2_000),
-      acknowledgedAt: rec.acknowledgedAt,
-      resolvedAt: rec.resolvedAt,
-      silencedUntil: rec.silencedUntil,
-      lastNotificationAt: rec.lastNotificationAt,
-      updatedAt: Math.max(cur.updatedAt, rec.updatedAt),
-    });
   }
 
   private persistSoon(): void {
     if (!this.initialized) return;
+    if (this.durableMutationHolds > 0) {
+      this.persistRequested = true;
+      return;
+    }
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = undefined;
       void this.persist();
-    }, 500);
+    }, PERSIST_COALESCE_MS);
+    this.persistTimer.unref?.();
   }
 
-  private async persist(): Promise<void> {
-    const alerts = [...this.alerts.values()]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, ALERT_HISTORY_LIMIT);
-    await this.ch.saveAlertState(alerts);
+  private persist(forceSnapshot = false): Promise<void> {
+    if (forceSnapshot) this.persistenceForceSnapshot = true;
+    this.persistRequested = true;
+    if (forceSnapshot && this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested && !this.persistenceRetryTimer) {
+          if (this.persistenceForceSnapshot) void this.persist(true);
+          else this.persistSoon();
+        }
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const forceSnapshot = this.persistenceForceSnapshot;
+      this.persistenceForceSnapshot = false;
+      const snapshot = [...this.alerts.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, ALERT_HISTORY_LIMIT);
+      const dirtyEntries = [...this.dirtyAlertIds.entries()]
+        .map(([alertId, generation]) => ({
+          alertId,
+          generation,
+          record: this.alerts.get(alertId),
+        }))
+        .filter((entry): entry is { alertId: string; generation: number; record: AlertRecord } => Boolean(entry.record))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt)
+        .slice(0, ALERT_HISTORY_LIMIT);
+      const dirtyRecords = dirtyEntries.map((entry) => entry.record);
+      const relationalRecords = forceSnapshot ? snapshot : dirtyRecords;
+      if (relationalRecords.length === 0 && !forceSnapshot) {
+        if (!this.persistRequested) break;
+        continue;
+      }
+
+      let relationalOk = true;
+      if (this.relationalPersistenceEnabled() && relationalRecords.length > 0) {
+        try {
+          relationalOk = await this.relational.saveAlerts(relationalRecords);
+        } catch {
+          relationalOk = false;
+        }
+      }
+      // ClickHouse stores one compatibility snapshot rather than per-alert rows. Keep that full
+      // snapshot even when PostgreSQL is temporarily unavailable; the dirty relational keys below
+      // remain queued for a later bounded retry.
+      await this.ch.saveAlertState(snapshot);
+      if (!relationalOk) {
+        this.persistenceFailures += 1;
+        // Keep every dirty key for a bounded retry. A failed write must not be mistaken for a
+        // successful projection, and clearing the request flag avoids a tight retry loop while the
+        // database is unavailable.
+        this.persistRequested = false;
+        this.schedulePersistenceRetry();
+        break;
+      }
+
+      const persistedIds = new Set(relationalRecords.map((record) => record.alertId));
+      for (const entry of dirtyEntries) {
+        if (persistedIds.has(entry.alertId)
+          && this.alerts.get(entry.alertId) === entry.record
+          && this.dirtyAlertIds.get(entry.alertId) === entry.generation) {
+          this.dirtyAlertIds.delete(entry.alertId);
+        }
+      }
+      this.markPersistenceSuccess();
+      // Follow-up dirty marks wait for the coalesce window. A forced snapshot may continue
+      // immediately so shutdown and explicit refresh still flush the latest generation.
+      if (!forceSnapshot) break;
+    } while (this.persistRequested);
+  }
+
+  private async refreshRelational(): Promise<void> {
+    for (const record of await this.relational.loadAlerts()) this.mergePersisted(record);
   }
 }

@@ -32,6 +32,9 @@ const expectedProtectedRoutes = [
   'PUT notifications/routes/:routeId',
   'POST objectives',
   'PUT objectives/:objectiveId',
+  'POST users',
+  'PUT users/:userId',
+  'PUT supply-chain/config',
   'POST supply-chain/workspaces/:workspaceId/scan',
   'POST supply-chain/workspaces/:workspaceId/assess',
   'PUT config',
@@ -40,6 +43,40 @@ const expectedProtectedRoutes = [
   'PUT config/model-connections/:profile',
   'POST config/model-connections/:profile/clear',
   'POST config/simulate',
+  'PUT unknown-learning/families/:familyId/review',
+  'POST unknown-learning/policies',
+  'PUT unknown-learning/policies/:policyId',
+  'POST unknown-learning/policies/:policyId/infrastructure-draft',
+  'PUT unknown-learning/config',
+  // Canonical observability reads are management protected because they expose
+  // raw kernel facts, evidence links, session membership and identity detail.
+  'GET v1/raw-observations',
+  'GET v1/raw-observations/:observationId',
+  'GET v1/coverage-gaps',
+  'GET v1/kernel-facts',
+  'GET v1/kernel-facts/:factId',
+  'GET v1/kernel-facts/:factId/context',
+  'GET v1/semantic-records',
+  'GET v1/semantic-records/:semanticRecordId',
+  'GET v1/evidence-links',
+  'GET v1/evidence-links/:linkId',
+  'GET v1/session-memberships',
+  'GET v1/session-memberships/:membershipId',
+  'GET v1/logical-agents',
+  'GET v1/logical-agents/:logicalAgentId',
+  'GET v1/logical-agents/:logicalAgentId/instances',
+  'GET v1/agent-instances',
+  'GET v1/agent-instances/:agentInstanceId',
+  'GET v1/agent-instances/:agentInstanceId/runtimes',
+  'GET v1/agent-instances/:agentInstanceId/sessions',
+  'GET v1/runtime-instances',
+  'GET v1/runtime-instances/:runtimeInstanceId',
+  'GET v1/sessions',
+  'GET v1/sessions/:sessionId',
+  'GET v1/sessions/:sessionId/timeline',
+  'GET v1/sessions/:sessionId/coverage',
+  'GET v1/semantic-events/:semanticEventId/evidence',
+  'GET v1/observability/contracts',
 ];
 
 function fail(message, details) {
@@ -125,6 +162,20 @@ function protectedWriteProbes(id) {
     { route: 'PUT notifications/routes/:routeId', label: 'notification route update', method: 'PUT', path: `/notifications/routes/${id}-missing-route`, body: { name: `${id} route updated`, enabled: false, channelIds: [], kinds: ['source'] } },
     { route: 'POST objectives', label: 'objective create', method: 'POST', path: '/objectives', body: { name: `${id} objective`, enabled: true, targetType: 'source', targetId: `${id}-source`, metric: 'active_alerts', comparator: 'lte', threshold: 0, severity: 'medium' } },
     { route: 'PUT objectives/:objectiveId', label: 'objective update', method: 'PUT', path: `/objectives/${id}-missing-objective`, body: { name: `${id} objective updated`, enabled: false, threshold: 1 } },
+    { route: 'POST users', label: 'user create', method: 'POST', path: '/users', body: { username: `${id}-user`, displayName: `${id} user`, role: 'viewer', enabled: true } },
+    { route: 'PUT users/:userId', label: 'user update', method: 'PUT', path: `/users/${id}-missing-user`, body: { displayName: `${id} user updated`, enabled: false } },
+    {
+      route: 'PUT supply-chain/config',
+      label: 'supply-chain config update',
+      method: 'PUT',
+      path: '/supply-chain/config',
+      body: {
+        enabled: false,
+        dailyRefreshEnabled: true,
+        runtimeCorrelationEnabled: false,
+        selectedWorkspaceIds: [],
+      },
+    },
     { route: 'POST supply-chain/workspaces/:workspaceId/scan', label: 'supply-chain manual scan', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/scan`, body: { reason: 'manual' } },
     { route: 'POST supply-chain/workspaces/:workspaceId/assess', label: 'supply-chain manual assessment', method: 'POST', path: `/supply-chain/workspaces/${id}-missing-workspace/assess` },
     { route: 'PUT config', label: 'policy update', method: 'PUT', path: '/config', body: {} },
@@ -133,6 +184,11 @@ function protectedWriteProbes(id) {
     { route: 'PUT config/model-connections/:profile', label: 'model connection apply', method: 'PUT', path: '/config/model-connections/fast_review', body: { testToken: 'invalid-auth-probe' } },
     { route: 'POST config/model-connections/:profile/clear', label: 'model credential clear', method: 'POST', path: '/config/model-connections/fast_review/clear' },
     { route: 'POST config/simulate', label: 'policy simulation', method: 'POST', path: '/config/simulate', body: { timeType: 'last_30d', limit: 1, policy: {} } },
+    { route: 'PUT unknown-learning/families/:familyId/review', label: 'Unknown family review', method: 'PUT', path: `/unknown-learning/families/${id}-missing-family/review`, body: { decision: 'non_agent', expectedRevision: 0, reason: 'auth guard probe' } },
+    { route: 'POST unknown-learning/policies', label: 'Unknown policy candidate', method: 'POST', path: '/unknown-learning/policies', body: { familyId: `${id}-missing-family`, desiredAction: 'sample', reason: 'auth guard probe' } },
+    { route: 'PUT unknown-learning/policies/:policyId', label: 'Unknown policy transition', method: 'PUT', path: `/unknown-learning/policies/${id}-missing-policy`, body: { expectedRevision: 1, to: 'rolled_back', reason: 'auth guard probe' } },
+    { route: 'POST unknown-learning/policies/:policyId/infrastructure-draft', label: 'Unknown recommendation Infrastructure draft', method: 'POST', path: `/unknown-learning/policies/${id}-missing-policy/infrastructure-draft`, body: { expectedPolicyRevision: 1, expectedReviewRevision: 1, reason: 'auth guard probe', workload: { placement: 'docker', composeProject: id, serviceName: 'probe', physicalWorkloadId: `${id}-workload`, classification: 'non_agent' } } },
+    { route: 'PUT unknown-learning/config', label: 'Unknown learning config', method: 'PUT', path: '/unknown-learning/config', body: { enabled: false, reason: 'auth guard probe' } },
   ];
 }
 
@@ -166,14 +222,15 @@ async function main() {
 
   const protectedProbes = protectedWriteProbes(runId);
   const probedRouteSet = new Set(['POST sources', ...protectedProbes.map((probe) => probe.route)]);
+  const runtimeProbeRouteSet = new Set([...expectedRouteSet].filter((route) => !route.startsWith('GET v1/')));
   assert(
     'management auth runtime probes cover every protected management route',
-    setDifference(expectedRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, expectedRouteSet).length === 0,
+    setDifference(runtimeProbeRouteSet, probedRouteSet).length === 0 && setDifference(probedRouteSet, runtimeProbeRouteSet).length === 0,
     {
-      expectedProtectedRoutes,
+      expectedRuntimeProbeRoutes: [...runtimeProbeRouteSet].sort(),
       probedRoutes: [...probedRouteSet].sort(),
-      missingRuntimeProbes: setDifference(expectedRouteSet, probedRouteSet),
-      unexpectedRuntimeProbes: setDifference(probedRouteSet, expectedRouteSet),
+      missingRuntimeProbes: setDifference(runtimeProbeRouteSet, probedRouteSet),
+      unexpectedRuntimeProbes: setDifference(probedRouteSet, runtimeProbeRouteSet),
     },
   );
 

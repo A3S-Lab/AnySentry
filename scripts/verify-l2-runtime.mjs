@@ -13,7 +13,7 @@ async function request(path, { method = 'POST', body } = {}) {
     method,
     headers: {
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      ...(adminToken ? { authorization: `Bearer ${adminToken}` } : {}),
+      ...(adminToken && path !== '/ingest' ? { authorization: `Bearer ${adminToken}` } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

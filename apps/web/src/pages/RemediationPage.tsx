@@ -1,8 +1,8 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
+import { formatSecurityDateTime, parseSecurityTimestamp } from "@/lib/date-time";
 import {
   AlertTriangle,
-  ArrowLeft,
   BellRing,
   Bot,
   CheckCircle2,
@@ -23,6 +23,7 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -39,6 +40,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -108,14 +112,12 @@ function clean(value: string) {
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function toDateTimeLocal(value?: string) {
   if (!value) return "";
-  const parsed = dayjs(value);
+  const parsed = parseSecurityTimestamp(value);
   return parsed.isValid() ? parsed.format("YYYY-MM-DDTHH:mm") : "";
 }
 
@@ -473,6 +475,7 @@ export default function RemediationPage() {
   const [status, setStatus] = useState<RemediationStatus | "all">((searchParams.get("status") as RemediationStatus) || "all");
   const [sourceType, setSourceType] = useState<RemediationSourceType | "all">((searchParams.get("sourceType") as RemediationSourceType) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");
+  const [includeBacklog, setIncludeBacklog] = useState(searchParams.get("includeBacklog") === "true");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedTaskId, setSelectedTaskId] = useState(searchParams.get("taskId") ?? "");
   const [owner, setOwner] = useState("");
@@ -491,6 +494,7 @@ export default function RemediationPage() {
 
   const query = useMemo<RemediationQuery>(() => ({
     timeType,
+    includeBacklog,
     taskId: clean(selectedTaskId),
     incidentId: clean(routeIncidentId),
     alertId: clean(routeAlertId),
@@ -506,7 +510,7 @@ export default function RemediationPage() {
     collectorId: clean(routeCollectorId),
     sourceId: clean(routeSourceId),
     limit: 200,
-  }), [queryText, routeAgentId, routeAlertId, routeCollectorId, routeEventId, routeIncidentId, routeIssueId, routeObjectiveId, routeSourceId, routeWorkspacePath, selectedTaskId, severity, sourceType, status, timeType]);
+  }), [includeBacklog, queryText, routeAgentId, routeAlertId, routeCollectorId, routeEventId, routeIncidentId, routeIssueId, routeObjectiveId, routeSourceId, routeWorkspacePath, selectedTaskId, severity, sourceType, status, timeType]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.remediations(query), {
     refreshDeps: [query],
@@ -526,6 +530,7 @@ export default function RemediationPage() {
     setDueAt(toDateTimeLocal(task.dueAt));
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    if (includeBacklog) next.set("includeBacklog", "true");
     next.set("taskId", task.taskId);
     next.set("sourceType", task.sourceType);
     if (task.agentId) next.set("agentId", task.agentId);
@@ -549,6 +554,7 @@ export default function RemediationPage() {
     setOwner("");
     setNote("");
     setDueAt("");
+    setIncludeBacklog(false);
     setSearchParams({});
   };
 
@@ -590,12 +596,6 @@ export default function RemediationPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <FileCheck2 className="size-5 shrink-0 text-teal-300" />
@@ -611,7 +611,7 @@ export default function RemediationPage() {
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-[120px_130px_130px_130px_minmax(180px,1fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-[120px_130px_130px_130px_minmax(180px,1fr)_auto_auto_auto]">
           <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
@@ -629,6 +629,17 @@ export default function RemediationPage() {
             <SelectContent>{SEVERITY_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
           <Input value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="task / agent / collector / source" className="h-9 border-white/10 bg-white/5 font-mono text-xs" />
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => setIncludeBacklog((current) => !current)}
+            className={includeBacklog
+              ? "h-9 border border-amber-400/30 bg-amber-500/10 text-amber-100 hover:bg-amber-500/15"
+              : "h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"}
+          >
+            {includeBacklog ? "全部积压" : "当前窗口"}
+          </Button>
           <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-9 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
             <X className="size-3.5" />
             清除
@@ -666,7 +677,13 @@ export default function RemediationPage() {
                   加载处置任务...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无处置任务</div>
+                <OperationalEmptyState
+                  icon={FileCheck2}
+                  title="当前没有处置任务"
+                  description="Incident、Alert 和覆盖缺口会生成可审计 Runbook。先从告警或 Incident 确认需要跟进的风险。"
+                  primary={{ label: "查看告警", href: "/alerts" }}
+                  secondary={{ label: "查看 Incident", href: "/incidents" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-320px)] overflow-y-auto">
                   {data?.items.map((task) => (

@@ -1,19 +1,30 @@
 import { useRequest } from "ahooks";
 import {
+  Activity,
   AlertTriangle,
-  ArrowLeft,
   BarChart3,
+  BellRing,
   Bot,
+  CalendarClock,
   CheckCircle2,
+  GitBranch,
   KeyRound,
+  LayoutDashboard,
   LoaderCircle,
   type LucideIcon,
   Plus,
+  Radar,
   Save,
   Search,
+  ServerCog,
   ShieldCheck,
+  ShieldAlert,
+  Siren,
+  SlidersHorizontal,
   Sparkles,
+  TerminalSquare,
   Trash2,
+  Wrench,
   X,
   Zap,
 } from "lucide-react";
@@ -42,7 +53,10 @@ import {
   type SecuritySeverity,
   type SecurityTimeType,
   type SecurityVerdict,
+  type SupplyChainControlConfig,
+  type SupplyChainControlResponse,
 } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 // ── Option tables (labels are zh-CN to match the dashboard) ──────────────────
@@ -84,12 +98,10 @@ const SPECULATE_OPTIONS: Array<{ value: PolicyConfig["speculate"]; label: string
   { value: "high", label: "高 (high)" },
 ];
 
-const CANDIDATE_PIPELINE_OPTIONS: Array<{ value: PolicyConfig["identity"]["candidatePipeline"]; label: string }> = [
-  { value: "full", label: "完整分级研判（默认）" },
-  { value: "l1_only", label: "仅执行 L1" },
-];
-
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -138,6 +150,18 @@ const EMPTY_CONNECTIVITY: Record<ModelConnectionProfile, ConnectivityViewState> 
   fast_review: { loading: false, applying: false, result: null },
   deep_investigation: { loading: false, applying: false, result: null },
 };
+
+const MONITORING_NAV_ITEMS = [
+  { view: "overview", label: "运行总览", description: "平台健康与实时状态", icon: Activity },
+  { view: "scan", label: "实时扫描", description: "可解释扫描与研判漏斗", icon: Radar },
+  { view: "risk", label: "风险态势", description: "风险分类与趋势分布", icon: Siren },
+  { view: "stream", label: "复合研判", description: "Flink 连续行为关联", icon: Sparkles },
+] as const;
+
+const PLATFORM_NAV_ITEMS = [
+  { view: "events", label: "运行链路", description: "无侵入事件时间线", icon: GitBranch },
+  { view: "workspace", label: "会话与工作区", description: "Agent 与 Workspace 风险", icon: TerminalSquare },
+] as const;
 
 function formatRequestError(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -193,10 +217,8 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 
 function IdentityJudgmentSection({
   value,
-  onChange,
 }: {
   value: PolicyConfig["identity"];
-  onChange: (next: PolicyConfig["identity"]) => void;
 }) {
   return (
     <Panel title="身份研判路由" icon={Bot} description="身份保留、页面可见性与风险研判层级相互独立。">
@@ -206,13 +228,9 @@ function IdentityJudgmentSection({
           <p className="mt-1 text-xs text-zinc-500">固定使用完整分级链路；只有上一层升级时才进入已配置的 L2/L3。</p>
         </div>
         <div className="rounded-md border border-amber-400/20 bg-amber-400/5 p-3">
-          <Field label="候选 Agent" hint="默认完整分级；可在成本敏感环境限制为只执行确定性 L1。">
-            <SelectField
-              value={value.candidatePipeline}
-              onChange={(candidatePipeline) => onChange({ candidatePipeline })}
-              options={CANDIDATE_PIPELINE_OPTIONS}
-            />
-          </Field>
+          <p className="text-sm font-medium text-amber-100">候选 Agent</p>
+          <p className="mt-1 text-xs leading-5 text-zinc-500">F3 保留路由已迁入统一过滤规则系统；这里保留兼容值 {value.candidatePipeline}，不再作为权威写入口。</p>
+          <Link to="/filter-rules?view=category&category=api_retention" className="mt-3 inline-flex min-h-11 items-center text-xs font-semibold text-amber-200 underline decoration-amber-400/40 underline-offset-4">打开 API Retention 规则</Link>
         </div>
         <div className="rounded-md border border-zinc-400/20 bg-white/[0.03] p-3">
           <p className="text-sm font-medium text-zinc-200">尚未识别</p>
@@ -247,16 +265,26 @@ function ToggleRow({
 }
 
 // Minimal accessible switch — no extra dependency, matches the dark theme.
-function Switch({ checked, onChange }: { checked: boolean; onChange: (next: boolean) => void }) {
+function Switch({
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cn(
         "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-300/50",
         checked ? "border-teal-400/40 bg-teal-500/80" : "border-white/15 bg-white/10",
+        disabled && "cursor-not-allowed opacity-40",
       )}
     >
       <span
@@ -514,7 +542,8 @@ function ConnectionControl({
   onClear: (profile: ModelConnectionProfile) => void;
 }) {
   const result = state.result;
-  const connected = active?.state === "active";
+  const configured = active?.state === "active";
+  const connected = configured && active.callable;
   const tone = result && !result.ok
     ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
     : connected || result?.ok
@@ -528,7 +557,7 @@ function ConnectionControl({
           autoComplete="new-password"
           value={apiKey}
           onChange={(event) => onApiKeyChange(event.target.value)}
-          placeholder={connected ? "已配置运行时凭据；输入新 Key 可替换" : "输入 API Key"}
+          placeholder={configured ? "已配置运行时凭据；输入新 Key 可替换" : "输入 API Key"}
           className="h-8 border-white/10 bg-white/5 font-mono text-xs"
         />
       </Field>
@@ -538,16 +567,16 @@ function ConnectionControl({
             {state.loading || state.applying ? <LoaderCircle className="size-3.5 animate-spin" />
               : result && !result.ok ? <AlertTriangle className="size-3.5" />
                 : connected || result?.ok ? <CheckCircle2 className="size-3.5" /> : <KeyRound className="size-3.5" />}
-            <span>{state.loading ? "正在验证连接…" : state.applying ? "正在应用…" : result?.message ?? (connected ? "运行时连接已生效" : "尚未配置运行时凭据")}</span>
+            <span>{state.loading ? "正在验证连接…" : state.applying ? "正在应用…" : result?.message ?? (connected ? "运行时连接已生效" : configured ? active?.message ?? "模型 API 当前不可用" : "尚未配置运行时凭据")}</span>
           </div>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] opacity-75">
             {result ? <><span>{result.model}</span><span>{result.latencyMs} ms</span><span className="break-all">{result.endpoint}</span></>
-              : connected ? <><span>{active?.model}</span><span>{active?.source === "environment" ? "部署配置" : "页面配置"}</span><span className="break-all">{active?.endpoint}</span></>
+              : configured ? <><span>{active?.model}</span><span>{active?.source === "environment" ? "部署配置" : "页面配置"}</span><span className="break-all">{active?.endpoint}</span></>
                 : <span>请先测试，成功后再应用</span>}
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
-          {connected ? <Button type="button" size="sm" variant="ghost" onClick={() => onClear(profile)} className="h-8 text-xs text-zinc-300 hover:bg-white/10">清除凭据</Button> : null}
+          {configured ? <Button type="button" size="sm" variant="ghost" onClick={() => onClear(profile)} className="h-8 text-xs text-zinc-300 hover:bg-white/10">清除凭据</Button> : null}
           <Button type="button" size="sm" variant="secondary" disabled={state.loading || state.applying || !apiKey.trim()} onClick={() => onTest(profile)} className="h-8 border border-white/10 bg-white/5 text-xs text-zinc-100 hover:bg-white/10">
             {state.loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <Zap className="size-3.5" />}测试连接
           </Button>
@@ -574,12 +603,12 @@ function FastReviewSection({ value, onChange, state, ...actions }: { value: L2Co
   const enabled = value !== null;
   const config = value ?? DEFAULT_L2;
   return (
-    <Panel title="快速研判模型" icon={Zap} description="用于快速结构化风险研判，并复用于 AI 身份辅助审核的模型连接。两类任务的会话、提示词和权限相互隔离。" action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}>
+    <Panel title="快速研判模型" icon={Zap} description="用于快速结构化风险研判、AI 身份辅助审核，以及 AI 对话助手（对话页共用此模型的连接与单次超时）。修改测试并应用后实时生效，无需重启。" action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}>
       {enabled ? <div className="space-y-4 p-4">
         <div className="grid gap-4 md:grid-cols-3">
           <Field label="API 基础 URL" hint="填写到 /v1；完整接口地址会自动规范化。"><Input value={config.url} onChange={(event) => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
           <Field label="模型名称"><Input value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
-          <Field label="单次超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="单次超时（秒）" hint="同时是 AI 对话助手的总超时预算，应用后下一轮对话立即生效。"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
         </div>
         <ConnectionControl profile="fast_review" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 仅保留基础规则研判，AI 身份辅助审核不可用。</div>}
@@ -604,6 +633,234 @@ function DeepReviewSection({ model, agent, onModelChange, onAgentChange, state, 
         </div>
         <ConnectionControl profile="deep_investigation" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 风险升级到深度调查时会明确记录“未配置”，不会伪装为完整研判成功。</div>}
+    </Panel>
+  );
+}
+
+function ReadinessPill({ label, ready }: { label: string; ready: boolean }) {
+  return (
+    <span className={cn(
+      "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold",
+      ready
+        ? "border-teal-400/30 bg-teal-500/10 text-teal-100"
+        : "border-amber-400/25 bg-amber-500/10 text-amber-100",
+    )}>
+      <span className={cn("size-1.5 rounded-full", ready ? "bg-teal-300" : "bg-amber-300")} />
+      {label}
+    </span>
+  );
+}
+
+function SupplyChainSection({
+  value,
+  draft,
+  loading,
+  saving,
+  onChange,
+  onSave,
+  onScan,
+  onDisable,
+  onRefresh,
+}: {
+  value: SupplyChainControlResponse | null;
+  draft: SupplyChainControlConfig | null;
+  loading: boolean;
+  saving: boolean;
+  onChange: (next: SupplyChainControlConfig) => void;
+  onSave: () => void;
+  onScan: () => void;
+  onDisable: () => void;
+  onRefresh: () => void;
+}) {
+  const readiness = value?.readiness;
+  const workspaces = value?.workspaceOptions ?? [];
+  const selected = new Set(draft?.selectedWorkspaceIds ?? []);
+  const effectiveSelected = selected.size > 0
+    ? selected
+    : new Set(workspaces.map((workspace) => workspace.workspaceId));
+  const toggleWorkspace = (workspaceId: string) => {
+    if (!draft) return;
+    const next = new Set(effectiveSelected);
+    if (next.has(workspaceId)) {
+      if (next.size === 1) return;
+      next.delete(workspaceId);
+    }
+    else next.add(workspaceId);
+    onChange({ ...draft, selectedWorkspaceIds: [...next] });
+  };
+
+  return (
+    <Panel
+      title="供应链漏洞"
+      icon={ShieldAlert}
+      description="OSV 依赖漏洞资产；基础组件常驻空闲，启用后才扫描和刷新情报。"
+      action={
+        <ReadinessPill
+          label={draft?.enabled ? "已启用" : "未启用"}
+          ready={Boolean(draft?.enabled && readiness?.serviceReady)}
+        />
+      }
+    >
+      {loading && !value ? (
+        <div className="flex min-h-28 items-center justify-center text-xs text-zinc-500">
+          <LoaderCircle className="mr-2 size-4 animate-spin" />
+          检查供应链运行环境…
+        </div>
+      ) : draft && readiness ? (
+        <div className="space-y-5 p-4">
+          <div className="flex flex-wrap gap-2">
+            <ReadinessPill label="API 与存储" ready={readiness.serviceReady} />
+            <ReadinessPill label="Scanner 凭据" ready={readiness.scannerAuthConfigured} />
+            <ReadinessPill
+              label={`Workspace Scanner ${readiness.scanners.some((scanner) => scanner.online) ? "在线" : "离线"}`}
+              ready={readiness.scanners.some((scanner) => scanner.online)}
+            />
+            <ReadinessPill label="OSV Assessment Worker" ready={readiness.assessmentWorkerOnline} />
+            <ReadinessPill label="运行时关联" ready={readiness.runtimeCorrelationAvailable} />
+          </div>
+
+          {readiness.issues.length ? (
+            <div className="rounded-md border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+              {readiness.issues.join("；")}
+            </div>
+          ) : (
+            <div className="rounded-md border border-teal-400/25 bg-teal-500/10 px-3 py-2 text-xs text-teal-100">
+              运行环境已就绪，可以启用并扫描所选 Workspace。
+            </div>
+          )}
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
+              <ToggleRow
+                label="每日刷新 OSV 漏洞情报"
+                description="依赖未变化时不重复提取组件，只刷新已保存组件的漏洞情报。"
+                checked={draft.dailyRefreshEnabled}
+                onChange={(next) => onChange({ ...draft, dailyRefreshEnabled: next })}
+              />
+            </div>
+            <div className="rounded-md border border-white/10 bg-white/[0.03] p-3">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-zinc-100">运行时漏洞利用关联</p>
+                  <p className="mt-0.5 text-xs text-zinc-500">将漏洞快照送入 Flink，与 Agent 运行证据关联。</p>
+                </div>
+                <Switch
+                  checked={draft.runtimeCorrelationEnabled}
+                  disabled={!readiness.runtimeCorrelationAvailable}
+                  onChange={(next) => onChange({ ...draft, runtimeCorrelationEnabled: next })}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-zinc-100">扫描 Workspace</p>
+                <p className="mt-0.5 text-xs text-zinc-500">只扫描已由可信 Workspace Scanner 注册的本地工作副本。</p>
+              </div>
+              <span className="text-[11px] text-zinc-500">
+                已选 {effectiveSelected.size} / {workspaces.length}
+              </span>
+            </div>
+            {workspaces.length ? (
+              <div className="grid gap-2 md:grid-cols-2">
+                {workspaces.map((workspace) => {
+                  const scanner = readiness.scanners.find((item) => item.scannerId === workspace.scannerId);
+                  const checked = effectiveSelected.has(workspace.workspaceId);
+                  return (
+                    <button
+                      key={workspace.workspaceId}
+                      type="button"
+                      onClick={() => toggleWorkspace(workspace.workspaceId)}
+                      className={cn(
+                        "flex items-start justify-between gap-3 rounded-md border px-3 py-3 text-left transition-colors",
+                        checked
+                          ? "border-teal-400/30 bg-teal-500/10"
+                          : "border-white/10 bg-white/[0.03] hover:bg-white/[0.06]",
+                      )}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium text-zinc-100">{workspace.displayName}</span>
+                        <span className="mt-0.5 block truncate font-mono text-[11px] text-zinc-500">{workspace.workspaceId}</span>
+                      </span>
+                      <span className={cn(
+                        "mt-0.5 shrink-0 text-[11px]",
+                        scanner?.online ? "text-teal-300" : "text-amber-300",
+                      )}>
+                        {scanner?.online ? "Scanner 在线" : "Scanner 离线"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="rounded-md border border-dashed border-white/10 px-3 py-6 text-center text-xs text-zinc-500">
+                尚无可信 Workspace。请先安装并启动 Workspace Scanner 完成注册。
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap justify-end gap-2 border-t border-white/10 pt-4">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onRefresh}
+              disabled={saving}
+              className="h-8 text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
+            >
+              刷新状态
+            </Button>
+            {draft.enabled ? (
+              <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onDisable}
+                  disabled={saving}
+                  className="h-8 text-rose-200 hover:bg-rose-500/10"
+                >
+                  停用
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={onSave}
+                  disabled={saving}
+                  className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+                >
+                  保存设置
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={onScan}
+                  disabled={saving || effectiveSelected.size === 0}
+                  className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400"
+                >
+                  {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <Radar className="size-3.5" />}
+                  扫描所选 Workspace
+                </Button>
+              </>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                onClick={onScan}
+                disabled={saving || effectiveSelected.size === 0}
+                className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400"
+              >
+                {saving ? <LoaderCircle className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
+                启用并执行首次扫描
+              </Button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="px-4 py-5 text-xs text-rose-200">供应链配置加载失败，请刷新状态后重试。</div>
+      )}
     </Panel>
   );
 }
@@ -670,6 +927,16 @@ function SimulationPanel({
       <div className="space-y-4 p-4">
         {result ? (
           <>
+            <div className={`rounded-md border px-3 py-2 text-xs ${
+              result.sampling.truncated
+                ? "border-amber-400/25 bg-amber-500/10 text-amber-100"
+                : "border-teal-400/20 bg-teal-500/10 text-teal-100"
+            }`}>
+              策略回放使用最近事件样本：已取 {result.sampling.sampledEvents} / 上限 {result.sampling.sampleLimit} 条
+              {result.sampling.truncated
+                ? "。所选时间范围数据更多，结果仅代表该有界样本。"
+                : "。当前时间范围未发生样本截断。"}
+            </div>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
               <MetricTile label="已评估" value={result.summary.evaluatedEvents} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
               <MetricTile label="变化事件" value={result.summary.changedEvents} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
@@ -764,6 +1031,7 @@ function StatusStrip({ status }: { status: PolicyStatus }) {
 }
 
 export default function PolicyConfigPage() {
+  const { t } = useI18n();
   const [draft, setDraft] = useState<PolicyConfig | null>(null);
   const [status, setStatus] = useState<PolicyStatus | null>(null);
   const [toast, setToast] = useState<{ kind: "success" | "error"; message: string } | null>(null);
@@ -771,6 +1039,9 @@ export default function PolicyConfigPage() {
   const [simulationTimeType, setSimulationTimeType] = useState<SecurityTimeType>("last_3h");
   const [simulation, setSimulation] = useState<PolicySimulationResult | null>(null);
   const [simulating, setSimulating] = useState(false);
+  const [supplyChain, setSupplyChain] = useState<SupplyChainControlResponse | null>(null);
+  const [supplyDraft, setSupplyDraft] = useState<SupplyChainControlConfig | null>(null);
+  const [savingSupplyChain, setSavingSupplyChain] = useState(false);
   const [connectivity, setConnectivity] = useState<Record<ModelConnectionProfile, ConnectivityViewState>>(EMPTY_CONNECTIVITY);
   const [connections, setConnections] = useState<PolicyConfigResponse["connections"] | null>(null);
   const [apiKeys, setApiKeys] = useState<Record<ModelConnectionProfile, string>>({ fast_review: "", deep_investigation: "" });
@@ -783,6 +1054,15 @@ export default function PolicyConfigPage() {
 
   const { loading, error, refresh } = useRequest(() => securityCenterApi.getConfig(), {
     onSuccess: applyResponse,
+  });
+  const {
+    loading: supplyChainLoading,
+    refresh: refreshSupplyChain,
+  } = useRequest(() => securityCenterApi.supplyChainConfig(), {
+    onSuccess: (response) => {
+      setSupplyChain(response);
+      setSupplyDraft(response.config);
+    },
   });
 
   // Auto-dismiss the toast a few seconds after it appears.
@@ -891,22 +1171,152 @@ export default function PolicyConfigPage() {
     }
   };
 
+  const applySupplyChainConfig = async (
+    enabled: boolean,
+    runInitialScan: boolean,
+  ) => {
+    if (!supplyDraft) return;
+    setSavingSupplyChain(true);
+    try {
+      const response = await securityCenterApi.updateSupplyChainConfig({
+        ...supplyDraft,
+        enabled,
+        runInitialScan,
+      });
+      setSupplyChain(response);
+      setSupplyDraft(response.config);
+      const queued = response.scanTasks?.length ?? 0;
+      setToast({
+        kind: "success",
+        message: runInitialScan
+          ? `供应链扫描已启用，已提交 ${queued} 个 Workspace 扫描任务`
+          : enabled ? "供应链配置已保存" : "供应链扫描已停用，历史结果仍然保留",
+      });
+    } catch (supplyError) {
+      setToast({ kind: "error", message: `供应链配置失败:${formatRequestError(supplyError)}` });
+      await refreshSupplyChain();
+    } finally {
+      setSavingSupplyChain(false);
+    }
+  };
+
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
+    <div className="flex h-full w-full overflow-hidden bg-[#0a0d12] text-zinc-100">
+      <aside className="hidden">
+        <nav className="space-y-1" aria-label={t("安全监控模块")}>
+          <p className="flex items-center gap-2 px-3 pb-1 pt-3 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <LayoutDashboard className="size-3.5" />
+            {t("概览")}
+          </p>
+          {MONITORING_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.view}
+                to={`/?view=${item.view}`}
+                className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+              >
+                <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+                  <Icon className="size-3.5" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+                  <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t(item.description)}</span>
+                </span>
+              </Link>
+            );
+          })}
+          <Link
+            to="/alerts"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <BellRing className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("告警")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("活跃告警与处置")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ServerCog className="size-3.5" />
+            {t("平台监控")}
+          </p>
+          {PLATFORM_NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.view}
+                to={`/?view=${item.view}`}
+                className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+              >
+                <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+                  <Icon className="size-3.5" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
+                  <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t(item.description)}</span>
+                </span>
+              </Link>
+            );
+          })}
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <Wrench className="size-3.5" />
+            {t("运维")}
+          </p>
+          <Link
+            to="/maintenance"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <CalendarClock className="size-3.5" />
+            </span>
+            <span className="block text-xs font-semibold leading-[1.45]">{t("维护")}</span>
+          </Link>
+          <div
+            aria-current="page"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent bg-[#1c222d] px-2.5 py-2 text-left text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#f97316]">
+              <SlidersHorizontal className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("策略配置")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#818a9c]">{t("L1 / L2 / L3 研判策略")}</span>
+            </span>
+          </div>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <ShieldAlert className="size-3.5" />
+            {t("安全治理")}
+          </p>
+          <Link
+            to="/?view=supplyChain"
+            className="flex w-full items-start gap-2.5 rounded-md border border-transparent px-2.5 py-2 text-left text-[#b6bdcc] transition-colors hover:bg-[#151a23] hover:text-[#e8ecf3]"
+          >
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center text-[#818a9c]">
+              <ShieldAlert className="size-3.5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-xs font-semibold leading-[1.45]">{t("供应链漏洞")}</span>
+              <span className="mt-0.5 block text-[10.5px] leading-4 text-[#5b6373]">{t("OSV 依赖漏洞资产")}</span>
+            </span>
+          </Link>
+
+          <p className="mt-3 flex items-center gap-2 border-t border-[#232a37] px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
+            <SlidersHorizontal className="size-3.5" />
+            {t("管理")}
+          </p>
+          <AdminTokenControl navigation />
+        </nav>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button
-              asChild
-              variant="secondary"
-              size="sm"
-              className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-            >
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Sparkles className="size-5 shrink-0 text-teal-300" />
@@ -986,7 +1396,7 @@ export default function PolicyConfigPage() {
               />
 
               <L1RulesSection rules={draft.rules} onChange={(next) => update("rules", next)} />
-              <IdentityJudgmentSection value={draft.identity} onChange={(next) => update("identity", next)} />
+              <IdentityJudgmentSection value={draft.identity} />
               <FastReviewSection
                 value={draft.llm}
                 onChange={(next) => update("llm", next)}
@@ -1011,10 +1421,22 @@ export default function PolicyConfigPage() {
                 onApply={handleApplyConnection}
                 onClear={handleClearConnection}
               />
+              <SupplyChainSection
+                value={supplyChain}
+                draft={supplyDraft}
+                loading={supplyChainLoading}
+                saving={savingSupplyChain}
+                onChange={setSupplyDraft}
+                onSave={() => void applySupplyChainConfig(true, false)}
+                onScan={() => void applySupplyChainConfig(true, true)}
+                onDisable={() => void applySupplyChainConfig(false, false)}
+                onRefresh={() => void refreshSupplyChain()}
+              />
             </>
           ) : null}
         </div>
       </main>
+      </div>
     </div>
   );
 }

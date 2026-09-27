@@ -1,7 +1,6 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import {
-  ArrowLeft,
   BellRing,
   CalendarClock,
   Clock3,
@@ -24,11 +23,13 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   type AgentEventCategory,
+  type CollectorHealthChannel,
   type CollectorHealthItem,
   type CollectorHealthQuery,
   type CollectorHealthState,
@@ -38,6 +39,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -69,9 +73,7 @@ function clean(value: string) {
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function stateClass(state?: CollectorHealthState) {
@@ -79,6 +81,36 @@ function stateClass(state?: CollectorHealthState) {
   if (state === "degraded" || state === "quiet") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
   return "border-teal-400/30 bg-teal-500/10 text-teal-100";
 }
+
+function channelClass(state?: CollectorHealthChannel["state"]) {
+  if (state === "degraded") return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+  if (state === "warning") return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  if (state === "unknown") return "border-zinc-500/30 bg-zinc-500/10 text-zinc-300";
+  return "border-teal-400/30 bg-teal-500/10 text-teal-100";
+}
+
+const CHANNEL_REASON_LABELS: Record<string, string> = {
+  heartbeat_unavailable: "暂无对应心跳",
+  capture_pipeline_loss: "采集链路发生丢失",
+  capture_aggregate_ledger_degraded: "采集聚合账本异常",
+  capture_accounting_not_conserved: "采集计数不守恒",
+  permanent_output_loss: "存在永久输出丢失",
+  protected_queue_pressure: "高优先级队列承压",
+  spool_at_capacity: "WAL 已到容量上限",
+  spool_backlog_over_slo: "WAL 积压超过 SLO",
+  queue_parked: "事件已停放到 WAL",
+  retry_parked: "在线重试耗尽后已停放",
+  heartbeat_delivery_failed: "Forwarder 心跳发送失败",
+  spool_backlog: "WAL 存在待确认记录",
+  delivery_backlog_aged: "投递积压时间偏长",
+  control_plane_starting: "控制面尚在初始化",
+  capture_profile_lkg_degraded: "Capture Profile 使用降级 LKG",
+  filter_projection_degraded: "过滤规则投影异常",
+  identity_snapshot_not_ready: "身份快照未就绪",
+  capture_recovering_after_recent_failure: "采集链路正在确认恢复",
+  delivery_recovering_after_recent_failure: "投递链路正在确认恢复",
+  control_recovering_after_recent_failure: "控制面正在确认恢复",
+};
 
 function Pill({ children, className }: { children: string; className?: string }) {
   return (
@@ -103,6 +135,36 @@ function FieldValue({ label, value }: { label: string; value?: string | number }
       <p className="text-[11px] text-zinc-600">{label}</p>
       <p className="mt-1 truncate font-mono text-xs text-zinc-300" title={String(value ?? "")}>
         {value ?? "--"}
+      </p>
+    </div>
+  );
+}
+
+function ChannelHealthCard({
+  label,
+  path,
+  channel,
+}: {
+  label: string;
+  path: string;
+  channel: CollectorHealthChannel;
+}) {
+  const reasons = channel.reasons.map((reason) =>
+    CHANNEL_REASON_LABELS[reason] ?? (reason.startsWith("control_") ? `控制通道异常：${reason.slice(8).replace(/_failed$/u, "")}` : reason));
+  return (
+    <div className="rounded-[8px] border border-white/10 bg-white/[0.025] p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-zinc-200">{label}</p>
+          <p className="mt-0.5 truncate text-[11px] text-zinc-600">{path}</p>
+        </div>
+        <Pill className={channelClass(channel.state)}>{channel.stateText}</Pill>
+      </div>
+      <p className="mt-3 min-h-8 text-xs leading-4 text-zinc-400">
+        {reasons.length ? reasons.join(" · ") : "当前通道没有异常证据"}
+      </p>
+      <p className="mt-2 font-mono text-[10px] text-zinc-600">
+        bad {channel.consecutiveBad} · clean {channel.consecutiveClean}
       </p>
     </div>
   );
@@ -229,6 +291,18 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
       </div>
 
       <div className="space-y-4 p-4">
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-zinc-300">当前链路状态</p>
+            <p className="text-[11px] text-zinc-600">所选时间范围只影响下方历史统计</p>
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            <ChannelHealthCard label="Capture" path="eBPF → Ring → Collector" channel={collector.healthChannels.capture} />
+            <ChannelHealthCard label="Delivery" path="Forwarder → WAL → API" channel={collector.healthChannels.delivery} />
+            <ChannelHealthCard label="Control" path="Identity → Rules → Runtime Snapshot" channel={collector.healthChannels.control} />
+          </div>
+        </div>
+
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <FieldValue label="Collector" value={collector.collectorId} />
           <FieldValue label="Node" value={collector.nodeName} />
@@ -245,7 +319,7 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           <MetricTile label="窗口事件" value={collector.eventCount} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
           <MetricTile label="速率" value={`${collector.eventRatePerMin}/m`} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
           <MetricTile label="Agent 覆盖" value={collector.observedAgentCount} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
-          <MetricTile label="丢弃" value={collector.droppedEvents + collector.outputDropped} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
+          <MetricTile label="当前永久丢失" value={collector.droppedEvents + collector.outputDropped} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-3">
@@ -253,6 +327,8 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           <FieldValue label="Output Dropped" value={collector.outputDropped} />
           <FieldValue label="Queue Depth" value={collector.queueDepth} />
           <FieldValue label="Errors" value={collector.errorCount} />
+          <FieldValue label="所选窗口 Drop 峰值" value={`${collector.windowErrorMaxima.droppedEvents} / ${collector.windowErrorMaxima.outputDropped}`} />
+          <FieldValue label="所选窗口 Error 峰值" value={collector.windowErrorMaxima.errorCount} />
           <FieldValue label="Workspaces" value={collector.observedWorkspaceCount} />
           <FieldValue label="Message" value={collector.message} />
         </div>
@@ -275,7 +351,15 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <FieldValue label="Filtered Non-Agent" value={collector.filterMetrics.filteredNonAgent} />
-            <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
+            <FieldValue label="Filtered Unknown" value={collector.filterMetrics.filteredUnknown} />
+            <FieldValue
+              label="Unknown Reasons"
+              value={Object.entries(collector.filterMetrics.unknownReasonCounts ?? {})
+                .filter(([, count]) => Number(count) > 0)
+                .map(([reason, count]) => `${reason}=${count}`)
+                .join(" · ") || "not reported"}
+            />
+            <FieldValue label="Shadow Would Filter" value={collector.filterMetrics.wouldFilterNonAgent + collector.filterMetrics.wouldFilterUnknown + collector.filterMetrics.wouldFilterNoise + collector.filterMetrics.wouldDiscoveryBudgetDrop} />
             <FieldValue label="Discovery Budget Drop" value={collector.filterMetrics.discoveryBudgetDropped} />
             <FieldValue label="Deduplicated / Queue Drop" value={`${collector.filterMetrics.deduplicated} / ${collector.filterMetrics.queueDropped}`} />
             <FieldValue label="Identity Cache" value={`${collector.filterMetrics.identityCacheEntries} identities · ${collector.filterMetrics.identityCgroupHits}/${collector.filterMetrics.identityCgroupMisses} cgroup hit/miss`} />
@@ -284,6 +368,18 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
             <FieldValue
               label="Process Cache / Tombstone"
               value={`${collector.filterMetrics.processCacheEntries} / ${collector.filterMetrics.processTombstones} · proc ${collector.filterMetrics.processBootstrapProcReads} bootstrap + ${collector.filterMetrics.processFallbackProcReads + collector.filterMetrics.processAncestryProcReads} hot`}
+            />
+            <FieldValue
+              label="File Prefilter"
+              value={collector.fileFilterMetricsReported
+                ? `${collector.fileFilterMetrics.enabled ? `epoch ${collector.fileFilterMetrics.epoch}` : "off"} · access ${collector.fileFilterMetrics.accessKept} keep / ${collector.fileFilterMetrics.accessSampled} sample / ${collector.fileFilterMetrics.accessDropped + collector.fileFilterMetrics.accessSuppressed} suppress`
+                : "not reported"}
+            />
+            <FieldValue
+              label="File Ring / Rule"
+              value={collector.fileFilterMetricsReported
+                ? `ring ${collector.fileFilterMetrics.accessRingDropped}/${collector.fileFilterMetrics.deleteRingDropped} drop · rule ${collector.fileFilterMetrics.ruleHits}/${collector.fileFilterMetrics.ruleMisses} hit/miss`
+                : "not reported"}
             />
           </div>
         </div>
@@ -415,12 +511,6 @@ export default function CollectorsPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <RadioTower className="size-5 shrink-0 text-teal-300" />
@@ -459,10 +549,11 @@ export default function CollectorsPage() {
 
       <main className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex w-full max-w-[1800px] flex-col gap-4">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <MetricTile label="Collector" value={data?.summary.totalCollectors ?? 0} tone="border-white/10 bg-white/[0.03] text-zinc-100" />
             <MetricTile label="健康" value={data?.summary.healthyCollectors ?? 0} tone="border-teal-400/25 bg-teal-500/10 text-teal-100" />
-            <MetricTile label="降级" value={(data?.summary.degradedCollectors ?? 0) + (data?.summary.quietCollectors ?? 0)} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+            <MetricTile label="提醒" value={data?.summary.warningCollectors ?? 0} tone="border-amber-400/25 bg-amber-500/10 text-amber-100" />
+            <MetricTile label="降级" value={data?.summary.degradedCollectors ?? 0} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
             <MetricTile label="断流" value={(data?.summary.downCollectors ?? 0) + (data?.summary.staleCollectors ?? 0)} tone="border-rose-400/25 bg-rose-500/10 text-rose-100" />
             <MetricTile label="窗口事件" value={data?.summary.observedEventCount ?? 0} tone="border-sky-400/25 bg-sky-500/10 text-sky-100" />
           </div>
@@ -482,7 +573,13 @@ export default function CollectorsPage() {
                   加载采集器...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无 Collector 心跳</div>
+                <OperationalEmptyState
+                  icon={RadioTower}
+                  title="尚未收到 Collector 心跳"
+                  description="启动 Observer Collector 与 Forwarder 后，节点心跳、吞吐、丢弃量和覆盖范围会自动出现在这里。"
+                  primary={{ label: "配置接入源", href: "/sources" }}
+                  secondary={{ label: "查看覆盖缺口", href: "/coverage" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-300px)] overflow-y-auto">
                   {data?.items.map((collector) => (

@@ -5,6 +5,8 @@ import { managementAuthHeaders, safeProbeId } from './probe-id.mjs';
 const baseUrl = (process.env.ANYSENTRY_API_BASE ?? process.env.API_BASE ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/, '');
 
 const runId = safeProbeId('ing');
+const createdSourceIds = new Set();
+let sourceCleanupFinished = false;
 
 function fail(message, details) {
   console.error(`FAIL ${message}`);
@@ -40,12 +42,35 @@ async function request(path, method = 'GET', body, headers = {}) {
   return payload?.data ?? payload;
 }
 
+async function disableCreatedSources() {
+  if (sourceCleanupFinished) return;
+  sourceCleanupFinished = true;
+  const discovered = await request('/sources/list', 'POST', {
+    q: runId,
+    includeVerification: true,
+    limit: 200,
+  }).catch(() => undefined);
+  for (const item of discovered?.items ?? []) {
+    if (item?.sourceId && String(item.name ?? '').includes(runId)) createdSourceIds.add(item.sourceId);
+  }
+  for (const sourceId of createdSourceIds) {
+    await request(`/sources/${encodeURIComponent(sourceId)}`, 'PUT', { enabled: false }).catch(() => undefined);
+  }
+}
+
 function sourceHeaders(sourceId, token, extra = {}) {
   return {
     'x-anysentry-source-id': sourceId,
     'x-anysentry-ingest-token': token,
     ...extra,
   };
+}
+
+async function bindSourceWorkspace(sourceId, workspacePath) {
+  // Workspace is an explicit Source security binding. This fixture intentionally reuses one
+  // protected token across isolated synthetic workspaces, so it updates the binding before each
+  // request instead of expecting the ingest path to accept a cross-workspace token.
+  await request(`/sources/${encodeURIComponent(sourceId)}`, 'PUT', { workspacePath });
 }
 
 function assertAccepted(message, result, expectedEvents = 1) {
@@ -83,6 +108,7 @@ async function createProtectedSource() {
     owner: 'verify-ingest-protocols',
     tags: [runId, 'protocol-verifier'],
   });
+  if (created.source?.sourceId) createdSourceIds.add(created.source.sourceId);
   assert('protected source creation returns token', Boolean(created.source?.sourceId && created.token), created);
   return created;
 }
@@ -129,6 +155,7 @@ async function verifyUnissuedProtectedSourceEnforcesToken() {
     owner: 'verify-ingest-protocols',
     tags: [runId, 'unissued-protected'],
   });
+  if (created.source?.sourceId) createdSourceIds.add(created.source.sourceId);
   assert('protected Source can exist before a token is issued', created.source?.sourceId === sourceId && created.source?.requireToken === true && !created.token, created);
 
   const collectorRejected = await request('/ingest/events', 'POST', {
@@ -208,6 +235,7 @@ async function verifyGenericJson(sourceId, token) {
   const collectorId = `${runId}-collector-generic`;
   const secret = `${runId}-generic-password`;
   const apiKey = `sk-${runId.replace(/[^a-z0-9]/gi, '').padEnd(18, 'a')}`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request('/ingest/events', 'POST', {
     sourceId,
     token,
@@ -260,6 +288,7 @@ async function verifyStructuredCloudEvent(sourceId, token) {
   const workspacePath = `repo://${runId}/ce-structured`;
   const secret = `${runId}-ce-password`;
   const apiKey = `sk-${runId.replace(/[^a-z0-9]/gi, '').padEnd(18, 'b')}`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request('/ingest/events', 'POST', {
     specversion: '1.0',
     id: `${runId}-ce-structured`,
@@ -310,6 +339,7 @@ async function verifyCloudEventDataBase64(sourceId, token) {
     query: `${runId}.example.test`,
     attributes: { probe: runId, protocol: 'cloudevents-data-base64' },
   };
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request(
     '/ingest/events',
     'POST',
@@ -338,6 +368,9 @@ async function verifyCloudEventDataBase64(sourceId, token) {
 }
 
 async function verifyInvalidCloudEventDataBase64(sourceId, token) {
+  // No workspace is present in this malformed envelope; clear the prior synthetic binding first
+  // so the rejection exercises base64 validation rather than Source workspace authorization.
+  await bindSourceWorkspace(sourceId, '');
   const result = await request(
     '/ingest/events',
     'POST',
@@ -363,6 +396,7 @@ async function verifyBinaryCloudEvent(sourceId, token) {
   const agentId = `${runId}-ce-binary-agent`;
   const workspacePath = `repo://${runId}/ce-binary`;
   const secret = `${runId}-binary-secret`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request(
     '/ingest/events',
     'POST',
@@ -402,6 +436,7 @@ async function verifyCloudEventsBatch(sourceId, token) {
   const agentA = `${runId}-ce-batch-agent-a`;
   const agentB = `${runId}-ce-batch-agent-b`;
   const workspacePath = `repo://${runId}/ce-batch`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request('/ingest/events', 'POST', [
     {
       specversion: '1.0',
@@ -464,6 +499,7 @@ async function verifyOtlpLogs(sourceId, token) {
   const password = `${runId}-otel-password`;
   const bodySecret = `${runId}-otel-body-token`;
   const apiKey = `sk-${runId.replace(/[^a-z0-9]/gi, '').padEnd(18, 'c')}`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request(
     '/ingest/otlp/v1/logs',
     'POST',
@@ -524,6 +560,7 @@ async function verifyOtlpLogs(sourceId, token) {
 async function verifyOtlpTraces(sourceId, token) {
   const agentId = `${runId}-otel-span-agent`;
   const workspacePath = `repo://${runId}/otel-traces`;
+  await bindSourceWorkspace(sourceId, workspacePath);
   const result = await request(
     '/ingest/otlp/v1/traces',
     'POST',
@@ -581,6 +618,7 @@ async function verifyOtelShortMixed(sourceId, token) {
   const spanWorkspacePath = `repo://${runId}/otel-short-traces`;
   const logCollectorId = `${runId}-collector-otel-short-logs`;
   const spanCollectorId = `${runId}-collector-otel-short-traces`;
+  await bindSourceWorkspace(sourceId, logWorkspacePath);
   const result = await request(
     '/ingest/otel',
     'POST',
@@ -677,28 +715,70 @@ async function verifySourceRollup(sourceId) {
   );
 }
 
-async function main() {
-  console.log(`AnySentry heterogeneous ingest verification against ${baseUrl}`);
-  await request('/stats');
-  const { source, token } = await createProtectedSource();
-  await verifyTokenRejection(source.sourceId);
-  await verifyUnissuedProtectedSourceEnforcesToken();
-  await verifyGenericJson(source.sourceId, token);
-  await verifyStructuredCloudEvent(source.sourceId, token);
-  await verifyCloudEventDataBase64(source.sourceId, token);
-  await verifyInvalidCloudEventDataBase64(source.sourceId, token);
-  await verifyBinaryCloudEvent(source.sourceId, token);
-  await verifyCloudEventsBatch(source.sourceId, token);
-  await verifyOtlpLogs(source.sourceId, token);
-  await verifyOtlpTraces(source.sourceId, token);
-  await verifyOtelShortMixed(source.sourceId, token);
-  await verifySourceRollup(source.sourceId);
+async function verifyUntrustedProviderSessionDowngrade() {
+  const sourceEventId = `${runId}-untrusted-provider-session`;
+  const line = JSON.stringify({
+    eventAtUnixNs: String(BigInt(Date.now()) * 1_000_000n),
+    receivedAtUnixNs: String(BigInt(Date.now()) * 1_000_000n),
+    identity: { agent: `${runId}-untrusted-agent` },
+    process: { pid: 78_001, ppid: 1, host_id: `${runId}-host`, boot_id: `${runId}-boot`, start_time_ticks: '78001' },
+    event: { RuntimeEvent: { pid: 78_001, kind: 'untrusted-session-check' } },
+  });
+  const response = await fetch(`${baseUrl}/ingest`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      line,
+      sourceEventId,
+      agentId: `${runId}-untrusted-agent`,
+      workspacePath: `repo://${runId}/untrusted-session`,
+      sessionId: `${runId}-forged-provider-session`,
+      sessionIdSource: 'provider',
+      sourceType: 'webhook',
+    }),
+  });
+  const raw = await response.text();
+  const result = raw ? JSON.parse(raw)?.data ?? JSON.parse(raw) : undefined;
+  assert('unauthenticated provider-session event is retained for audit', response.ok && result?.accepted === true && result?.eventId, result);
+  if (!result?.eventId) return;
+  await assertEvent('unauthenticated provider session is downgraded to legacy/inferred identity', result.eventId, (event) =>
+    event.sessionIdentityQuality !== 'confirmed'
+      && event.sessionIdSource !== 'provider'
+      && event.sessionIdSource === 'legacy_observer_session'
+      && event.sessionMode !== 'resumable'
+      && event.legacySessionId === `${runId}-forged-provider-session`
+      && event.logicalIdentityAuthority !== 'management_registration'
+      && event.runIdSource === 'derived_ephemeral',
+  );
+}
 
-  if (process.exitCode) {
-    console.error(`Heterogeneous ingest verification failed for probe ${runId}`);
-    process.exit(process.exitCode);
+async function main() {
+  try {
+    console.log(`AnySentry heterogeneous ingest verification against ${baseUrl}`);
+    await request('/stats');
+    const { source, token } = await createProtectedSource();
+    await verifyTokenRejection(source.sourceId);
+    await verifyUnissuedProtectedSourceEnforcesToken();
+    await verifyGenericJson(source.sourceId, token);
+    await verifyStructuredCloudEvent(source.sourceId, token);
+    await verifyCloudEventDataBase64(source.sourceId, token);
+    await verifyInvalidCloudEventDataBase64(source.sourceId, token);
+    await verifyBinaryCloudEvent(source.sourceId, token);
+    await verifyCloudEventsBatch(source.sourceId, token);
+    await verifyOtlpLogs(source.sourceId, token);
+    await verifyOtlpTraces(source.sourceId, token);
+    await verifyOtelShortMixed(source.sourceId, token);
+    await verifyUntrustedProviderSessionDowngrade();
+    await verifySourceRollup(source.sourceId);
+
+    if (process.exitCode) {
+      console.error(`Heterogeneous ingest verification failed for probe ${runId}`);
+      return;
+    }
+    console.log(`Heterogeneous ingest verification passed for probe ${runId}`);
+  } finally {
+    await disableCreatedSources();
   }
-  console.log(`Heterogeneous ingest verification passed for probe ${runId}`);
 }
 
 main().catch((error) => {

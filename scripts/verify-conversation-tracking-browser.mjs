@@ -1,0 +1,569 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+const apiBase = (process.env.ANYSENTRY_API_BASE
+  ?? `http://127.0.0.1:${process.env.PORT ?? '29653'}/security-center`).replace(/\/$/u, '');
+const dashboardUrl = (process.env.ANYSENTRY_DASHBOARD_URL
+  ?? apiBase.replace(/\/security-center$/u, '')).replace(/\/$/u, '');
+const marker = process.env.ANYSENTRY_CONVERSATION_MARKER ?? 'FINAL_REQUEST_SENTINEL';
+const responseMarker = process.env.ANYSENTRY_CONVERSATION_RESPONSE_MARKER ?? 'VISIBLE_RESPONSE_SENTINEL';
+const toolMarker = process.env.ANYSENTRY_CONVERSATION_TOOL_MARKER ?? 'TOOL_RESULT_SENTINEL';
+const requestedConversationId = process.env.ANYSENTRY_CONVERSATION_ID?.trim();
+const alternateConversationId = process.env.ANYSENTRY_ALTERNATE_CONVERSATION_ID?.trim();
+const timeType = process.env.ANYSENTRY_CONVERSATION_TIME_TYPE?.trim() || 'last_30d';
+const chromeBinary = process.env.CHROME_BIN ?? '/usr/bin/google-chrome';
+const profile = mkdtempSync(path.join(tmpdir(), 'anysentry-conversation-chrome-'));
+const outputDirectory = path.join(tmpdir(), `anysentry-conversation-view-${process.pid}`);
+mkdirSync(outputDirectory, { recursive: true });
+
+async function api(pathname, body) {
+  const response = await fetch(`${apiBase}${pathname}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`${pathname} -> ${response.status}: ${text}`);
+  const payload = JSON.parse(text);
+  return payload?.data ?? payload;
+}
+
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function waitFor(label, read, accept, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs;
+  let latest;
+  while (Date.now() < deadline) {
+    try {
+      latest = await read();
+      if (accept(latest)) return latest;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  throw new Error(`${label} did not converge: ${JSON.stringify(latest)}`);
+}
+
+let conversations = await api('/agents/conversations', {
+  timeType,
+  scope: 'agent',
+  classificationView: 'current_effective',
+  ...(requestedConversationId ? { conversationId: requestedConversationId } : { q: marker }),
+  limit: 50,
+});
+let conversation = conversations.items.find((item) => item.hasContent && (
+  requestedConversationId
+    ? item.conversationId === requestedConversationId
+    : item.firstPromptPreview?.includes(marker)
+));
+if (!conversation) {
+  const interactions = await api('/agents/interactions', {
+    timeType, scope: 'agent', classificationView: 'current_effective', limit: 500,
+  });
+  const interaction = interactions.items.find((item) => JSON.stringify(item).includes(marker));
+  if (interaction?.agentAssetId) {
+    conversations = await api('/agents/conversations', {
+      timeType,
+      scope: 'agent',
+      classificationView: 'current_effective',
+      agentAssetId: interaction.agentAssetId,
+      limit: 100,
+    });
+    for (const candidate of conversations.items.filter((item) => item.hasContent)) {
+      const timeline = await api('/agents/conversations/timeline', {
+        timeType,
+        scope: 'agent',
+        classificationView: 'current_effective',
+        agentAssetId: interaction.agentAssetId,
+        conversationId: candidate.conversationId,
+      });
+      if (JSON.stringify(timeline).includes(marker)) {
+        conversation = candidate;
+        break;
+      }
+    }
+  }
+}
+assert.ok(conversation?.conversationId, `conversation fixture not found: ${JSON.stringify(conversations)}`);
+const scopedTimeline = await api('/agents/conversations/timeline', {
+  timeType,
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.ok(scopedTimeline.items.length > 0,
+  'conversationId must remain resolvable when its owning agentAssetId is supplied');
+assert.ok(JSON.stringify(scopedTimeline).includes(marker),
+  'scoped conversation timeline must retain the selected plaintext marker');
+const scopedInteractionId = scopedTimeline.interactionIds.at(-1);
+assert.ok(scopedInteractionId, 'conversation timeline must retain its Interaction references');
+const scopedInteraction = await api('/agents/interactions', {
+  timeType,
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  interactionId: scopedInteractionId,
+  limit: 1,
+});
+assert.equal(scopedInteraction.items[0]?.interactionId, scopedInteractionId,
+  'interactionId must remain resolvable through a reconciled Agent asset alias');
+const semanticTimeline = await api('/agents/conversations/timeline-v2', {
+  timeType,
+  scope: 'agent',
+  classificationView: 'current_effective',
+  agentAssetId: conversation.agentAssetId,
+  conversationId: conversation.conversationId,
+});
+assert.ok(semanticTimeline.turns.length > 0, 'V2 timeline must expose semantic turns');
+assert.deepEqual(
+  [...new Set(semanticTimeline.turns.flatMap((turn) => turn.events.map((event) => event.actor)))].sort(),
+  ['model', 'tool', 'user'],
+  'the visible actor contract must contain only User, Model and Tool',
+);
+
+const port = await freePort();
+const chrome = spawn(chromeBinary, [
+  '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
+  '--no-proxy-server',
+  `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
+], { stdio: ['ignore', 'ignore', 'pipe'] });
+let socket;
+const pending = new Map();
+let commandId = 0;
+const runtimeExceptions = [];
+const failedRequests = [];
+let historicalAgentCollapseVerified = false;
+let historicalInstanceCollapseVerified = false;
+
+try {
+  await waitFor('Chrome DevTools endpoint',
+    async () => fetch(`http://127.0.0.1:${port}/json/version`).then((response) => response.ok), Boolean);
+  const targetPage = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(dashboardUrl)}`, { method: 'PUT' })
+    .then((response) => response.json());
+  socket = new WebSocket(targetPage.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener('open', resolve, { once: true });
+    socket.addEventListener('error', reject, { once: true });
+  });
+  socket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data));
+    if (message.id) {
+      const entry = pending.get(message.id);
+      if (!entry) return;
+      pending.delete(message.id);
+      if (message.error) entry.reject(new Error(message.error.message));
+      else entry.resolve(message.result);
+      return;
+    }
+    if (message.method === 'Runtime.exceptionThrown') {
+      runtimeExceptions.push(message.params.exceptionDetails?.text ?? 'runtime exception');
+    }
+    if (message.method === 'Network.loadingFailed'
+      && !message.params.canceled
+      && message.params.errorText !== 'net::ERR_ABORTED') {
+      failedRequests.push(message.params.errorText);
+    }
+  });
+  const command = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++commandId;
+    pending.set(id, { resolve, reject });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+  const evaluate = async (expression) => {
+    const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? 'browser evaluation failed');
+    return result.result?.value;
+  };
+  const viewport = (width, height) => command('Emulation.setDeviceMetricsOverride', {
+    width, height, deviceScaleFactor: 1, mobile: width < 500,
+  });
+  const screenshot = async (name) => {
+    const image = await command('Page.captureScreenshot', {
+      format: 'png', fromSurface: true, captureBeyondViewport: false,
+    });
+    writeFileSync(path.join(outputDirectory, name), Buffer.from(image.data, 'base64'));
+  };
+  const assertNoOverflow = async (label) => {
+    const size = await evaluate('({ width: innerWidth, doc: document.documentElement.scrollWidth, body: document.body.scrollWidth })');
+    assert(size.doc <= size.width + 1, `${label} document overflow: ${JSON.stringify(size)}`);
+    assert(size.body <= size.width + 1, `${label} body overflow: ${JSON.stringify(size)}`);
+  };
+
+  await command('Page.enable');
+  await command('Runtime.enable');
+  await command('Network.enable');
+  await viewport(1440, 1000);
+  const url = `${dashboardUrl}/conversations?timeType=${encodeURIComponent(timeType)}&conversationId=${encodeURIComponent(conversation.conversationId)}`;
+  await command('Page.navigate', { url });
+  const bodyText = await waitFor('conversation timeline', () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('对话追踪')
+      && text.includes(marker)
+      && text.includes('用户')
+      && text.includes('模型')
+      && text.includes('工具')
+      && text.includes(toolMarker), 60_000);
+  assert(!bodyText.includes('management token required'));
+  await waitFor(
+    'Agent directory options',
+    () => evaluate('document.querySelectorAll("[role=option]").length > 0'),
+    Boolean,
+    60_000,
+  );
+  const panelSeparators = await evaluate(`[...document.querySelectorAll('[role="separator"]')]
+    .map((node) => ({ label: node.getAttribute('aria-label'), display: getComputedStyle(node).display }))`);
+  assert.equal(
+    panelSeparators.filter((item) => [
+      '调整 Agent 目录宽度',
+      '调整事件检查器宽度',
+    ].includes(item.label)).length,
+    2,
+    `resizable panel separators: ${JSON.stringify(panelSeparators)}`,
+  );
+  const resized = await evaluate(`(() => new Promise((resolve) => {
+    const workspace = document.querySelector('#conversation-workspace > div');
+    const separator = document.querySelector('[role="separator"][aria-label="调整 Agent 目录宽度"]');
+    if (!workspace || !separator) { resolve(false); return; }
+    const before = getComputedStyle(workspace).getPropertyValue('--conversation-left');
+    separator.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    requestAnimationFrame(() => {
+      const after = getComputedStyle(workspace).getPropertyValue('--conversation-left');
+      resolve(before !== after);
+    });
+  }))()`);
+  assert.equal(resized, true, 'keyboard resizing must update the left panel width');
+  await assertNoOverflow('conversation 1440');
+  await waitFor(
+    'selectable semantic timeline event',
+    () => evaluate(`({
+      routeConversationId: new URLSearchParams(location.search).get('conversationId'),
+      timelineConversationId: document
+        .querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')
+        ?.getAttribute('data-conversation-id'),
+      bodyHasMarker: (document.body?.innerText ?? '').includes(${JSON.stringify(marker)}),
+      events: [...document.querySelectorAll('button[data-semantic-kind]')].map((node) => ({
+        kind: node.dataset.semanticKind,
+        text: (node.textContent ?? '').slice(0, 500)
+      }))
+    })`),
+    (value) => value.events.some((item) =>
+      (item.kind === 'model_final' && item.text.includes(responseMarker))
+      || (item.kind === 'user_message' && item.text.includes(marker))
+      || (item.kind === 'tool_call' && item.text.includes(toolMarker))),
+    60_000,
+  );
+  await screenshot('conversation-tracking-1440.png');
+
+  await evaluate(`document.querySelector('button[role="option"][aria-selected="true"]')?.click()`);
+  await waitFor(
+    'Agent overview selection',
+    () => evaluate(`({
+      route: new URLSearchParams(location.search).get('conversationId'),
+      text: document.body?.innerText ?? ''
+    })`),
+    (value) => value.route === null && value.text.includes('Agent 整体概览'),
+    60_000,
+  );
+  await screenshot('conversation-overview-1440.png');
+  await evaluate(`document.querySelector('button[data-conversation-id=${JSON.stringify(conversation.conversationId)}]')?.click()`);
+  await waitFor(
+    'restore fixture after Agent overview',
+    () => evaluate(`({
+      route: new URLSearchParams(location.search).get('conversationId'),
+      timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id'),
+      text: document.body?.innerText ?? ''
+    })`),
+    (value) => value.route === conversation.conversationId
+      && value.timeline === conversation.conversationId
+      && value.text.includes(marker),
+    60_000,
+  );
+
+  const rapidSwitch = await evaluate(`(() => new Promise(async (resolve) => {
+    const ids = [...new Set([...document.querySelectorAll('[data-conversation-id]')]
+      .map((node) => node.getAttribute('data-conversation-id')).filter(Boolean))];
+    const configured = [
+      ${JSON.stringify(conversation.conversationId)},
+      ${JSON.stringify(alternateConversationId ?? '')}
+    ].filter(Boolean);
+    const targets = ids.length >= 2 ? ids.slice(0, 2) : [...new Set(configured)].slice(0, 2);
+    if (targets.length < 2) { resolve({ tested: false }); return; }
+    for (let index = 0; index < 100; index += 1) {
+      const id = targets[index % targets.length];
+      const button = document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]');
+      if (button) {
+        button.click();
+      } else {
+        const next = new URL(location.href);
+        next.searchParams.set('conversationId', id);
+        next.searchParams.delete('interactionId');
+        next.searchParams.delete('semanticEventId');
+        history.pushState({}, '', next);
+        dispatchEvent(new PopStateEvent('popstate'));
+      }
+      await new Promise((next) => setTimeout(next, 5));
+    }
+    resolve({ tested: true, finalId: targets[99 % targets.length] });
+  }))()`);
+  if (rapidSwitch.tested) {
+    await waitFor(
+      'rapid Thread selection consistency',
+      () => evaluate(`({
+        route: new URLSearchParams(location.search).get('conversationId'),
+        timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id')
+      })`),
+      (value) => value.route === rapidSwitch.finalId && value.timeline === rapidSwitch.finalId,
+      60_000,
+    );
+    await evaluate(`(() => {
+      const id = ${JSON.stringify(conversation.conversationId)};
+      const button = document.querySelector('button[data-conversation-id="' + CSS.escape(id) + '"]');
+      if (button) { button.click(); return; }
+      const next = new URL(location.href);
+      next.searchParams.set('conversationId', id);
+      next.searchParams.delete('interactionId');
+      next.searchParams.delete('semanticEventId');
+      history.pushState({}, '', next);
+      dispatchEvent(new PopStateEvent('popstate'));
+    })()`);
+    await waitFor(
+      'restore browser fixture Thread',
+      () => evaluate(`({
+        route: new URLSearchParams(location.search).get('conversationId'),
+        timeline: document.querySelector('[aria-label="Agent 对话时间线"][data-conversation-id]')?.getAttribute('data-conversation-id'),
+        text: document.body?.innerText ?? ''
+      })`),
+      (value) => value.route === conversation.conversationId
+        && value.timeline === conversation.conversationId
+        && value.text.includes(marker),
+      60_000,
+    );
+  }
+
+  await evaluate(`(() => {
+    const button = [...document.querySelectorAll('button[data-semantic-kind]')]
+      .find((node) => node.dataset.semanticKind === 'model_final'
+        && node.textContent?.includes(${JSON.stringify(responseMarker)}))
+      ?? [...document.querySelectorAll('button[data-semantic-kind]')]
+        .find((node) => node.dataset.semanticKind === 'user_message'
+          && node.textContent?.includes(${JSON.stringify(marker)}))
+      ?? [...document.querySelectorAll('button[data-semantic-kind]')]
+        .find((node) => node.dataset.semanticKind === 'tool_call'
+          && node.textContent?.includes(${JSON.stringify(toolMarker)}));
+    button?.click();
+  })()`);
+  await waitFor(
+    'interaction inspector',
+    () => evaluate('document.querySelectorAll("[role=tab]").length'),
+    (count) => count === 4,
+  );
+  await waitFor(
+    'interaction deep link',
+    () => evaluate('location.search.includes("interactionId=")'),
+    Boolean,
+  );
+  await waitFor(
+    'per-call token usage',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => /总 token/iu.test(text) && text.includes('输入') && text.includes('输出'),
+  );
+  await screenshot('conversation-usage-inspector-1440.png');
+  await evaluate(`(() => {
+    const raw = [...document.querySelectorAll('[role=tab]')]
+      .find((node) => node.textContent?.trim() === '原始');
+    raw?.click();
+  })()`);
+  const rawText = await waitFor('raw interaction body', () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('最终发送给 LLM / 工具的请求')
+      && text.includes('LLM / 工具返回给 Agent 的响应')
+      && text.includes(marker)
+      && text.includes(responseMarker));
+  assert(rawText.includes(toolMarker));
+  await screenshot('conversation-inspector-1440.png');
+
+  const selectedToolCall = await evaluate(`(() => {
+    const button = document.querySelector('button[data-semantic-kind="tool_call"]');
+    button?.click();
+    return button?.textContent ?? '';
+  })()`);
+  assert.ok(selectedToolCall, 'the semantic timeline must expose a selectable tool_call event');
+  await waitFor(
+    'semantic Tool inspector',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('工具 ·') && text.includes('内核证据'),
+  );
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '内核证据'))?.click()`);
+  await waitFor(
+    'semantic Kernel evidence relation',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.toLowerCase().includes('relation status')
+      && (text.includes('semantic_only') || text.includes('coverage_gap') || text.includes('linked_'))
+      && !text.includes('TOOL INVOCATION\n--'),
+    60_000,
+  );
+  await screenshot('conversation-kernel-evidence-1440.png');
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '风险研判'))?.click()`);
+  await waitFor(
+    'existing Kernel risk view',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('Kernel Judgment') || text.includes('风险 '),
+  );
+  await screenshot('conversation-risk-1440.png');
+  await evaluate(`([...document.querySelectorAll('[role=tab]')]
+    .find((node) => node.textContent?.trim() === '原始'))?.click()`);
+  await waitFor('restore raw inspector', () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes('最终发送给 LLM / 工具的请求'));
+
+  await viewport(1024, 900);
+  await assertNoOverflow('conversation 1024');
+  await screenshot('conversation-inspector-1024.png');
+
+  await viewport(390, 844);
+  await assertNoOverflow('conversation inspector 390');
+  const mobileTabHeights = await evaluate(`[...document.querySelectorAll('[role="tab"]')]
+    .map((node) => node.getBoundingClientRect().height)`);
+  assert.equal(mobileTabHeights.length, 4, `mobile inspector tabs: ${JSON.stringify(mobileTabHeights)}`);
+  assert.ok(mobileTabHeights.every((height) => height >= 44),
+    `mobile inspector tab targets must be at least 44px: ${JSON.stringify(mobileTabHeights)}`);
+  await screenshot('conversation-inspector-390.png');
+  await evaluate(`(() => {
+    const controls = [...document.querySelectorAll('[aria-label="关闭事件检查器"]')];
+    controls.at(-1)?.click();
+  })()`);
+  await waitFor('mobile inspector close', () => evaluate('document.querySelectorAll("[role=tab]").length'), (count) => count === 0);
+  await assertNoOverflow('conversation timeline 390');
+  await screenshot('conversation-timeline-390.png');
+
+  await command('Emulation.setEmulatedMedia', {
+    features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+  });
+  await viewport(375, 812);
+  await waitFor(
+    'reduced-motion conversation timeline',
+    () => evaluate('document.body?.innerText ?? ""'),
+    (text) => text.includes(marker) && text.includes('第 1 轮'),
+  );
+  await assertNoOverflow('conversation reduced-motion 375');
+  const runningTimelineAnimations = await waitFor(
+    'reduced-motion animations settle',
+    () => evaluate(`document
+      .querySelector('[aria-label="Agent 对话时间线"]')
+      ?.getAnimations({ subtree: true })
+      .filter((animation) => animation.playState === 'running').length ?? 0`),
+    (count) => count === 0,
+    10_000,
+  );
+  assert.equal(runningTimelineAnimations, 0,
+    `reduced-motion timeline animations: ${runningTimelineAnimations}`);
+  await screenshot('conversation-timeline-375-reduced-motion.png');
+
+  await viewport(1440, 1000);
+  await command('Page.navigate', {
+    url: `${dashboardUrl}/conversations?timeType=${encodeURIComponent(timeType)}`,
+  });
+  await waitFor(
+    'clean Agent overview route',
+    () => evaluate(`({
+      ready: (document.body?.innerText ?? '').includes('Agent 整体概览'),
+      history: document.querySelector('button[data-agent-history-toggle]')?.getAttribute('aria-expanded')
+    })`),
+    (value) => value.ready,
+    60_000,
+  );
+  const collapsedHistory = await evaluate(`(() => {
+    const toggle = document.querySelector('button[data-agent-history-toggle]');
+    if (!toggle) return { available: false };
+    const target = document.getElementById(toggle.getAttribute('aria-controls'));
+    return {
+      available: true,
+      expanded: toggle.getAttribute('aria-expanded'),
+      hidden: target?.hidden,
+    };
+  })()`);
+  if (collapsedHistory.available) {
+    assert.equal(collapsedHistory.expanded, 'false', JSON.stringify(collapsedHistory));
+    assert.equal(collapsedHistory.hidden, true, JSON.stringify(collapsedHistory));
+    historicalAgentCollapseVerified = true;
+  }
+  const instanceCollapse = await evaluate(`(() => {
+    const toggle = document.querySelector('button[data-instance-history-toggle]');
+    if (!toggle) return { available: false };
+    return {
+      available: true,
+      expanded: toggle.getAttribute('aria-expanded'),
+      visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length,
+    };
+  })()`);
+  if (instanceCollapse.available) {
+    assert.equal(instanceCollapse.expanded, 'false', JSON.stringify(instanceCollapse));
+    assert.equal(instanceCollapse.visibleHistory, 0, JSON.stringify(instanceCollapse));
+    await evaluate(`document.querySelector('button[data-instance-history-toggle]')?.click()`);
+    await waitFor(
+      'historical instances expand',
+      () => evaluate(`({
+        expanded: document.querySelector('button[data-instance-history-toggle]')?.getAttribute('aria-expanded'),
+        visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length
+      })`),
+      (value) => value.expanded === 'true' && value.visibleHistory > 0,
+    );
+    historicalInstanceCollapseVerified = true;
+    await evaluate(`document.querySelector('button[data-instance-history-toggle]')?.click()`);
+    await waitFor(
+      'historical instances collapse again',
+      () => evaluate(`({
+        expanded: document.querySelector('button[data-instance-history-toggle]')?.getAttribute('aria-expanded'),
+        visibleHistory: document.querySelectorAll('button[data-runtime-state="lost"], button[data-runtime-state="exited"]').length
+      })`),
+      (value) => value.expanded === 'false' && value.visibleHistory === 0,
+    );
+  }
+  const overviewText = await evaluate('document.body?.innerText ?? ""');
+  assert(/token 用量/iu.test(overviewText) && overviewText.includes('模型调用'),
+    `Agent overview must expose token and model-call summaries: ${overviewText.slice(0, 2_000)}`);
+  await assertNoOverflow('conversation collapsed history 1440');
+  await screenshot('conversation-history-collapsed-1440.png');
+
+  assert.deepEqual(runtimeExceptions, [], `browser runtime exceptions: ${runtimeExceptions.join('; ')}`);
+  assert.deepEqual(failedRequests, [], `browser network failures: ${failedRequests.join('; ')}`);
+  console.log(JSON.stringify({
+    dashboardUrl,
+    screenshots: outputDirectory,
+    conversationId: conversation.conversationId,
+    managementTokenRequiredForRead: false,
+    semanticActors: ['user', 'model', 'tool'],
+    resizablePanels: true,
+    desktopTimelineVisible: true,
+    inspectorStructuredRawEvidence: true,
+    responsiveViewports: [1440, 1024, 390, 375],
+    reducedMotion: true,
+    tokenUsageSummary: true,
+    historicalAgentCollapseVerified,
+    historicalInstanceCollapseVerified,
+    mobileTouchTargets: true,
+    rapidThreadSwitches: rapidSwitch.tested ? 100 : 0,
+    horizontalOverflow: false,
+    runtimeExceptions: 0,
+    networkFailures: 0,
+  }, null, 2));
+  console.log('PASS Conversation Tracking browser verification');
+} finally {
+  try { socket?.close(); } catch {}
+  chrome.kill('SIGTERM');
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  if (chrome.exitCode === null) chrome.kill('SIGKILL');
+  rmSync(profile, { recursive: true, force: true });
+}

@@ -25,6 +25,11 @@ export interface RuntimeModelPublicStatus {
   profile: RuntimeModelProfile;
   state: 'active' | 'missing_credential';
   keyConfigured: boolean;
+  callable: boolean;
+  connectivityStatus?: 'connected' | 'unauthorized' | 'rate_limited' | 'timeout' | 'unreachable' | 'invalid_response';
+  checkedAt?: string;
+  latencyMs?: number;
+  message?: string;
   source?: RuntimeCredentialSource;
   endpoint?: string;
   model?: string;
@@ -56,9 +61,21 @@ interface PendingConnection {
   expiresAt: number;
 }
 
+interface RuntimeModelHealth {
+  snapshotVersion: string;
+  callable: boolean;
+  status: NonNullable<RuntimeModelPublicStatus['connectivityStatus']>;
+  checkedAt: string;
+  checkedAtMs: number;
+  latencyMs: number;
+  message: string;
+}
+
 export const RUNTIME_MODEL_UPDATE_CHANNEL = 'anysentry:model-runtime:updates:v1';
 export const RUNTIME_MODEL_REQUEST_CHANNEL = 'anysentry:model-runtime:requests:v1';
 const TEST_TOKEN_TTL_MS = 5 * 60_000;
+const HEALTH_CHECK_INTERVAL_MS = 30_000;
+const HEALTH_CHECK_FRESH_MS = 20_000;
 
 function positiveInt(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
@@ -114,12 +131,22 @@ function environmentConnection(profile: RuntimeModelProfile, env: NodeJS.Process
   }
 }
 
-function publicStatus(profile: RuntimeModelProfile, snapshot: RuntimeModelSnapshot | null): RuntimeModelPublicStatus {
-  if (!snapshot) return { profile, state: 'missing_credential', keyConfigured: false };
+function publicStatus(
+  profile: RuntimeModelProfile,
+  snapshot: RuntimeModelSnapshot | null,
+  health?: RuntimeModelHealth,
+): RuntimeModelPublicStatus {
+  if (!snapshot) return { profile, state: 'missing_credential', keyConfigured: false, callable: false };
+  const currentHealth = health?.snapshotVersion === snapshot.version ? health : undefined;
   return {
     profile,
     state: 'active',
     keyConfigured: true,
+    callable: currentHealth?.callable === true,
+    connectivityStatus: currentHealth?.status,
+    checkedAt: currentHealth?.checkedAt,
+    latencyMs: currentHealth?.latencyMs,
+    message: currentHealth?.message ?? '等待模型 API 连通性检查',
     source: snapshot.source,
     endpoint: snapshot.url,
     model: snapshot.model,
@@ -135,7 +162,10 @@ function publicStatus(profile: RuntimeModelProfile, snapshot: RuntimeModelSnapsh
 export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy {
   private readonly bootId = randomUUID();
   private readonly snapshots = new Map<RuntimeModelProfile, RuntimeModelSnapshot>();
+  private readonly health = new Map<RuntimeModelProfile, RuntimeModelHealth>();
   private readonly pending = new Map<string, PendingConnection>();
+  private healthCheckTimer?: NodeJS.Timeout;
+  private healthCheckInFlight?: Promise<void>;
   private publisher?: IORedis;
   private subscriber?: IORedis;
 
@@ -144,6 +174,9 @@ export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy 
       const connection = environmentConnection(profile, process.env);
       if (connection) this.snapshots.set(profile, this.snapshot(profile, connection, 'environment'));
     }
+    void this.refreshConnectivity(true);
+    this.healthCheckTimer = setInterval(() => void this.refreshConnectivity(true), HEALTH_CHECK_INTERVAL_MS);
+    this.healthCheckTimer.unref();
     if (process.env.ANYSENTRY_ASYNC_JUDGE !== 'on') return;
     const redisUrl = process.env.ANYSENTRY_REDIS_URL || 'redis://redis:6379/0';
     this.publisher = new IORedis(redisUrl, { maxRetriesPerRequest: null });
@@ -162,7 +195,9 @@ export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy 
   }
 
   async onModuleDestroy(): Promise<void> {
+    if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
     this.pending.clear();
+    this.health.clear();
     this.snapshots.clear();
     if (this.subscriber) await this.subscriber.quit().catch(() => undefined);
     if (this.publisher) await this.publisher.quit().catch(() => undefined);
@@ -172,11 +207,44 @@ export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy 
     return this.snapshots.get(profile) ?? null;
   }
 
+  isCallable(profile: RuntimeModelProfile): boolean {
+    const snapshot = this.get(profile);
+    const health = this.health.get(profile);
+    return Boolean(snapshot && health?.snapshotVersion === snapshot.version && health.callable);
+  }
+
   statuses(): Record<RuntimeModelProfile, RuntimeModelPublicStatus> {
     return {
-      fast_review: publicStatus('fast_review', this.get('fast_review')),
-      deep_investigation: publicStatus('deep_investigation', this.get('deep_investigation')),
+      fast_review: publicStatus('fast_review', this.get('fast_review'), this.health.get('fast_review')),
+      deep_investigation: publicStatus('deep_investigation', this.get('deep_investigation'), this.health.get('deep_investigation')),
     };
+  }
+
+  async refreshConnectivity(force = false): Promise<void> {
+    if (this.healthCheckInFlight) return this.healthCheckInFlight;
+    const now = Date.now();
+    const profiles = (['fast_review', 'deep_investigation'] as const).filter((profile) => {
+      const snapshot = this.get(profile);
+      if (!snapshot) {
+        this.health.delete(profile);
+        return false;
+      }
+      const health = this.health.get(profile);
+      return force
+        || !health
+        || health.snapshotVersion !== snapshot.version
+        || now - health.checkedAtMs >= HEALTH_CHECK_FRESH_MS;
+    });
+    if (!profiles.length) return;
+    this.healthCheckInFlight = Promise.all(profiles.map(async (profile) => {
+      const snapshot = this.get(profile);
+      if (!snapshot) return;
+      const health = await this.probe(snapshot);
+      if (this.get(profile)?.version === snapshot.version) this.health.set(profile, health);
+    })).then(() => undefined).finally(() => {
+      this.healthCheckInFlight = undefined;
+    });
+    return this.healthCheckInFlight;
   }
 
   rememberSuccessfulTest(profile: RuntimeModelProfile, connection: RuntimeModelConnection): { testToken: string; expiresAt: string } {
@@ -198,12 +266,23 @@ export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy 
   async activate(profile: RuntimeModelProfile, connection: RuntimeModelConnection): Promise<RuntimeModelSnapshot> {
     const snapshot = this.snapshot(profile, connection, 'runtime');
     this.snapshots.set(profile, snapshot);
+    const checkedAtMs = Date.now();
+    this.health.set(profile, {
+      snapshotVersion: snapshot.version,
+      callable: true,
+      status: 'connected',
+      checkedAt: new Date(checkedAtMs).toISOString(),
+      checkedAtMs,
+      latencyMs: 0,
+      message: '模型连接已通过真实调用测试',
+    });
     await this.publish(profile);
     return snapshot;
   }
 
   async clear(profile: RuntimeModelProfile): Promise<void> {
     this.snapshots.delete(profile);
+    this.health.delete(profile);
     for (const [token, pending] of this.pending) if (pending.profile === profile) this.pending.delete(token);
     await this.publish(profile);
   }
@@ -215,6 +294,65 @@ export class RuntimeModelConfigService implements OnModuleInit, OnModuleDestroy 
   private prunePending(): void {
     const now = Date.now();
     for (const [token, pending] of this.pending) if (pending.expiresAt <= now) this.pending.delete(token);
+  }
+
+  private async probe(snapshot: RuntimeModelSnapshot): Promise<RuntimeModelHealth> {
+    const startedAt = Date.now();
+    const checkedAtMs = Date.now();
+    const timeoutMs = positiveInt(process.env.ANYSENTRY_MODEL_HEALTH_TIMEOUT_MS, 5_000, 500, 30_000);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error(`model API health check exceeded ${timeoutMs}ms`)), timeoutMs);
+    let callable = false;
+    let status: RuntimeModelHealth['status'] = 'unreachable';
+    let message = '模型 API 无法访问';
+    try {
+      const response = await fetch(new URL('models', `${snapshot.url.replace(/\/+$/u, '')}/`), {
+        headers: { authorization: `Bearer ${snapshot.apiKey}` },
+        signal: controller.signal,
+      });
+      if (response.status === 401 || response.status === 403) {
+        status = 'unauthorized';
+        message = '模型 API 鉴权失败';
+      } else if (response.status === 429) {
+        status = 'rate_limited';
+        message = '模型 API 正在限流';
+      } else if (!response.ok) {
+        status = 'unreachable';
+        message = `模型 API 返回 HTTP ${response.status}`;
+      } else {
+        const payload = await response.json() as { data?: Array<{ id?: unknown }> };
+        const modelIds = Array.isArray(payload?.data)
+          ? payload.data.map((item) => typeof item?.id === 'string' ? item.id : '').filter(Boolean)
+          : [];
+        if (!modelIds.includes(snapshot.model)) {
+          status = 'invalid_response';
+          message = `模型 API 未返回已配置模型 ${snapshot.model}`;
+        } else {
+          callable = true;
+          status = 'connected';
+          message = '模型 API 在线且已配置模型可用';
+        }
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        status = 'timeout';
+        message = '模型 API 连通性检查超时';
+      } else {
+        status = 'unreachable';
+        message = error instanceof Error ? `模型 API 无法访问：${error.message}` : '模型 API 无法访问';
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+    return {
+      snapshotVersion: snapshot.version,
+      callable,
+      status,
+      checkedAt: new Date(checkedAtMs).toISOString(),
+      checkedAtMs,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      message,
+    };
   }
 
   private async publish(profile: RuntimeModelProfile): Promise<void> {

@@ -1,12 +1,14 @@
 import { ClickHouseClient, createClient } from '@clickhouse/client';
 import {
   DependencySnapshot,
+  SupplyChainControlConfig,
   SupplyChainOverview,
   VulnerabilityAssessment,
   VulnerabilityFinding,
   WorkspaceRegistration,
   WorkspaceSnapshotBinding,
 } from './supply-chain.types';
+import { staticFindingPriority } from './supply-chain-priority';
 
 const WORKSPACES_TABLE = 'supply_chain_workspaces';
 const SNAPSHOTS_TABLE = 'supply_chain_dependency_snapshots';
@@ -14,6 +16,7 @@ const BINDINGS_TABLE = 'supply_chain_workspace_snapshot_bindings';
 const ASSESSMENTS_TABLE = 'supply_chain_vulnerability_assessments';
 const FINDINGS_TABLE = 'supply_chain_vulnerability_findings';
 const FAILURES_TABLE = 'supply_chain_assessment_failures';
+const CONTROL_TABLE = 'supply_chain_control';
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS ${WORKSPACES_TABLE} (
@@ -110,7 +113,13 @@ const DDL = [
     failureId String,
     ts DateTime MATERIALIZED toDateTime(intDiv(failedAt, 1000))
   ) ENGINE = MergeTree
-  ORDER BY (vulnerabilityAssessmentId, failureId)`,
+    ORDER BY (vulnerabilityAssessmentId, failureId)`,
+  `CREATE TABLE IF NOT EXISTS ${CONTROL_TABLE} (
+    controlId String,
+    value String,
+    updatedAt UInt64
+  ) ENGINE = ReplacingMergeTree(updatedAt)
+  ORDER BY controlId`,
 ];
 
 const ALTER_DDL = [
@@ -146,18 +155,8 @@ function findingFromRow(row: Record<string, unknown>): VulnerabilityFinding {
     modified: '',
     aliases: [],
   });
-  const deploymentStatus = component.deploymentImages?.length ? 'confirmed' : 'unknown';
-  const fallbackScore = Math.min(100, {
-    critical: 80,
-    high: 60,
-    medium: 40,
-    low: 20,
-    unknown: 10,
-  }[vulnerability.severityLevel ?? 'unknown']
-    + (deploymentStatus === 'confirmed' ? 15 : 0)
-    + (component.direct === true ? 5 : 0)
-    + (component.dependencyScope === 'runtime' ? 5 : 0));
-  const priorityScore = num(row.priorityScore) || fallbackScore;
+  const calculated = staticFindingPriority(component, vulnerability);
+  const priorityScore = num(row.priorityScore) || calculated.priorityScore;
   return {
     findingId: String(row.findingId ?? ''),
     workspaceId: String(row.workspaceId ?? ''),
@@ -173,7 +172,9 @@ function findingFromRow(row: Record<string, unknown>): VulnerabilityFinding {
       priorityScore >= 90 ? 'P0' : priorityScore >= 60 ? 'P1' : priorityScore >= 35 ? 'P2' : 'P3'
     )) as VulnerabilityFinding['priority'],
     priorityScore,
-    deploymentStatus: (String(row.deploymentStatus || '') || deploymentStatus) as VulnerabilityFinding['deploymentStatus'],
+    priorityFactors: calculated.priorityFactors,
+    deploymentStatus: (String(row.deploymentStatus || '') || calculated.deploymentStatus) as VulnerabilityFinding['deploymentStatus'],
+    remediation: calculated.remediation,
     shadow: true,
   };
 }
@@ -223,6 +224,46 @@ export class SupplyChainStore {
         sourceId: workspace.sourceId ?? '',
         environmentId: workspace.environmentId ?? '',
         recordVersion: workspace.updatedAt,
+      }],
+      format: 'JSONEachRow',
+    });
+  }
+
+  async registeredWorkspaces(): Promise<WorkspaceRegistration[]> {
+    const result = await this.requireClient().query({
+      query: `SELECT * FROM ${WORKSPACES_TABLE} FINAL ORDER BY lower(displayName), workspaceId`,
+      format: 'JSONEachRow',
+    });
+    return (await result.json() as Array<Record<string, unknown>>).map((row) => ({
+      schemaVersion: 'anysentry.workspace_registration.v1',
+      repositoryId: String(row.repositoryId),
+      workspaceId: String(row.workspaceId),
+      scannerId: String(row.scannerId),
+      workspacePathFingerprint: String(row.workspacePathFingerprint),
+      displayName: String(row.displayName),
+      sourceId: String(row.sourceId || '') || undefined,
+      environmentId: String(row.environmentId || '') || undefined,
+      registeredAt: num(row.registeredAt),
+      updatedAt: num(row.updatedAt),
+    }));
+  }
+
+  async loadControl(): Promise<SupplyChainControlConfig | undefined> {
+    const result = await this.requireClient().query({
+      query: `SELECT value FROM ${CONTROL_TABLE} FINAL WHERE controlId = 'default' LIMIT 1`,
+      format: 'JSONEachRow',
+    });
+    const [row] = await result.json() as Array<{ value: string }>;
+    return row ? parseJson<SupplyChainControlConfig | undefined>(row.value, undefined) : undefined;
+  }
+
+  async saveControl(config: SupplyChainControlConfig): Promise<void> {
+    await this.requireClient().insert({
+      table: CONTROL_TABLE,
+      values: [{
+        controlId: 'default',
+        value: JSON.stringify(config),
+        updatedAt: config.updatedAt,
       }],
       format: 'JSONEachRow',
     });
@@ -478,14 +519,21 @@ export class SupplyChainStore {
     if (rows.length === 0) return;
     await this.requireClient().insert({
       table: FINDINGS_TABLE,
-      values: rows.map((finding) => ({
-        ...finding,
-        component: JSON.stringify(finding.component),
-        vulnerability: JSON.stringify(finding.vulnerability),
-        closureReason: finding.closureReason ?? '',
-        shadow: 1,
-        recordVersion: assessment.assessedAt,
-      })),
+      values: rows.map((finding) => {
+        const {
+          priorityFactors: _priorityFactors,
+          remediation: _remediation,
+          ...persisted
+        } = finding;
+        return {
+          ...persisted,
+          component: JSON.stringify(finding.component),
+          vulnerability: JSON.stringify(finding.vulnerability),
+          closureReason: finding.closureReason ?? '',
+          shadow: 1,
+          recordVersion: assessment.assessedAt,
+        };
+      }),
       format: 'JSONEachRow',
     });
   }
@@ -496,6 +544,7 @@ export class SupplyChainStore {
         enabled: false,
         runtimeCorrelationEnabled: false,
         workspaces: 0,
+        workspaceOptions: [],
         activeSnapshots: 0,
         openFindings: 0,
         staleFindings: 0,
@@ -505,7 +554,9 @@ export class SupplyChainStore {
     const safeLimit = Math.max(1, Math.min(500, limit));
     const [workspaceResult, bindingResult, assessmentResult, findingCountResult, findingResult] = await Promise.all([
       this.requireClient().query({
-        query: `SELECT count() AS count FROM ${WORKSPACES_TABLE} FINAL`,
+        query: `SELECT workspaceId, repositoryId, displayName, sourceId, environmentId
+          FROM ${WORKSPACES_TABLE} FINAL
+          ORDER BY lower(displayName), workspaceId`,
         format: 'JSONEachRow',
       }),
       this.requireClient().query({
@@ -554,7 +605,14 @@ export class SupplyChainStore {
     return {
       enabled: true,
       runtimeCorrelationEnabled: false,
-      workspaces: num(workspaceRows[0]?.count),
+      workspaces: workspaceRows.length,
+      workspaceOptions: workspaceRows.map((row) => ({
+        workspaceId: String(row.workspaceId ?? ''),
+        repositoryId: String(row.repositoryId ?? ''),
+        displayName: String(row.displayName || row.workspaceId || ''),
+        sourceId: String(row.sourceId || '') || undefined,
+        environmentId: String(row.environmentId || '') || undefined,
+      })),
       activeSnapshots: num(bindingRows[0]?.count),
       openFindings: num(findingCountRows[0]?.openFindings),
       staleFindings: num(findingCountRows[0]?.staleFindings),

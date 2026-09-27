@@ -1,9 +1,17 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
 import { ClickHouseStore } from './clickhouse-store';
+import { DistributedCurrentStateService } from './distributed-current-state.service';
+import { RelationalBusinessStore } from './relational-business-store.service';
 import {
+  CorrelationClaimAuthority,
+  CorrelationClaimAuthorizationReason,
   IngestionSourceCheckInAck,
   IngestionSourceCheckInRequest,
+  IngestionSourceCorrelationClaimBindings,
+  IngestionSourceCorrelationClaimsPolicy,
+  IngestionSourceCorrelationClaimsPolicyInput,
+  IngestionSourceCurrentActivity,
   IngestionSourceItem,
   IngestionSourceList,
   IngestionSourceMutationResult,
@@ -15,15 +23,39 @@ import {
   SourceTokenRotationStatus,
 } from './types';
 import { cleanText } from './redaction';
+import { correlationCaptureRollout } from './correlation-rollout';
 
 const RETAIN_LIMIT = 2_000;
+// Keep the pending durability queue bounded by the same compatibility retention window used by
+// the source snapshot. Dropping a dirty key never drops the in-memory/ClickHouse source fact; the
+// counter is exposed through stateStatus for an explicit degraded read/write signal.
+const SOURCE_DIRTY_MAX_ENTRIES = RETAIN_LIMIT;
 const STALE_AFTER_MS = 10 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
+const PERSIST_RETRY_INITIAL_MS = 5_000;
+const PERSIST_RETRY_MAX_MS = 60_000;
 
 export interface IngestionSourceResolution {
   accepted: boolean;
   reason?: string;
   source?: IngestionSourceRecord;
+  authenticated: boolean;
+  authentication: 'token' | 'none';
+  claimAuthorization: boolean;
+  claimAuthorizationReason: CorrelationClaimAuthorizationReason;
+  claimAuthority?: CorrelationClaimAuthority;
+}
+
+export interface IngestionSourceCorrelationClaimRequest {
+  authority?: CorrelationClaimAuthority;
+  /** Raw identity values; authorization performs strict, non-truncating validation. */
+  tenantId?: unknown;
+  environmentId?: unknown;
+  workspaceId?: unknown;
+  workspacePath?: unknown;
+  collectorId?: unknown;
+  physicalWorkloadId?: unknown;
+  agentScopeId?: unknown;
 }
 
 export interface IngestionSourceResolveInput {
@@ -33,6 +65,7 @@ export interface IngestionSourceResolveInput {
   workspacePath?: string;
   sourceName?: string;
   type?: IngestionSourceType;
+  correlationClaim?: IngestionSourceCorrelationClaimRequest;
 }
 
 export type IngestionActivityKind = 'event' | 'heartbeat';
@@ -79,6 +112,237 @@ function cleanTags(tags: unknown): string[] {
   return [...new Set(tags.map((tag) => cleanText(tag, 48)).filter((tag): tag is string => Boolean(tag)))].slice(0, 24);
 }
 
+const CLAIM_BINDING_LIMIT = 64;
+
+function strictClaimIdentity(value: unknown, limit: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > limit || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    return undefined;
+  }
+  return normalized;
+}
+
+const CORRELATION_AUTHORITY_SOURCE_TYPES: Readonly<Record<CorrelationClaimAuthority, readonly IngestionSourceType[]>> = {
+  application: ['otel', 'webhook', 'custom'],
+  agent_adapter: ['forwarder', 'otel', 'webhook', 'custom'],
+  observer_runtime: ['observer', 'forwarder'],
+};
+
+/**
+ * A managed Observer running with hostPID in Kubernetes reports the containerd rootfs path of
+ * the process it enriched.  That path contains a per-Pod/container ID and therefore changes on
+ * every DaemonSet rollout.  It is useful runtime evidence, but it is not a stable Source trust
+ * binding.  Only the explicit managed-observer tag plus a token-protected observer_runtime policy
+ * with an exact collector allow-list enables this descriptive/ephemeral treatment; ordinary
+ * workspace-bound Observer or Forwarder Sources retain exact path matching below.
+ */
+function isEphemeralManagedObserverSource(record: IngestionSourceRecord | undefined): boolean {
+  if (!record || record.discovered || !record.requireToken) return false;
+  if (record.type !== 'observer' || !record.tags.includes('managed-observer')) return false;
+  const policy = record.correlationClaims;
+  return policy?.enabled === true
+    && policy.authority === 'observer_runtime'
+    && Boolean(record.collectorId)
+    && policy.bindings.collectorIds.length > 0
+    && policy.bindings.workspaceIds.length === 0
+    && policy.bindings.workspacePaths.length === 0;
+}
+
+function cleanClaimAuthority(value: unknown): CorrelationClaimAuthority | undefined {
+  return value === 'application' || value === 'agent_adapter' || value === 'observer_runtime' ? value : undefined;
+}
+
+function cleanBindingList(value: unknown, limit: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => strictClaimIdentity(item, limit)).filter((item): item is string => Boolean(item)))].slice(0, CLAIM_BINDING_LIMIT);
+}
+
+function emptyClaimBindings(): IngestionSourceCorrelationClaimBindings {
+  return {
+    tenantIds: [],
+    environmentIds: [],
+    workspaceIds: [],
+    workspacePaths: [],
+    collectorIds: [],
+    physicalWorkloadIds: [],
+    agentScopeIds: [],
+  };
+}
+
+export function normalizeCorrelationClaimsPolicy(
+  input: IngestionSourceCorrelationClaimsPolicyInput | IngestionSourceCorrelationClaimsPolicy | undefined,
+  current?: IngestionSourceCorrelationClaimsPolicy,
+): IngestionSourceCorrelationClaimsPolicy {
+  const prior = current?.bindings ?? emptyClaimBindings();
+  const incoming = input?.bindings;
+  const binding = (key: keyof IngestionSourceCorrelationClaimBindings, limit: number): string[] =>
+    incoming && Object.prototype.hasOwnProperty.call(incoming, key)
+      ? cleanBindingList(incoming[key], limit)
+      : cleanBindingList(prior[key], limit);
+  const hasEnabled = Boolean(input && Object.prototype.hasOwnProperty.call(input, 'enabled'));
+  const hasAuthority = Boolean(input && Object.prototype.hasOwnProperty.call(input, 'authority'));
+  return {
+    enabled: hasEnabled ? input?.enabled === true : current?.enabled === true,
+    authority: hasAuthority ? cleanClaimAuthority(input?.authority) : cleanClaimAuthority(current?.authority),
+    bindings: {
+      tenantIds: binding('tenantIds', 160),
+      environmentIds: binding('environmentIds', 80),
+      workspaceIds: binding('workspaceIds', 180),
+      workspacePaths: binding('workspacePaths', 500),
+      collectorIds: binding('collectorIds', 180),
+      physicalWorkloadIds: binding('physicalWorkloadIds', 240),
+      agentScopeIds: binding('agentScopeIds', 160),
+    },
+  };
+}
+
+function scopeFailure(
+  requested: string | undefined,
+  bindings: readonly string[],
+  missingReason: CorrelationClaimAuthorizationReason,
+  mismatchReason: CorrelationClaimAuthorizationReason,
+): CorrelationClaimAuthorizationReason | undefined {
+  if (!requested) return undefined;
+  if (!bindings.length) return missingReason;
+  return bindings.includes(requested) ? undefined : mismatchReason;
+}
+
+export function authorizeCorrelationClaims(input: {
+  source?: IngestionSourceRecord;
+  tokenProvided: boolean;
+  tokenMatched: boolean;
+  sourceIdMismatch?: boolean;
+  claim?: IngestionSourceCorrelationClaimRequest;
+}): Pick<IngestionSourceResolution, 'claimAuthorization' | 'claimAuthorizationReason' | 'claimAuthority'> {
+  const source = input.source;
+  const authority = cleanClaimAuthority(input.claim?.authority);
+  const denied = (reason: CorrelationClaimAuthorizationReason) => ({
+    claimAuthorization: false as const,
+    claimAuthorizationReason: reason,
+    claimAuthority: authority,
+  });
+  if (!source) return denied('source_unresolved');
+  if (!source.enabled) return denied('source_disabled');
+  if (source.discovered) return denied('source_discovered');
+  const policy = normalizeCorrelationClaimsPolicy(source.correlationClaims);
+  if (!policy.enabled) return denied('policy_disabled');
+  if (!policy.authority) return denied('policy_invalid');
+  if (!source.requireToken) return denied('protected_source_required');
+  if (!input.tokenProvided) return denied('token_missing');
+  if (!input.tokenMatched) return denied('token_invalid');
+  if (input.sourceIdMismatch) return denied('source_id_mismatch');
+  if (!authority) return denied('authority_missing');
+  if (policy.authority !== authority) return denied('authority_mismatch');
+  if (!CORRELATION_AUTHORITY_SOURCE_TYPES[authority].includes(source.type)) return denied('source_type_not_allowed');
+
+  const claim = input.claim ?? {};
+  const bindings = policy.bindings;
+  const requestedScopes = {
+    tenantId: strictClaimIdentity(claim.tenantId, 160),
+    environmentId: strictClaimIdentity(claim.environmentId, 80),
+    workspaceId: strictClaimIdentity(claim.workspaceId, 180),
+    workspacePath: strictClaimIdentity(claim.workspacePath, 500),
+    collectorId: strictClaimIdentity(claim.collectorId, 180),
+    physicalWorkloadId: strictClaimIdentity(claim.physicalWorkloadId, 240),
+    agentScopeId: strictClaimIdentity(claim.agentScopeId, 160),
+  };
+  const workspacePolicyConfigured = bindings.workspaceIds.length > 0 || bindings.workspacePaths.length > 0;
+  const workspaceRequested = Boolean(requestedScopes.workspaceId || requestedScopes.workspacePath);
+  const workloadPolicyConfigured = bindings.physicalWorkloadIds.length > 0;
+  const workloadRequested = Boolean(requestedScopes.physicalWorkloadId);
+  const agentPolicyConfigured = bindings.agentScopeIds.length > 0;
+  const agentRequested = Boolean(requestedScopes.agentScopeId);
+  const invalidProvidedScope = (
+    raw: unknown,
+    parsed: string | undefined,
+    configured: boolean,
+    reason: CorrelationClaimAuthorizationReason,
+  ): CorrelationClaimAuthorizationReason | undefined =>
+    configured && raw !== undefined && parsed === undefined ? reason : undefined;
+  const invalidScope = [
+    invalidProvidedScope(claim.tenantId, requestedScopes.tenantId, bindings.tenantIds.length > 0, 'tenant_binding_mismatch'),
+    invalidProvidedScope(claim.environmentId, requestedScopes.environmentId, bindings.environmentIds.length > 0, 'environment_binding_mismatch'),
+    invalidProvidedScope(claim.workspaceId, requestedScopes.workspaceId, bindings.workspaceIds.length > 0, 'workspace_binding_mismatch'),
+    invalidProvidedScope(claim.workspacePath, requestedScopes.workspacePath, bindings.workspacePaths.length > 0, 'workspace_binding_mismatch'),
+    invalidProvidedScope(claim.collectorId, requestedScopes.collectorId, bindings.collectorIds.length > 0, 'collector_binding_mismatch'),
+    invalidProvidedScope(claim.physicalWorkloadId, requestedScopes.physicalWorkloadId, bindings.physicalWorkloadIds.length > 0, 'workload_binding_mismatch'),
+    invalidProvidedScope(claim.agentScopeId, requestedScopes.agentScopeId, bindings.agentScopeIds.length > 0, 'agent_binding_mismatch'),
+  ].find((reason): reason is CorrelationClaimAuthorizationReason => Boolean(reason));
+  if (invalidScope) return denied(invalidScope);
+  if (authority === 'application' || authority === 'agent_adapter') {
+    if (!bindings.tenantIds.length || !bindings.environmentIds.length || (!workspacePolicyConfigured && !workloadPolicyConfigured && !agentPolicyConfigured)) {
+      return denied('policy_invalid');
+    }
+    if (!requestedScopes.tenantId || !requestedScopes.environmentId || (!workspaceRequested && !workloadRequested && !agentRequested)) {
+      return denied('required_scope_missing');
+    }
+  } else if (!bindings.collectorIds.length) {
+    return denied('policy_invalid');
+  } else if (!requestedScopes.collectorId) {
+    return denied('required_scope_missing');
+  } else if (!bindings.collectorIds.includes(requestedScopes.collectorId)) {
+    return denied('collector_binding_mismatch');
+  }
+
+  const workspaceFailure = (): CorrelationClaimAuthorizationReason | undefined => {
+    if (!workspaceRequested) return undefined;
+    if (requestedScopes.workspaceId) {
+      if (!bindings.workspaceIds.length) return 'workspace_binding_missing';
+      if (!bindings.workspaceIds.includes(requestedScopes.workspaceId)) return 'workspace_binding_mismatch';
+    }
+    if (requestedScopes.workspacePath) {
+      if (!bindings.workspacePaths.length) return 'workspace_binding_missing';
+      if (!bindings.workspacePaths.includes(requestedScopes.workspacePath)) return 'workspace_binding_mismatch';
+    }
+    return undefined;
+  };
+  const failures: Array<CorrelationClaimAuthorizationReason | undefined> = [
+    scopeFailure(requestedScopes.tenantId, bindings.tenantIds, 'tenant_binding_missing', 'tenant_binding_mismatch'),
+    scopeFailure(requestedScopes.environmentId, bindings.environmentIds, 'environment_binding_missing', 'environment_binding_mismatch'),
+    workspaceFailure(),
+    scopeFailure(requestedScopes.collectorId, bindings.collectorIds, 'collector_binding_missing', 'collector_binding_mismatch'),
+    scopeFailure(requestedScopes.physicalWorkloadId, bindings.physicalWorkloadIds, 'workload_binding_missing', 'workload_binding_mismatch'),
+    scopeFailure(requestedScopes.agentScopeId, bindings.agentScopeIds, 'agent_binding_missing', 'agent_binding_mismatch'),
+  ];
+  if (bindings.tenantIds.length && !requestedScopes.tenantId) failures[0] = 'tenant_binding_missing';
+  if (bindings.environmentIds.length && !requestedScopes.environmentId) failures[1] = 'environment_binding_missing';
+  if (bindings.collectorIds.length && !requestedScopes.collectorId) failures[3] = 'collector_binding_missing';
+  if (authority === 'observer_runtime') {
+    if (bindings.workspaceIds.length && !requestedScopes.workspaceId) failures[2] = 'workspace_binding_missing';
+    if (bindings.workspacePaths.length && !requestedScopes.workspacePath) failures[2] = 'workspace_binding_missing';
+    if (bindings.physicalWorkloadIds.length && !requestedScopes.physicalWorkloadId) failures[4] = 'workload_binding_missing';
+    if (bindings.agentScopeIds.length && !requestedScopes.agentScopeId) failures[5] = 'agent_binding_missing';
+  }
+  const failure = failures.find((reason): reason is CorrelationClaimAuthorizationReason => Boolean(reason));
+  if (failure) return denied(failure);
+  return {
+    claimAuthorization: true,
+    claimAuthorizationReason: 'authorized',
+    claimAuthority: authority,
+  };
+}
+
+type VerificationSourceIdentity = Pick<
+  IngestionSourceRecord,
+  'sourceId' | 'name' | 'owner' | 'team' | 'environment' | 'note' | 'tags'
+>;
+
+export function isVerificationSource(item: VerificationSourceIdentity): boolean {
+  const searchable = [
+    item.sourceId,
+    item.name,
+    item.owner,
+    item.team,
+    item.environment,
+    item.note,
+    ...(item.tags ?? []),
+  ].filter(Boolean).join(' ').toLowerCase();
+  return /\b(?:verify|verifier|verification|contract-test|streaming-phase|temporal-episode|supply-chain-(?:runtime|temporal|phase))\b/u.test(searchable)
+    || item.sourceId.startsWith('src_verify_')
+    || item.sourceId.startsWith('src_flink_');
+}
+
 function lastSignalAt(record: IngestionSourceRecord): number | undefined {
   const at = Math.max(Number(record.lastEventAt) || 0, Number(record.lastHeartbeatAt) || 0);
   return at > 0 ? at : undefined;
@@ -122,24 +386,123 @@ function defaultTokenRotationDays(): number {
 
 @Injectable()
 export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly sources = new Map<string, IngestionSourceRecord>();
+  /** Source IDs and mutation generations that have not crossed the relational durability fence. */
+  private readonly dirtySourceIds = new Map<string, number>();
+  private dirtySourceGeneration = 0;
+  private dirtySourceDropped = 0;
+  private persistenceFailures = 0;
+  private persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+  private persistenceRetryTimer?: NodeJS.Timeout;
+  private persistenceForceSnapshot = false;
+  private closing = false;
   private persistTimer?: NodeJS.Timeout;
+  private currentStateTimer?: NodeJS.Timeout;
+  private persistInFlight?: Promise<void>;
+  private persistRequested = false;
   private initialized = false;
+
+  constructor(
+    private readonly ch: ClickHouseStore,
+    private readonly currentState: DistributedCurrentStateService,
+    private readonly relational: RelationalBusinessStore,
+  ) {}
+
+  private markSourceDirty(sourceId: string): void {
+    const id = sourceId.trim();
+    if (!id) return;
+    const generation = ++this.dirtySourceGeneration;
+    if (this.dirtySourceIds.has(id)) {
+      this.dirtySourceIds.set(id, generation);
+      return;
+    }
+    if (this.dirtySourceIds.size >= SOURCE_DIRTY_MAX_ENTRIES) {
+      const oldest = this.dirtySourceIds.keys().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.dirtySourceIds.delete(oldest);
+        this.dirtySourceDropped += 1;
+      }
+    }
+    this.dirtySourceIds.set(id, generation);
+  }
+
+  private relationalPersistenceEnabled(): boolean {
+    const configured = (this.relational as unknown as { configured?: () => boolean }).configured;
+    return typeof configured !== 'function' || configured.call(this.relational);
+  }
+
+  private schedulePersistenceRetry(): void {
+    if (this.closing || !this.initialized || this.persistenceRetryTimer || this.dirtySourceIds.size === 0) return;
+    const delay = this.persistenceRetryDelayMs;
+    this.persistenceRetryDelayMs = Math.min(PERSIST_RETRY_MAX_MS, delay * 2);
+    this.persistenceRetryTimer = setTimeout(() => {
+      this.persistenceRetryTimer = undefined;
+      void this.persist();
+    }, delay);
+    this.persistenceRetryTimer.unref?.();
+  }
+
+  private markPersistenceSuccess(): void {
+    this.persistenceRetryDelayMs = PERSIST_RETRY_INITIAL_MS;
+    if (this.persistenceRetryTimer) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+  }
+
+  private sourcePersistenceStatus(): {
+    dirty: number;
+    maxDirty: number;
+    dropped: number;
+    failures: number;
+    inFlight: boolean;
+    retryScheduled: boolean;
+  } {
+    return {
+      dirty: this.dirtySourceIds.size,
+      maxDirty: SOURCE_DIRTY_MAX_ENTRIES,
+      dropped: this.dirtySourceDropped,
+      failures: this.persistenceFailures,
+      inFlight: Boolean(this.persistInFlight),
+      retryScheduled: Boolean(this.persistenceRetryTimer),
+    };
+  }
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
       for (const record of await this.ch.loadIngestionSources()) {
-        if (record.sourceId) this.sources.set(record.sourceId, this.normalize(record));
+        this.mergePersisted(record);
       }
     }
+    for (const record of await this.relational.loadIngestionSources()) {
+      this.mergePersisted(record);
+    }
     this.initialized = true;
+    await this.persist(true);
+    await this.refreshDistributedCurrentState();
+    this.currentStateTimer = setInterval(() => {
+      void this.refreshRelationalState();
+      void this.refreshDistributedCurrentState();
+    }, 15_000);
+    this.currentStateTimer.unref();
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
-    await this.persist();
-    await this.ch.close();
+    if (this.currentStateTimer) clearInterval(this.currentStateTimer);
+    if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
+    this.persistenceRetryTimer = undefined;
+    await this.persist(true);
+  }
+
+  stateStatus() {
+    return {
+      sourceCount: this.sources.size,
+      postgresqlBacked: this.relational.isReady(),
+      clickhouseMigrationCopy: this.ch.enabled,
+      persistence: this.sourcePersistenceStatus(),
+    };
   }
 
   create(input: IngestionSourceUpdateRequest): IngestionSourceMutationResult {
@@ -170,11 +533,17 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       .map((record) => this.item(record))
       .filter((item) => {
         const matchesSourceId = Boolean(sourceId && item.sourceId === sourceId);
+        const matchesCollectorId = Boolean(collectorId && item.collectorId === collectorId);
+        const matchesWorkspacePath = Boolean(workspacePath && item.workspacePath === workspacePath);
+        // Verification sources stay out of broad inventory views, but an operator's exact
+        // identity selector must remain authoritative and auditable.
+        const matchesExactIdentity = matchesSourceId || matchesCollectorId || matchesWorkspacePath;
+        if (!query.includeVerification && !matchesExactIdentity && isVerificationSource(item)) return false;
         const matchesFilter =
           (!query.status || query.status === 'all' || item.status === query.status) &&
           (!query.type || query.type === 'all' || item.type === query.type) &&
-          (!collectorId || item.collectorId === collectorId) &&
-          (!workspacePath || item.workspacePath === workspacePath) &&
+          (!collectorId || matchesCollectorId) &&
+          (!workspacePath || matchesWorkspacePath) &&
           (!q || [item.sourceId, item.name, item.type, item.collectorId, item.workspacePath, item.owner, item.team, item.environment, item.note, ...(item.tags ?? [])].some((value) => (value ?? '').toLowerCase().includes(q)));
         if (sourceId && !hasFilter) return matchesSourceId;
         return matchesSourceId || matchesFilter;
@@ -202,7 +571,13 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   snapshot(): IngestionSourceRecord[] {
-    return [...this.sources.values()].map((record) => ({ ...record, tags: [...record.tags] }));
+    return [...this.sources.values()].map((record) => ({
+      ...record,
+      tags: [...record.tags],
+      ...(record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
+    }));
   }
 
   resolve(input: IngestionSourceResolveInput): IngestionSourceResolution {
@@ -211,31 +586,69 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     const collectorId = clean(input.collectorId, 180);
     const sourceName = cleanText(input.sourceName, 180);
     let source: IngestionSourceRecord | undefined;
+    let tokenMatched = false;
+    const finish = (
+      result: Pick<IngestionSourceResolution, 'accepted' | 'reason' | 'source'>,
+      sourceIdMismatch = false,
+    ): IngestionSourceResolution => ({
+      ...result,
+      authenticated: tokenMatched,
+      authentication: tokenMatched ? 'token' : 'none',
+      ...(correlationCaptureRollout().trustedCorrelation === 'off'
+        ? {
+            claimAuthorization: false as const,
+            claimAuthorizationReason: 'policy_disabled' as const,
+            claimAuthority: cleanClaimAuthority(input.correlationClaim?.authority),
+          }
+        : authorizeCorrelationClaims({
+            source: result.source,
+            tokenProvided: Boolean(token),
+            tokenMatched,
+            sourceIdMismatch,
+            claim: input.correlationClaim
+              ? {
+                  ...input.correlationClaim,
+                  collectorId: input.correlationClaim.collectorId ?? input.collectorId,
+                  workspacePath: input.correlationClaim.workspacePath ?? input.workspacePath,
+                }
+              : undefined,
+          })),
+    });
 
     if (token) {
       const hashed = tokenHash(token);
       source = [...this.sources.values()].find((item) => item.tokenHash === hashed);
       if (!source) {
         const hinted = sourceId ? this.sources.get(sourceId) : undefined;
-        return { accepted: false, source: hinted, reason: 'invalid source token' };
+        return finish({ accepted: false, source: hinted, reason: 'invalid source token' });
       }
+      tokenMatched = true;
       if (sourceId && source.sourceId !== sourceId) {
-        return { accepted: false, source, reason: 'source id does not match token' };
+        return finish({ accepted: false, source, reason: 'source id does not match token' }, true);
       }
     }
-
     if (!source && sourceId) source = this.sources.get(sourceId);
     if (!source) source = this.findExistingIdentity(input);
     if (!source && (collectorId || sourceName)) source = this.discover({ ...input, collectorId, sourceName });
-    if (!source) return { accepted: true };
+    if (!source) return finish({ accepted: true });
+
+    const requestedWorkspace = clean(input.workspacePath, 500);
+    if (
+      source.workspacePath
+      && requestedWorkspace
+      && source.workspacePath !== requestedWorkspace
+      && !isEphemeralManagedObserverSource(source)
+    ) {
+      return finish({ accepted: false, source, reason: 'source workspace does not match token binding' });
+    }
 
     if (!source.enabled) {
-      return { accepted: false, source, reason: 'source disabled' };
+      return finish({ accepted: false, source, reason: 'source disabled' });
     }
     if (source.requireToken && !token) {
-      return { accepted: false, source, reason: 'source token required' };
+      return finish({ accepted: false, source, reason: 'source token required' });
     }
-    return { accepted: true, source };
+    return finish({ accepted: true, source });
   }
 
   private findExistingIdentity(input: IngestionSourceResolveInput): IngestionSourceRecord | undefined {
@@ -293,7 +706,13 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     record.lastResult = 'accepted';
     record.lastError = undefined;
     if (context.collectorId) record.collectorId = clean(context.collectorId, 180);
-    if (context.workspacePath) record.workspacePath = clean(context.workspacePath, 500);
+    // For a managed hostPID Observer the enriched rootfs path is per-Pod ephemeral evidence, not
+    // a trust binding.  Do not learn it into the Source record, otherwise the next rollout would
+    // reject every event before the new path can be observed. Explicitly workspace-bound sources
+    // keep the historical exact-learning behavior.
+    if (context.workspacePath && !isEphemeralManagedObserverSource(record)) {
+      record.workspacePath = clean(context.workspacePath, 500);
+    }
     if (kind === 'heartbeat') {
       record.lastHeartbeatAt = at;
       record.acceptedHeartbeats += 1;
@@ -301,7 +720,21 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       record.lastEventAt = at;
       record.acceptedEvents += 1;
     }
+    this.markSourceDirty(record.sourceId);
+    void this.currentState.recordSourceActivity({
+      sourceId: record.sourceId,
+      lastSeenAt: at,
+      lastEventAt: kind === 'event' ? at : undefined,
+      lastHeartbeatAt: kind === 'heartbeat' ? at : undefined,
+      collectorId: record.collectorId,
+      workspacePath: record.workspacePath,
+    });
     this.persistSoon();
+  }
+
+  async refreshDistributedCurrentState(untilMs = Date.now()): Promise<void> {
+    const activities = await this.currentState.latestSourceActivities(untilMs);
+    for (const activity of activities) this.mergeCurrentActivity(activity);
   }
 
   recordRejected(resolution: IngestionSourceResolution, reason: string): void {
@@ -342,6 +775,11 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenPreview: token ? tokenPreview(token) : cur?.tokenPreview,
       tokenIssuedAt: token ? at : cur?.tokenIssuedAt,
       tokenRotationDays: 'tokenRotationDays' in input ? cleanRotationDays(input.tokenRotationDays, cur?.tokenRotationDays ?? defaultTokenRotationDays()) : cur?.tokenRotationDays ?? defaultTokenRotationDays(),
+      ...(correlationCaptureRollout().trustedCorrelation !== 'off' && input.correlationClaims !== undefined
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(input.correlationClaims, cur?.correlationClaims) }
+        : cur?.correlationClaims
+          ? { correlationClaims: normalizeCorrelationClaimsPolicy(cur.correlationClaims) }
+          : {}),
       collectorId: 'collectorId' in input ? clean(input.collectorId, 180) : cur?.collectorId,
       workspacePath: 'workspacePath' in input ? clean(input.workspacePath, 500) : cur?.workspacePath,
       owner: 'owner' in input ? cleanText(input.owner, 160) : cur?.owner,
@@ -362,6 +800,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       lastError: cur?.lastError,
     };
     this.sources.set(id, next);
+    this.markSourceDirty(id);
     this.trim();
     this.persistSoon();
     return this.item(next);
@@ -395,6 +834,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       rejectedEvents: 0,
     };
     this.sources.set(id, record);
+    this.markSourceDirty(id);
     this.trim();
     this.persistSoon();
     return record;
@@ -409,6 +849,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     record.rejectedEvents += 1;
     record.lastResult = 'rejected';
     record.lastError = cleanText(reason, 300);
+    this.markSourceDirty(sourceId);
     this.persistSoon();
   }
 
@@ -424,6 +865,9 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenPreview: clean(record.tokenPreview, 32),
       tokenIssuedAt: Number(record.tokenIssuedAt) || (record.tokenHash ? Number(record.createdAt) || Date.now() : undefined),
       tokenRotationDays: cleanRotationDays(record.tokenRotationDays, defaultTokenRotationDays()),
+      ...(record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
       collectorId: clean(record.collectorId, 180),
       workspacePath: clean(record.workspacePath, 500),
       owner: cleanText(record.owner, 160),
@@ -445,6 +889,44 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  private mergeCurrentActivity(activity: IngestionSourceCurrentActivity): void {
+    const record = this.sources.get(activity.sourceId);
+    if (!record) return;
+    const existingAt = lastSignalAt(record) ?? 0;
+    if (existingAt > activity.lastSeenAt) return;
+    const before = {
+      lastSeenAt: record.lastSeenAt,
+      updatedAt: record.updatedAt,
+      lastResult: record.lastResult,
+      lastError: record.lastError,
+      collectorId: record.collectorId,
+      workspacePath: record.workspacePath,
+      lastHeartbeatAt: record.lastHeartbeatAt,
+      lastEventAt: record.lastEventAt,
+    };
+    record.lastSeenAt = Math.max(record.lastSeenAt ?? 0, activity.lastSeenAt);
+    record.updatedAt = Math.max(record.updatedAt, activity.lastSeenAt);
+    record.lastResult = 'accepted';
+    record.lastError = undefined;
+    if (activity.collectorId) record.collectorId = clean(activity.collectorId, 180);
+    if (activity.workspacePath && !isEphemeralManagedObserverSource(record)) {
+      record.workspacePath = clean(activity.workspacePath, 500);
+    }
+    if (activity.lastHeartbeatAt) record.lastHeartbeatAt = Math.max(record.lastHeartbeatAt ?? 0, activity.lastHeartbeatAt);
+    if (activity.lastEventAt) record.lastEventAt = Math.max(record.lastEventAt ?? 0, activity.lastEventAt);
+    const changed = record.lastSeenAt !== before.lastSeenAt
+      || record.updatedAt !== before.updatedAt
+      || record.lastResult !== before.lastResult
+      || record.lastError !== before.lastError
+      || record.collectorId !== before.collectorId
+      || record.workspacePath !== before.workspacePath
+      || record.lastHeartbeatAt !== before.lastHeartbeatAt
+      || record.lastEventAt !== before.lastEventAt;
+    if (!changed) return;
+    this.markSourceDirty(record.sourceId);
+    this.persistSoon();
+  }
+
   private item(record: IngestionSourceRecord): IngestionSourceItem {
     const status = statusOf(record);
     const signalAt = lastSignalAt(record);
@@ -460,6 +942,9 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       tokenIssuedAt: record.tokenIssuedAt ? iso(record.tokenIssuedAt) : undefined,
       tokenRotationDueAt: rotationDueAt ? iso(rotationDueAt) : undefined,
       tokenRotationDays: record.tokenRotationDays,
+      ...(correlationCaptureRollout().trustedCorrelation !== 'off' && record.correlationClaims
+        ? { correlationClaims: normalizeCorrelationClaimsPolicy(record.correlationClaims) }
+        : {}),
       tokenAgeSecs: record.tokenIssuedAt ? Math.max(0, Math.round((Date.now() - record.tokenIssuedAt) / 1000)) : undefined,
       tokenRotationStatus: rotationStatus,
       collectorId: record.collectorId,
@@ -490,8 +975,12 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private trim(): void {
     if (this.sources.size <= RETAIN_LIMIT) return;
     const keep = [...this.sources.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT);
+    const keepIds = new Set(keep.map((record) => record.sourceId));
     this.sources.clear();
     for (const record of keep) this.sources.set(record.sourceId, record);
+    for (const sourceId of this.dirtySourceIds.keys()) {
+      if (!keepIds.has(sourceId)) this.dirtySourceIds.delete(sourceId);
+    }
   }
 
   private persistSoon(): void {
@@ -503,7 +992,84 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     }, 500);
   }
 
-  private async persist(): Promise<void> {
-    await this.ch.saveIngestionSources([...this.sources.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RETAIN_LIMIT));
+  private persist(forceSnapshot = false): Promise<void> {
+    if (forceSnapshot) this.persistenceForceSnapshot = true;
+    this.persistRequested = true;
+    if (!this.persistInFlight) {
+      this.persistInFlight = this.drainPersistence().finally(() => {
+        this.persistInFlight = undefined;
+        if (this.persistRequested && !this.persistenceRetryTimer) void this.persist();
+      });
+    }
+    return this.persistInFlight;
+  }
+
+  private async drainPersistence(): Promise<void> {
+    do {
+      this.persistRequested = false;
+      const snapshot = [...this.sources.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      const dirtyEntries = [...this.dirtySourceIds.entries()]
+        .map(([sourceId, generation]) => ({
+          sourceId,
+          generation,
+          record: this.sources.get(sourceId),
+        }))
+        .filter((entry): entry is { sourceId: string; generation: number; record: IngestionSourceRecord } => Boolean(entry.record))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt)
+        .slice(0, RETAIN_LIMIT);
+      const dirtyRecords = dirtyEntries.map((entry) => entry.record);
+      const forceSnapshot = this.persistenceForceSnapshot;
+      this.persistenceForceSnapshot = false;
+      const relationalRecords = forceSnapshot ? snapshot : dirtyRecords;
+      if (relationalRecords.length === 0 && !forceSnapshot) {
+        if (!this.persistRequested) break;
+        continue;
+      }
+
+      let relationalOk = true;
+      if (this.relationalPersistenceEnabled() && relationalRecords.length > 0) {
+        try {
+          relationalOk = await this.relational.saveIngestionSources(relationalRecords);
+        } catch {
+          relationalOk = false;
+        }
+      }
+      // ClickHouse stores one complete source snapshot. Keep it current even when PostgreSQL is
+      // unavailable; dirty relational IDs stay queued for a bounded retry.
+      await this.ch.saveIngestionSources(snapshot);
+      if (!relationalOk) {
+        this.persistenceFailures += 1;
+        this.persistRequested = false;
+        this.schedulePersistenceRetry();
+        break;
+      }
+      const persistedIds = new Set(relationalRecords.map((record) => record.sourceId));
+      for (const entry of dirtyEntries) {
+        if (persistedIds.has(entry.sourceId)
+          && this.sources.get(entry.sourceId) === entry.record
+          && this.dirtySourceIds.get(entry.sourceId) === entry.generation) {
+          this.dirtySourceIds.delete(entry.sourceId);
+        }
+      }
+      this.markPersistenceSuccess();
+      if (!this.persistRequested) break;
+    } while (this.persistRequested);
+  }
+
+  private mergePersisted(record: IngestionSourceRecord): void {
+    if (!record.sourceId) return;
+    const normalized = this.normalize(record);
+    const current = this.sources.get(normalized.sourceId);
+    if (!current || normalized.updatedAt > current.updatedAt) {
+      this.sources.set(normalized.sourceId, normalized);
+    }
+  }
+
+  private async refreshRelationalState(): Promise<void> {
+    for (const record of await this.relational.loadIngestionSources()) {
+      this.mergePersisted(record);
+    }
   }
 }

@@ -5,6 +5,7 @@
 - [AnySentry 部署手册](./AnySentry部署手册.md)：环境校验、安装、升级和基础排错。
 - [AnySentry 使用手册](./AnySentry使用手册.md)：页面访问、监控对象和状态说明。
 - [AnySentry 脚本说明](./AnySentry脚本说明.md)：发布包内各 Shell 脚本的用途和参数。
+- [现场问题采集](./现场问题采集.md)：安装失败、服务异常和资源占用过高时的采集与临时停止命令。
 
 详细兼容性说明见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
@@ -32,8 +33,8 @@
 | `/var/lib/anysentry` | 正式安装 | ClickHouse、Redis、Kafka、Flink 和 L3 状态 |
 | `/var/log/anysentry` | 正式安装 | 服务日志和安装诊断 |
 | `/etc/sysctl.d/90-anysentry.conf` | 正式安装 | 运行时内存参数 |
-| `/tmp/anysentry-install-0.3.0-compat1` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
-| `/tmp/anysentry-health-smoke-0.3.0-compat1` | 执行健康检查脚本 | 健康检查报告 |
+| `/tmp/anysentry-install-0.4.0-compat1` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
+| `/tmp/anysentry-health-smoke-0.4.0-compat1` | 执行健康检查脚本 | 健康检查报告 |
 | `/opt/.anysentry.rollback.*` | 成功升级且已有旧版本 | 上一版本程序备份 |
 | `/opt/anysentry.failed.*` | 激活失败并回滚 | 失败版本现场 |
 
@@ -44,9 +45,9 @@
 将压缩包及同名 `.sha256` 文件放在同一目录：
 
 ```bash
-sha256sum --check anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.3.0-compat1-uos20-arm64
+sha256sum --check anysentry-security-suite-0.4.0-compat1-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.4.0-compat1-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.4.0-compat1-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -96,7 +97,7 @@ systemctl is-active anysentry-observer.service
 该命令仅使用 `/tmp`、回环网络和带唯一标识的模拟事件。报告目录由脚本创建：
 
 ```text
-/tmp/anysentry-health-smoke-0.3.0-compat1
+/tmp/anysentry-health-smoke-0.4.0-compat1
 ```
 
 ## 6. 安装日志
@@ -104,21 +105,21 @@ systemctl is-active anysentry-observer.service
 每次执行安装程序都会覆盖本版本诊断目录：
 
 ```text
-/var/log/anysentry/install/0.3.0-compat1
+/var/log/anysentry/install/0.4.0-compat1
 ```
 
 快速入口：
 
 ```text
-/tmp/anysentry-install-0.3.0-compat1
+/tmp/anysentry-install-0.4.0-compat1
 ```
 
 查看结果：
 
 ```bash
-cat /var/log/anysentry/install/0.3.0-compat1/summary.txt
-less /var/log/anysentry/install/0.3.0-compat1/install.log
-cat /var/log/anysentry/install/0.3.0-compat1/current-stage.txt
+cat /var/log/anysentry/install/0.4.0-compat1/summary.txt
+less /var/log/anysentry/install/0.4.0-compat1/install.log
+cat /var/log/anysentry/install/0.4.0-compat1/current-stage.txt
 ```
 
 安装失败时，诊断目录会在自动回滚前记录服务状态、接口响应、验证输出和 journal。
@@ -146,3 +147,41 @@ location /anysentry/ {
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
+
+## 8. 升级失败和临时停止服务
+
+升级由 `./install.sh` 原地完成。激活验证失败时，安装程序自动停止新版本、恢复上一版程序和配置，并写诊断日志。先看：
+
+```bash
+cat /var/log/anysentry/install/0.4.0-compat1/summary.txt
+cat /var/log/anysentry/install/0.4.0-compat1/current-stage.txt
+ls -ld /opt/.anysentry.rollback.* /opt/anysentry.failed.*
+```
+
+`summary.txt` 里 `rollback=completed` 表示已回到上一版。`rollback=failed` 时再按 [DEPLOYMENT.md](./DEPLOYMENT.md) 的手工恢复步骤处理。不要在自动回滚尚未结束时手工搬移 `/opt/anysentry`。
+
+某个服务占用过高、需要先让机器恢复时，只停止对应单元，数据目录保留：
+
+```bash
+systemctl stop anysentry-observer.service
+systemctl stop anysentry-flink-job.service anysentry-flink-taskmanager.service anysentry-flink-jobmanager.service
+systemctl stop anysentry-stream-worker.service anysentry-composite-judge.service
+systemctl stop anysentry-fast-judge.service anysentry-l3-worker.service
+```
+
+Observer 停止后不再采集。Flink 和流处理停止后，页面和 ClickHouse 仍可访问，但流式发现不再更新。恢复：
+
+```bash
+systemctl start anysentry-flink-jobmanager.service anysentry-flink-taskmanager.service anysentry-flink-job.service
+systemctl start anysentry-fast-judge.service anysentry-l3-worker.service
+systemctl start anysentry-stream-worker.service anysentry-composite-judge.service
+systemctl start anysentry-observer.service
+```
+
+把现场状态打包回传：
+
+```bash
+sudo /opt/anysentry/collect-support-bundle.sh
+```
+
+说明见 [现场问题采集](./现场问题采集.md)。

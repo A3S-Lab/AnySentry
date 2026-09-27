@@ -5,6 +5,7 @@
 - [AnySentry 部署手册](./AnySentry部署手册.md)：环境校验、安装、升级和基础排错。
 - [AnySentry 使用手册](./AnySentry使用手册.md)：页面访问、监控对象和状态说明。
 - [AnySentry 脚本说明](./AnySentry脚本说明.md)：发布包内各 Shell 脚本的用途和参数。
+- [现场问题采集](./现场问题采集.md)：把现场日志打成一个可回传文件。
 
 ## 1. 访问监控页面
 

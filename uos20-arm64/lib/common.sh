@@ -2,7 +2,7 @@
 
 CHANNEL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ANYSENTRY_REPO=${ANYSENTRY_REPO:-$(git -C "$CHANNEL_DIR/.." rev-parse --show-toplevel)}
-OBSERVER_REPO=${OBSERVER_REPO:-/home/chensicheng/.config/superpowers/worktrees/Observer/uos20-arm64-legacy}
+OBSERVER_REPO=${OBSERVER_REPO:-/home/chensicheng/.config/superpowers/worktrees/Observer/uos20-arm64-0.4.0}
 SENTRY_REPO=${SENTRY_REPO:-/home/chensicheng/.config/superpowers/worktrees/Sentry/uos20-arm64-0.3.0}
 # shellcheck source=../versions.env
 source "$CHANNEL_DIR/versions.env"

@@ -23,25 +23,25 @@ async function request(path, body, method = body === undefined ? 'GET' : 'POST')
   return payload?.data ?? payload;
 }
 
-function line(event) {
+function line(event, process) {
   return JSON.stringify({
     identity: { agent: agentId, session: sessionId, task: `${runId}-task` },
     process: {
-      pid: 74001,
-      ppid: 73999,
       uid: 1000,
       comm: 'supply-chain-verifier',
       exe: '/usr/bin/supply-chain-verifier',
       cwd: workspacePath,
-      start_time_ns: '1785000000000000000',
+      hostId: `${runId}-node`,
+      bootId: `${runId}-boot`,
+      ...process,
     },
     event,
   });
 }
 
-async function ingest(sourceId, sourceEventId, event) {
+async function ingest(sourceId, sourceEventId, event, process) {
   const result = await request('/ingest', {
-    line: line(event),
+    line: line(event, process),
     sourceEventId,
     sourceId,
     collectorId: `${runId}-collector`,
@@ -95,15 +95,38 @@ await ingest(sourceId, `${runId}-component`, {
     argv: [executable, '--version'],
     exec_confirmed: true,
   },
+}, {
+  pid: 74001,
+  ppid: 73999,
+  startTimeNs: '1785000000000000000',
+});
+await ingest(sourceId, `${runId}-shell`, {
+  ToolExec: {
+    pid: 74002,
+    ppid: 74001,
+    uid: 1000,
+    cwd: workspacePath,
+    argv: ['bash', '-c', 'printf supply-chain-verification'],
+    exec_confirmed: true,
+  },
+}, {
+  pid: 74002,
+  ppid: 74001,
+  startTimeNs: '1785000001000000000',
 });
 await ingest(sourceId, `${runId}-egress`, {
   ToolExec: {
-    pid: 74001,
+    pid: 74003,
+    ppid: 74002,
     uid: 1000,
     cwd: workspacePath,
     argv: ['curl', 'https://example.com/supply-chain-runtime-verification'],
     exec_confirmed: true,
   },
+}, {
+  pid: 74003,
+  ppid: 74002,
+  startTimeNs: '1785000002000000000',
 });
 
 const deadline = Date.now() + Number(process.env.ANYSENTRY_STREAM_VERIFY_TIMEOUT_MS ?? 150_000);
@@ -111,13 +134,13 @@ while (Date.now() < deadline) {
   const findings = await request('/stream/findings', { timeType: 'last_3h', limit: 200 });
   const judgment = findings.compositeJudgments?.find((item) =>
     item.agentType === agentId
-    && item.ruleVersion === 'supply-chain-exploit-v1'
+    && item.ruleVersion === 'supply-chain-temporal-v2'
     && item.status === 'succeeded');
   if (judgment) {
     const matches = judgment.evidence.flatMap((item) => item.runtimeVulnerabilities ?? []);
     assert.equal(judgment.shadow, true);
     assert.equal(judgment.synthetic, true);
-    assert.equal(judgment.decisionSource, 'composite_judge');
+    assert.equal(judgment.decisionSource, 'deterministic_rule');
     assert.equal(judgment.classification, 'simulation');
     assert.equal(judgment.verdict, 'allow');
     const runtimeMatch = matches.find((item) =>

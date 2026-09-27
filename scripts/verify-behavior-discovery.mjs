@@ -7,9 +7,36 @@ const require = createRequire(import.meta.url);
 const {
   BehavioralAgentDetector,
   behaviorKey,
+  DEFAULT_BEHAVIOR_SIGNAL_REGISTRY,
+  normalizeSignalRegistry,
+  isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
+  physicalInfrastructureClassification,
+  physicalInfrastructureReason,
 } = require('./observer-behavior-discovery');
+const { behaviorDiscoveryEligible } = require('./observer-workload-filter');
+
+assert.equal(DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.version, 'behavior-window-v1');
+const tunedRegistry = normalizeSignalRegistry({
+  version: 'behavior-window-test-v2',
+  weights: { llm: 2, tool: 0 },
+  caps: { llm: 4 },
+});
+assert.equal(tunedRegistry.version, 'behavior-window-test-v2');
+assert.equal(tunedRegistry.weights.llm, 2);
+assert.equal(tunedRegistry.weights.tool, 0);
+assert.equal(tunedRegistry.caps.llm, 4);
+assert.equal(
+  normalizeSignalRegistry(JSON.stringify({ version: 'behavior-window-json-v1', weights: { llm: 3 } })).version,
+  'behavior-window-json-v1',
+  'runtime registry may be supplied as a bounded JSON snapshot',
+);
+assert.equal(
+  normalizeSignalRegistry('{not-json').version,
+  'behavior-window-v1',
+  'invalid runtime registry falls back to the safe default',
+);
 
 let now = 1_000_000;
 const detector = new BehavioralAgentDetector({
@@ -66,10 +93,173 @@ const promoted = detector.observe(
 assert.equal(promoted.state, 'agent');
 assert.equal(promoted.attribution.classification, 'probable_agent');
 assert.equal(promoted.attribution.source, 'behavior');
+assert.equal(promoted.attribution.algorithmVersion, 'behavior-window-v1');
+assert.equal(promoted.attribution.threshold, 8);
+assert.equal(promoted.attribution.window, '60000ms');
 assert.equal(promoted.attribution.agentDisplayName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.podName, 'research-agent-7b8d9');
 assert.equal(promoted.attribution.workloadRef.containerName, 'agent');
 assert.match(promoted.attribution.evidence[0], /behavior:score=/);
+
+const generationOne = { ...behaviorAttribution, agentInstanceId: 'runtime-generation-1' };
+const generationTwo = { ...behaviorAttribution, agentInstanceId: 'runtime-generation-2' };
+assert.notEqual(
+  behaviorKey(tool, generationOne),
+  behaviorKey(tool, generationTwo),
+  'short-window behavior state is fenced by process generation inside one physical workload',
+);
+const rootGenerationOne = {
+  ...behaviorAttribution,
+  rootPid: 901,
+  rootStartTimeTicks: '10001',
+};
+const rootGenerationTwo = {
+  ...behaviorAttribution,
+  rootPid: 901,
+  rootStartTimeTicks: '20002',
+};
+assert.notEqual(
+  behaviorKey({ process: { rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  behaviorKey({ process: { rootPid: 901, rootStartTimeTicks: '20002' } }, rootGenerationTwo),
+  'root start time fences cold-start windows before the process graph is available',
+);
+assert.equal(
+  behaviorKey({ process: { pid: 902, rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  behaviorKey({ process: { pid: 903, rootPid: 901, rootStartTimeTicks: '10001' } }, rootGenerationOne),
+  'child PIDs remain in the root generation window',
+);
+const generationDetector = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+generationDetector.observe(event('Egress', { pid: 120, host: '10.0.0.8', path: '/v1/responses' }), generationOne);
+assert.equal(
+  generationDetector.observe(event('ToolExec', { pid: 120, argv: ['agent-tool', 'run'] }), generationOne)?.state,
+  'agent',
+);
+assert.equal(
+  generationDetector.observe(event('ToolExec', { pid: 220, argv: ['agent-tool', 'run'] }), generationTwo),
+  undefined,
+  'a restarted generation must not inherit the previous generation score',
+);
+
+const privateGatewayDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+privateGatewayDetector.observe(
+  event('Egress', { pid: 110, host: '10.20.0.8', path: '/v1/chat/completions' }, 'private-gateway'),
+  behaviorAttribution,
+);
+const privateGatewayCandidate = privateGatewayDetector.observe(
+  event('ToolExec', { pid: 110, argv: ['custom-tool', 'run'] }, 'private-gateway'),
+  behaviorAttribution,
+);
+assert.equal(privateGatewayCandidate?.state, 'agent',
+  'a private gateway is discoverable from generic model route shape without provider host hints');
+
+const modelOnlyServiceDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+const modelOnlyScope = {
+  physicalWorkloadId: 'docker:model-only-service',
+  processGenerationKey: 'model-only-generation-1',
+  workloadRef: { environment: 'docker', kind: 'container', name: 'opaque-http-service' },
+};
+modelOnlyServiceDetector.observe(
+  event('Egress', { pid: 114, host: '10.30.0.8', path: '/v1/responses' }, 'model-only-service'),
+  modelOnlyScope,
+);
+const modelOnlyCandidate = modelOnlyServiceDetector.observe(
+  event('Egress', { pid: 114, host: '10.30.0.8', path: '/v1/responses' }, 'model-only-service'),
+  modelOnlyScope,
+);
+assert.equal(modelOnlyCandidate?.state, 'agent',
+  'a model-only HTTP service becomes a bounded probable candidate from kernel transport without a tool call');
+assert.equal(modelOnlyCandidate?.attribution.classification, 'probable_agent');
+assert(modelOnlyCandidate.attribution.evidence.includes('behavior:pattern=model_transport'));
+
+const registryDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 4,
+  llmHostHints: [],
+  signalRegistry: {
+    version: 'behavior-window-test-v2',
+    weights: { llm: 2, tool: 0 },
+    caps: { llm: 4 },
+  },
+});
+const registryCandidate = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(registryCandidate, undefined, 'one model signal remains below the custom threshold');
+const registryPromoted = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(registryPromoted?.attribution.algorithmVersion, 'behavior-window-test-v2');
+const updatedRegistry = registryDetector.updateSignalRegistry({
+  version: 'behavior-window-test-v3',
+  weights: { llm: 4 },
+});
+assert.equal(updatedRegistry.version, 'behavior-window-test-v3');
+const postReload = registryDetector.observe(
+  event('Egress', { pid: 115, host: '10.31.0.8', path: '/v1/responses' }, 'registry-service'),
+  { physicalWorkloadId: 'docker:registry-service', processGenerationKey: 'registry-generation' },
+);
+assert.equal(postReload?.attribution.algorithmVersion, 'behavior-window-test-v3',
+  'a live registry reload takes effect on the next observation');
+
+const semanticDetector = new BehavioralAgentDetector({
+  now: () => now,
+  threshold: 8,
+  llmHostHints: [],
+});
+semanticDetector.observe(
+  event('Egress', { pid: 111, host: '192.0.2.10', operation: 'model_invoke' }, 'semantic-gateway'),
+  behaviorAttribution,
+);
+assert.equal(
+  semanticDetector.observe(
+    event('ToolExec', { pid: 111, argv: ['another-tool', 'run'] }, 'semantic-gateway'),
+    behaviorAttribution,
+  )?.state,
+  'agent',
+  'a generic model operation marker is sufficient without a provider-specific host name',
+);
+for (const kind of ['FileAccess', 'FileRead', 'FileDelete', 'ToolExec', 'ProcessExit', 'SecurityAction']) {
+  assert.equal(isLlmEvent(kind, {
+    path: '/workspace/messages/responses.json',
+    host: 'api.openai.com',
+    semanticKind: 'inference',
+  }), false, `${kind} fields cannot fabricate a model transport observation`);
+}
+const pathOnlyDetector = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+pathOnlyDetector.observe(event('ToolExec', { pid: 112, argv: ['custom-worker'] }));
+assert.equal(pathOnlyDetector.observe(event('FileAccess', {
+  pid: 112, path: '/workspace/messages/responses.json', write: true,
+})), undefined, 'model-like directory names plus one exec must not promote an Agent');
+
+for (const name of ['anonymous-service', 'redis-research-agent', 'postgres-task-runner']) {
+  const kernelOnlyDetector = new BehavioralAgentDetector({ now: () => now, llmHostHints: [] });
+  const scope = {
+    physicalWorkloadId: `docker:test:${name}`,
+    processGenerationKey: 'pgk-fixture-service-generation',
+    workloadRef: { environment: 'docker', kind: 'container', name },
+  };
+  for (const observation of [
+    event('ToolExec', { pid: 113, argv: ['opaque-action-a'] }),
+    event('Connect', { pid: 113, peer: '192.0.2.17', port: 17439 }),
+    event('ToolExec', { pid: 113, argv: ['opaque-action-b'] }),
+  ]) kernelOnlyDetector.observe(observation, scope);
+  const candidate = kernelOnlyDetector.observe(event('FileAccess', {
+    pid: 113, path: '/workspace/result.bin', write: true,
+  }), scope);
+  assert.equal(candidate?.state, 'agent', `${name}: a workload name cannot veto kernel behavior`);
+  assert(candidate.attribution.evidence.includes('behavior:llm=0'));
+  assert(candidate.attribution.evidence.includes('behavior:agent_sequences=1'));
+}
 const continued = detector.observe(
   event('ToolExec', { pid: 101, argv: ['curl', 'https://example.test'] }),
   behaviorAttribution,
@@ -104,10 +294,44 @@ for (let index = 0; index < 150; index++) {
 assert.ok(bounded.metrics().workloads <= 100);
 assert.ok(bounded.metrics().evicted > 0);
 
+const saturated = new BehavioralAgentDetector({ now: () => now, maxWorkloads: 100 });
+const activeScope = { physicalWorkloadId: 'fixture:active', processGenerationKey: 'generation-1' };
+saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }), activeScope);
+assert.equal(saturated.observe(event('LlmCall', { path: '/v1/messages' }), activeScope)?.state, 'agent');
+assert.equal(isLlmEvent('LlmCall', {}), false, 'a probe label without a protocol route is not a model operation');
+const unlabeledControlPlane = new BehavioralAgentDetector({ now: () => now, threshold: 8, llmHostHints: [] });
+for (let index = 0; index < 8; index++) {
+  unlabeledControlPlane.observe({
+    process: {
+      host_id: 'node-a', boot_id: 'boot-a', pid: 2256, start_time_ticks: '1',
+      cgroup_id: '9002', cgroup: '0::/system.slice/node.service',
+      comm: 'node-agent', exe: '/usr/local/bin/node-agent',
+    },
+    event: { LlmCall: { peer: `10.0.0.${index}` } },
+  });
+}
+assert.equal(unlabeledControlPlane.metrics().candidates, 0, 'host service traffic labeled LlmCall without a protocol route does not become an Agent');
+for (let index = 0; index < 99; index++) {
+  saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }, `capacity-${index}`));
+}
+assert.equal(saturated.metrics().workloads, 100);
+saturated.prune();
+assert.equal(saturated.metrics().evicted, 0, 'pruning at exact capacity does not evict live records');
+assert.equal(saturated.observe(event('FileAccess', { path: '/workspace/result' }), activeScope)?.state,
+  'agent', 'a candidate at capacity must retain its score and promotion on its next event');
+assert.equal(saturated.metrics().evicted, 0, 'a known scope needs no capacity eviction');
+saturated.observe(event('ToolExec', { argv: ['opaque-tool'] }, 'capacity-new'));
+assert.equal(saturated.metrics().workloads, 100, 'a new scope remains bounded at capacity');
+assert.equal(saturated.metrics().evicted, 1, 'one new scope evicts exactly one inactive scope');
+assert.equal(saturated.observe(event('FileAccess', { path: '/workspace/result-2' }), activeScope)?.state,
+  'agent', 'recently observed candidate survives cold-start admission of another scope');
+
 assert.equal(isServiceDataFile({ path: '/var/lib/clickhouse/store/abc/data.bin' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/postgresql/16/main/base/1' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/mysql/orders.ibd' }), true);
 assert.equal(isServiceDataFile({ path: '/var/lib/redis/dump.rdb' }), true);
+assert.equal(isServiceDataFile({ path: '/var/lib/kafka/data/topic-0/000000.log' }), true);
+assert.equal(isServiceDataFile({ path: '/opt/apache-doris/be/storage/data/0/1.dat' }), true);
 const customServicePaths = new BehavioralAgentDetector({
   serviceDataPaths: ['/srv/state/vector-db'],
 }).serviceDataPaths;
@@ -123,6 +347,29 @@ assert.equal(
   'service data is not Agent workspace evidence',
 );
 assert.equal(isWorkspaceFile({ path: '/workspace/src/index.ts' }), true);
+
+for (const role of ['anysentry_internal', 'platform_infrastructure', 'business_service']) {
+  assert.equal(behaviorDiscoveryEligible({
+    state: 'unknown',
+    workloadRole: role,
+    attribution: { classification: 'unknown', source: 'kubernetes' },
+  }), false, `${role} inventory cannot enter weak behavior promotion`);
+}
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { classification: 'unknown', source: 'docker' },
+  infrastructureFacts: { labels: { 'anysentry.io/workload-role': 'platform_infrastructure' } },
+}), false, 'role carried only by inventory labels still blocks behavior promotion');
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  workloadRole: 'unknown',
+  attribution: { classification: 'unknown', source: 'kubernetes' },
+  infrastructureFacts: { workloadRole: 'anysentry_internal' },
+}), false, 'an early unknown placeholder cannot mask a later authoritative inventory role');
+assert.equal(behaviorDiscoveryEligible({
+  state: 'unknown',
+  attribution: { classification: 'unknown', source: 'none' },
+}), true, 'role-unknown workloads remain eligible for Agent discovery');
 
 const sequenceDetector = new BehavioralAgentDetector({
   now: () => now,
@@ -186,6 +433,35 @@ assert.equal(
   'many exec/file events without a decision cycle are insufficient for Agent promotion',
 );
 
+for (const infrastructureName of [
+  'ai-apm-ingest',
+  'ai-apm-web',
+  'anysentry-kafka-1',
+  'ai-apm-doris-fe',
+  'ai-apm-doris-be',
+  'anysentry-clickhouse-1',
+]) {
+  const knownInfrastructure = new BehavioralAgentDetector({ now: () => now, threshold: 8 });
+  const result = knownInfrastructure.observe(
+    event('ToolExec', { pid: 650, argv: ['service', 'start'] }, `infra-${infrastructureName}`),
+    {
+      physicalWorkloadId: `docker:local:${infrastructureName}`,
+      workloadRef: {
+        environment: 'docker',
+        kind: 'container',
+        name: infrastructureName,
+        containerName: infrastructureName,
+      },
+    },
+  );
+  assert.equal(result?.state, 'unknown', `${infrastructureName} must remain outside Agent scope`);
+  assert.ok(
+    result.attribution.evidence.includes('behavior:negative=known_infrastructure_workload'),
+    `${infrastructureName} must carry explicit infrastructure negative evidence`,
+  );
+  assert.equal(knownInfrastructure.metrics().candidates, 0);
+}
+
 let infrastructureNow = now;
 const infrastructureDetector = new BehavioralAgentDetector({
   now: () => infrastructureNow,
@@ -196,11 +472,11 @@ const infrastructureDetector = new BehavioralAgentDetector({
 });
 infrastructureDetector.observe(
   event('ToolExec', { pid: 700, argv: ['worker', 'query'] }, '700'),
-  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+  { physicalWorkloadId: 'k8s:test:database-container' },
 );
 const initialCandidate = infrastructureDetector.observe(
   event('Egress', { pid: 700, host: 'api.openai.com' }, '700'),
-  { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+  { physicalWorkloadId: 'k8s:test:database-container' },
 );
 assert.equal(initialCandidate?.state, 'agent');
 infrastructureNow += 61_000;
@@ -213,7 +489,7 @@ for (let index = 0; index < 6; index++) {
   const before = structuredClone(fileEvent);
   infrastructureResult = infrastructureDetector.observe(
     fileEvent,
-    { physicalWorkloadId: 'k8s:test:clickhouse-container' },
+    { physicalWorkloadId: 'k8s:test:database-container' },
   );
   assert.deepEqual(fileEvent, before, 'behavior classification must not mutate or delete the raw event');
 }
@@ -227,5 +503,73 @@ assert.equal(
   'strong infrastructure evidence clears probable TTL before its natural expiry',
 );
 assert.equal(infrastructureDetector.metrics().demoted, 1);
+
+assert.equal(
+  physicalInfrastructureReason('0::/system.slice/k3s.service', {}, {}),
+  'host_control_plane',
+  'k3s.service is host control-plane infrastructure by cgroup, not by process name',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/kubepods/burstable/podabc', { namespace: 'anysentry' }, {}),
+  'self_plane',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/kubepods.slice/kubepods-besteffort.slice', {}, {}),
+  'runtime_ancestor',
+);
+assert.equal(
+  physicalInfrastructureReason(
+    '0::/kubepods/burstable/podaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    { namespace: 'default' },
+    {},
+  ),
+  '',
+  'a leaf pod/container is not the runtime ancestor',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/user.slice/agent.scope', {}, {}),
+  '',
+  'a user-slice Agent must not inherit host-control-plane infrastructure',
+);
+assert.equal(
+  physicalInfrastructureReason('0::/docker/deadbeef', {}, {}),
+  '',
+  'a docker container id is a leaf workload, not a runtime ancestor',
+);
+const k3sClassified = physicalInfrastructureClassification({
+  process: {
+    cgroup: '0::/system.slice/k3s.service',
+    comm: 'k3s-server',
+    exe: '/usr/local/bin/k3s',
+    host_id: 'node-a',
+    boot_id: 'boot-a',
+    pid: 1,
+    cgroup_id: '9',
+  },
+  event: { FileAccess: { path: '/var/lib/rancher/k3s/server/db/state.db' } },
+});
+assert.equal(k3sClassified?.state, 'infrastructure');
+assert.equal(k3sClassified?.attribution.source, 'physical_context');
+assert.ok(k3sClassified.attribution.evidence.includes('f0:physical_infrastructure=host_control_plane'));
+
+let relayNow = now;
+const relayDetector = new BehavioralAgentDetector({
+  now: () => relayNow,
+  threshold: 8,
+  windowMs: 60_000,
+  probableTtlMs: 180_000,
+  negativeMinAgeMs: 1_000,
+});
+for (const peer of ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']) {
+  relayDetector.observe(event('Connect', { pid: 800, peer, port: 443 }, 'relay'));
+}
+relayNow += 1_000;
+const relayResult = relayDetector.observe(event('Connect', { pid: 800, peer: '10.0.0.5', port: 443 }, 'relay'));
+assert.equal(relayResult?.state, 'unknown');
+assert.ok(
+  relayResult.attribution.evidence.includes('behavior:negative=network_relay_shape'),
+  'Connect/Tls-only relays without a tool or workspace cycle must not promote',
+);
+assert.equal(relayDetector.metrics().candidates, 0);
 
 console.log('Behavior discovery verification passed');

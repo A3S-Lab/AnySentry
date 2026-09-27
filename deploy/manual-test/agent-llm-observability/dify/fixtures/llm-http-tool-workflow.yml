@@ -1,0 +1,224 @@
+app:
+  description: LLM request/response followed by an HTTPS tool instruction/result fixture.
+  icon: "🛠️"
+  icon_background: '#FFF4E5'
+  mode: workflow
+  name: AnySentry Dify LLM and HTTP Tool Observation
+  use_icon_as_answer_icon: false
+dependencies:
+  - current_identifier: null
+    type: marketplace
+    value:
+      marketplace_plugin_unique_identifier: langgenius/openai_api_compatible:0.0.64@ed082da9060cdaf69127de0f39e7ba5d255d74276feed9c88b2ba5226515728c
+kind: app
+version: 0.4.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+      - data:
+          isInIteration: false
+          isInLoop: false
+          sourceType: start
+          targetType: llm
+        id: start-to-llm
+        source: start_node
+        sourceHandle: source
+        target: llm_node
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          isInLoop: false
+          sourceType: llm
+          targetType: http-request
+        id: llm-to-http-tool
+        source: llm_node
+        sourceHandle: source
+        target: http_tool_node
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          isInLoop: false
+          sourceType: http-request
+          targetType: end
+        id: http-tool-to-end
+        source: http_tool_node
+        sourceHandle: source
+        target: end_node
+        targetHandle: target
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: ''
+          selected: false
+          title: Start
+          type: start
+          variables:
+            - label: Tool instruction seed
+              max_length: 4096
+              options: []
+              required: true
+              type: text-input
+              variable: query
+        height: 90
+        id: start_node
+        position:
+          x: 30
+          y: 227
+        positionAbsolute:
+          x: 30
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          context:
+            enabled: false
+            variable_selector: []
+          desc: Produces the exact instruction forwarded to the HTTPS tool.
+          memory:
+            enabled: false
+            window:
+              enabled: false
+              size: 50
+          model:
+            completion_params:
+              temperature: 0
+            mode: chat
+            name: anysentry-observation-model
+            provider: langgenius/openai_api_compatible/openai_api_compatible
+          prompt_template:
+            - id: tool-system-prompt-v1
+              role: system
+              text: Return one deterministic tool instruction and preserve ANYSENTRY_TOOL_INSTRUCTION.
+            - id: tool-user-prompt-v1
+              role: user
+              text: ANYSENTRY_TOOL_INSTRUCTION={{#start_node.query#}}
+          retry_config:
+            enabled: false
+            exponential_backoff:
+              enabled: false
+              max_interval: 10000
+              multiplier: 2
+            max_retries: 1
+            retry_interval: 1000
+          selected: false
+          structured_output:
+            enabled: false
+          title: Prepare Tool Instruction
+          type: llm
+          variables: []
+          vision:
+            enabled: false
+        height: 110
+        id: llm_node
+        position:
+          x: 334
+          y: 227
+        positionAbsolute:
+          x: 334
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          authorization:
+            config: null
+            type: no-auth
+          body:
+            data: '{"instruction":"{{#llm_node.text#}}","requested_by":"dify-observation-lab"}'
+            type: json
+          desc: Test-only HTTPS tool endpoint; its request and result are independently hashable.
+          headers: ''
+          method: post
+          params: ''
+          retry_config:
+            max_retries: 0
+            retry_enabled: false
+            retry_interval: 100
+          selected: false
+          ssl_verify: true
+          timeout:
+            max_connect_timeout: 10
+            max_read_timeout: 30
+            max_write_timeout: 30
+          title: HTTPS Tool Execute
+          type: http-request
+          url: https://tool-mock/tool/execute
+          variables: []
+        height: 122
+        id: http_tool_node
+        position:
+          x: 638
+          y: 227
+        positionAbsolute:
+          x: 638
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: ''
+          outputs:
+            - value_selector:
+                - llm_node
+                - text
+              value_type: string
+              variable: llm_instruction
+            - value_selector:
+                - http_tool_node
+                - status_code
+              value_type: number
+              variable: tool_status_code
+            - value_selector:
+                - http_tool_node
+                - body
+              value_type: string
+              variable: tool_result
+          selected: false
+          title: End
+          type: end
+        height: 116
+        id: end_node
+        position:
+          x: 942
+          y: 227
+        positionAbsolute:
+          x: 942
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.7

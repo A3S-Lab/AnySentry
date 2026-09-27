@@ -6,6 +6,7 @@ dist/
 .env
 .env.local
 config/workspace-scanner.local.json
+config/workspace-scanner.token
 .a3s/
 perf-results/
 .build/
@@ -14,3 +15,23 @@ release/uos20-arm64/
 release/anysentry-*-uos20-arm64/
 release/anysentry-*-uos20-arm64.tar.gz
 release/anysentry-*-uos20-arm64.tar.gz.sha256
+.a3s-test/
+
+# Local manual-test overlays / build artifacts (never commit)
+scripts/.local-bin/
+api-dist/
+api-dist-overlay/
+web-dist/
+.Dockerfile.anysentry-overlay
+pelican-bicycle.html
+
+# Personal/local evidence & draft reports (do not commit on goal branch)
+codex*.png
+docs/agent-llm-observability-validation-*.json
+docs/agent-observability-architecture-assets/
+docs/anysentry-agent-observability-architecture-v2.md
+docs/anysentry-multiagent-refactor-execution-prompt.md
+docs/technical-report-assets/
+docs/technical-report.md
+docs/weekly-report-agent-observability-architecture.md
+.runtime/

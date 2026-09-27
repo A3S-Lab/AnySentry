@@ -1,0 +1,105 @@
+# syntax=docker/dockerfile:1
+# Development-only component targets. The canonical production Dockerfile remains the final
+# immutable release artifact; these targets keep source churn inside the component that owns it.
+
+ARG NODE_BUILD_IMAGE=node:20-bookworm-slim
+ARG NODE_RUNTIME_IMAGE=ubuntu:24.04
+ARG NGINX_IMAGE=nginx:1.27-alpine
+ARG OBSERVER_COLLECTOR_IMAGE=ghcr.io/a3s-lab/observer:latest
+ARG FLINK_MAVEN_IMAGE=maven:3.9.9-eclipse-temurin-17
+ARG FLINK_RUNTIME_IMAGE=flink:2.2.1-java17
+ARG OSV_SCANNER_IMAGE=ghcr.io/google/osv-scanner:v2.3.8
+
+FROM ${NODE_BUILD_IMAGE} AS node-dependencies
+RUN corepack enable
+WORKDIR /src
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
+COPY apps/api/package.json apps/api/.npmrc ./apps/api/
+COPY apps/web/package.json ./apps/web/
+RUN corepack prepare pnpm@9.0.0 --activate && pnpm install --frozen-lockfile
+
+FROM node-dependencies AS api-build
+COPY apps/api ./apps/api
+RUN pnpm --filter @anysentry/api build
+
+# Production dependencies change with manifests/lockfiles, not with ordinary TypeScript edits.
+# Keeping the relatively expensive portable-deploy step outside api-build is what makes the
+# component image useful for the local edit -> compile -> restart loop.
+FROM node-dependencies AS api-production-dependencies
+COPY scripts/generate-production-component-manifest.mjs ./scripts/
+RUN pnpm --filter @anysentry/api --prod deploy /out \
+ && node scripts/generate-production-component-manifest.mjs \
+      /out/node_modules \
+      /out/package.json \
+      /out/anysentry-production-components.json
+
+FROM ${NODE_BUILD_IMAGE} AS nodebin
+
+FROM ${NODE_RUNTIME_IMAGE} AS node-runtime
+COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=api-production-dependencies /out/node_modules ./node_modules
+COPY --from=api-production-dependencies /out/anysentry-production-components.json ./anysentry-production-components.json
+COPY scripts/l3-agent.mjs /opt/anysentry/l3-agent.mjs
+COPY skills/l3 /opt/anysentry/skills
+RUN chmod 755 /opt/anysentry/l3-agent.mjs && mkdir -p /app/empty-web
+# Keep the frequently changing API output last. A TypeScript edit now invalidates only this small
+# copy and the final image export; static L3 assets and runtime setup remain cached.
+COPY --from=api-build /src/apps/api/dist ./dist
+
+FROM node-runtime AS api
+ENV PORT=29653 ANYSENTRY_WEB_DIR=/app/empty-web
+EXPOSE 29653
+CMD ["node", "dist/main.js"]
+
+FROM node-runtime AS worker
+CMD ["node", "dist/security-monitoring/worker-main.js"]
+
+FROM ${OSV_SCANNER_IMAGE} AS osv-scanner-bin
+
+# Trusted, unprivileged source scanner. It is a separate service because source-tree access should
+# never be granted to the API or judgment workers.
+FROM ${NODE_BUILD_IMAGE} AS workspace-scanner
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=osv-scanner-bin /osv-scanner /usr/local/bin/osv-scanner
+COPY scripts/workspace-scanner.mjs /opt/anysentry/workspace-scanner.mjs
+USER node
+ENTRYPOINT ["node", "/opt/anysentry/workspace-scanner.mjs"]
+
+FROM node-dependencies AS web-build
+ARG PUBLIC_BASE_PATH=""
+ENV PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
+COPY apps/web ./apps/web
+RUN pnpm --filter @anysentry/web build
+
+FROM ${NGINX_IMAGE} AS web
+COPY deploy/modules/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=web-build /src/apps/web/dist /usr/share/nginx/html
+EXPOSE 8080
+
+# Thin wrapper only: the privileged Collector remains supplied by a stable, independently versioned
+# base image. In the development Compose overlay scripts are bind-mounted over these copies, and the
+# whole observer service is restarted because the current stdout pipe has no durable restart relay.
+FROM ${OBSERVER_COLLECTOR_IMAGE} AS observer-wrapper
+COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
+COPY scripts/observer-*.js /opt/
+ENTRYPOINT ["/usr/local/bin/node", "/opt/observer-supervisor.js"]
+
+FROM ${FLINK_MAVEN_IMAGE} AS flink-job-build
+WORKDIR /src
+COPY streaming/flink/pom.xml ./
+RUN mvn -B -DexcludeScope=test dependency:go-offline
+COPY streaming/flink/src ./src
+# Unit tests are an earlier mandatory gate. The job-image build skips test compilation so the
+# test-only Flink harness and MiniCluster dependency never enter this production artifact layer.
+RUN mvn -B -Dmaven.test.skip=true package
+
+# JobManager and TaskManager use FLINK_RUNTIME_IMAGE directly. Only this submission image contains
+# the AnySentry business JAR, so replacing a job does not roll the stable Flink runtime services.
+FROM ${FLINK_RUNTIME_IMAGE} AS flink-job
+COPY --from=flink-job-build /src/target/anysentry-flink-streaming.jar /opt/flink/usrlib/anysentry-flink-streaming.jar
+COPY --chmod=755 deploy/modules/flink-job-replace.sh /opt/anysentry/flink-job-replace.sh
+ENTRYPOINT ["/bin/bash", "/opt/anysentry/flink-job-replace.sh"]

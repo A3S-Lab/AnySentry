@@ -1,0 +1,16 @@
+{
+  "scannerId": "docker-anysentry-workspace-scanner",
+  "allowedRoots": [
+    "/workspace"
+  ],
+  "workspaces": [
+    {
+      "repositoryId": "repo-anysentry-local",
+      "workspaceId": "wsp-anysentry-docker-local",
+      "displayName": "AnySentry Docker Workspace",
+      "localPath": "/workspace/AnySentry",
+      "environmentId": "docker-full",
+      "deploymentImages": []
+    }
+  ]
+}

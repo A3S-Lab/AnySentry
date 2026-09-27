@@ -19,13 +19,28 @@ data:
       "schemaVersion": "anysentry.agent_templates.v1",
       "templates": []
     }
+  agent-runtime-signatures.json: |
+    {
+      "schemaVersion": "anysentry.agent_runtime_signatures.v1",
+      "version": 3,
+      "runtimes": [
+        { "id": "codex", "displayName": "Codex", "variants": [{ "commExact": ["codex"] }, { "argv0Basename": ["codex"] }] },
+        { "id": "a3s-code", "agentScopeId": "a3s code", "displayName": "A3S Code", "variants": [{ "commExact": ["a3s", "a3s-code", "a3s code"] }, { "argv0Basename": ["a3s", "a3s-code"] }, { "argvPrefix": ["a3s code", "a3s-code"] }] },
+        { "id": "claude-code", "agentScopeId": "Claude Code", "displayName": "Claude Code", "variants": [{ "commExact": ["claude", "claude-code", "claude code"] }, { "argv0Basename": ["claude", "claude-code"] }] },
+        { "id": "langchain-service", "agentScopeId": "langchain", "displayName": "LangChain", "variants": [{ "argvPrefix": ["python /opt/anysentry-langchain-service/service.py"] }, { "argvPrefix": ["python3 /opt/anysentry-langchain-service/service.py"] }, { "argvPrefix": ["/opt/anysentry-langchain-service/.venv/bin/python /opt/anysentry-langchain-service/service.py"] }] },
+        { "id": "langgraph-service", "agentScopeId": "langgraph", "displayName": "LangGraph", "variants": [{ "argvPrefix": ["python -m uvicorn agent.langchain_langgraph_service:app"] }, { "argvPrefix": ["python3 -m uvicorn agent.langchain_langgraph_service:app"] }, { "argvPrefix": ["/opt/venv/bin/python -m uvicorn agent.langchain_langgraph_service:app"] }, { "argvPrefix": ["python -m uvicorn app.langgraph_orchestrator_service:app"] }, { "argvPrefix": ["python3 -m uvicorn app.langgraph_orchestrator_service:app"] }, { "argvPrefix": ["python -m uvicorn app.langgraph_worker_service:app"] }, { "argvPrefix": ["python3 -m uvicorn app.langgraph_worker_service:app"] }] },
+        { "id": "gemini-cli", "displayName": "Gemini CLI", "variants": [{ "commExact": ["gemini", "gemini-cli", "gemini cli"] }, { "argv0Basename": ["gemini", "gemini-cli"] }] },
+        { "id": "pi", "displayName": "Pi", "variants": [{ "commExact": ["pi"] }, { "argv0Basename": ["pi"] }] },
+        { "id": "kimi-cli", "displayName": "Kimi Code CLI", "variants": [{ "commExact": ["Kimi Code", "kimi", "kimi-cli"] }, { "argv0Basename": ["kimi", "kimi-cli"] }] }
+      ]
+    }
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: a3s-observer
   namespace: anysentry
-  labels: { app: a3s-observer }
+  labels: { app: a3s-observer, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
   selector:
     matchLabels: { app: a3s-observer }
@@ -34,7 +49,12 @@ spec:
     rollingUpdate: { maxUnavailable: 1 }
   template:
     metadata:
-      labels: { app: a3s-observer }
+      labels: { app: a3s-observer, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+      annotations:
+        # This is an observation-only privilege envelope, not a product/version selector.  The
+        # explicit marker lets local admission/acceptance checks distinguish a capable Observer
+        # from an unprivileged compatibility Pod without treating Pod names as Agent identity.
+        anysentry.io/privilege-profile: "hostpid-bpf-perfmon-observe-only-v1"
     spec:
       hostPID: true # resolve /proc/<pid> for host-process identity
       priorityClassName: system-node-critical
@@ -45,13 +65,76 @@ spec:
           image: ghcr.io/a3s-lab/anysentry-observer:latest
           securityContext:
             privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
+            # Keep the privilege contract explicit instead of relying only on the shorthand above.
+            # The collector is observation-only; these capabilities allow attachment on hosts
+            # with unprivileged_bpf_disabled/perf_event_paranoid enabled, while no deny/enforce
+            # program is shipped in this image.
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: [BPF, PERFMON, SYS_ADMIN, SYS_PTRACE]
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 120
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 90
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  test -s /run/a3s-observer.alive
+                  now="$(date +%s)"
+                  seen="$(stat -c %Y /run/a3s-observer.alive)"
+                  test "$((now - seen))" -le 120
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
+            # F0 reduces steady-state bulk traffic before Ring reservation; this bounded lane
+            # absorbs startup/profile convergence and short host-disk stalls without borrowing
+            # Critical or Semantic capacity. The Collector hard-caps the value at 262144.
+            - { name: A3S_OBSERVER_JSON_BULK_QUEUE_CAPACITY, value: "262144" }
+            - { name: A3S_OBSERVER_BULK_INBOX_CAPACITY, value: "65536" }
+            # Critical lifecycle/security records receive a finite 100 ms admission retry when
+            # the Forwarder pipe is transiently full; an exhausted wait remains an explicit drop
+            # metric and never becomes an unbounded Collector stall.
+            - { name: A3S_OBSERVER_JSON_CRITICAL_BACKPRESSURE_MS, value: "100" }
             # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
             # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
             # Set to "0" to reduce footprint on a busy node.
-            - { name: A3S_OBSERVER_FILES, value: "1" }
+            - { name: A3S_OBSERVER_FILES, value: "0" }
+            - { name: A3S_OBSERVER_FILE_READ, value: "0" }
             - { name: A3S_OBSERVER_SSL, value: "1" }
+            # Optional comma-separated host-visible CLI/libssl paths. Exact profiles or standard
+            # exported TLS symbols are attached once per inode; verified PID + LLM route gates
+            # still decide whether plaintext may enter the ring.
+            - { name: A3S_OBSERVER_TLS_STATIC_TARGETS, value: "" }
             # Stable node-scoped Collector identity for the AnySentry Collector and Source consoles.
             - name: A3S_OBSERVER_COLLECTOR_ID
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
@@ -59,33 +142,142 @@ spec:
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - { name: ANYSENTRY_SOURCE_TYPE, value: "observer" }
             - { name: ANYSENTRY_SOURCE_NAME, value: "kubernetes-a3s-observer" }
+            # Per-node managed Source credentials are generated by deploy/install.sh. One shared
+            # read-only Secret contains an exact collectorId -> Source/token mapping; the
+            # Forwarder selects only its own node/Collector entry.
+            - { name: ANYSENTRY_SOURCE_CREDENTIALS_FILE, value: "/etc/anysentry-auth/observer-sources.json" }
+            - name: ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN
+              valueFrom: { secretKeyRef: { name: anysentry-control-auth, key: management-token } }
             - { name: ANYSENTRY_HEARTBEAT_SECS, value: "30" }
             # Retain unresolved identities for later review, stop reviewed non-Agents, and keep
             # routine pseudo-filesystem noise independent from identity classification.
-            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            # Roll out new attribution in shadow first. Switch this to `enforce` only after the
+            # real local/Docker/Kubernetes comparison meets the documented acceptance gates.
+            - { name: FORWARD_FILTER_MODE, value: "shadow" }
+            # The Forwarder owns S3 identity/role/profile production. Keep its rollout explicit so
+            # canonical reinstall cannot silently revert Unknown reasons to legacy not_evaluated.
+            - { name: ANYSENTRY_UNKNOWN_RETENTION_MODE, value: "shadow" }
+            - { name: ANYSENTRY_PROBABLE_PROFILE_TTL_MS, value: "120000" }
+            - { name: ANYSENTRY_PROBABLE_PROFILE_MAX_ENTRIES, value: "4096" }
             - { name: FORWARD_RETAIN_UNKNOWN, value: "true" }
             - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
             - { name: FORWARD_NOISE_POLICY, value: "balanced" }
+            # Atomically published decisions feed the Collector's observation-only cgroup map.
+            - { name: ANYSENTRY_FILTER_RULES_FILE, value: "/run/anysentry-filter/filter-rules.json" }
+            - { name: ANYSENTRY_FILTER_RULES_ACK_FILE, value: "/run/anysentry-filter/filter-rules.ack.json" }
+            # Docker label discovery publishes a separate observation-only TLS admission scope.
+            # It never grants enforcement or bypasses the bounded plaintext/protocol gates.
+            - { name: ANYSENTRY_TLS_AGENT_CGROUPS_FILE, value: "/run/anysentry-filter/tls-agent-cgroups.json" }
+            # The co-located Collector and Forwarder inherit the same rollout mode. Shadow emits
+            # desired intent/ACK telemetry while keeping every probe FULL.
+            - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "shadow" }
+            - { name: ANYSENTRY_CAPTURE_PROFILE_ACK_POLL_MS, value: "250" }
+            # Default-on Ring-before bounded unknown lifecycle. Manual enforce overlays keep this
+            # explicit; set to 0 only when comparing against the legacy protected=FULL matrix.
+            - { name: A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE, value: "1" }
+            - { name: ANYSENTRY_INFRASTRUCTURE_POLICY_URL, value: "http://anysentry:29653/security-center/infrastructure-rules/policy" }
+            - { name: ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL, value: "http://anysentry:29653/security-center/infrastructure-rules/materializations/report" }
+            - { name: ANYSENTRY_INFRASTRUCTURE_POLICY_SECS, value: "5" }
+            # Unified F0/F1/F2 projection is authoritative after the first successful load.
+            # ConfigMap signatures and the legacy Forwarder env above remain bounded bootstrap/LKG.
+            - { name: ANYSENTRY_FILTER_RULE_PROJECTION_URL, value: "http://anysentry:29653/security-center/filter-rules/projections/forwarder" }
+            - { name: ANYSENTRY_FILTER_RULE_PROJECTION_SECS, value: "5" }
+            - { name: ANYSENTRY_FILTER_RULE_PROJECTION_MAX_BYTES, value: "16777216" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_PER_CGROUP, value: "20" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_PER_NODE, value: "200" }
+            - { name: A3S_OBSERVER_FILE_SAMPLE_WINDOW_MS, value: "1000" }
+            # Remains off in the canonical shadow profile; the explicit file canary enables it.
+            - { name: FORWARD_FILE_AGGREGATION, value: "false" }
+            - { name: FORWARD_FILE_AGGREGATION_WINDOW_MS, value: "100" }
             - { name: ANYSENTRY_INGEST_URL, value: "http://anysentry:29653/security-center/ingest" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/identity/snapshot" }
             - { name: ANYSENTRY_IDENTITY_SNAPSHOT_SECS, value: "15" }
+            - { name: FORWARD_IDENTITY_SNAPSHOT_MAX_BYTES, value: "4194304" }
             - { name: ANYSENTRY_AGENT_TEMPLATES_FILE, value: "/etc/anysentry/agent-templates.json" }
-            # Bound memory and amortize HTTP/JSON overhead without adding perceptible UI delay.
+            # Low-trust exact process signatures hot-reload to probable_agent only. ConfigMap
+            # projection is read-only; operators update it with kubectl, while directory watch plus
+            # periodic hash polling handles Kubernetes' atomic `..data` symlink rotation.
+            - { name: ANYSENTRY_AGENT_RUNTIME_SIGNATURES_FILE, value: "/etc/anysentry/agent-runtime-signatures.json" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LEASE_URL, value: "http://anysentry:29653/security-center/runtime/lease" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL, value: "http://anysentry:29653/security-center/runtime/snapshot" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_SECS, value: "10" }
+            - { name: ANYSENTRY_AGENT_RUNTIME_LIVENESS_SECS, value: "5" }
+            # Bound total Forwarder ownership across queued, in-flight, and API-authorized retry
+            # states; the retry window plus this budget covers a bounded ClickHouse restart.
             - { name: FORWARD_BATCH_SIZE, value: "32" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
-            - { name: FORWARD_MAX_QUEUE, value: "4096" }
-          command: ["/bin/sh", "-c"]
-          args: ["a3s-observer-collector | node /opt/observer-forward.js"]
+            # Four concurrent bounded batches cover measured throughput while leaving the single
+            # API event loop responsive to identity/rule/runtime control requests.
+            - { name: FORWARD_MAX_INFLIGHT, value: "4" }
+            # A deadline is still strict, but an already-arrived response gets one I/O turn before
+            # an overdue timer aborts it after a synchronous data-plane burst.
+            - { name: FORWARD_CONTROL_HTTP_TIMEOUT_MS, value: "15000" }
+            # Events are removed only after an item-level durable ack. The hostPath survives
+            # container/Pod restarts. Keep the record cap high enough to use the existing 2 GiB
+            # byte bound (the previous 250k cap filled while the API was temporarily degraded),
+            # while the protected tail and explicit pause/coverage metrics remain hard limits.
+            - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool.wal" }
+            - { name: FORWARD_SPOOL_FSYNC, value: "periodic" }
+            - { name: FORWARD_SPOOL_FSYNC_MS, value: "250" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "1000000" }
+            - { name: FORWARD_SPOOL_MAX_BYTES, value: "2147483648" }
+            # Physical PUT/ACK journal bytes have their own ceiling while large-live-set
+            # compaction is deferred; this is intentionally above logical live bytes but finite.
+            - { name: FORWARD_SPOOL_MAX_WAL_BYTES, value: "4294967296" }
+            # Reserve bounded journal space for ACKs so a full PUT history can still make
+            # forward progress without deleting live records.
+            - { name: FORWARD_SPOOL_ACK_HEADROOM_BYTES, value: "67108864" }
+            # A retry deadline parks evidence in the WAL; the same process continuously redrives
+            # bounded priority batches, so recovery never depends on a container restart.
+            - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "500" }
+            - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "256" }
+            - { name: FORWARD_SPOOL_DEGRADED_AGE_MS, value: "60000" }
+            - { name: FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS, value: "16384" }
+            - { name: FORWARD_SPOOL_LIVE_RESERVE_EVENTS, value: "4096" }
+            - { name: FORWARD_SPOOL_LIVE_RESERVE_BYTES, value: "16777216" }
+            - { name: FORWARD_DEFERRED_CRITICAL_MAX_EVENTS, value: "4096" }
+            - { name: FORWARD_DEFERRED_CRITICAL_MAX_BYTES, value: "16777216" }
+            - { name: FORWARD_DEFERRED_CRITICAL_TTL_MS, value: "60000" }
+            - { name: FORWARD_WAL_PENDING_MAX_EVENTS, value: "65536" }
+            - { name: FORWARD_WAL_PENDING_MAX_BYTES, value: "268435456" }
+            - { name: FORWARD_BATCH_MAX_BYTES, value: "524288" }
+            - { name: FORWARD_MAX_EVENT_BYTES, value: "12582912" }
+            - { name: FORWARD_MAX_OUTSTANDING_EVENTS, value: "16384" }
+            - { name: FORWARD_MAX_OUTSTANDING_BYTES, value: "67108864" }
+            - { name: FORWARD_PROTECTED_RESERVE_EVENTS, value: "4096" }
+            - { name: FORWARD_PROTECTED_RESERVE_BYTES, value: "16777216" }
+            - { name: FORWARD_RETRY_BASE_DELAY_MS, value: "250" }
+            - { name: FORWARD_RETRY_MAX_DELAY_MS, value: "2000" }
+            - { name: FORWARD_RETRY_MAX_AGE_MS, value: "45000" }
+            # Forwarder event/control drain < PID 1 child supervision < Kubernetes grace.
+            - { name: FORWARD_SHUTDOWN_TIMEOUT_MS, value: "15000" }
+            - { name: OBSERVER_SUPERVISOR_SHUTDOWN_TIMEOUT_MS, value: "20000" }
+          command: ["/usr/local/bin/node"]
+          args: ["/opt/observer-supervisor.js"]
           volumeMounts:
             - { name: sys, mountPath: /sys, readOnly: true } # tracepoint ids under /sys
+            - { name: bpf, mountPath: /sys/fs/bpf, readOnly: true }
+            - { name: debugfs, mountPath: /sys/kernel/debug, readOnly: true }
             - { name: agent-templates, mountPath: /etc/anysentry, readOnly: true }
+            - { name: observer-auth, mountPath: /etc/anysentry-auth, readOnly: true }
+            - { name: filter-rules, mountPath: /run/anysentry-filter }
+            - { name: forwarder-spool, mountPath: /var/lib/anysentry-forwarder }
           resources:
-            requests: { cpu: 50m, memory: 128Mi }
-            # 1Gi: full signal set (FILES high-volume + SSL uprobes) tracks more state, plus the
-            # co-located node forwarder. No CPU limit: a tracer shouldn't be throttled into dropping.
-            limits: { memory: 1Gi }
+            requests: { cpu: 50m, memory: 256Mi }
+            # 2Gi covers streaming recovery of a 250k-record WAL plus the bounded 131k bulk export
+            # reserve. No CPU limit: a tracer should not be throttled into dropping kernel events.
+            limits: { memory: 2Gi }
       volumes:
         - { name: sys, hostPath: { path: /sys } }
+        - { name: bpf, hostPath: { path: /sys/fs/bpf, type: Directory } }
+        - { name: debugfs, hostPath: { path: /sys/kernel/debug, type: Directory } }
         - { name: agent-templates, configMap: { name: anysentry-agent-templates } }
+        - { name: forwarder-spool, hostPath: { path: /var/lib/anysentry-forwarder, type: DirectoryOrCreate } }
+        - name: observer-auth
+          secret:
+            secretName: anysentry-observer-auth
+            items:
+              - { key: observer-sources.json, path: observer-sources.json, mode: 0400 }
+        - { name: filter-rules, emptyDir: {} }
       tolerations:
         - operator: Exists # every node, including tainted/control-plane

@@ -1,0 +1,20 @@
+suite "a3s-tender-codex-smoke" {
+    version = 1
+
+    scenario "tender-codex-http-fixture" {
+        surface = "tui"
+        timeout_ms = 180000
+
+        wait "fixture-complete" {
+            text = "A3S_TENDER_TUI_PASS codex"
+        }
+
+        expect "tool-result-visible" {
+            text = "A3S_TENDER_TUI_PASS codex"
+        }
+
+        terminal_recording "evidence" {
+            path = "terminal/tender-codex-fixture.vt"
+        }
+    }
+}

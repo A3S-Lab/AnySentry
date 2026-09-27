@@ -57,9 +57,10 @@ discovery and filtering scripts. Compose also bind-mounts those scripts from
 the current checkout so forwarder-only changes can be tested without rebuilding
 the image. The lab uses AnySentry's native
 `/security-center/ingest/batch` and `/security-center/identity/snapshot`
-endpoints. `FORWARD_FILTER_MODE=enforce` with unknown and known non-Agent
-retention disabled keeps this dedicated test collector scoped to the two
-explicitly labeled Agent containers. Plaintext SSL capture and the high-volume
+endpoints. The lab defaults to `FORWARD_FILTER_MODE=shadow` so all decisions remain observable
+until the local, Docker, and Kubernetes comparison passes; set it explicitly to `enforce` for the
+post-approval phase. Unknown and known non-Agent retention can then keep this dedicated collector
+scoped to the two explicitly labeled Agent containers. Plaintext SSL capture and the high-volume
 file-write probe are disabled in this lightweight profile; process execution,
 network, DNS, security, and other core signals remain available.
 

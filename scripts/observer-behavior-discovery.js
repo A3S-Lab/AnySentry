@@ -4,7 +4,10 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { eventIdentityCandidates } = require('./observer-workload-filter');
 
-const LLM_HOST_HINTS = [
+// Host names are only a compatibility hint. Candidate discovery must work when a service uses
+// an internal gateway, an IP address, or a self-hosted model endpoint. Protocol/event shape is
+// the primary signal; deployments may extend this bounded list through configuration.
+const DEFAULT_LLM_HOST_HINTS = [
   'api.openai.com',
   'anthropic.com',
   'generativelanguage.googleapis.com',
@@ -21,7 +24,41 @@ const DEFAULT_SERVICE_DATA_PATHS = [
   '/var/lib/postgresql/',
   '/var/lib/mysql/',
   '/var/lib/redis/',
+  '/var/lib/kafka/',
+  '/bitnami/kafka/',
+  '/opt/kafka/',
+  '/opt/apache-doris/',
 ];
+
+const DEFAULT_INFRASTRUCTURE_NAME_PATTERNS = [
+  /(?:^|[-_.:/])(?:kafka|clickhouse|doris(?:-fe|-be)?|postgres(?:ql)?|redis|mysql|mariadb|zookeeper)(?:[-_.:/]|$)/i,
+  /(?:^|[-_.:/])flink(?:-jobmanager|-taskmanager)?(?:[-_.:/]|$)/i,
+  /(?:^|[-_.:/])ai-apm(?:[-_.:/]|$)/i,
+];
+
+// Keep the scoring contract independent from any framework, tool name, or provider.  A
+// deployment may tune bounded weights, but the snapshot must carry an explicit version so a
+// candidate can always explain which signal registry produced it.
+const DEFAULT_BEHAVIOR_SIGNAL_REGISTRY = Object.freeze({
+  version: 'behavior-window-v1',
+  weights: Object.freeze({
+    llm: 4,
+    tool: 1,
+    uniqueTool: 1,
+    alternation: 2,
+    networkTarget: 1,
+    workspace: 1,
+    childFanout: 1,
+    agentSequence: 4,
+  }),
+  caps: Object.freeze({
+    llm: 8,
+    uniqueTool: 3,
+    alternation: 6,
+    networkTarget: 2,
+    agentSequence: 8,
+  }),
+});
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -50,7 +87,46 @@ function processInfo(observerEvent) {
 }
 
 function behaviorKey(observerEvent, attribution) {
-  if (text(attribution?.physicalWorkloadId)) return text(attribution.physicalWorkloadId);
+  // A physical workload is the retention boundary, not a process-generation identity.  A
+  // A restarted service (or two agent roots sharing one pod/cgroup) must not inherit the previous
+  // short-window score. Use explicit runtime/root fences when available, while retaining
+  // workload-level aggregation for child processes and older collectors without a root fence.
+  if (text(attribution?.physicalWorkloadId)) {
+    // processGenerationKey identifies an individual observed process in the kernel lane, not
+    // necessarily the workload root. Prefer explicit runtime/AgentInstance fences and root
+    // start-time facts; otherwise child Tool/Network/File processes in one physical workload
+    // must share the same cold-start window.
+    const generation = text(
+      attribution?.agentInstanceId
+        ?? attribution?.agent_instance_id
+        ?? attribution?.runtimeInstanceId
+        ?? attribution?.runtime_instance_id,
+    );
+    if (generation) return `workload:${text(attribution.physicalWorkloadId)}:generation:${generation}`;
+
+    // F0 may know the physical workload before its process graph has materialized. When the
+    // event still carries a root generation fence, use it so a restart cannot inherit the old
+    // window. Do not fall back to the event PID: child processes in one workload must continue
+    // contributing to the same window while the root start time remains stable.
+    const process = processInfo(observerEvent);
+    const rootPid = text(
+      process.rootPid ?? process.root_pid ?? attribution?.rootPid ?? attribution?.root_pid,
+    );
+    const rootStart = text(
+      process.rootStartTimeTicks
+        ?? process.root_start_time_ticks
+        ?? process.rootStartTime
+        ?? process.root_start_time
+        ?? attribution?.rootStartTimeTicks
+        ?? attribution?.root_start_time_ticks
+        ?? attribution?.rootStartTime
+        ?? attribution?.root_start_time,
+    );
+    if (rootPid && rootStart) {
+      return `workload:${text(attribution.physicalWorkloadId)}:root:${rootPid}:${rootStart}`;
+    }
+    return text(attribution.physicalWorkloadId);
+  }
   const identity = eventIdentityCandidates(observerEvent);
   if (identity.candidates[0]) return `container:${identity.candidates[0]}`;
   const process = processInfo(observerEvent);
@@ -87,6 +163,28 @@ function targetText(payload) {
       payload.url ??
       payload.sni,
   ).toLowerCase();
+}
+
+function routeText(payload) {
+  return text(
+    payload.path ??
+      payload.route ??
+      payload.requestPath ??
+      payload.request_path ??
+      payload.operation ??
+      payload.operationName ??
+      payload.operation_name ??
+      payload.protocolOperation,
+  ).toLowerCase();
+}
+
+function normalizedHints(value, fallback = DEFAULT_LLM_HOST_HINTS) {
+  const configured = Array.isArray(value)
+    ? value
+    : text(value)
+      ? text(value).split(',')
+      : fallback;
+  return [...new Set(configured.map((item) => text(item).toLowerCase()).filter(Boolean))].slice(0, 64);
 }
 
 function toolText(payload) {
@@ -156,10 +254,92 @@ function workloadDisplayName(ref) {
   );
 }
 
-function isLlmEvent(kind, payload) {
-  if (['LlmApi', 'LlmCall'].includes(kind)) return true;
+function isKnownInfrastructureWorkload(ref, attribution) {
+  const values = [
+    attribution?.physicalWorkloadId,
+    ref?.name,
+    ref?.podName,
+    ref?.containerName,
+    ref?.containerImage,
+    ref?.systemdUnit,
+    ref?.processName,
+    ref?.executable,
+  ].map(text).filter(Boolean);
+  return values.some((value) =>
+    DEFAULT_INFRASTRUCTURE_NAME_PATTERNS.some((pattern) => pattern.test(value)),
+  );
+}
+
+const HOST_CONTROL_PLANE_UNIT =
+  /(?:^|\/)system\.slice\/(?:k3s|containerd|docker|crio|kubelet)\.service(?:\/|$)/iu;
+const CONTAINER_LEAF_ID = /(?:^|[-/])(?:[a-f0-9]{64}|docker-[a-f0-9]{8,})(?:\.scope|$|[/.-])/iu;
+const POD_LEAF_ID = /(?:^|\/)pod[a-f0-9a-z_-]+/iu;
+
+function physicalInfrastructureReason(cgroup, workloadRef, facts) {
+  const path = text(cgroup);
+  if (!path) return '';
+  if (HOST_CONTROL_PLANE_UNIT.test(path)) return 'host_control_plane';
+  const namespace = text(workloadRef?.namespace ?? facts?.namespace).toLowerCase();
+  if (/kubepods/iu.test(path) && namespace === 'anysentry') return 'self_plane';
+  // Runtime parents are kubepods QoS/slice roots without a pod or container leaf.
+  // A /docker/<id> path is a container, not the runtime ancestor.
+  if (
+    /(?:^|\/)kubepods(?:\.slice)?(?:\/|$)/iu.test(path)
+    && !CONTAINER_LEAF_ID.test(path)
+    && !POD_LEAF_ID.test(path)
+  ) {
+    return 'runtime_ancestor';
+  }
+  return '';
+}
+
+function physicalInfrastructureClassification(observerEvent, attribution) {
+  const process = processInfo(observerEvent);
+  const ref = workloadRef(observerEvent, attribution);
+  const facts = attribution?.infrastructureFacts && typeof attribution.infrastructureFacts === 'object'
+    ? attribution.infrastructureFacts
+    : {};
+  const reason = physicalInfrastructureReason(process.cgroup, ref, facts);
+  if (!reason) return undefined;
+  return {
+    state: 'infrastructure',
+    attribution: {
+      monitored: false,
+      classification: 'non_agent',
+      confidence: 1,
+      reason: 'platform_infrastructure',
+      source: 'physical_context',
+      evidence: [
+        ...(Array.isArray(attribution?.evidence) ? attribution.evidence : []),
+        `f0:physical_infrastructure=${reason}`,
+      ].slice(-16),
+      physicalWorkloadId: text(attribution?.physicalWorkloadId) || behaviorKey(observerEvent, attribution),
+      workloadRef: ref,
+    },
+  };
+}
+
+function isLlmEvent(kind, payload, llmHostHints = DEFAULT_LLM_HOST_HINTS) {
+  // A probe may label a flow LlmCall before a protocol shape exists. Counting that label
+  // promotes host control planes and proxies. Model operations come from the route or the
+  // semantic operation, including on LlmCall / LlmInteraction events.
+  const transport = ['Egress', 'Connect', 'Dns', 'DnsQuery', 'Tls', 'TlsHandshake', 'LlmApi', 'LlmCall', 'LlmInteraction'];
+  if (!transport.includes(kind)) return false;
+  const route = routeText(payload);
+  // These are protocol operation shapes, not provider or framework names. They also cover
+  // private gateways where the peer address carries no useful vendor identity.
+  if (/(?:chat\/completions|completions|responses|messages|text-generation|generate-content|inference|model[_-]?invoke|llm)/u.test(route)) {
+    return true;
+  }
+  const semanticKind = text(
+    payload.semanticKind ?? payload.semantic_kind ?? payload.operationType ?? payload.operation_type,
+  ).toLowerCase();
+  if (/(?:llm|language[_ -]?model|model[_ -]?(?:call|request|response|generation)|chat|completion|inference)/u.test(semanticKind)) {
+    return true;
+  }
+  if (['LlmApi', 'LlmCall', 'LlmInteraction'].includes(kind)) return false;
   const target = targetText(payload);
-  return Boolean(target && LLM_HOST_HINTS.some((hint) => target.includes(hint)));
+  return Boolean(target && normalizedHints(llmHostHints).some((hint) => target.includes(hint)));
 }
 
 function normalizedPathPrefix(value) {
@@ -211,19 +391,59 @@ function dominantCount(map) {
   return max;
 }
 
-function scoreRecord(record) {
-  const llm = Math.min(8, record.llmEvents * 4);
-  const tools = Math.min(4, record.toolExecs);
-  const uniqueTools = Math.min(3, record.uniqueTools.size);
-  const alternation = Math.min(6, record.alternations * 2);
-  const network = Math.min(2, record.networkTargets.size);
-  const workspace = record.workspaceFiles >= 2 ? 1 : 0;
-  const fanout = record.childPids.size >= 3 ? 1 : 0;
-  const sequences = Math.min(8, record.agentSequences * 4);
+function boundedWeight(value, fallback, max = 100) {
+  return boundedNumber(value, fallback, 0, max);
+}
+
+function normalizeSignalRegistry(value) {
+  let source = value && typeof value === 'object' ? value : {};
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      source = parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      source = {};
+    }
+  }
+  const weights = source.weights && typeof source.weights === 'object' ? source.weights : {};
+  const caps = source.caps && typeof source.caps === 'object' ? source.caps : {};
+  return {
+    version: text(source.version) || DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.version,
+    weights: {
+      llm: boundedWeight(weights.llm, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.llm),
+      tool: boundedWeight(weights.tool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.tool),
+      uniqueTool: boundedWeight(weights.uniqueTool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.uniqueTool),
+      alternation: boundedWeight(weights.alternation, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.alternation),
+      networkTarget: boundedWeight(weights.networkTarget, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.networkTarget),
+      workspace: boundedWeight(weights.workspace, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.workspace),
+      childFanout: boundedWeight(weights.childFanout, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.childFanout),
+      agentSequence: boundedWeight(weights.agentSequence, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.weights.agentSequence),
+    },
+    caps: {
+      llm: boundedWeight(caps.llm, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.llm),
+      uniqueTool: boundedWeight(caps.uniqueTool, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.uniqueTool),
+      alternation: boundedWeight(caps.alternation, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.alternation),
+      networkTarget: boundedWeight(caps.networkTarget, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.networkTarget),
+      agentSequence: boundedWeight(caps.agentSequence, DEFAULT_BEHAVIOR_SIGNAL_REGISTRY.caps.agentSequence),
+    },
+  };
+}
+
+function scoreRecord(record, registry = DEFAULT_BEHAVIOR_SIGNAL_REGISTRY) {
+  const normalized = normalizeSignalRegistry(registry);
+  const { weights, caps } = normalized;
+  const llm = Math.min(caps.llm, record.llmEvents * weights.llm);
+  const tools = Math.min(4, record.toolExecs * weights.tool);
+  const uniqueTools = Math.min(caps.uniqueTool, record.uniqueTools.size * weights.uniqueTool);
+  const alternation = Math.min(caps.alternation, record.alternations * weights.alternation);
+  const network = Math.min(caps.networkTarget, record.networkTargets.size * weights.networkTarget);
+  const workspace = record.workspaceFiles >= 2 ? weights.workspace : 0;
+  const fanout = record.childPids.size >= 3 ? weights.childFanout : 0;
+  const sequences = Math.min(caps.agentSequence, record.agentSequences * weights.agentSequence);
   return llm + tools + uniqueTools + alternation + network + workspace + fanout + sequences;
 }
 
-function qualifies(record, threshold) {
+function qualificationPattern(record) {
   const llmToolPattern =
     record.llmEvents > 0 &&
     record.toolExecs > 0 &&
@@ -233,10 +453,43 @@ function qualifies(record, threshold) {
     record.toolExecs >= 2 &&
     record.uniqueTools.size >= 2 &&
     record.workspaceFiles > 0;
-  return record.score >= threshold && (llmToolPattern || autonomousToolPattern);
+  // A service Agent can legitimately complete a run without invoking a tool. Requiring
+  // ToolExec here would leave a model-only HTTP Agent invisible forever. Two model transport
+  // observations in one generation/window are enough for a bounded probable candidate; this is
+  // deliberately weaker than confirmation and still carries the normal candidate TTL/profile.
+  const modelServicePattern = record.llmEvents >= 2 && record.networkTargets.size > 0;
+  if (llmToolPattern) return 'llm_tool';
+  if (autonomousToolPattern) return 'autonomous_tool';
+  if (modelServicePattern) return 'model_transport';
+  return '';
 }
 
-function strongInfrastructurePattern(record, now, minAgeMs) {
+function qualifies(record, threshold) {
+  return record.score >= threshold && Boolean(qualificationPattern(record));
+}
+
+function strongInfrastructurePattern(record, now, minAgeMs, ref, attribution) {
+  // Inventory names are weak negative hints. A complete kernel-only decision/tool sequence
+  // must survive a deployment rename (for example an Agent which manages a database).
+  if (record.llmEvents === 0 && record.agentSequences === 0 && isKnownInfrastructureWorkload(ref, attribution)) {
+    return 'known_infrastructure_workload';
+  }
+  // A host proxy that only forwards Connect/Tls, with no model or tool cycle and no workspace
+  // writes, is a network relay. Wait for the same negative-age fence used by service-data so a
+  // cold Agent that has only opened its first sockets is not demoted.
+  if (
+    now - record.firstSeenAt >= minAgeMs
+    && record.llmEvents === 0
+    && record.agentSequences === 0
+    && record.alternations === 0
+    && record.uniqueTools.size === 0
+    && record.workspaceFiles === 0
+    && record.toolExecs === 0
+    && record.networkTargets.size > 0
+    && record.events >= 4
+  ) {
+    return 'network_relay_shape';
+  }
   const fileEvents = record.workspaceFiles + record.serviceDataFiles;
   const serviceDataDominant =
     record.serviceDataFiles >= 4 &&
@@ -254,7 +507,7 @@ function strongInfrastructurePattern(record, now, minAgeMs) {
     serviceDataDominant &&
     executableDominant &&
     lacksAgentCycle
-  );
+  ) ? 'service_data_pattern' : '';
 }
 
 class BehavioralAgentDetector {
@@ -287,6 +540,12 @@ class BehavioralAgentDetector {
     this.serviceDataPaths = serviceDataPrefixes(
       options.serviceDataPaths ?? process.env.ANYSENTRY_BEHAVIOR_SERVICE_DATA_PATHS,
     );
+    this.llmHostHints = normalizedHints(
+      options.llmHostHints ?? process.env.ANYSENTRY_BEHAVIOR_LLM_HOST_HINTS,
+    );
+    this.signalRegistry = normalizeSignalRegistry(
+      options.signalRegistry ?? process.env.ANYSENTRY_BEHAVIOR_SIGNAL_REGISTRY,
+    );
     this.maxWorkloads = boundedNumber(
       options.maxWorkloads ?? process.env.ANYSENTRY_BEHAVIOR_MAX_WORKLOADS,
       20_000,
@@ -310,6 +569,13 @@ class BehavioralAgentDetector {
     this.operations = 0;
   }
 
+  /** Atomically replace the bounded signal registry for subsequent observations. */
+  updateSignalRegistry(registry) {
+    const next = normalizeSignalRegistry(registry);
+    this.signalRegistry = next;
+    return { version: next.version, weights: { ...next.weights }, caps: { ...next.caps } };
+  }
+
   observe(observerEvent, attribution) {
     if (!this.enabled) return undefined;
     this.stats.observed++;
@@ -320,8 +586,14 @@ class BehavioralAgentDetector {
     }
     const now = this.now();
     this.operations++;
-    if (this.operations % 1_024 === 0 || this.records.size >= this.maxWorkloads) this.prune(now);
+    if (this.operations % 1_024 === 0) this.prune(now);
     let record = this.records.get(key);
+    // Capacity applies to new scopes only. Visiting a known scope must not evict its evidence.
+    // Map insertion order tracks accesses, avoiding a full-table scan for each cold-start scope.
+    if (!record && this.records.size >= this.maxWorkloads) {
+      this.records.delete(this.records.keys().next().value);
+      this.stats.evicted++;
+    }
     if (!record || now - record.windowStartedAt >= this.windowMs) {
       const previousProbableUntil = record?.probableUntil ?? 0;
       record = {
@@ -349,12 +621,13 @@ class BehavioralAgentDetector {
         awaitingWorkspace: false,
         score: 0,
       };
-      this.records.set(key, record);
     }
+    this.records.delete(key);
+    this.records.set(key, record);
     record.lastSeenAt = now;
     const kind = eventKind(observerEvent);
     const payload = eventPayload(observerEvent);
-    const llm = isLlmEvent(kind, payload);
+    const llm = isLlmEvent(kind, payload, this.llmHostHints);
     const tool = kind === 'ToolExec';
     const network =
       ['Egress', 'DnsQuery', 'Dns', 'Connect'].includes(kind) &&
@@ -397,12 +670,20 @@ class BehavioralAgentDetector {
     const signal = llm ? 'llm' : tool ? 'tool' : '';
     if (signal && record.lastSignal && signal !== record.lastSignal) record.alternations++;
     if (signal) record.lastSignal = signal;
-    record.score = scoreRecord(record);
-    if (qualifies(record, this.threshold) && record.probableUntil < now) {
+    record.score = scoreRecord(record, this.signalRegistry);
+    const pattern = qualifies(record, this.threshold) ? qualificationPattern(record) : '';
+    if (pattern && record.probableUntil < now) {
       record.probableUntil = now + this.probableTtlMs;
       this.stats.promoted++;
     }
-    const negative = strongInfrastructurePattern(record, now, this.negativeMinAgeMs);
+    const candidateWorkload = workloadRef(observerEvent, attribution);
+    const negative = strongInfrastructurePattern(
+      record,
+      now,
+      this.negativeMinAgeMs,
+      candidateWorkload,
+      attribution,
+    );
     if (negative) {
       if (record.probableUntil > now) {
         record.probableUntil = 0;
@@ -410,7 +691,6 @@ class BehavioralAgentDetector {
       }
       this.stats.negativeEvidenceEvents++;
       if (attribution?.classification === 'non_agent') return undefined;
-      const candidateWorkload = workloadRef(observerEvent, attribution);
       return {
         state: 'unknown',
         attribution: {
@@ -423,7 +703,7 @@ class BehavioralAgentDetector {
           source: 'behavior',
           evidence: [
             ...(Array.isArray(attribution?.evidence) ? attribution.evidence : []),
-            'behavior:negative=service_data_pattern',
+            `behavior:negative=${negative}`,
             `behavior:service_data_files=${record.serviceDataFiles}`,
             `behavior:service_data_directories=${record.serviceDataDirectories.size}`,
             `behavior:dominant_executable_ratio=${(
@@ -437,7 +717,6 @@ class BehavioralAgentDetector {
     }
     if (record.probableUntil <= now) return undefined;
     this.stats.probableEvents++;
-    const candidateWorkload = workloadRef(observerEvent, attribution);
     return {
       state: 'agent',
       attribution: {
@@ -451,8 +730,13 @@ class BehavioralAgentDetector {
         confidence: Math.min(0.9, 0.5 + record.score / Math.max(20, this.threshold * 2) * 0.4),
         reason: 'hint_only',
         source: 'behavior',
+        algorithmVersion: this.signalRegistry.version,
+        score: record.score,
+        threshold: this.threshold,
+        window: `${this.windowMs}ms`,
         evidence: [
           `behavior:score=${record.score}`,
+          `behavior:pattern=${pattern || 'hysteresis'}`,
           `behavior:llm=${record.llmEvents}`,
           `behavior:tools=${record.toolExecs}`,
           `behavior:unique_tools=${record.uniqueTools.size}`,
@@ -478,17 +762,8 @@ class BehavioralAgentDetector {
         this.stats.expired++;
       }
     }
-    while (this.records.size >= this.maxWorkloads) {
-      let oldestKey;
-      let oldestAt = Infinity;
-      for (const [key, record] of this.records) {
-        if (record.lastSeenAt < oldestAt) {
-          oldestAt = record.lastSeenAt;
-          oldestKey = key;
-        }
-      }
-      if (!oldestKey) break;
-      this.records.delete(oldestKey);
+    while (this.records.size > this.maxWorkloads) {
+      this.records.delete(this.records.keys().next().value);
       this.stats.evicted++;
     }
   }
@@ -514,6 +789,10 @@ module.exports = {
   isLlmEvent,
   isServiceDataFile,
   isWorkspaceFile,
+  physicalInfrastructureReason,
+  physicalInfrastructureClassification,
+  DEFAULT_BEHAVIOR_SIGNAL_REGISTRY,
+  normalizeSignalRegistry,
   qualifies,
   scoreRecord,
   strongInfrastructurePattern,

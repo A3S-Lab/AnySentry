@@ -1,0 +1,180 @@
+app:
+  description: Final Agent-to-LLM request and streamed response observation fixture.
+  icon: "🔍"
+  icon_background: '#E8F5FF'
+  mode: workflow
+  name: AnySentry Dify LLM Observation
+  use_icon_as_answer_icon: false
+dependencies:
+  - current_identifier: null
+    type: marketplace
+    value:
+      marketplace_plugin_unique_identifier: langgenius/openai_api_compatible:0.0.64@ed082da9060cdaf69127de0f39e7ba5d255d74276feed9c88b2ba5226515728c
+kind: app
+version: 0.4.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+      - data:
+          isInIteration: false
+          isInLoop: false
+          sourceType: start
+          targetType: llm
+        id: start-to-llm
+        source: start_node
+        sourceHandle: source
+        target: llm_node
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          isInLoop: false
+          sourceType: llm
+          targetType: end
+        id: llm-to-end
+        source: llm_node
+        sourceHandle: source
+        target: end_node
+        targetHandle: target
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: The internal_rag_sentinel input is deliberately not referenced by the LLM node.
+          selected: false
+          title: Start
+          type: start
+          variables:
+            - label: User query
+              max_length: 4096
+              options: []
+              required: true
+              type: text-input
+              variable: query
+            - label: Final selected RAG context
+              max_length: 8192
+              options: []
+              required: true
+              type: paragraph
+              variable: final_context
+            - label: Internal unselected RAG sentinel
+              max_length: 4096
+              options: []
+              required: true
+              type: text-input
+              variable: internal_rag_sentinel
+        height: 142
+        id: start_node
+        position:
+          x: 30
+          y: 227
+        positionAbsolute:
+          x: 30
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          context:
+            enabled: false
+            variable_selector: []
+          desc: Only the serialized prompt below belongs to the observation boundary.
+          memory:
+            enabled: false
+            window:
+              enabled: false
+              size: 50
+          model:
+            completion_params:
+              temperature: 0
+            mode: chat
+            name: anysentry-observation-model
+            provider: langgenius/openai_api_compatible/openai_api_compatible
+          prompt_template:
+            - id: system-prompt-v1
+              role: system
+              text: |-
+                ANYSENTRY_DIFY_SYSTEM_V1
+                Answer concisely and preserve the supplied observation markers.
+            - id: user-prompt-v1
+              role: user
+              text: |-
+                USER_QUERY={{#start_node.query#}}
+                FINAL_SELECTED_RAG={{#start_node.final_context#}}
+          retry_config:
+            enabled: false
+            exponential_backoff:
+              enabled: false
+              max_interval: 10000
+              multiplier: 2
+            max_retries: 1
+            retry_interval: 1000
+          selected: false
+          structured_output:
+            enabled: false
+          title: Final LLM Call
+          type: llm
+          variables: []
+          vision:
+            enabled: false
+        height: 110
+        id: llm_node
+        position:
+          x: 334
+          y: 227
+        positionAbsolute:
+          x: 334
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: ''
+          outputs:
+            - value_selector:
+                - llm_node
+                - text
+              value_type: string
+              variable: answer
+          selected: false
+          title: End
+          type: end
+        height: 90
+        id: end_node
+        position:
+          x: 638
+          y: 227
+        positionAbsolute:
+          x: 638
+          y: 227
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.7

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "anysentry.filter_rule_golden.v1",
+  "projectionInput": {
+    "catalogVersion": 11,
+    "domainVersions": {
+      "identity": 2,
+      "capture": 3,
+      "forwarder": 4,
+      "retention": 5
+    },
+    "now": "2026-08-25T12:00:00.000Z",
+    "ttlMs": 120000
+  },
+  "projection": {
+    "contentHash": "d78bd53bfd1b4484cc55e8b1074f9722c7b994694ac55183919e1f44d5de74be",
+    "intentHash": "e6dad321e8d8f0abb898c711383c2995cdf01cf5c0c0511adddb09fb54848558",
+    "counts": {
+      "runtimeSignatures": 8,
+      "agentTemplates": 2,
+      "identityRules": 11,
+      "captureProfileRules": 8,
+      "signalEnablementRules": 1,
+      "semanticRetentionRules": 7,
+      "persistenceRetentionRules": 5,
+      "safetyGuardrails": 5
+    }
+  },
+  "expected": {
+    "codexRuntime": "codex",
+    "agentLabelClassification": "confirmed_agent",
+    "agentLabelRole": "agent",
+    "vscodeSamplerClassification": "non_agent",
+    "probableCaptureProfile": "agent_full",
+    "infrastructureCaptureProfile": "infrastructure_aggregate",
+    "securityF2RuleId": "fr_guardrail_security_full",
+    "nonAgentF2RuleId": "fr_builtin_f2_non_agent_suppress",
+    "internalLifecycleF2RuleId": "fr_builtin_f2_trusted_infrastructure_lifecycle_suppress",
+    "nonAgentFamilyF2RuleId": "fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress",
+    "unknownF2RuleId": "fr_builtin_f2_unknown_keep"
+  }
+}

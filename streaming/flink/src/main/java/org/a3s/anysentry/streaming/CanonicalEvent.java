@@ -39,9 +39,14 @@ public class CanonicalEvent implements Serializable {
     public boolean argvTruncated;
     public String argvSource;
     public String behaviorStage;
+    public long repeatCount = 1L;
+    public long firstEventAt;
+    public long lastEventAt;
+    public long aggregationWindowMs;
     public boolean platformRuntime;
     public boolean synthetic;
     public ProcessIdentity processIdentity;
+    public FileIdentity fileIdentity;
     public String supplyChainWorkspaceId;
     public String dependencySnapshotId;
     public String vulnerabilityAssessmentId;
@@ -49,11 +54,28 @@ public class CanonicalEvent implements Serializable {
 
     public static class ProcessIdentity implements Serializable {
         public String hostId;
+        public String bootId;
         public String containerId;
+        public String cgroupId;
         public Integer pid;
         public Integer ppid;
         public Integer rootPid;
+        public String rootStartTime;
+        public String startTimeTicks;
         public String startTimeNs;
+        public Long mountNamespace;
+        public String processInstanceId;
+        public String identityConfidence;
+    }
+
+    public static class FileIdentity implements Serializable {
+        public String fileInstanceId;
+        public String path;
+        public String device;
+        public String inode;
+        public Long mountNamespace;
+        public String identityBasis;
+        public String identityConfidence;
     }
 
     public static class RuntimeVulnerabilityMatch implements Serializable {

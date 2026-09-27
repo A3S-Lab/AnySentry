@@ -1,0 +1,537 @@
+{
+  "schemaVersion": "anysentry.s0_golden_events.v1",
+  "boundary": "judged_event_to_canonical_event",
+  "notes": [
+    "These inputs freeze current S0 behavior only.",
+    "traceInputKind documents where an already-populated traceId came from; S0 does not produce traceOrigin or Invocation identity."
+  ],
+  "baseEvent": {
+    "schemaVersion": "anysentry.agent_event.v1",
+    "eventKind": "ToolExec",
+    "eventCategory": "tool",
+    "source": "observer",
+    "collectorId": "collector-s0",
+    "userId": "user-s0",
+    "verdict": "allow",
+    "tier": "L1",
+    "severity": "low",
+    "reason": "S0 golden compatibility fixture",
+    "riskCategory": "none",
+    "riskName": "None",
+    "riskType": "none",
+    "riskScore": 0,
+    "tokenCount": 0,
+    "latencyMs": 1,
+    "attributes": {
+      "tenantId": "tenant-s0",
+      "environmentId": "compatibility"
+    }
+  },
+  "cases": [
+    {
+      "id": "host-pid-original",
+      "environment": "host",
+      "tags": ["pid_reuse", "incoming_trace"],
+      "traceInputKind": "incoming",
+      "receivedAt": 1787000000100,
+      "eventPatch": {
+        "eventId": "host-record-original",
+        "sourceEventId": "host-source-original",
+        "sourceId": "source-host-1",
+        "at": 1787000000000,
+        "subject": "host agent root exec",
+        "workspacePath": "/workspace/host-agent",
+        "agentId": "pi",
+        "sessionId": "host-invocation-77",
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "spanId": "00f067aa0ba902b7",
+        "runId": "host-run-77",
+        "attributes": {
+          "collectorNode": "host-a"
+        },
+        "process": {
+          "hostId": "host-a",
+          "bootId": "boot-host-a",
+          "pid": 4321,
+          "ppid": 1,
+          "startTimeTicks": "1000",
+          "mountNamespace": 4026531840
+        },
+        "attribution": {
+          "monitored": true,
+          "classification": "confirmed_agent",
+          "agentScopeId": "pi",
+          "agentDisplayName": "Pi",
+          "agentSessionId": "host-invocation-77",
+          "rootPid": 4321,
+          "rootStartTime": "1000",
+          "confidence": 0.99,
+          "reason": "process_lineage",
+          "source": "process_graph"
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 4321,
+            "ppid": 1,
+            "cwd": "/workspace/host-agent",
+            "argv": ["pi", "--serve"]
+          }
+        }
+      }
+    },
+    {
+      "id": "host-pid-reused",
+      "environment": "host",
+      "tags": ["pid_reuse", "incoming_trace"],
+      "traceInputKind": "incoming",
+      "receivedAt": 1787000010100,
+      "eventPatch": {
+        "eventId": "host-record-reused",
+        "sourceEventId": "host-source-reused",
+        "sourceId": "source-host-1",
+        "at": 1787000010000,
+        "subject": "host agent root exec after pid reuse",
+        "workspacePath": "/workspace/host-agent",
+        "agentId": "pi",
+        "sessionId": "host-invocation-78",
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4737",
+        "spanId": "00f067aa0ba902b8",
+        "runId": "host-run-78",
+        "attributes": {
+          "collectorNode": "host-a"
+        },
+        "process": {
+          "hostId": "host-a",
+          "bootId": "boot-host-a",
+          "pid": 4321,
+          "ppid": 1,
+          "startTimeTicks": "2000",
+          "mountNamespace": 4026531840
+        },
+        "attribution": {
+          "monitored": true,
+          "classification": "confirmed_agent",
+          "agentScopeId": "pi",
+          "agentDisplayName": "Pi",
+          "agentSessionId": "host-invocation-78",
+          "rootPid": 4321,
+          "rootStartTime": "2000",
+          "confidence": 0.99,
+          "reason": "process_lineage",
+          "source": "process_graph"
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 4321,
+            "ppid": 1,
+            "cwd": "/workspace/host-agent",
+            "argv": ["pi", "--serve"]
+          }
+        }
+      }
+    },
+    {
+      "id": "docker-agent-pi",
+      "environment": "docker",
+      "tags": ["same_container_two_agents", "legacy_synthetic_trace"],
+      "traceInputKind": "legacy_synthetic_already_assigned",
+      "receivedAt": 1787000020100,
+      "eventPatch": {
+        "eventId": "docker-pi-record",
+        "sourceEventId": "docker-pi-source",
+        "sourceId": "source-docker-1",
+        "at": 1787000020000,
+        "subject": "pi root inside shared container",
+        "workspacePath": "/workspace/shared",
+        "agentId": "pi",
+        "sessionId": "pi-session-a",
+        "traceId": "tr_docker_pi_session_a",
+        "spanId": "sp_docker_pi_a",
+        "runId": "pi-run-a",
+        "attributes": {
+          "collectorNode": "docker-host-a",
+          "containerName": "shared-agent-box"
+        },
+        "process": {
+          "hostId": "docker-host-a",
+          "bootId": "boot-docker-a",
+          "cgroupId": "811",
+          "cgroup": "0::/system.slice/docker-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope",
+          "pid": 5001,
+          "ppid": 1,
+          "startTimeTicks": "500100",
+          "mountNamespace": 4026532001
+        },
+        "attribution": {
+          "monitored": true,
+          "classification": "confirmed_agent",
+          "agentScopeId": "pi",
+          "agentDisplayName": "Pi",
+          "agentSessionId": "pi-session-a",
+          "rootPid": 5001,
+          "rootStartTime": "500100",
+          "confidence": 0.98,
+          "reason": "process_lineage",
+          "source": "process_graph"
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 5001,
+            "ppid": 1,
+            "cwd": "/workspace/shared",
+            "argv": ["pi", "--mode", "server"]
+          }
+        }
+      }
+    },
+    {
+      "id": "docker-agent-codex",
+      "environment": "docker",
+      "tags": ["same_container_two_agents", "legacy_synthetic_trace"],
+      "traceInputKind": "legacy_synthetic_already_assigned",
+      "receivedAt": 1787000021100,
+      "eventPatch": {
+        "eventId": "docker-codex-record",
+        "sourceEventId": "docker-codex-source",
+        "sourceId": "source-docker-1",
+        "at": 1787000021000,
+        "subject": "codex root inside shared container",
+        "workspacePath": "/workspace/shared",
+        "agentId": "codex",
+        "sessionId": "codex-session-b",
+        "traceId": "tr_docker_codex_session_b",
+        "spanId": "sp_docker_codex_b",
+        "runId": "codex-run-b",
+        "attributes": {
+          "collectorNode": "docker-host-a",
+          "containerName": "shared-agent-box"
+        },
+        "process": {
+          "hostId": "docker-host-a",
+          "bootId": "boot-docker-a",
+          "cgroupId": "811",
+          "cgroup": "0::/system.slice/docker-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope",
+          "pid": 5002,
+          "ppid": 1,
+          "startTimeTicks": "500200",
+          "mountNamespace": 4026532001
+        },
+        "attribution": {
+          "monitored": true,
+          "classification": "confirmed_agent",
+          "agentScopeId": "codex",
+          "agentDisplayName": "Codex",
+          "agentSessionId": "codex-session-b",
+          "rootPid": 5002,
+          "rootStartTime": "500200",
+          "confidence": 0.98,
+          "reason": "process_lineage",
+          "source": "process_graph"
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 5002,
+            "ppid": 1,
+            "cwd": "/workspace/shared",
+            "argv": ["codex", "exec", "check"]
+          }
+        }
+      }
+    },
+    {
+      "id": "docker-unknown-original",
+      "environment": "docker",
+      "tags": ["unknown", "replay", "legacy_synthetic_trace"],
+      "traceInputKind": "legacy_synthetic_already_assigned",
+      "receivedAt": 1787000030100,
+      "eventPatch": {
+        "eventId": "docker-unknown-record",
+        "sourceEventId": "docker-unknown-source",
+        "sourceId": "source-docker-1",
+        "at": 1787000030000,
+        "subject": "unclassified executable in docker",
+        "workspacePath": "",
+        "agentId": "unknown",
+        "sessionId": "unknown",
+        "traceId": "tr_unknown_legacy_synthetic",
+        "spanId": "sp_unknown_legacy",
+        "runId": "unknown",
+        "attributes": {
+          "collectorNode": "docker-host-a",
+          "containerName": "unclassified-box"
+        },
+        "process": {
+          "hostId": "docker-host-a",
+          "bootId": "boot-docker-a",
+          "cgroupId": "812",
+          "cgroup": "0::/system.slice/docker-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.scope",
+          "pid": 5100,
+          "ppid": 1,
+          "startTimeTicks": "510000",
+          "mountNamespace": 4026532002
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 5100,
+            "ppid": 1,
+            "cwd": "/tmp",
+            "argv": ["mystery-runtime", "--scan"]
+          }
+        }
+      }
+    },
+    {
+      "id": "docker-unknown-replay",
+      "environment": "docker",
+      "tags": ["unknown", "replay", "legacy_synthetic_trace"],
+      "traceInputKind": "legacy_synthetic_already_assigned",
+      "receivedAt": 1787000090100,
+      "eventPatch": {
+        "eventId": "docker-unknown-record",
+        "sourceEventId": "docker-unknown-source",
+        "sourceId": "source-docker-1",
+        "at": 1787000030000,
+        "subject": "unclassified executable in docker",
+        "workspacePath": "",
+        "agentId": "unknown",
+        "sessionId": "unknown",
+        "traceId": "tr_unknown_legacy_synthetic",
+        "spanId": "sp_unknown_legacy",
+        "runId": "unknown",
+        "attributes": {
+          "collectorNode": "docker-host-a",
+          "containerName": "unclassified-box"
+        },
+        "process": {
+          "hostId": "docker-host-a",
+          "bootId": "boot-docker-a",
+          "cgroupId": "812",
+          "cgroup": "0::/system.slice/docker-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.scope",
+          "pid": 5100,
+          "ppid": 1,
+          "startTimeTicks": "510000",
+          "mountNamespace": 4026532002
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 5100,
+            "ppid": 1,
+            "cwd": "/tmp",
+            "argv": ["mystery-runtime", "--scan"]
+          }
+        }
+      }
+    },
+    {
+      "id": "k8s-agent-incoming",
+      "environment": "kubernetes",
+      "tags": ["incoming_trace", "cri_container"],
+      "traceInputKind": "incoming",
+      "receivedAt": 1787000040100,
+      "eventPatch": {
+        "eventId": "k8s-agent-record",
+        "sourceEventId": "k8s-agent-source",
+        "sourceId": "source-k8s-1",
+        "at": 1787000040000,
+        "subject": "pi request inside kubernetes",
+        "workspacePath": "/workspace/k8s-agent",
+        "agentId": "pi",
+        "sessionId": "k8s-invocation-42",
+        "traceId": "7af7651916cd43dd8448eb211c80319c",
+        "spanId": "b7ad6b7169203331",
+        "runId": "k8s-run-42",
+        "attributes": {
+          "collectorNode": "k8s-node-a",
+          "clusterName": "cluster-s0",
+          "namespace": "agents",
+          "podName": "pi-agent-0",
+          "containerName": "pi-runtime"
+        },
+        "process": {
+          "hostId": "k8s-node-a",
+          "bootId": "boot-k8s-a",
+          "cgroupId": "901",
+          "cgroup": "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod11111111_2222_3333_4444_555555555555.slice/cri-containerd-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.scope",
+          "pid": 6200,
+          "ppid": 1,
+          "startTimeTicks": "620000",
+          "mountNamespace": 4026532100
+        },
+        "attribution": {
+          "monitored": true,
+          "classification": "confirmed_agent",
+          "agentScopeId": "pi",
+          "agentDisplayName": "Pi",
+          "agentSessionId": "k8s-invocation-42",
+          "rootPid": 6200,
+          "rootStartTime": "620000",
+          "confidence": 0.99,
+          "reason": "process_lineage",
+          "source": "process_graph"
+        }
+      },
+      "observerLine": {
+        "event": {
+          "ToolExec": {
+            "pid": 6200,
+            "ppid": 1,
+            "cwd": "/workspace/k8s-agent",
+            "argv": ["pi", "--request", "42"]
+          }
+        }
+      }
+    }
+  ],
+  "expectedByCase": {
+    "host-pid-original": {
+      "eventId": "evt_5b5300358178cc35b95e441e",
+      "agentType": "pi",
+      "agentInstanceId": "agi_3bdbb223a91bf2a697456d84",
+      "agentCorrelationId": "agc_23c774a8cf30e04bda970caf",
+      "sessionId": "host-invocation-77",
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "processIdentity.processInstanceId": "pri_694ead61cd8b2764456b556e",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "host-pid-reused": {
+      "eventId": "evt_4ef842a21d1999d7600aa064",
+      "agentType": "pi",
+      "agentInstanceId": "agi_b0fab5dd29f3153583b8adc2",
+      "agentCorrelationId": "agc_23c774a8cf30e04bda970caf",
+      "sessionId": "host-invocation-78",
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4737",
+      "processIdentity.processInstanceId": "pri_7784effbcc5e1dd98bcd7c42",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "docker-agent-pi": {
+      "eventId": "evt_81b76e4c714e58bc0503ba04",
+      "agentType": "pi",
+      "agentInstanceId": "agi_c43f3b448567415df9dd0c35",
+      "agentCorrelationId": "agc_136e80c601aeafeb2d113900",
+      "sessionId": "pi-session-a",
+      "traceId": "tr_docker_pi_session_a",
+      "processIdentity.processInstanceId": "pri_0a197105e34e75149a5f8d8f",
+      "processIdentity.containerId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "docker-agent-codex": {
+      "eventId": "evt_7744051b86198f71b945d839",
+      "agentType": "codex",
+      "agentInstanceId": "agi_1c2797969ff8bee6dcaae108",
+      "agentCorrelationId": "agc_28bb685c43e3232cda086b91",
+      "sessionId": "codex-session-b",
+      "traceId": "tr_docker_codex_session_b",
+      "processIdentity.processInstanceId": "pri_987d1400bca3e644d1118f23",
+      "processIdentity.containerId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "docker-unknown-original": {
+      "eventId": "evt_b8497b69938c328cc06063c3",
+      "agentType": "unknown",
+      "agentInstanceId": "agi_f98397a12dcc7d15ae86d9f7",
+      "agentCorrelationId": "agc_6d0b9ee730d6ea1398f9030c",
+      "sessionId": "trace:tr_unknown_legacy_synthetic",
+      "traceId": "tr_unknown_legacy_synthetic",
+      "processIdentity.processInstanceId": "pri_2653fd21c73e529280378170",
+      "processIdentity.containerId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "docker-unknown-replay": {
+      "eventId": "evt_b8497b69938c328cc06063c3",
+      "agentType": "unknown",
+      "agentInstanceId": "agi_f98397a12dcc7d15ae86d9f7",
+      "agentCorrelationId": "agc_6d0b9ee730d6ea1398f9030c",
+      "sessionId": "trace:tr_unknown_legacy_synthetic",
+      "traceId": "tr_unknown_legacy_synthetic",
+      "processIdentity.processInstanceId": "pri_2653fd21c73e529280378170",
+      "processIdentity.containerId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    },
+    "k8s-agent-incoming": {
+      "eventId": "evt_067e8dba15bec46ff4200292",
+      "agentType": "pi",
+      "agentInstanceId": "agi_f8e010999418beb8deacae87",
+      "agentCorrelationId": "agc_8920a9f4573358f882e11815",
+      "sessionId": "k8s-invocation-42",
+      "traceId": "7af7651916cd43dd8448eb211c80319c",
+      "processIdentity.processInstanceId": "pri_7eb16157312749101c8a99ba",
+      "processIdentity.containerId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "processIdentity.identityConfidence": "strong",
+      "synthetic": false
+    }
+  },
+  "relations": [
+    {
+      "name": "pid reuse creates a new process instance",
+      "operator": "notEqual",
+      "left": "host-pid-original.processIdentity.processInstanceId",
+      "right": "host-pid-reused.processIdentity.processInstanceId"
+    },
+    {
+      "name": "pid reuse creates a new runtime instance",
+      "operator": "notEqual",
+      "left": "host-pid-original.agentInstanceId",
+      "right": "host-pid-reused.agentInstanceId"
+    },
+    {
+      "name": "pid reuse keeps the existing asset correlation",
+      "operator": "equal",
+      "left": "host-pid-original.agentCorrelationId",
+      "right": "host-pid-reused.agentCorrelationId"
+    },
+    {
+      "name": "two agents share one Docker container",
+      "operator": "equal",
+      "left": "docker-agent-pi.processIdentity.containerId",
+      "right": "docker-agent-codex.processIdentity.containerId"
+    },
+    {
+      "name": "two agents in one container retain distinct asset correlations",
+      "operator": "notEqual",
+      "left": "docker-agent-pi.agentCorrelationId",
+      "right": "docker-agent-codex.agentCorrelationId"
+    },
+    {
+      "name": "two agents in one container retain distinct runtimes",
+      "operator": "notEqual",
+      "left": "docker-agent-pi.agentInstanceId",
+      "right": "docker-agent-codex.agentInstanceId"
+    },
+    {
+      "name": "replay keeps canonical event identity",
+      "operator": "equal",
+      "left": "docker-unknown-original.eventId",
+      "right": "docker-unknown-replay.eventId"
+    },
+    {
+      "name": "replay keeps process identity",
+      "operator": "equal",
+      "left": "docker-unknown-original.processIdentity.processInstanceId",
+      "right": "docker-unknown-replay.processIdentity.processInstanceId"
+    },
+    {
+      "name": "replay may have a new receive time",
+      "operator": "notEqual",
+      "left": "docker-unknown-original.receivedAt",
+      "right": "docker-unknown-replay.receivedAt"
+    }
+  ]
+}

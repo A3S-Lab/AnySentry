@@ -13,14 +13,22 @@ required=(
   java/bin/java kafka/bin/kafka-server-start.sh
   flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar
   observer/bin/a3s-observer-collector observer/observer-forward.js
-  observer/observer-agent-attribution.js observer/observer-agent-templates.js
-  observer/observer-behavior-discovery.js observer/observer-docker-discovery.js
-  observer/observer-event-dedup.js observer/observer-infrastructure-roots.js
-  observer/observer-priority-queue.js observer/observer-workload-filter.js
+  observer/observer-agent-attribution.js observer/observer-agent-runtime-signatures.js
+  observer/observer-agent-templates.js observer/observer-attribution-merge.js
+  observer/observer-behavior-discovery.js observer/observer-capture-profile-control.js
+  observer/observer-capture-profile-reporter.js observer/observer-classification-semantics.js
+  observer/observer-docker-discovery.js observer/observer-durable-spool.js
+  observer/observer-event-dedup.js observer/observer-file-aggregation.js
+  observer/observer-filter-rule-publisher.js observer/observer-filter-rules.js
+  observer/observer-infrastructure-policy.js observer/observer-infrastructure-roots.js
+  observer/observer-infrastructure-rules.js observer/observer-launch-context.js
+  observer/observer-pipeline-accounting.js observer/observer-priority-queue.js
+  observer/observer-systemd-enrichment.js observer/observer-tls-agent-cgroups.js
+  observer/observer-unified-filter-policy.js observer/observer-workload-filter.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
-  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh DEPLOYMENT.md
-  AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
+  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh collect-support-bundle.sh DEPLOYMENT.md
+  AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md 现场问题采集.md
   VERSION PROVENANCE manifest.sha256
 )
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done

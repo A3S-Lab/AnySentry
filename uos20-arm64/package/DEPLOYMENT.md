@@ -18,9 +18,9 @@
 
 ```bash
 cd /opt/shannon/anysentry
-sha256sum --check anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.3.0-compat1-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.3.0-compat1-uos20-arm64
+sha256sum --check anysentry-security-suite-0.4.0-compat1-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.4.0-compat1-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.4.0-compat1-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -47,10 +47,10 @@ sha256sum --check manifest.sha256
 每次执行安装程序都会覆盖写入本 compat 版本的完整诊断目录：
 
 ```text
-/var/log/anysentry/install/0.3.0-compat1
+/var/log/anysentry/install/0.4.0-compat1
 ```
 
-`/tmp/anysentry-install-0.3.0-compat1` 指向同一目录。安装失败时，安装器先保存新版本服务状态、
+`/tmp/anysentry-install-0.4.0-compat1` 指向同一目录。安装失败时，安装器先保存新版本服务状态、
 健康响应和 journal，再执行 rollback，并将失败阶段和回滚结果写入 `summary.txt`。
 
 正式安装还会写入 `/etc/sysctl.d/90-anysentry.conf`，持久设置
@@ -100,8 +100,10 @@ ANYSENTRY_ASYNC_JUDGE=on
 
 ```ini
 ANYSENTRY_L3_ENABLED=true
-ANYSENTRY_L3_TIMEOUT=180
-ANYSENTRY_L3_TIMEOUT_MS=180000
+ANYSENTRY_L3_MODE=completion
+ANYSENTRY_L3_TIMEOUT=600
+ANYSENTRY_L3_TIMEOUT_MS=300000
+ANYSENTRY_L3_RETRY_TIMEOUT_MS=330000
 ANYSENTRY_L3_WORKSPACE=/var/lib/anysentry/l3
 A3S_SENTRY_L3_URL=https://<LLM服务地址>/v1
 A3S_SENTRY_L3_MODEL=<模型名>

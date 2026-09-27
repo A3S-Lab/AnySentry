@@ -3,3 +3,4 @@ npm-debug.log
 .git
 .pi
 workspace
+config/models.deepseek.json

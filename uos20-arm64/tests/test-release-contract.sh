@@ -17,8 +17,8 @@ for script in \
 done
 
 for file in \
-  package/install.sh package/verify.sh package/inspect-host.sh package/RUN_HEALTH_SMOKE.sh package/DEPLOYMENT.md \
-  package/AnySentry部署手册.md package/AnySentry使用手册.md package/AnySentry脚本说明.md \
+  package/install.sh package/verify.sh package/inspect-host.sh package/RUN_HEALTH_SMOKE.sh package/collect-support-bundle.sh package/DEPLOYMENT.md \
+  package/AnySentry部署手册.md package/AnySentry使用手册.md package/AnySentry脚本说明.md package/现场问题采集.md \
   package/provision-observer.mjs package/wait-clickhouse.sh package/uninstall.sh \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
@@ -64,6 +64,14 @@ grep -Fq 'AnySentry使用手册.md' "$CHANNEL/scripts/verify-release.sh" || fail
 grep -Fq 'AnySentry脚本说明.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the script guide"
 grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the health smoke script"
 grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the health smoke script"
+grep -Fq 'collect-support-bundle.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the support bundle script"
+grep -Fq '现场问题采集.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the field collection guide"
+grep -Fq 'ANYSENTRY_STREAMING=on' "$CHANNEL/package/config/anysentry.env.example" || fail "streaming is not enabled in the release environment"
+grep -Fq 'ANYSENTRY_ASYNC_JUDGE=on' "$CHANNEL/package/config/anysentry.env.example" || fail "async judgment is not enabled in the release environment"
+grep -Fq 'systemctl enable --now anysentry-fast-judge.service' "$CHANNEL/package/install.sh" || fail "installer does not enable fast-judge"
+grep -Fq 'systemctl enable --now anysentry-composite-judge.service' "$CHANNEL/package/install.sh" || fail "installer does not enable composite-judge"
+grep -Fq 'systemctl enable --now anysentry-stream-worker.service' "$CHANNEL/package/install.sh" || fail "installer does not enable stream-worker"
+grep -Fq 'systemctl enable --now anysentry-flink-job.service' "$CHANNEL/package/install.sh" || fail "installer does not enable the Flink job"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"
 grep -Fq "'Linux BPF'" "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not recognize the legacy BPF object"
 grep -Fq 'maxmemory 4gb' "$CHANNEL/package/config/redis.conf" || fail "Redis queue memory is not capped at 4 GiB"
@@ -76,6 +84,6 @@ grep -Fq 'NODE_OPTIONS=--max-old-space-size=4096' "$CHANNEL/package/systemd/anys
 grep -Fq 'NODE_OPTIONS=--max-old-space-size=1024' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer forwarder Node heap is not configured"
 grep -Fq 'FORWARD_HTTP_TIMEOUT_MS=20000' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer HTTP timeout hotfix is not persisted"
 grep -Fq 'FORWARD_HTTP_TIMEOUT_MS' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not read the HTTP timeout"
-grep -Fq '[observer-forward] POST' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not log HTTP failure details"
+grep -Fq '[observer-forward] heartbeat delivery failed' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not log HTTP failure details"
 
 echo "PASS release file and metadata contract"

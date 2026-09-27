@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: a3s-observer
+  namespace: anysentry
+spec:
+  template:
+    metadata:
+      annotations:
+        anysentry.io/manual-observer-profile: "agent-enforce-docker-files-v6-python-tcp-plaintext-20260907"
+        # Keep the locally delivered immutable overlay and source checkpoints auditable in the
+        # rendered PodTemplate; this is not a remote publication identifier.
+        anysentry.io/local-overlay-manifest: "sha256:26999af83759ee3e2fa02da8844e96b85a89a3c76eab7607903e8e0b02a6204d"
+        anysentry.io/local-source-revision: "Observer@goal/canonical-observability-20260903+9dd4fbd+cli-admit+ws-early-activate"
+    spec:
+      containers:
+        - name: a3s-observer
+          env:
+            # The manual test is deterministic: Kubernetes/Docker workload metadata and exact
+            # runtime signatures identify Agents. Background behavior promotion is intentionally
+            # disabled so unrelated host churn cannot become an unbounded ingest source.
+            - { name: ANYSENTRY_BEHAVIOR_DISCOVERY, value: "off" }
+            - { name: FORWARD_FILTER_MODE, value: "enforce" }
+            # Keep all three rollout planes explicit in the reproducible manual profile. The
+            # canonical base is deliberately shadow-safe, so omitting either override here would
+            # silently regress S3 production or Ring-before enforcement on a later re-apply.
+            - { name: ANYSENTRY_UNKNOWN_RETENTION_MODE, value: "enforce" }
+            - { name: ANYSENTRY_CAPTURE_PROFILE_MODE, value: "enforce" }
+            # Ring-before Agent/Candidate FULL with bounded unknown Exec/Exit/LLM discovery.
+            # Set to 0 to restore legacy protected=always-FULL lifecycle behavior.
+            - { name: A3S_OBSERVER_BOUNDED_UNKNOWN_LIFECYCLE, value: "1" }
+            # Unknown remains discoverable; only its high-volume FileAccess lane is budgeted.
+            - { name: FORWARD_RETAIN_UNKNOWN, value: "false" }
+            - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
+            # File probes are enabled independently. Their unknown/non-Agent path is dropped
+            # before path copy/Ring reservation, while Agent/candidate matches use the bounded
+            # per-scope/node sample budget in the Collector. FileRead must remain explicit.
+            - { name: A3S_OBSERVER_FILES, value: "1" }
+            - { name: A3S_OBSERVER_FILE_ACCESS, value: "1" }
+            - { name: A3S_OBSERVER_FILE_DELETE, value: "1" }
+            # FileRead is explicit and Agent/Candidate-only before path copy/Ring reserve.
+            # Unknown/infrastructure reads stay NOT_ENABLED/DROP; admitted Agents use the shared
+            # SAMPLE budget so Dify/Codex open(O_RDONLY) cannot reopen an unbounded flood.
+            - { name: A3S_OBSERVER_FILE_READ, value: "1" }
+            - { name: A3S_OBSERVER_FILE_UNKNOWN_POLICY, value: "drop" }
+            # Discovery budget for unknown Exec/LLM after bounded-lifecycle remap. Keep this far
+            # below the historical unprotected FULL flood while still allowing first-seen Agent
+            # promotion evidence. Shared across non-protected probes per sample window.
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_SCOPE, value: "3" }
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_PER_NODE, value: "30" }
+            - { name: ANYSENTRY_CAPTURE_FIRST_SAMPLES, value: "2" }
+            - { name: ANYSENTRY_CAPTURE_SAMPLE_WINDOW_MS, value: "1000" }
+            # Exec/Exit are correctness-critical and share one bounded lane. The host can emit
+            # short process bursts while CLI agents fan out helpers; size this lane for bursts so
+            # a slow downstream write cannot turn ordinary lifecycle evidence into an inbox drop.
+            - { name: A3S_OBSERVER_CRITICAL_INBOX_CAPACITY, value: "131072" }
+            - { name: A3S_OBSERVER_SEMANTIC_INBOX_CAPACITY, value: "65536" }
+            - { name: A3S_OBSERVER_SSL, value: "1" }
+            # Dify lab: capture HTTPS HTTP-Request tool nodes on the explicit tool path. Without
+            # this, /tool/execute plaintext never enters the interaction lane even when TLS
+            # uprobes fire on the Agent cgroup.
+            # /bash/execute + /mcp: customer-langgraph-sim-lab Design B tool-mocks.
+            # Observer wire template recognizes command+timeout_ms (bash) and mcp-jsonrpc.
+            - { name: A3S_OBSERVER_TOOL_HTTP_ROUTES, value: "/tool/execute,/execute,/bash/execute,/mcp" }
+            # Cross-agent RPC (LangGraph Design B orchestrator → worker POST /runs).
+            - { name: A3S_OBSERVER_AGENT_RPC_ROUTES, value: "/runs" }
+            # BigModel Anthropic-compatible gateway used by host Claude Code
+            # (ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic → POST /api/anthropic/v1/messages).
+            # Without these exact paths, SSL classic uprobes fire but emit_tls_plaintext route-gates
+            # silently and interaction_connections stays 0.
+            - { name: A3S_OBSERVER_LLM_HTTP_ROUTES, value: "/api/anthropic/v1/messages,/api/anthropic/v1/messages/count_tokens" }
+            # Test-only process name fragments so plugin_daemon OpenAI-compatible provider workers
+            # and Celery HTTP Request tool workers are selected for TLS attach. Do not broaden.
+            # uvicorn/python cover customer-langgraph-sim-lab Design B containers.
+            - { name: A3S_OBSERVER_TLS_PROCESS_PATTERNS, value: "openai_api_compatible,celery,uvicorn" }
+            # This single host also runs the retained Docker Pi workload. Reuse the same Observer
+            # and enrich its eBPF events from the Docker lifecycle/inspect stream.
+            - { name: ANYSENTRY_DOCKER_DISCOVERY, value: "on" }
+            - { name: ANYSENTRY_DOCKER_SOCKET, value: "/var/run/docker.sock" }
+            # The API now persists each immutable Observer batch as one ClickHouse block. Retain
+            # the canonical 32-event batch so protected Exec/Exit traffic can drain faster than the
+            # node emits it; byte, ownership, retry-age, and protected-reserve bounds remain hard.
+            - { name: FORWARD_BATCH_SIZE, value: "128" }
+            - { name: FORWARD_HTTP_TIMEOUT_MS, value: "30000" }
+            - { name: ANYSENTRY_BATCH_INGEST_URL, value: "http://anysentry:29653/security-center/ingest/batch" }
+            # Keep the historical WAL files intact, but do not replay a multi-GB backlog into the
+            # already busy single-node ClickHouse during this controlled observation window. A
+            # fresh bounded journal is created by the Forwarder; old journals remain recoverable
+            # artifacts and are never deleted or truncated by deployment.
+            - { name: FORWARD_MAX_INFLIGHT, value: "8" }
+            - { name: FORWARD_SPOOL_PATH, value: "/var/lib/anysentry-forwarder/spool-stable-20260907.wal" }
+            - { name: FORWARD_SPOOL_MAX_RECORDS, value: "250000" }
+            - { name: FORWARD_SPOOL_MAX_BYTES, value: "536870912" }
+            - { name: FORWARD_SPOOL_MAX_WAL_BYTES, value: "1073741824" }
+            - { name: FORWARD_SPOOL_REPLAY_BATCH_SIZE, value: "128" }
+            - { name: FORWARD_SPOOL_REPLAY_INTERVAL_MS, value: "1000" }
+          volumeMounts:
+            - { name: docker-sock, mountPath: /var/run/docker.sock, readOnly: true }
+            # Local-only hot path: mount patched Forwarder capture-profile scripts from the
+            # development tree so FileRead dedicated-docker scope fixes survive pod restarts
+            # without republishing the Observer image.
+            - { name: forwarder-scripts, mountPath: /opt/observer-capture-profile-control.js, subPath: observer-capture-profile-control.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-attribution.js, subPath: observer-agent-attribution.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-filter-rule-publisher.js, subPath: observer-filter-rule-publisher.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-filter-rules.js, subPath: observer-filter-rules.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-forward.js, subPath: observer-forward.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-tls-agent-cgroups.js, subPath: observer-tls-agent-cgroups.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-workload-filter.js, subPath: observer-workload-filter.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-docker-discovery.js, subPath: observer-docker-discovery.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-behavior-discovery.js, subPath: observer-behavior-discovery.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-pipeline-accounting.js, subPath: observer-pipeline-accounting.js, readOnly: true }
+            # Template/signature registries are identity-domain code: agent_template rules projected
+            # from the control plane are evaluated here, so they must track the development tree too.
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-templates.js, subPath: observer-agent-templates.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-runtime-signatures.js, subPath: observer-agent-runtime-signatures.js, readOnly: true }
+            # Local-only: rebuilt collector with plain-HTTP write/sendto probes (Python urllib/httpx).
+            - { name: local-collector, mountPath: /usr/local/bin/a3s-observer-collector, readOnly: true }
+      volumes:
+        - { name: docker-sock, hostPath: { path: /var/run/docker.sock, type: Socket } }
+        - {
+            name: forwarder-scripts,
+            hostPath: {
+              path: /home/chensicheng/a3s/security/AnySentry/scripts,
+              type: Directory
+            }
+          }
+        - {
+            name: local-collector,
+            hostPath: {
+              path: /home/chensicheng/a3s/security/AnySentry/scripts/.local-bin/a3s-observer-collector,
+              type: File
+            }
+          }

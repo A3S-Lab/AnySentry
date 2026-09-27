@@ -1,0 +1,130 @@
+# Local-path Prometheus so platform monitoring is not stuck on "Prometheus 未配置".
+# Production anysentry.yaml stays unchanged; this is the single-node manual overlay only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anysentry-prometheus
+  namespace: anysentry
+  labels: { app: prometheus, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+data:
+  anysentry.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        platform: anysentry
+        plane: k8s-local-path
+    scrape_configs:
+      - job_name: anysentry-api
+        metrics_path: /security-center/platform/metrics/prometheus
+        static_configs:
+          - targets: ["anysentry:29653"]
+            labels:
+              component: anysentry
+      - job_name: node
+        static_configs:
+          - targets: ["node-exporter:9100"]
+            labels:
+              component: host
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+            labels:
+              component: prometheus
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: anysentry
+  labels: { app: prometheus, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  selector: { app: prometheus }
+  ports:
+    - { name: http, port: 9090, targetPort: 9090 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: anysentry
+  labels: { app: prometheus, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+    spec:
+      containers:
+        - name: prometheus
+          image: quay.io/prometheus/prometheus:v3.12.0
+          args:
+            - --config.file=/etc/prometheus/anysentry.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=24h
+            - --web.enable-lifecycle
+          ports:
+            - { name: http, containerPort: 9090 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus, readOnly: true }
+            - { name: data, mountPath: /prometheus }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 512Mi }
+      volumes:
+        - name: config
+          configMap: { name: anysentry-prometheus }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: anysentry
+  labels: { app: node-exporter, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  selector: { app: node-exporter }
+  ports:
+    - { name: metrics, port: 9100, targetPort: 9100 }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: anysentry
+  labels: { app: node-exporter, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+spec:
+  selector:
+    matchLabels: { app: node-exporter }
+  template:
+    metadata:
+      labels: { app: node-exporter, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.12.1
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host/root
+            - --web.listen-address=:9100
+          ports:
+            - { name: metrics, containerPort: 9100, hostPort: 9100 }
+          volumeMounts:
+            - { name: proc, mountPath: /host/proc, readOnly: true }
+            - { name: sys, mountPath: /host/sys, readOnly: true }
+            - { name: root, mountPath: /host/root, readOnly: true }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      volumes:
+        - { name: proc, hostPath: { path: /proc } }
+        - { name: sys, hostPath: { path: /sys } }
+        - { name: root, hostPath: { path: / } }

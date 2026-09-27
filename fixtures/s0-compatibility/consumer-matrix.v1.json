@@ -1,0 +1,317 @@
+{
+  "schemaVersion": "anysentry.s0_consumer_matrix.v1",
+  "stage": "S0",
+  "purpose": "Freeze the identity and trace contracts that must remain compatible while additive correlation is introduced.",
+  "futureAdditiveFields": {
+    "status": "planned_not_implemented_in_s0",
+    "fields": [
+      "invocationId",
+      "toolCallId",
+      "attribution.correlation",
+      "captureProfile"
+    ],
+    "rule": "Readers must be upgraded before producers emit these fields. Their future presence must not change any legacy field or key."
+  },
+  "permanentLegacyFields": [
+    "eventId",
+    "sourceEventId",
+    "agentId",
+    "sessionId",
+    "traceId",
+    "spanId",
+    "parentSpanId",
+    "runId",
+    "attribution.agentInstanceId",
+    "agentCorrelationId",
+    "processIdentity.processInstanceId"
+  ],
+  "globalSwitchingGates": {
+    "producerEnable": [
+      "all readers accept optional additive fields",
+      "Flink parser compatibility test passes",
+      "legacy golden replay is byte-for-byte equal for selected identity fields",
+      "old trace query and deep-link tests pass"
+    ],
+    "readerOptIn": [
+      "dual-write shadow metrics are available",
+      "split, merge and collision rates meet the release threshold",
+      "the reader has an independent rollback switch"
+    ],
+    "streamKeyMigration": [
+      "parallel versioned pipeline exists",
+      "savepoint restore is tested",
+      "legacy keyed state remains recoverable"
+    ],
+    "rollback": [
+      "disable additive producer and reader switches",
+      "keep legacy columns, query parameters, IDs and state keys unchanged",
+      "never rewrite historical traceId"
+    ]
+  },
+  "consumers": [
+    {
+      "id": "observer",
+      "role": "kernel_event_producer",
+      "sourcePaths": [
+        "../Observer/a3s-observer-ebpf/src/main.rs",
+        "../Observer/a3s-observer-collector/src/main.rs",
+        "../Observer/a3s-observer-common/src/lib.rs"
+      ],
+      "reads": [
+        "kernel process and cgroup state",
+        "node-local probe configuration"
+      ],
+      "writes": [
+        "event.<kind>",
+        "process.pid",
+        "process.ppid",
+        "process.start_time_ticks",
+        "process.start_time_ns",
+        "process.cgroup_id",
+        "process.cgroup"
+      ],
+      "compatibilityPromise": "Do not silently reinterpret existing process identity fields or raw event names.",
+      "switchingGate": "Any future capture switch is off by default and must preserve critical lifecycle discovery when disabled."
+    },
+    {
+      "id": "forwarder",
+      "role": "raw_event_enricher_and_ingest_client",
+      "sourcePaths": [
+        "scripts/observer-forward.js",
+        "scripts/observer-agent-attribution.js"
+      ],
+      "reads": [
+        "event.<kind>",
+        "process.pid",
+        "process.ppid",
+        "process.start_time_ticks",
+        "process.cgroup_id",
+        "process.cgroup"
+      ],
+      "writes": [
+        "sourceEventId",
+        "process",
+        "attribution.agentScopeId",
+        "attribution.agentInstanceId",
+        "attribution.agentSessionId",
+        "attribution.rootPid",
+        "attribution.rootStartTime"
+      ],
+      "compatibilityPromise": "Existing source-event identity and attribution fields remain present and keep their current meaning.",
+      "switchingGate": "Additive correlation emission stays disabled until API and stream readers are compatible."
+    },
+    {
+      "id": "api",
+      "role": "ingest_judgment_query_and_canonicalization",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/security-monitoring.controller.ts",
+        "apps/api/src/security-monitoring/sentry-judge.service.ts",
+        "apps/api/src/security-monitoring/streaming-normalizer.ts",
+        "apps/api/src/security-monitoring/aggregation.service.ts"
+      ],
+      "reads": [
+        "eventId",
+        "sourceEventId",
+        "agentId",
+        "sessionId",
+        "traceId",
+        "spanId",
+        "parentSpanId",
+        "runId",
+        "attribution",
+        "process"
+      ],
+      "writes": [
+        "eventId",
+        "sourceEventId",
+        "agentId",
+        "sessionId",
+        "traceId",
+        "spanId",
+        "parentSpanId",
+        "runId",
+        "agentCorrelationId",
+        "processIdentity.processInstanceId"
+      ],
+      "compatibilityPromise": "Legacy query parameters and canonical identity values remain unchanged; additive identity never overwrites traceId.",
+      "switchingGate": "Reader/schema support lands before any producer; new invocation queries are independent of traceId queries."
+    },
+    {
+      "id": "clickhouse",
+      "role": "durable_event_and_finding_store",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/clickhouse-store.ts",
+        "apps/api/src/security-monitoring/streaming-finding.service.ts"
+      ],
+      "reads": [
+        "eventId",
+        "sourceEventId",
+        "agentId",
+        "sessionId",
+        "traceId",
+        "spanId",
+        "runId",
+        "agentIdentityKey",
+        "agentInstanceKey",
+        "agentCorrelationId"
+      ],
+      "writes": [
+        "event and finding columns keyed by existing revision semantics"
+      ],
+      "compatibilityPromise": "Legacy columns remain queryable and historical traceId is never rewritten.",
+      "switchingGate": "Add nullable/defaulted columns first; replay must not create a legacy revision conflict."
+    },
+    {
+      "id": "kafka",
+      "role": "canonical_event_transport",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/streaming-queue.service.ts",
+        "apps/api/src/security-monitoring/streaming.types.ts"
+      ],
+      "reads": [
+        "canonical event",
+        "tenantId",
+        "environmentId",
+        "agentCorrelationId"
+      ],
+      "writes": [
+        "anysentry.events.canonical.v1",
+        "message key tenantId:environmentId:agentCorrelationId"
+      ],
+      "compatibilityPromise": "The v1 topic and current partition key remain unchanged during additive shadowing.",
+      "switchingGate": "Do not re-key the v1 topic; a future key requires a parallel versioned topic."
+    },
+    {
+      "id": "flink",
+      "role": "canonical_stream_stateful_consumer",
+      "sourcePaths": [
+        "streaming/flink/src/main/java/org/a3s/anysentry/streaming/CanonicalEvent.java",
+        "streaming/flink/src/main/java/org/a3s/anysentry/streaming/CanonicalEventParser.java",
+        "streaming/flink/src/main/java/org/a3s/anysentry/streaming/AnySentryStreamJob.java",
+        "streaming/flink/src/main/java/org/a3s/anysentry/streaming/BehaviorSignal.java"
+      ],
+      "reads": [
+        "eventId",
+        "agentCorrelationId",
+        "sessionId",
+        "traceId",
+        "processIdentity.processInstanceId"
+      ],
+      "writes": [
+        "profile and episode keyed state",
+        "judgments and findings"
+      ],
+      "compatibilityPromise": "Existing agentCorrelationId/session state keys and savepoints remain valid.",
+      "switchingGate": "Upgrade the strict POJO reader first; any new episode key uses a parallel pipeline and tested savepoint migration."
+    },
+    {
+      "id": "web",
+      "role": "query_and_deep_link_consumer",
+      "sourcePaths": [
+        "apps/web/src/lib/api/security-center.ts",
+        "apps/web/src/pages/AgentEventsPage.tsx",
+        "apps/web/src/pages/IncidentsPage.tsx",
+        "apps/web/src/pages/EvidenceBundlePage.tsx"
+      ],
+      "reads": [
+        "eventId",
+        "agentId",
+        "agentInstanceId",
+        "sessionId",
+        "traceId",
+        "runId"
+      ],
+      "writes": [
+        "eventId, agentInstanceId, sessionId, traceId and runId URL query parameters"
+      ],
+      "compatibilityPromise": "Old bookmarks and traceId deep links continue to resolve to the same legacy chain.",
+      "switchingGate": "Invocation navigation is added as a separate opt-in query parameter and never changes traceId semantics."
+    },
+    {
+      "id": "alert",
+      "role": "event_alert_deduplication",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/alerting.service.ts"
+      ],
+      "reads": [
+        "eventId",
+        "workspacePath",
+        "agentId",
+        "traceId",
+        "riskCategory"
+      ],
+      "writes": [
+        "dedupeKey",
+        "alert.traceId",
+        "alert.eventId"
+      ],
+      "compatibilityPromise": "The existing event/workspace/agent/trace/risk dedupe identity remains stable.",
+      "switchingGate": "Any invocation-aware dedupe is shadow-only until duplicate and split rates are accepted."
+    },
+    {
+      "id": "incident",
+      "role": "incident_identity_and_lifecycle",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/sentry-judge.service.ts"
+      ],
+      "reads": [
+        "workspacePath",
+        "agentId",
+        "sessionId",
+        "traceId",
+        "runId",
+        "riskCategory"
+      ],
+      "writes": [
+        "incidentId",
+        "incident.traceId",
+        "incident.sessionId"
+      ],
+      "compatibilityPromise": "The current Incident hash inputs and resulting incidentId remain unchanged.",
+      "switchingGate": "A future invocation incident view must be a separate versioned identity, not an in-place hash change."
+    },
+    {
+      "id": "evidence",
+      "role": "cross_entity_evidence_bundle",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/security-monitoring.controller.ts",
+        "apps/web/src/pages/EvidenceBundlePage.tsx"
+      ],
+      "reads": [
+        "eventId",
+        "incidentId",
+        "alertId",
+        "agentId",
+        "sessionId",
+        "traceId",
+        "runId"
+      ],
+      "writes": [
+        "evidence scope and deep-link query parameters"
+      ],
+      "compatibilityPromise": "Legacy evidence selectors continue returning the same trace-scoped evidence.",
+      "switchingGate": "Add invocation selection independently and retain the legacy selector path for old bundles."
+    },
+    {
+      "id": "remediation",
+      "role": "alert_or_incident_to_action_linkage",
+      "sourcePaths": [
+        "apps/api/src/security-monitoring/remediation.service.ts",
+        "apps/web/src/pages/RemediationPage.tsx"
+      ],
+      "reads": [
+        "incidentId",
+        "alertId",
+        "eventId",
+        "agentId",
+        "sessionId",
+        "traceId"
+      ],
+      "writes": [
+        "remediation trace and entity references"
+      ],
+      "compatibilityPromise": "Existing remediation-to-event/incident/evidence links remain resolvable.",
+      "switchingGate": "New correlation references are additive; legacy references remain authoritative until explicit opt-in."
+    }
+  ]
+}

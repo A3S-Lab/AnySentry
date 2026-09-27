@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${ANYSENTRY_INSTALL_MODE:-${1:-docker}}"
@@ -7,7 +8,12 @@ NAMESPACE="${ANYSENTRY_NAMESPACE:-anysentry}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-anysentry}"
 CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-change-me}"
 OBSERVER_IMAGE="${ANYSENTRY_OBSERVER_IMAGE:-}"
+ANYSENTRY_IMAGE="${ANYSENTRY_IMAGE:-ghcr.io/a3s-lab/anysentry:latest}"
+FLINK_IMAGE="${ANYSENTRY_FLINK_IMAGE:-}"
 APPLY_INGRESS="${ANYSENTRY_APPLY_INGRESS:-0}"
+MANAGEMENT_TOKEN="${ANYSENTRY_MANAGEMENT_TOKEN:-}"
+SESSION_HASH_SECRET="${ANYSENTRY_SESSION_HASH_SECRET:-}"
+BOOTSTRAP_PORT="${ANYSENTRY_OBSERVER_BOOTSTRAP_PORT:-29654}"
 
 usage() {
   cat <<'USAGE'
@@ -15,14 +21,19 @@ Install AnySentry as an integrated middleware stack.
 
 Modes:
   docker       Build and run AnySentry + ClickHouse with docker compose.
-  kubernetes   Install AnySentry + ClickHouse + a3s-observer DaemonSet.
+  kubernetes   Install the complete AnySentry Kubernetes stack and observer DaemonSet.
 
 Environment:
   ANYSENTRY_INSTALL_MODE=docker|kubernetes
   ANYSENTRY_NAMESPACE=anysentry
   CLICKHOUSE_USER=anysentry
   CLICKHOUSE_PASSWORD=change-me
+  ANYSENTRY_IMAGE=ghcr.io/a3s-lab/anysentry:latest
+  ANYSENTRY_FLINK_IMAGE=<registry>/anysentry-flink-streaming:<version>  (required for Kubernetes)
   ANYSENTRY_OBSERVER_IMAGE=<registry>/anysentry-observer:latest
+  ANYSENTRY_MANAGEMENT_TOKEN=<random high-entropy token>  (generated when omitted in Kubernetes)
+  ANYSENTRY_SESSION_HASH_SECRET=<separate random secret>  (generated/preserved in Kubernetes)
+  ANYSENTRY_OBSERVER_BOOTSTRAP_PORT=29654
   ANYSENTRY_APPLY_INGRESS=1
 
 Examples:
@@ -49,7 +60,7 @@ AnySentry is starting at:
 
 This image already bundles @a3s-lab/sentry. To attach a local a3s-observer collector:
   A3S_OBSERVER_JSON=1 sudo -E a3s-observer-collector \
-    | FORWARD_FILTER_MODE=enforce FORWARD_RETAIN_UNKNOWN=true FORWARD_RETAIN_NON_AGENT=false FORWARD_NOISE_POLICY=balanced ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
+    | FORWARD_FILTER_MODE=shadow FORWARD_RETAIN_UNKNOWN=true FORWARD_RETAIN_NON_AGENT=false FORWARD_NOISE_POLICY=balanced ANYSENTRY_INGEST_URL=http://localhost:29653/security-center/ingest node scripts/observer-forward.js
 
 For a fully integrated node/fleet install with a3s-observer, use:
   ANYSENTRY_INSTALL_MODE=kubernetes deploy/install.sh
@@ -58,36 +69,156 @@ DONE
 
 install_kubernetes() {
   need kubectl
-  echo "Installing AnySentry + ClickHouse + a3s-observer in namespace ${NAMESPACE}..."
+  need node
+  need openssl
+  if [[ -z "$FLINK_IMAGE" ]]; then
+    echo "ANYSENTRY_FLINK_IMAGE is required: build streaming/flink/Dockerfile and publish the image first" >&2
+    exit 1
+  fi
+  echo "Installing the complete AnySentry stack in namespace ${NAMESPACE}..."
 
   kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  if [[ -z "$MANAGEMENT_TOKEN" ]]; then
+    MANAGEMENT_TOKEN="$(openssl rand -hex 32)"
+  fi
+  if [[ -z "$SESSION_HASH_SECRET" ]]; then
+    existing_session_secret_b64="$(kubectl -n "$NAMESPACE" get secret anysentry-control-auth \
+      -o jsonpath='{.data.session-hash-secret}' 2>/dev/null || true)"
+    if [[ -n "$existing_session_secret_b64" ]]; then
+      SESSION_HASH_SECRET="$(printf '%s' "$existing_session_secret_b64" | base64 --decode)"
+    else
+      SESSION_HASH_SECRET="$(openssl rand -hex 32)"
+    fi
+  fi
+  # Keep secret values out of kubectl argv and shell/process listings.  `--from-literal` is
+  # convenient but exposes the value to any local observer of the short-lived kubectl command;
+  # use a 0700/0600 material directory and --from-file instead, then remove it on every exit path.
+  secret_material_dir="$(mktemp -d)"
+  chmod 700 "$secret_material_dir"
+  secret_material_cleanup() {
+    if [[ -n "${secret_material_dir:-}" && -d "$secret_material_dir" ]]; then
+      rm -rf -- "$secret_material_dir"
+    fi
+  }
+  trap secret_material_cleanup EXIT
+  umask 077
+  printf '%s' "$CLICKHOUSE_USER" >"$secret_material_dir/clickhouse-user"
+  printf '%s' "$CLICKHOUSE_PASSWORD" >"$secret_material_dir/clickhouse-password"
+  printf '%s' "$MANAGEMENT_TOKEN" >"$secret_material_dir/management-token"
+  printf '%s' "$SESSION_HASH_SECRET" >"$secret_material_dir/session-hash-secret"
   kubectl -n "$NAMESPACE" create secret generic anysentry-clickhouse \
-    --from-literal=CLICKHOUSE_USER="$CLICKHOUSE_USER" \
-    --from-literal=CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD" \
+    --from-file=CLICKHOUSE_USER="$secret_material_dir/clickhouse-user" \
+    --from-file=CLICKHOUSE_PASSWORD="$secret_material_dir/clickhouse-password" \
     --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$NAMESPACE" create secret generic anysentry-control-auth \
+    --from-file=management-token="$secret_material_dir/management-token" \
+    --from-file=session-hash-secret="$secret_material_dir/session-hash-secret" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  # The two Secret objects now own the values; remove the local material before any long-running
+  # rollout/port-forward work.  The EXIT trap above still covers failures during creation.
+  secret_material_cleanup
+  secret_material_dir=""
+  trap - EXIT
 
-  kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/anysentry.yaml"
+  render_core_manifest() {
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry:latest#${ANYSENTRY_IMAGE}#g" \
+      "$1"
+  }
+
+  render_streaming_manifest() {
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry-flink-streaming:latest#${FLINK_IMAGE}#g" \
+      -e "s#ghcr.io/a3s-lab/anysentry:latest#${ANYSENTRY_IMAGE}#g" \
+      "$1"
+  }
+
+  render_core_manifest "$ROOT_DIR/deploy/anysentry.yaml" | kubectl -n "$NAMESPACE" apply -f -
+  # Migrate the legacy minute-loop Deployment and rerun the idempotent one-shot Job on every
+  # install/upgrade. Kafka topic creation is durable and safe to repeat with --if-not-exists.
+  kubectl -n "$NAMESPACE" delete deployment kafka-topic-manager --ignore-not-found --wait=true
+  kubectl -n "$NAMESPACE" delete job kafka-topic-manager --ignore-not-found --wait=true
+  render_streaming_manifest "$ROOT_DIR/deploy/streaming.yaml" | kubectl -n "$NAMESPACE" apply -f -
+  # Environment-backed Secret values are read only at process start. This also makes an explicit
+  # token rotation deterministic on reinstall before the bootstrap client authenticates.
+  kubectl -n "$NAMESPACE" rollout restart deployment/anysentry
+
+  # Source credentials must exist before the DaemonSet starts. Bootstrap one exact managed Source
+  # per node through the authenticated API, then publish only the resulting mapping as a Kubernetes
+  # Secret. No token is rendered into a repository manifest or printed to stdout.
+  kubectl -n "$NAMESPACE" rollout status deploy/clickhouse --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/anysentry --timeout=300s
+  observer_auth_dir="$(mktemp -d)"
+  observer_port_forward_pid=""
+  cleanup_observer_bootstrap() {
+    if [[ -n "$observer_port_forward_pid" ]]; then
+      kill "$observer_port_forward_pid" >/dev/null 2>&1 || true
+      wait "$observer_port_forward_pid" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$observer_auth_dir" && -d "$observer_auth_dir" ]]; then
+      rm -rf -- "$observer_auth_dir"
+    fi
+  }
+  trap cleanup_observer_bootstrap EXIT
+  kubectl -n "$NAMESPACE" port-forward service/anysentry "${BOOTSTRAP_PORT}:29653" \
+    >"$observer_auth_dir/port-forward.log" 2>&1 &
+  observer_port_forward_pid="$!"
+  observer_collectors="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+  ANYSENTRY_API_BASE="http://127.0.0.1:${BOOTSTRAP_PORT}/security-center" \
+  ANYSENTRY_MANAGEMENT_TOKEN="$MANAGEMENT_TOKEN" \
+  ANYSENTRY_OBSERVER_COLLECTOR_IDS="$observer_collectors" \
+  ANYSENTRY_OBSERVER_AUTH_OUTPUT="$observer_auth_dir/observer-sources.json" \
+  ANYSENTRY_OBSERVER_AUTH_FORMAT=json \
+    node "$ROOT_DIR/scripts/bootstrap-observer-sources.mjs"
+  kubectl -n "$NAMESPACE" create secret generic anysentry-observer-auth \
+    --from-file=observer-sources.json="$observer_auth_dir/observer-sources.json" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  cleanup_observer_bootstrap
+  observer_auth_dir=""
+  observer_port_forward_pid=""
+  trap - EXIT
 
   if [[ -n "$OBSERVER_IMAGE" ]]; then
-    sed "s#ghcr.io/a3s-lab/anysentry-observer:latest#${OBSERVER_IMAGE}#g" "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
+    sed \
+      -e "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      -e "s#ghcr.io/a3s-lab/anysentry-observer:latest#${OBSERVER_IMAGE}#g" \
+      "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
   else
-    kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/observer.yaml"
+    sed "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      "$ROOT_DIR/deploy/observer.yaml" | kubectl -n "$NAMESPACE" apply -f -
   fi
+  # Projected Secrets update in place, while the Forwarder intentionally reads its credential once
+  # at process start. Restart after every create/rotate so no pod keeps the now-revoked token.
+  kubectl -n "$NAMESPACE" rollout restart daemonset/a3s-observer
 
   if [[ "$APPLY_INGRESS" == "1" ]]; then
-    kubectl -n "$NAMESPACE" apply -f "$ROOT_DIR/deploy/ingress.yaml"
+    sed "s/namespace: anysentry/namespace: ${NAMESPACE}/g" \
+      "$ROOT_DIR/deploy/ingress.yaml" | kubectl -n "$NAMESPACE" apply -f -
   fi
 
-  kubectl -n "$NAMESPACE" rollout status deploy/clickhouse
-  kubectl -n "$NAMESPACE" rollout status deploy/anysentry
-  kubectl -n "$NAMESPACE" rollout status daemonset/a3s-observer
+  kubectl -n "$NAMESPACE" rollout status statefulset/kafka --timeout=600s
+  kubectl -n "$NAMESPACE" wait --for=condition=complete job/kafka-topic-manager --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-jobmanager --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-taskmanager --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/flink-job-submit --timeout=600s
+  kubectl -n "$NAMESPACE" rollout status deploy/fast-judge --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/l3-worker --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/stream-worker --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/composite-judge --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status deploy/supply-chain-assessment --timeout=300s
+  kubectl -n "$NAMESPACE" rollout status daemonset/a3s-observer --timeout=300s
 
   cat <<DONE
 
 AnySentry is installed with:
   - AnySentry API/dashboard
-  - @a3s-lab/sentry judge bundled in the AnySentry image
-  - ClickHouse storage
+  - ClickHouse and Redis durable state
+  - Fast Judge and L3 asynchronous workers
+  - Kafka, Flink, Stream Worker, and Composite Judge
+  - OSV supply-chain assessment worker
   - a3s-observer observe-only DaemonSet + AnySentry forwarder
 
 Open a local tunnel:

@@ -1,0 +1,10 @@
+# Immutable API/Web overlay for a dependency-identical AnySentry runtime.
+#
+# Use only when package manifests and the lockfile are unchanged. The digest-pinned base owns
+# Node, production node_modules, the component manifest, L3 assets and the entrypoint; this layer
+# replaces only locally verified API and Web build artifacts.
+ARG ANYSENTRY_RUNTIME_BASE=invalid.invalid/anysentry:must-be-overridden
+FROM ${ANYSENTRY_RUNTIME_BASE}
+
+COPY api-dist/ /app/dist/
+COPY web-dist/ /app/web/

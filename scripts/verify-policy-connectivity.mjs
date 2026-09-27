@@ -43,25 +43,17 @@ const deep = sanitizeRuntimeModelConnection({
   url: 'https://deep.example/v1', model: 'model-deep', apiKey: 'verify-deep-secret', timeoutS: 30, contextTokens: 32_768,
 }, 'deep_investigation');
 let deepOptions;
-let deepSkills;
 let deepClosed = 0;
 const deepResult = await testDeepInvestigationConnection(deep, '/skills', (options) => {
   deepOptions = options;
   return {
-    initialize: async () => undefined,
-    run: async (skills, _prompt, validate) => {
-      deepSkills = skills;
-      const text = '{"verdict":"allow","severity":"low","reason":"connectivity ok"}';
-      validate?.(text);
-      return { text, poolWaitMs: 0, agentRunMs: 1 };
-    },
+    judge: async () => ({ verdict: 'allow', severity: 'info', reason: 'ok', tier: 'Llm' }),
     close: async () => { deepClosed += 1; },
   };
 });
 assert.equal(deepResult.ok, true);
 assert.equal(deepResult.profile, 'deep_investigation');
-assert.equal(deepOptions.modelConfig.key, 'verify-deep-secret');
-assert.equal(deepSkills, '/skills');
+assert.equal(deepOptions.key, 'verify-deep-secret');
 assert.equal(deepClosed, 1);
 assert.equal(JSON.stringify(deepResult).includes('verify-deep-secret'), false);
 
@@ -73,6 +65,16 @@ const page = fs.readFileSync(path.join(root, 'apps/web/src/pages/PolicyConfigPag
 assert.match(controller, /model-connections\/test/u);
 assert.match(controller, /rememberSuccessfulTest/u);
 assert.match(controller, /consumeSuccessfulTest/u);
+assert.match(
+  controller,
+  /fast\?\.source === 'runtime'[\s\S]*?runtimeModels\.clear\('fast_review'\)/u,
+  'a policy update must not clear deployment-managed fast-review credentials',
+);
+assert.match(
+  controller,
+  /deep\?\.source === 'runtime'[\s\S]*?runtimeModels\.clear\('deep_investigation'\)/u,
+  'a policy update must not clear deployment-managed deep-investigation credentials',
+);
 assert.match(runtime, /publisher\.publish\(RUNTIME_MODEL_UPDATE_CHANNEL/u);
 assert.doesNotMatch(runtime, /\.set\([^\n]*apiKey/u, 'credentials must not be written into Redis keys');
 assert.match(worker, /RuntimeModelClient/u);

@@ -1,0 +1,975 @@
+import { createHash } from 'node:crypto';
+
+import type * as T from './types';
+import { interactionHumanMessages } from './agent-conversation-resolution-v2';
+import {
+  closeToolCallsAcrossInteractions,
+  linkHttpToolCaptureEvidence,
+  projectInteractionsWithReconstructedHistoryToolCalls,
+} from './agent-tool-closure';
+
+export const SEMANTIC_PROJECTION_PARSER_ID = 'anysentry.agent-semantic-timeline';
+export const SEMANTIC_PROJECTION_PARSER_VERSION = 2;
+const UNRESOLVED_TOOL_GAP_GRACE_MS = 90_000;
+/** Projection markers that describe recovery, not an open capture gap. */
+const INFORMATIONAL_PARTIAL_REASONS = new Set([
+  'tool_call_reconstructed_from_request_history',
+  'semantic_items_reconciled',
+]);
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function messageText(value: unknown, depth = 0): string | undefined {
+  if (depth > 6) return undefined;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    const output = value
+      .map((item) => messageText(item, depth + 1))
+      .filter((item): item is string => Boolean(item))
+      .join('');
+    return output || undefined;
+  }
+  const item = record(value);
+  if (!item) return undefined;
+  const kind = text(item.type);
+  if (kind && ![
+    'message', 'text', 'output_text', 'input_text', 'content_block',
+  ].includes(kind)) return undefined;
+  return messageText(
+    item.text ?? item.output_text ?? item.content ?? item.output,
+    depth + 1,
+  );
+}
+
+/**
+ * Reproject model text from typed provider events when available. Older Observer revisions copied
+ * every top-level SSE `delta`, including custom-tool input, into `response.text`; replaying the
+ * structured event list here corrects historical rows without mutating their raw evidence.
+ */
+export function normalizedModelResponseText(
+  interaction: T.AgentInteractionRecord,
+): string | undefined {
+  const structured = interaction.response.structured;
+  if (!Array.isArray(structured)) {
+    return text(interaction.response.text);
+  }
+
+  let recognizedStream = false;
+  let responseDeltas = '';
+  let anthropicDeltas = '';
+  let chatDeltas = '';
+  let terminalText: string | undefined;
+
+  for (const rawEvent of structured) {
+    const event = record(rawEvent);
+    if (!event) continue;
+    const eventType = text(event.type);
+    if (eventType?.startsWith('response.')
+      || eventType?.startsWith('content_block_')
+      || eventType?.startsWith('message_')) recognizedStream = true;
+
+    if (eventType === 'response.output_text.delta') {
+      responseDeltas += text(event.delta) ?? '';
+    } else if (eventType === 'response.output_text.done') {
+      terminalText = text(event.text) ?? text(event.delta) ?? terminalText;
+    } else if (eventType === 'response.output_item.done') {
+      const item = record(event.item);
+      if (item?.type === 'message') terminalText = messageText(item) ?? terminalText;
+    } else if (eventType === 'response.completed' || eventType === 'response.done') {
+      terminalText = messageText(record(event.response)?.output) ?? terminalText;
+    } else if (eventType === 'content_block_start') {
+      const block = record(event.content_block);
+      if (block?.type === 'text') anthropicDeltas += text(block.text) ?? '';
+    } else if (eventType === 'content_block_delta') {
+      const delta = record(event.delta);
+      if (delta?.type === 'text_delta' || (delta?.type === undefined && delta?.partial_json === undefined)) {
+        anthropicDeltas += text(delta?.text) ?? '';
+      }
+    }
+
+    if (Array.isArray(event.choices)) {
+      recognizedStream = true;
+      for (const rawChoice of event.choices) {
+        const choice = record(rawChoice);
+        const delta = record(choice?.delta);
+        const message = record(choice?.message);
+        chatDeltas += text(delta?.content) ?? '';
+        terminalText = text(message?.content) ?? terminalText;
+      }
+    }
+  }
+
+  const projected = responseDeltas || anthropicDeltas || chatDeltas || terminalText;
+  if (recognizedStream) return text(projected);
+  return text(interaction.response.text);
+}
+
+function semanticItemId(interactionId: string, kind: string, sequence: number): string {
+  return `si_${createHash('sha256')
+    .update(`${interactionId}\u0000${kind}\u0000${sequence}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function runtimeContextPart(value: unknown): boolean {
+  const item = record(value);
+  const valueText = typeof value === 'string'
+    ? value.trim()
+    : typeof item?.text === 'string' ? item.text.trim() : undefined;
+  return Boolean(valueText && ['environment_context', 'system-reminder'].some((tag) =>
+    valueText.startsWith(`<${tag}>`) && valueText.endsWith(`</${tag}>`)));
+}
+
+/** Claude Code injects this as role=user when the human returns; it is not human input. */
+function claudeResumeRecapContent(value: unknown): boolean {
+  const text = typeof value === 'string'
+    ? value.trim()
+    : Array.isArray(value)
+      ? value
+        .map((part) => {
+          const item = record(part);
+          return typeof item?.text === 'string' ? item.text : '';
+        })
+        .join('\n')
+        .trim()
+      : typeof record(value)?.text === 'string'
+        ? String(record(value)?.text).trim()
+        : '';
+  return /^The user stepped away and is coming back\./u.test(text);
+}
+
+export function humanVisibleUserContent(content: unknown): unknown {
+  if (claudeResumeRecapContent(content)) return undefined;
+  if (!Array.isArray(content)) return runtimeContextPart(content) ? undefined : content;
+  const visible = content.filter((part) =>
+    record(part)?.type !== 'tool_result'
+    && !runtimeContextPart(part)
+    && !claudeResumeRecapContent(part));
+  return visible.length && !claudeResumeRecapContent(visible) ? visible : undefined;
+}
+
+/** Additive compatibility parser for persisted interactions created before Observer semantic v1. */
+export function semanticItemsForInteraction(
+  interaction: T.AgentInteractionRecord,
+): T.AgentInteractionSemanticItem[] {
+  if (interaction.semanticItems?.length) {
+    const retained = interaction.semanticItems.flatMap((item) => {
+      if (item.kind !== 'user_message') return [item];
+      if ((interaction.semanticParserVersion ?? 1) < 2) return [];
+      const content = humanVisibleUserContent(item.content);
+      return content === undefined ? [] : [{ ...item, content }];
+    });
+    if ((interaction.semanticParserVersion ?? 1) >= 2) {
+      const callIds = new Set(retained
+        .filter((item) => item.kind === 'tool_call' && item.toolCallId)
+        .map((item) => item.toolCallId));
+      const resultIds = new Set(retained
+        .filter((item) => item.kind === 'tool_result' && item.toolCallId)
+        .map((item) => item.toolCallId));
+      const reconciled: T.AgentInteractionSemanticItem[] = [...retained];
+      const completeness = interaction.completeness === 'complete' ? 'complete' as const : 'partial' as const;
+      const rawSemanticContentAllowed = ![
+        'reference_only', 'redacted', 'unsupported', 'unavailable', 'missing',
+      ].includes(interaction.completeness)
+        && !['reference_only', 'redacted', 'unsupported', 'unavailable', 'missing']
+          .includes(interaction.request.completeness)
+        && !['reference_only', 'redacted', 'unsupported', 'unavailable', 'missing']
+          .includes(interaction.response.completeness);
+      const reconciledContent = (value: unknown): unknown => {
+        if (rawSemanticContentAllowed) return value;
+        return {
+          schemaVersion: 'anysentry.semantic_reference.v1',
+          payloadRef: `sha256:${semanticHash(value)}`,
+          contentState: 'reference_only',
+        };
+      };
+      for (const [index, call] of interaction.toolCalls.entries()) {
+        if (callIds.has(call.toolCallId)) continue;
+        reconciled.push({
+          semanticItemId: semanticItemId(interaction.interactionId, 'tool_call_reconciled', index),
+          actor: 'tool', kind: 'tool_call', phase: 'final', origin: 'response',
+          atUnixNs: call.issuedAtUnixNs ?? interaction.startedAtUnixNs,
+          content: reconciledContent(call.arguments), toolCallId: call.toolCallId, toolName: call.name,
+          turnId: interaction.turnId, completeness,
+          partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
+        });
+      }
+      for (const [index, result] of interaction.toolResults.entries()) {
+        if (resultIds.has(result.toolCallId)) continue;
+        reconciled.push({
+          semanticItemId: semanticItemId(interaction.interactionId, 'tool_result_reconciled', index),
+          actor: 'tool', kind: 'tool_result', phase: 'final', origin: 'request',
+          atUnixNs: result.observedAtUnixNs ?? interaction.startedAtUnixNs,
+          content: reconciledContent(result.content), toolCallId: result.toolCallId, toolName: result.name,
+          turnId: interaction.turnId, completeness,
+          partialReasons: [...new Set([...interaction.partialReasons, 'semantic_items_reconciled'])],
+        });
+      }
+      return reconciled.sort((left, right) => {
+        try { return BigInt(left.atUnixNs) === BigInt(right.atUnixNs) ? (left.sequenceNumber ?? 0) - (right.sequenceNumber ?? 0) : BigInt(left.atUnixNs) < BigInt(right.atUnixNs) ? -1 : 1; }
+        catch { return 0; }
+      });
+    }
+    const users = interactionHumanMessages(interaction).map((message, index) => ({
+      semanticItemId: semanticItemId(interaction.interactionId, 'user_message', index),
+      actor: 'user' as const,
+      kind: 'user_message' as const,
+      phase: 'final' as const,
+      origin: 'request' as const,
+      atUnixNs: interaction.startedAtUnixNs,
+      content: message.content,
+      ...(message.sourceItemId ? { sourceItemId: message.sourceItemId } : {}),
+      ...(message.turnId ? { turnId: message.turnId } : {}),
+      messageOrigin: 'human_input' as const,
+      sequenceNumber: index,
+      completeness: interaction.completeness === 'complete' ? 'complete' as const : 'partial' as const,
+      partialReasons: [...interaction.partialReasons],
+    }));
+    return [...users, ...retained];
+  }
+  const items: T.AgentInteractionSemanticItem[] = [];
+  const push = (
+    actor: T.AgentInteractionSemanticActor,
+    kind: T.AgentInteractionSemanticKind,
+    origin: T.AgentInteractionSemanticItem['origin'],
+    atUnixNs: string,
+    content?: unknown,
+    tool?: { toolCallId: string; toolName?: string },
+    identity?: {
+      sourceItemId?: string;
+      turnId?: string;
+      contentItemKinds?: string[];
+      messageOrigin?: T.AgentInteractionMessage['messageOrigin'];
+    },
+  ) => {
+    const sequenceNumber = items.length;
+    items.push({
+      semanticItemId: semanticItemId(interaction.interactionId, kind, sequenceNumber),
+      actor,
+      kind,
+      phase: kind === 'model_progress' ? 'progress' : 'final',
+      origin,
+      atUnixNs,
+      ...(content !== undefined ? { content } : {}),
+      ...(tool?.toolCallId ? { toolCallId: tool.toolCallId } : {}),
+      ...(tool?.toolName ? { toolName: tool.toolName } : {}),
+      ...(identity?.sourceItemId ? { sourceItemId: identity.sourceItemId } : {}),
+      ...(identity?.turnId ? { turnId: identity.turnId } : {}),
+      ...(identity?.contentItemKinds?.length
+        ? { contentItemKinds: [...identity.contentItemKinds] }
+        : {}),
+      ...(identity?.messageOrigin ? { messageOrigin: identity.messageOrigin } : {}),
+      sequenceNumber,
+      completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
+      partialReasons: [...interaction.partialReasons],
+    });
+  };
+
+  for (const message of interactionHumanMessages(interaction)) {
+    const content = humanVisibleUserContent(message.content);
+    if (content !== undefined) {
+      push(
+        'user',
+        'user_message',
+        'request',
+        interaction.startedAtUnixNs,
+        content,
+        undefined,
+        {
+          sourceItemId: message.sourceItemId,
+          turnId: message.turnId,
+          messageOrigin: 'human_input',
+        },
+      );
+    }
+  }
+  for (const result of interaction.toolResults) {
+    push(
+      'tool',
+      'tool_result',
+      'request',
+      interaction.startedAtUnixNs,
+      result.content,
+      { toolCallId: result.toolCallId, ...(result.name ? { toolName: result.name } : {}) },
+    );
+  }
+  const modelText = normalizedModelResponseText(interaction);
+  if (modelText) {
+    push(
+      'model',
+      interaction.toolCalls.length ? 'model_progress' : 'model_final',
+      'response',
+      interaction.firstResponseAtUnixNs,
+      modelText,
+    );
+  }
+  for (const call of interaction.toolCalls) {
+    push(
+      'tool',
+      'tool_call',
+      'response',
+      call.issuedAtUnixNs ?? interaction.endedAtUnixNs,
+      call.arguments,
+      { toolCallId: call.toolCallId, toolName: call.name },
+    );
+  }
+  return items;
+}
+
+function preview(value: unknown, limit = 320, depth = 0): string | undefined {
+  if (depth > 5) return undefined;
+  let output: string | undefined;
+  if (typeof value === 'string') output = value.replace(/\s+/gu, ' ').trim();
+  else if (Array.isArray(value)) {
+    output = value
+      .map((item) => preview(item, limit, depth + 1))
+      .filter((item): item is string => Boolean(item))
+      .join(' ');
+  } else if (value && typeof value === 'object') {
+    const item = value as Record<string, unknown>;
+    // File tools put the path beside a body (`content` / `new_string`). Prefer the path so body
+    // markers like「待验证」are not mistaken for tool-execution status in the timeline card.
+    const filePath = [
+      item.file_path, item.filePath, item.notebook_path, item.notebookPath,
+      item.path, item.target_file, item.targetFile,
+    ].find((candidate): candidate is string => typeof candidate === 'string' && Boolean(candidate.trim()));
+    if (filePath) {
+      const body = [item.content, item.new_string, item.new_source, item.old_string]
+        .find((candidate): candidate is string => typeof candidate === 'string' && Boolean(candidate.trim()));
+      const bodyPreview = body
+        ? body.replace(/\s+/gu, ' ').trim().slice(0, Math.min(96, Math.max(24, limit - filePath.length - 3)))
+        : undefined;
+      output = bodyPreview ? `${filePath.trim()} · ${bodyPreview}` : filePath.trim();
+    } else {
+      const direct = item.text
+        ?? item.input_text
+        ?? item.output_text
+        ?? item.content
+        ?? item.result
+        ?? item.output;
+      if (direct !== undefined && direct !== value) output = preview(direct, limit, depth + 1);
+      else {
+        try {
+          output = JSON.stringify(value);
+        } catch {
+          output = undefined;
+        }
+      }
+    }
+  } else if (value !== undefined) {
+    try {
+      output = JSON.stringify(value);
+    } catch {
+      output = undefined;
+    }
+  }
+  if (!output) return undefined;
+  return output.length > limit ? `${output.slice(0, limit)}…` : output;
+}
+
+function semanticHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value) ?? 'undefined').digest('hex');
+}
+
+export function projectContextReplaySummaries(
+  interactions: T.AgentInteractionRecord[],
+  segments: T.ConversationInstanceSegment[],
+): T.AgentContextReplaySummary[] {
+  const seenUsers = new Set<string>();
+  const seenCalls = new Set<string>();
+  const seenResults = new Set<string>();
+  const summaries: T.AgentContextReplaySummary[] = [];
+  for (const interaction of [...interactions].sort((left, right) =>
+    left.at - right.at || left.interactionId.localeCompare(right.interactionId))) {
+    let replayedUserMessages = 0;
+    let replayedToolCalls = 0;
+    let replayedToolResults = 0;
+    let newUserMessages = 0;
+    const users = semanticItemsForInteraction(interaction)
+      .filter((item) => item.kind === 'user_message');
+    // A bounded query can begin at a resumed/cumulative request whose original earlier Turns are
+    // outside the window. Multiple human messages in that first visible request are strong
+    // product-neutral evidence that every item except the latest is restored context.
+    const boundaryReplayUserCount = seenUsers.size === 0 && users.length > 1
+      ? users.length - 1
+      : 0;
+    for (const [index, user] of users.entries()) {
+      const key = user.sourceItemId
+        ? `item:${user.sourceItemId}`
+        : user.turnId
+          ? `turn:${user.turnId}:${semanticHash(user.content)}`
+          : `legacy:${semanticHash(user.content)}`;
+      if (index < boundaryReplayUserCount || seenUsers.has(key)) replayedUserMessages += 1;
+      else {
+        seenUsers.add(key);
+        newUserMessages += 1;
+      }
+      if (index < boundaryReplayUserCount) seenUsers.add(key);
+    }
+    for (const call of interaction.toolCalls) {
+      if (seenCalls.has(call.toolCallId)) replayedToolCalls += 1;
+      else seenCalls.add(call.toolCallId);
+    }
+    for (const result of interaction.toolResults) {
+      const key = `${result.toolCallId}\u0000${semanticHash({
+        content: result.content,
+        isError: result.isError,
+      })}`;
+      if (boundaryReplayUserCount > 0 || seenResults.has(key)) replayedToolResults += 1;
+      else seenResults.add(key);
+      if (boundaryReplayUserCount > 0) seenResults.add(key);
+    }
+    if (!replayedUserMessages && !replayedToolCalls && !replayedToolResults) continue;
+    const matchingSegments = segments.filter((segment) =>
+      segment.agentInstanceId === interaction.agentInstanceId);
+    const at = BigInt(interaction.startedAtUnixNs);
+    const segment = matchingSegments.find((candidate) => {
+      const startedAt = BigInt(candidate.startedAtUnixNs);
+      const endedAt = candidate.endedAtUnixNs ? BigInt(candidate.endedAtUnixNs) : undefined;
+      return at >= startedAt && (endedAt === undefined || at <= endedAt);
+    }) ?? matchingSegments.at(-1);
+    summaries.push({
+      interactionId: interaction.interactionId,
+      ...(segment ? { segmentId: segment.segmentId } : {}),
+      atUnixNs: interaction.startedAtUnixNs,
+      replayedUserMessages,
+      replayedToolCalls,
+      replayedToolResults,
+      newUserMessages,
+    });
+  }
+  return summaries;
+}
+
+function toolIdentity(name: string | undefined, content: unknown): {
+  toolName: string;
+  toolKind: T.AgentToolKind;
+} {
+  const nested = typeof content === 'string'
+    ? content.match(/\btools\.([A-Za-z_][A-Za-z0-9_]*)/u)?.[1]
+    : undefined;
+  const raw = (nested ?? name ?? 'tool').trim();
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/gu, '_');
+  const toolKind: T.AgentToolKind = /(?:^|_)(?:exec|exec_command|bash|shell|terminal)(?:_|$)/u.test(normalized)
+    ? 'bash'
+    : /(?:^|_)(?:read|read_file|view)(?:_|$)/u.test(normalized)
+      ? 'read'
+      : /(?:^|_)(?:write|write_file|apply_patch|edit)(?:_|$)/u.test(normalized)
+        ? 'write'
+        : /(?:search|grep|find|web_search|search_query)/u.test(normalized)
+          ? 'search'
+          : /(?:^|_)mcp(?:_|$)/u.test(normalized)
+            ? 'mcp'
+            : /(?:^|_)skill(?:_|$)/u.test(normalized)
+              ? 'skill'
+              : /(?:http|fetch|request)/u.test(normalized)
+                ? 'http'
+                : /(?:python|javascript|code)/u.test(normalized) ? 'code' : 'other';
+  return { toolName: raw, toolKind };
+}
+
+function semanticEventId(
+  interactionId: string,
+  item: T.AgentInteractionSemanticItem,
+): string {
+  return `se_${createHash('sha256')
+    .update(`${interactionId}\u0000${item.sourceItemId ?? item.semanticItemId}\u0000${item.kind}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function delegationSemanticEventId(
+  interactionId: string,
+  kind: 'delegation_send' | 'delegation_reply',
+): string {
+  return `se_${createHash('sha256')
+    .update(`${interactionId}\u0000${kind}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+}
+
+function parsePeerEndpoint(endpoint: string | undefined): { host?: string; port?: number } | undefined {
+  const raw = endpoint?.trim();
+  if (!raw) return undefined;
+  try {
+    const url = raw.includes('://') ? new URL(raw) : new URL(`http://${raw}`);
+    const host = url.hostname || undefined;
+    const port = url.port ? Number(url.port) : undefined;
+    if (!host && (port === undefined || !Number.isFinite(port))) return undefined;
+    return {
+      ...(host ? { host } : {}),
+      ...(port !== undefined && Number.isFinite(port) ? { port } : {}),
+    };
+  } catch {
+    const match = raw.match(/^([^:/]+)(?::(\d+))?/u);
+    if (!match?.[1]) return undefined;
+    return {
+      host: match[1],
+      ...(match[2] ? { port: Number(match[2]) } : {}),
+    };
+  }
+}
+
+function relatedConversationIdForDelegation(
+  conversation: T.AgentConversationSummary,
+  interaction: T.AgentInteractionRecord,
+): string | undefined {
+  const related = conversation.relatedConversations ?? [];
+  const byDelegation = interaction.delegationId
+    ? related.find((item) =>
+      item.relation === 'delegates_to' && item.delegationId === interaction.delegationId)
+    : undefined;
+  if (byDelegation) return byDelegation.conversationId;
+  const byRun = interaction.runId
+    ? related.find((item) =>
+      item.relation === 'delegates_to' && item.runId === interaction.runId)
+    : undefined;
+  return byRun?.conversationId
+    ?? related.find((item) => item.relation === 'delegates_to')?.conversationId;
+}
+
+function compareSemanticEvent(left: T.AgentSemanticEvent, right: T.AgentSemanticEvent): number {
+  const leftAt = BigInt(left.atUnixNs);
+  const rightAt = BigInt(right.atUnixNs);
+  if (leftAt !== rightAt) return leftAt < rightAt ? -1 : 1;
+  const rank: Record<T.AgentSemanticEventKind, number> = {
+    user_message: 10,
+    tool_result: 20,
+    model_progress: 30,
+    model_final: 30,
+    tool_call: 40,
+    delegation_send: 35,
+    delegation_reply: 36,
+  };
+  return rank[left.kind] - rank[right.kind]
+    || (left.sourceInteractionIds[0] === right.sourceInteractionIds[0]
+      ? (left.sequenceNumber ?? Number.MAX_SAFE_INTEGER)
+        - (right.sequenceNumber ?? Number.MAX_SAFE_INTEGER)
+      : 0)
+    || left.semanticEventId.localeCompare(right.semanticEventId);
+}
+
+function resolvedToolCallIdsForTimeline(
+  interactions: readonly T.AgentInteractionRecord[],
+  matches = closeToolCallsAcrossInteractions(interactions).matches,
+): Set<string> {
+  const callAt = new Map<string, bigint>();
+  for (const interaction of interactions) {
+    let boundary: bigint | undefined;
+    try { boundary = BigInt(interaction.startedAtUnixNs); } catch { /* keep unknown */ }
+    for (const call of interaction.toolCalls) {
+      let at = boundary;
+      try { if (call.issuedAtUnixNs) at = BigInt(call.issuedAtUnixNs); } catch { /* boundary */ }
+      if (at !== undefined && (!callAt.has(call.toolCallId) || at < callAt.get(call.toolCallId)!)) {
+        callAt.set(call.toolCallId, at);
+      }
+    }
+  }
+  const resolved = new Set<string>();
+  for (const interaction of interactions) {
+    for (const result of interaction.toolResults) {
+      const started = callAt.get(result.toolCallId);
+      if (started !== undefined && result.observedAtUnixNs) {
+        try {
+          if (BigInt(result.observedAtUnixNs) < started) continue;
+        } catch { continue; }
+      }
+      resolved.add(result.toolCallId);
+    }
+  }
+  for (const match of matches) {
+    if (match.firstSeen) resolved.add(match.toolCallId);
+  }
+  return resolved;
+}
+
+function leftoverResultByToolCallId(
+  interactions: readonly T.AgentInteractionRecord[],
+  matches: ReturnType<typeof closeToolCallsAcrossInteractions>['matches'],
+): Map<string, T.AgentInteractionRecord['toolResults'][number]> {
+  const byId = new Map(interactions.map((interaction) => [interaction.interactionId, interaction]));
+  const leftover = new Map<string, T.AgentInteractionRecord['toolResults'][number]>();
+  for (const match of matches) {
+    if (!match.firstSeen || leftover.has(match.toolCallId)) continue;
+    const resultInteraction = byId.get(match.resultInteractionId);
+    const result = resultInteraction?.toolResults.find((item) => item.toolCallId === match.toolCallId)
+      ?? resultInteraction?.toolResults[0];
+    if (result) leftover.set(match.toolCallId, result);
+  }
+  return leftover;
+}
+
+export function projectSemanticConversationTimeline(
+  conversation: T.AgentConversationSummary,
+  interactions: T.AgentInteractionRecord[],
+  segments: T.ConversationInstanceSegment[],
+): T.AgentConversationTurnV2[] {
+  const ordered = projectInteractionsWithReconstructedHistoryToolCalls(interactions);
+  const httpToolEvidence = linkHttpToolCaptureEvidence(ordered);
+  const segmentByInteraction = new Map<string, string>();
+  for (const interaction of ordered) {
+    const interactionAt = BigInt(interaction.startedAtUnixNs);
+    const matching = segments.filter((segment) =>
+      segment.agentInstanceId === interaction.agentInstanceId);
+    const segment = matching.find((candidate) => {
+      const startedAt = BigInt(candidate.startedAtUnixNs);
+      const endedAt = candidate.endedAtUnixNs ? BigInt(candidate.endedAtUnixNs) : undefined;
+      return interactionAt >= startedAt && (endedAt === undefined || interactionAt <= endedAt);
+    }) ?? matching.at(-1);
+    if (segment) segmentByInteraction.set(interaction.interactionId, segment.segmentId);
+  }
+
+  const calls = new Map<string, T.AgentSemanticEvent>();
+  const resultKeys = new Set<string>();
+  const observedResultIds = new Set<string>();
+  const observedUserItemIds = new Set<string>();
+  const closureMatches = closeToolCallsAcrossInteractions(ordered).matches;
+  const resolvedToolCallIds = resolvedToolCallIdsForTimeline(ordered, closureMatches);
+  const leftoverResults = leftoverResultByToolCallId(ordered, closureMatches);
+  const unknownToolCallIds = new Set(ordered.flatMap((interaction) =>
+    interaction.toolResults
+      .filter((result) => typeof result.isError !== 'boolean')
+      .map((result) => result.toolCallId)));
+  let previousUserLineage: string[] = [];
+  const turns = new Map<string, {
+    ordinal: number;
+    events: T.AgentSemanticEvent[];
+    diagnostics: T.AgentTimelineDiagnostic[];
+    startedAtUnixNs: string;
+    endedAtUnixNs: string;
+  }>();
+
+  for (const interaction of ordered) {
+    const turnId = interaction.turnId ?? `${conversation.conversationId}:turn:1`;
+    const turn = turns.get(turnId) ?? {
+      ordinal: turns.size + 1,
+      events: [],
+      diagnostics: [],
+      startedAtUnixNs: interaction.startedAtUnixNs,
+      endedAtUnixNs: interaction.endedAtUnixNs,
+    };
+    turn.endedAtUnixNs = interaction.endedAtUnixNs;
+    turns.set(turnId, turn);
+    const segmentId = segmentByInteraction.get(interaction.interactionId)
+      ?? segments[0]?.segmentId
+      ?? `seg_unlinked_${interaction.interactionId}`;
+
+    if (interaction.interactionType === 'remote_agent' || interaction.trafficRole === 'delegation') {
+      const peer = parsePeerEndpoint(interaction.endpoint);
+      const relatedConversationId = relatedConversationIdForDelegation(conversation, interaction);
+      const requestStructured = record(interaction.request.structured);
+      const responseStructured = record(interaction.response.structured);
+      const sendContent = {
+        goal: text(requestStructured?.goal) ?? preview(interaction.request.structured) ?? preview(interaction.request.text),
+        ...(requestStructured?.thread_id !== undefined
+          ? { threadId: requestStructured.thread_id }
+          : {}),
+        ...(requestStructured?.todos !== undefined ? { todos: requestStructured.todos } : {}),
+        path: interaction.path,
+        method: interaction.method,
+        endpoint: interaction.endpoint,
+      };
+      const replyStatus = text(responseStructured?.status);
+      const replyContent = {
+        status: replyStatus,
+        ...(responseStructured?.result !== undefined ? { result: responseStructured.result } : {}),
+        ...(responseStructured?.thread_id !== undefined
+          ? { threadId: responseStructured.thread_id }
+          : {}),
+        ...(preview(interaction.response.structured) || preview(interaction.response.text)
+          ? {
+              summary: preview(interaction.response.structured)
+                ?? preview(interaction.response.text),
+            }
+          : {}),
+      };
+      const sendFailed = interaction.statusCode >= 400;
+      const replyFailed = sendFailed
+        || replyStatus === 'failed'
+        || replyStatus === 'error';
+      const hopFields = {
+        ...(interaction.workflowNode ? { workflowNode: interaction.workflowNode } : {}),
+        ...(interaction.hop ? { hop: interaction.hop } : {}),
+        ...(interaction.delegationId ? { delegationId: interaction.delegationId } : {}),
+        ...(relatedConversationId ? { relatedConversationId } : {}),
+        ...(peer ? { peer } : {}),
+      };
+      turn.events.push({
+        semanticEventId: delegationSemanticEventId(interaction.interactionId, 'delegation_send'),
+        conversationId: conversation.conversationId,
+        segmentId,
+        turnId,
+        actor: 'agent',
+        kind: 'delegation_send',
+        atUnixNs: interaction.startedAtUnixNs,
+        content: sendContent,
+        ...(preview(sendContent.goal) ? { contentPreview: preview(sendContent.goal) } : {}),
+        toolName: 'remote_agent.run',
+        toolKind: 'http',
+        status: sendFailed ? 'failed' : 'succeeded',
+        sourceInteractionIds: [interaction.interactionId],
+        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
+        parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
+        parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
+        correlationQuality: interaction.correlationQuality ?? 'inferred',
+        completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
+        partialReasons: [...interaction.partialReasons],
+        ...hopFields,
+      });
+      turn.events.push({
+        semanticEventId: delegationSemanticEventId(interaction.interactionId, 'delegation_reply'),
+        conversationId: conversation.conversationId,
+        segmentId,
+        turnId,
+        actor: 'agent',
+        kind: 'delegation_reply',
+        atUnixNs: interaction.endedAtUnixNs,
+        endedAtUnixNs: interaction.endedAtUnixNs,
+        content: replyContent,
+        ...(preview(replyContent) ? { contentPreview: preview(replyContent) } : {}),
+        toolName: 'remote_agent.run',
+        toolKind: 'http',
+        status: replyFailed ? 'failed' : 'succeeded',
+        sourceInteractionIds: [interaction.interactionId],
+        evidenceEventIds: [...(interaction.evidenceEventIds ?? [])],
+        parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
+        parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
+        correlationQuality: interaction.correlationQuality ?? 'inferred',
+        completeness: interaction.completeness === 'complete' ? 'complete' : 'partial',
+        partialReasons: [...interaction.partialReasons],
+        ...hopFields,
+      });
+      continue;
+    }
+
+    const semanticItems = semanticItemsForInteraction(interaction);
+    const userItems = semanticItems.filter((item) => item.kind === 'user_message');
+    const userHashes = userItems.map((item) => semanticHash(item.content));
+    const boundaryContextReplay = previousUserLineage.length === 0 && userHashes.length > 1;
+    let firstNewUser = boundaryContextReplay ? userHashes.length - 1 : 0;
+    if (!boundaryContextReplay) {
+      while (
+        firstNewUser < previousUserLineage.length
+        && firstNewUser < userHashes.length
+        && previousUserLineage[firstNewUser] === userHashes[firstNewUser]
+      ) firstNewUser += 1;
+    }
+    if (userHashes.length) previousUserLineage = userHashes;
+
+    for (const item of semanticItems) {
+      if (item.kind === 'user_message' && userItems.indexOf(item) < firstNewUser) continue;
+      if (item.kind === 'user_message') {
+        // Claude/Codex request histories use positional ids like `request.messages[43]`.
+        // When the transcript grows, the same index is reused for a different human turn —
+        // dedupe by index alone drops the new prompt (e.g. "重新验证…"). Bind content too.
+        const userKey = item.sourceItemId
+          ? `${item.sourceItemId}\u0000${semanticHash(item.content)}`
+          : `content:${semanticHash(item.content)}`;
+        if (observedUserItemIds.has(userKey)) continue;
+        observedUserItemIds.add(userKey);
+      }
+      if (item.kind === 'tool_result') {
+        const resultKey = `${item.toolCallId ?? 'unlinked'}\u0000${semanticHash(item.content)}`;
+        if (resultKeys.has(resultKey)) continue;
+        resultKeys.add(resultKey);
+        if (item.toolCallId) observedResultIds.add(item.toolCallId);
+        if (boundaryContextReplay) continue;
+      }
+      if (item.kind === 'tool_call' && item.toolCallId && calls.has(item.toolCallId)) continue;
+      const segmentId = segmentByInteraction.get(interaction.interactionId)
+        ?? segments[0]?.segmentId
+        ?? `seg_unlinked_${interaction.interactionId}`;
+      const tool = item.actor === 'tool'
+        ? toolIdentity(item.toolName, item.content)
+        : undefined;
+      const itemAt = (() => {
+        try { return BigInt(item.atUnixNs); } catch { return 0n; }
+      })();
+      const pairedToolResult = item.toolCallId
+        ? ordered
+          .flatMap((record) => record.toolResults)
+          .filter((result) => {
+            if (result.toolCallId !== item.toolCallId) return false;
+            if (!result.observedAtUnixNs) return true;
+            try {
+              // A late/out-of-order result is retained as raw evidence but cannot close an earlier
+              // ToolCall in the human lane. Equal timestamps are accepted for legacy one-record
+              // projections whose request/result boundary is intentionally coarse.
+              return BigInt(result.observedAtUnixNs) >= itemAt;
+            } catch {
+              return false;
+            }
+          })
+          .sort((left, right) => {
+            try { return Number(BigInt(left.observedAtUnixNs ?? '0') - BigInt(right.observedAtUnixNs ?? '0')); }
+            catch { return 0; }
+          })
+          .at(0)
+          ?? leftoverResults.get(item.toolCallId)
+        : undefined;
+      const pairedResult = item.kind === 'tool_call' && Boolean(pairedToolResult);
+      // A result ID alone proves that a result-shaped record arrived; it does not prove success.
+      // Keep unknown status explicit when an adapter omitted the error bit instead of silently
+      // turning a partial/unsupported tool observation into a successful execution.
+      const resultStatus: T.AgentSemanticEvent['status'] = pairedToolResult
+        ? pairedToolResult.isError === true ? 'failed'
+          : pairedToolResult.isError === false ? 'succeeded' : 'unknown'
+        : undefined;
+      let itemPartialReasons = [...item.partialReasons];
+      if (item.kind === 'tool_result' && resultStatus === 'unknown'
+        && !itemPartialReasons.includes('tool_result_status_unobserved')) {
+        itemPartialReasons.push('tool_result_status_unobserved');
+      }
+      // Cross-interaction ToolResult closure / history reconstruction can leave
+      // `tool_result_pending` on the originating call after the result is already paired.
+      if (pairedResult) {
+        itemPartialReasons = itemPartialReasons.filter((reason) => reason !== 'tool_result_pending');
+      }
+      const materialPartialReasons = itemPartialReasons
+        .filter((reason) => !INFORMATIONAL_PARTIAL_REASONS.has(reason));
+      const itemCompleteness: T.AgentSemanticEvent['completeness'] = materialPartialReasons.length === 0
+        && (item.kind !== 'tool_call' || pairedResult || item.completeness === 'complete')
+        ? 'complete'
+        : item.completeness;
+      const httpLink = item.kind === 'tool_call' && item.toolCallId
+        ? httpToolEvidence.byToolCallId.get(item.toolCallId)
+        : item.kind === 'tool_result' && item.toolCallId
+          ? httpToolEvidence.byToolCallId.get(item.toolCallId)
+          : undefined;
+      const evidenceEventIds = [...new Set([
+        ...(interaction.evidenceEventIds ?? []),
+        ...(httpLink?.evidenceEventIds ?? []),
+      ])];
+      // Prefer the HTTP tool Interaction first so the inspector raw tab opens the tool
+      // request/response bodies rather than the enclosing model turn transcript.
+      const sourceInteractionIds = httpLink
+        ? [...new Set([httpLink.httpInteractionId, interaction.interactionId])]
+        : [interaction.interactionId];
+      const event: T.AgentSemanticEvent = {
+        semanticEventId: semanticEventId(interaction.interactionId, item),
+        conversationId: conversation.conversationId,
+        segmentId,
+        turnId,
+        actor: item.actor,
+        kind: item.kind,
+        ...(item.phase ? { phase: item.phase } : {}),
+        atUnixNs: item.atUnixNs,
+        ...(item.content !== undefined ? { content: item.content } : {}),
+        ...(preview(item.content) ? { contentPreview: preview(item.content) } : {}),
+        ...(item.toolCallId ? { toolCallId: item.toolCallId } : {}),
+        ...(tool ? { toolName: tool.toolName, toolKind: tool.toolKind } : {}),
+        ...(item.kind === 'tool_call'
+          ? { status: pairedResult ? (resultStatus ?? 'unknown') : 'pending' as const }
+          : item.kind === 'tool_result' && resultStatus
+            ? { status: resultStatus }
+            : item.kind === 'tool_result' ? { status: 'unknown' as const } : {}),
+        sourceInteractionIds,
+        sourceItemIds: [item.sourceItemId ?? item.semanticItemId],
+        ...(item.sequenceNumber !== undefined ? { sequenceNumber: item.sequenceNumber } : {}),
+        evidenceEventIds,
+        parserId: interaction.semanticParserId ?? SEMANTIC_PROJECTION_PARSER_ID,
+        parserVersion: interaction.semanticParserVersion ?? SEMANTIC_PROJECTION_PARSER_VERSION,
+        correlationQuality: interaction.correlationQuality ?? 'inferred',
+        completeness: itemCompleteness,
+        partialReasons: itemPartialReasons,
+        ...(interaction.workflowNode ? { workflowNode: interaction.workflowNode } : {}),
+        ...(interaction.hop ? { hop: interaction.hop } : {}),
+        ...(interaction.delegationId ? { delegationId: interaction.delegationId } : {}),
+      };
+      turn.events.push(event);
+      if (item.kind === 'tool_call' && item.toolCallId) calls.set(item.toolCallId, event);
+    }
+
+    const attemptNumber = Number(interaction.attemptId?.match(/:attempt:(\d+)$/u)?.[1]);
+    if (Number.isSafeInteger(attemptNumber) && attemptNumber > 1) {
+      turn.diagnostics.push({
+        diagnosticId: `diag_retry_${interaction.interactionId}`,
+        type: 'retry',
+        severity: 'info',
+        message: `模型请求发生重试 · Attempt ${attemptNumber}`,
+        interactionId: interaction.interactionId,
+      });
+    }
+    const unresolvedToolCall = interaction.toolCalls.some((call) =>
+      !resolvedToolCallIds.has(call.toolCallId));
+    const materialPartialReasons = interaction.partialReasons
+      .filter((reason) => !INFORMATIONAL_PARTIAL_REASONS.has(reason));
+    const resolvedToolPending = interaction.statusCode < 400
+      && interaction.toolCalls.length > 0
+      && !unresolvedToolCall
+      && !interaction.toolCalls.some((call) => unknownToolCallIds.has(call.toolCallId))
+      && (
+        interaction.conversationCompleteness === 'tool_pending'
+        || materialPartialReasons.includes('tool_result_pending')
+        || interaction.partialReasons.includes('tool_result_pending')
+      )
+      && interaction.transportCompleteness !== 'partial'
+      && (interaction.wireCompleteness === undefined || interaction.wireCompleteness === 'complete')
+      && materialPartialReasons.every((reason) => reason === 'tool_result_pending');
+    // History reconstruction / semantic reconcile are recovery markers. When every tool_call is
+    // already paired, do not surface them as capture_gap noise in the human timeline.
+    const onlyInformationalPartial = interaction.completeness !== 'complete'
+      && materialPartialReasons.length === 0
+      && !unresolvedToolCall
+      && interaction.statusCode < 400;
+    if (
+      interaction.statusCode >= 400
+      || (interaction.completeness !== 'complete' && !resolvedToolPending && !onlyInformationalPartial)
+    ) {
+      const gapMessageReasons = materialPartialReasons.length
+        ? materialPartialReasons
+        : interaction.partialReasons;
+      turn.diagnostics.push({
+        diagnosticId: `diag_gap_${interaction.interactionId}`,
+        type: interaction.parseState && interaction.parseState !== 'parsed' ? 'parse_gap' : 'capture_gap',
+        severity: interaction.statusCode >= 400 ? 'error' : 'warning',
+        message: interaction.statusCode >= 400
+          ? `模型请求失败（HTTP ${interaction.statusCode}）`
+          : gapMessageReasons.join('、') || '该次交互的采集证据不完整',
+        interactionId: interaction.interactionId,
+      });
+    }
+  }
+
+  const lastInteraction = ordered.at(-1);
+  const conversationStale = lastInteraction
+    ? Date.now() - Number(BigInt(lastInteraction.endedAtUnixNs) / 1_000_000n)
+      >= UNRESOLVED_TOOL_GAP_GRACE_MS
+    : false;
+  if (conversationStale) {
+    for (const [toolCallId, event] of calls) {
+      if (observedResultIds.has(toolCallId) || resolvedToolCallIds.has(toolCallId)) continue;
+      const turn = turns.get(event.turnId);
+      if (!turn) continue;
+      turn.diagnostics.push({
+        diagnosticId: `diag_tool_gap_${createHash('sha256')
+          .update(`${conversation.conversationId}\u0000${toolCallId}`)
+          .digest('hex')
+          .slice(0, 24)}`,
+        type: 'capture_gap',
+        severity: 'warning',
+        message: `工具 ${event.toolName ?? toolCallId} 超过 90 秒仍未观察到返回结果`,
+        attachedToEventId: event.semanticEventId,
+        interactionId: event.sourceInteractionIds[0],
+      });
+    }
+  }
+
+  return [...turns.entries()].map(([turnId, turn]) => ({
+    turnId,
+    ordinal: turn.ordinal,
+    state: turn.diagnostics.some((item) => item.severity !== 'info') ? 'incomplete' : 'complete',
+    startedAtUnixNs: turn.startedAtUnixNs,
+    endedAtUnixNs: turn.endedAtUnixNs,
+    events: turn.events.sort(compareSemanticEvent),
+    diagnostics: turn.diagnostics,
+  }));
+}

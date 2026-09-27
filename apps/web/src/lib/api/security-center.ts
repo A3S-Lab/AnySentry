@@ -9,11 +9,29 @@ function querySuffix(params: object) {
   return qs.toString() ? `?${qs.toString()}` : "";
 }
 
-export type SecurityTimeType = "last_3h" | "last_1d" | "last_7d" | "last_30d" | "custom";
+export type SecurityTimeType =
+  | "last_30m"
+  | "last_1h"
+  | "last_2h"
+  | "last_3h"
+  | "last_1d"
+  | "last_7d"
+  | "last_30d"
+  | "custom";
 export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" | "unknown" | string;
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
 export type AgentClassification = "confirmed_agent" | "probable_agent" | "unknown" | "non_agent";
+export type WorkloadRole = "agent" | "anysentry_internal" | "platform_infrastructure" | "business_service" | "ordinary_process" | "unknown";
+export type CaptureProfile = "agent_full" | "probable_investigation" | "security_full" | "investigation_full" | "business_context" | "infrastructure_aggregate" | "unknown_discovery" | "self_health";
+export type UnknownReason = "snapshot_not_ready" | "snapshot_miss" | "container_identity_missing" | "container_name_missing" | "parent_missing" | "process_exited_before_enrichment" | "ancestry_incomplete" | "pid_reuse_ambiguous" | "signature_miss" | "template_conflict" | "policy_expired" | "shared_scope_ambiguous" | "unsupported_agent_adapter";
+export interface ClassificationSemanticsV1 {
+  schemaVersion: "anysentry.classification_semantics.v1";
+  identityClassification: AgentClassification;
+  workloadRole: WorkloadRole;
+  captureProfile: CaptureProfile;
+  unknownReason?: UnknownReason;
+}
 export interface EventJudgmentMetadata {
   classification: AgentClassification;
   profile: "full" | "l1_only" | "discard";
@@ -44,6 +62,8 @@ export interface ProcessContext {
   cgroup?: string;
   cgroupId?: string;
   systemdUnit?: string;
+  lifecycleSource?: "exec_process_key" | "exec_tombstone";
+  lifecycleReason?: UnknownReason;
 }
 
 export interface AgentWorkloadRef {
@@ -73,6 +93,7 @@ export interface AgentAttribution {
   physicalWorkloadId?: string;
   workloadRef?: AgentWorkloadRef;
   rootPid?: number;
+  rootStartTime?: string;
   confidence: number;
   reason: AgentAttributionReason;
   source: AgentAttributionSource;
@@ -85,10 +106,135 @@ export interface SecurityTimeFilter {
   timeType?: SecurityTimeType;
   startTime?: string;
   endTime?: string;
+  snapshotAsOf?: string;
   scope?: "agent" | "raw";
+  classificationView?: ClassificationView;
+}
+export type ClassificationView = "as_observed" | "current_effective";
+export type QueryTotalMode = "exact" | "estimated" | "omitted";
+export type QueryDataSource = "clickhouse" | "clickhouse+hot_delta" | "clickhouse+redis_current" | "memory_hot_ring";
+export interface QueryCommitProgress {
+  sourceId?: string;
+  collectorId?: string;
+  committedEventTime: string;
+  committedAt: string;
+}
+export interface QueryCoverage {
+  requestedFrom: string;
+  requestedTo: string;
+  snapshotAsOf: string;
+  asOf: string;
+  dataFrom?: string;
+  dataTo?: string;
+  observedDurableThrough?: string;
+  /** @deprecated Compatibility alias for observedDurableThrough. */
+  committedCutoff?: string;
+  commitBoundaryKind?: "observed_durable_high_water";
+  commitProgress?: QueryCommitProgress[];
+  commitProgressScope?: "all_sources" | "query_sources";
+  lateDataPolicy?: "commit_journal_revision_repair";
+  completeness?: "exact_as_observed" | "exact_current_effective" | "partial";
+  watermark?: string;
+  partial: boolean;
+  partialReason?:
+    | "hot_ring_only"
+    | "scan_limit"
+    | "storage_unavailable"
+    | "membership_store_unavailable"
+    | "membership_ephemeral"
+    | "membership_limit"
+    | "membership_records_missing";
+  source: QueryDataSource;
+  totalMode: QueryTotalMode;
 }
 
-export interface SecurityHealthCard {
+export type SecurityAssistantLocale = "en" | "zh-CN";
+export type SecurityAssistantMessageRole = "user" | "assistant";
+
+export interface SecurityAssistantMessage {
+  role: SecurityAssistantMessageRole;
+  content: string;
+}
+
+export interface SecurityAssistantContext {
+  path?: string;
+  view?: string;
+  timeType?: SecurityTimeType;
+  startTime?: string;
+  endTime?: string;
+  agentId?: string;
+  workspacePath?: string;
+  eventId?: string;
+  traceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  incidentId?: string;
+  alertId?: string;
+}
+
+export interface SecurityAssistantQuery {
+  sessionId?: string;
+  question: string;
+  locale?: SecurityAssistantLocale;
+  history?: SecurityAssistantMessage[];
+  context?: SecurityAssistantContext;
+}
+
+export interface SecurityAssistantReference {
+  kind: "event" | "alert" | "incident" | "episode" | "vulnerability" | "view";
+  id: string;
+  label: string;
+  href: string;
+}
+
+export interface SecurityAssistantSystemContextSummary {
+  status: "complete" | "partial";
+  requested: boolean;
+  agentAssetId?: string;
+  bundleId?: string;
+  confidence?: number;
+  estimatedBytes?: number;
+  reasonCodes: string[];
+}
+
+export interface SecurityAssistantAnswer {
+  sessionId: string;
+  answer: string;
+  model: string;
+  elapsedMs: number;
+  totalTokens: number;
+  evidenceSummary: string;
+  systemContext?: SecurityAssistantSystemContextSummary;
+  references: SecurityAssistantReference[];
+  readOnly: true;
+  toolCalls?: Array<{
+    name: "inspect_workloads" | "propose_identity_rule" | "apply_identity_rule" | "explain_rule_decision";
+    arguments: Record<string, unknown>;
+    persisted: boolean;
+    enforced?: boolean;
+    ruleId?: string;
+    summary?: string;
+    workloads?: Array<{
+      containerName?: string;
+      podName?: string;
+      classification: string;
+      physicalWorkloadId: string;
+      comm?: string;
+      exeBasename?: string;
+    }>;
+  }>;
+}
+
+export interface ClassifiedResponseMeta {
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
+  coverage?: QueryCoverage;
+}
+
+export interface SecurityHealthCard extends ClassifiedResponseMeta {
   healthScore: number;
   healthStatusText: string;
   tokenConsumptionTotal: number;
@@ -106,7 +252,7 @@ export interface SecurityWaveSeries {
   riskSeries: SecurityWaveSeriesPoint[];
 }
 
-export interface SecurityExplainabilityScan {
+export interface SecurityExplainabilityScan extends ClassifiedResponseMeta {
   waveSeries: SecurityWaveSeries[];
   threatInterception: string;
   sessionActiveCount: string;
@@ -124,7 +270,7 @@ export interface SecurityLatencyMetric {
   unit: string;
 }
 
-export interface SecurityPerformanceCard {
+export interface SecurityPerformanceCard extends ClassifiedResponseMeta {
   componentRequestCount: SecurityPerformanceMetric;
   tps: SecurityPerformanceMetric;
   avgLatency: SecurityLatencyMetric;
@@ -137,7 +283,7 @@ export interface SecurityRiskSummaryCard {
   eventCount: number;
 }
 
-export interface SecurityRiskSummary {
+export interface SecurityRiskSummary extends ClassifiedResponseMeta {
   summaryCards: SecurityRiskSummaryCard[];
   updateTime: string;
 }
@@ -155,7 +301,7 @@ export interface SecurityRiskCategory {
   items: SecurityRiskBreakdownItem[];
 }
 
-export interface SecurityRiskBreakdown {
+export interface SecurityRiskBreakdown extends ClassifiedResponseMeta {
   systemRisks: SecurityRiskCategory;
   communicationRisks: SecurityRiskCategory;
   singleAgentRisks: SecurityRiskCategory;
@@ -168,7 +314,7 @@ export interface SecurityRiskDimension {
   score: number;
 }
 
-export interface SecurityHighestRiskSession {
+export interface SecurityHighestRiskSession extends ClassifiedResponseMeta {
   sessionId: string;
   userId: string;
   workspacePath: string;
@@ -188,7 +334,7 @@ export interface SecurityDecisionTier {
   slaDesc: string;
 }
 
-export interface SecurityDecisionFunnel {
+export interface SecurityDecisionFunnel extends ClassifiedResponseMeta {
   tiers: SecurityDecisionTier[];
   finalBlock: {
     count: number;
@@ -198,11 +344,78 @@ export interface SecurityDecisionFunnel {
 }
 
 // 智能体可观测性:Agent Observability = Infra Metrics + Behavior Analytics。
-export interface AgentObservability {
+export interface AgentObservability extends ClassifiedResponseMeta {
   health: { heartbeatOk: boolean; resourceUtil: number; errorRate: number; decisionLatencyMs: number };
   behavioral: { actionRate: number; decisionPattern: "baseline" | "drift"; stateTransitions: number; goalProgress: number };
   system: { agentCount: number; commThroughput: number; infraHealthy: boolean };
+  coverage?: QueryCoverage;
   updateTime: string;
+}
+
+export type PlatformMetricStatus = "healthy" | "warning" | "critical" | "unknown";
+export type PlatformMetricSource = "prometheus" | "runtime_fallback";
+
+export interface PlatformMetricPoint {
+  at: string;
+  value: number;
+}
+
+export interface PlatformMetricSeries {
+  key: "cpu" | "memory" | "disk" | "network_rx" | "network_tx" | "api_p95" | "api_error_rate";
+  label: string;
+  unit: "%" | "B/s" | "ms";
+  points: PlatformMetricPoint[];
+}
+
+export interface PlatformComponentMetric {
+  id: string;
+  name: string;
+  kind: "service" | "node" | "scrape_target";
+  status: PlatformMetricStatus;
+  cpuPercent?: number;
+  memoryBytes?: number;
+  memoryLimitBytes?: number;
+  memoryPercent?: number;
+  lastSeen?: string;
+  message?: string;
+}
+
+export interface PlatformMetricAnomaly {
+  id: string;
+  severity: "warning" | "critical";
+  metric: string;
+  subject: string;
+  value: number;
+  unit: "%" | "ms";
+  threshold: number;
+  message: string;
+}
+
+export interface PlatformMetricsOverview {
+  schemaVersion: "anysentry.platform_metrics.v1";
+  status: "ready" | "partial" | "unavailable";
+  source: PlatformMetricSource;
+  from: string;
+  to: string;
+  stepSeconds: number;
+  updatedAt: string;
+  summary: {
+    nodeReady?: number;
+    nodeTotal?: number;
+    cpuPercent?: number;
+    memoryPercent?: number;
+    diskPercent?: number;
+    networkRxBytesPerSecond?: number;
+    networkTxBytesPerSecond?: number;
+    apiP95Ms?: number;
+    apiErrorRatePercent?: number;
+    apiRequestRate?: number;
+    componentAnomalies: number;
+  };
+  series: PlatformMetricSeries[];
+  components: PlatformComponentMetric[];
+  anomalies: PlatformMetricAnomaly[];
+  message?: string;
 }
 
 export interface SecurityWorkspaceRiskItem {
@@ -213,7 +426,7 @@ export interface SecurityWorkspaceRiskItem {
   riskLevelText: string;
 }
 
-export interface SecurityWorkspaceRiskDistribution {
+export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
   list: SecurityWorkspaceRiskItem[];
   updateTime: string;
 }
@@ -263,14 +476,32 @@ export type SecuritySeverity = "info" | "low" | "medium" | "high" | "critical";
 export type AgentEventSource = "observer" | "synthetic" | "api";
 export type AgentDecisionStatus = "accepted" | "pending" | "running" | "succeeded" | "failed" | "timeout";
 export type AgentEventCategory = "tool" | "network" | "file" | "llm" | "security" | "process" | "runtime" | "unknown";
+export type ActivityContext = "agent_action" | "platform_healthcheck" | "collector_heartbeat";
+export type ActivitySubtype =
+  | "docker_healthcheck"
+  | "k8s_exec_probe"
+  | "k8s_liveness_probe"
+  | "k8s_readiness_probe"
+  | "k8s_startup_probe"
+  | "observer_heartbeat";
 export type AgentEventAttributeValue = string | number | boolean;
 export type IncidentStatus = "open" | "acknowledged" | "resolved";
 export type AgentHealthState = "active" | "idle" | "stale" | "risky";
+export type AgentLifecycleState = "current" | "historical" | "terminated";
 export type AgentCriticality = "low" | "medium" | "high" | "critical";
 export type CollectorHealthState = "healthy" | "quiet" | "degraded" | "stale" | "down";
+export type CollectorHealthChannelState = "healthy" | "warning" | "degraded" | "unknown";
+export interface CollectorHealthChannel {
+  state: CollectorHealthChannelState;
+  stateText: string;
+  reasons: string[];
+  consecutiveBad: number;
+  consecutiveClean: number;
+}
 export type CollectorReportedStatus = "ok" | "degraded" | "error";
 export type AlertStatus = "open" | "acknowledged" | "resolved" | "silenced";
-export type AlertKind = "incident" | "collector" | "agent" | "event" | "source" | "coverage" | "objective" | "remediation";
+export type AlertKind = "incident" | "collector" | "agent" | "event" | "judgment" | "source" | "coverage" | "objective" | "remediation";
+export type AlertTimeMode = "window" | "backlog" | "combined";
 export type TopologyNodeType = "agent" | "workspace" | "collector" | "tool" | "network" | "file" | "llm" | "security";
 export type TopologyEdgeType = "runs_in" | "observed_by" | "executes" | "connects" | "resolves" | "accesses" | "calls_llm" | "triggers";
 export type MaintenanceTargetType = "all" | "workspace" | "agent" | "collector" | "source";
@@ -284,6 +515,9 @@ export type ObjectiveStatus = "ok" | "breach" | "disabled";
 export type IngestionSourceType = "observer" | "forwarder" | "webhook" | "otel" | "custom";
 export type IngestionSourceStatus = "active" | "stale" | "unused" | "disabled";
 export type SourceTokenRotationStatus = "untracked" | "fresh" | "overdue";
+export type PlatformUserRole = "administrator" | "security_analyst" | "operator" | "viewer";
+export type PlatformUserStatus = "active" | "disabled";
+export type PlatformUserSource = "local";
 export type AuditActorType = "system" | "operator" | "api";
 export type AuditAction =
   | "policy.updated"
@@ -294,15 +528,38 @@ export type AuditAction =
   | "agent.metadata.updated"
   | "agent.review.updated"
   | "agent.review.cleared"
+  | "asset.review.updated"
+  | "asset.review.cleared"
   | "agent.identity_ai_review.completed"
+  | "agent.interaction.content.read"
+  | "agent.conversation.content.list"
+  | "agent.conversation.content.read"
   | "maintenance.window.updated"
   | "notification.channel.updated"
   | "notification.route.updated"
   | "notification.delivery_failed"
   | "objective.updated"
   | "source.updated"
-  | "source.token_rotated";
-export type AuditResourceType = "policy" | "incident" | "alert" | "remediation" | "agent" | "event" | "maintenance" | "notification" | "objective" | "source";
+  | "source.token_rotated"
+  | "user.updated"
+  | "infrastructure_rule.created"
+  | "infrastructure_rule.shadowed"
+  | "infrastructure_rule.promoted"
+  | "infrastructure_rule.revoked"
+  | "infrastructure_rule.validated"
+  | "infrastructure_rule.materialization_reported"
+  | "filter_rule.created"
+  | "filter_rule.shadowed"
+  | "filter_rule.promoted"
+  | "filter_rule.revoked"
+  | "filter_rule.previewed"
+  | "unknown_learning.reviewed"
+  | "unknown_learning.policy_updated"
+  | "unknown_learning.infrastructure_draft_created"
+  | "unknown_learning.infrastructure_draft_reused"
+  | "unknown_learning.infrastructure_draft_rejected"
+  | "unknown_learning.config_updated";
+export type AuditResourceType = "policy" | "filter-rule" | "infrastructure-rule" | "unknown-learning" | "supply-chain" | "incident" | "alert" | "remediation" | "agent" | "asset" | "event" | "maintenance" | "notification" | "objective" | "source" | "user";
 export type AuditResult = "success" | "failure";
 export type CoverageIssueType =
   | "collector_down"
@@ -322,6 +579,8 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   scope?: "agent" | "raw";
   /** Raw-view visibility only. Defaults to true; Agent scope always excludes Unknown. */
   includeUnknown?: boolean;
+  /** Bounded hot-ring preview for dashboard first paint; full history remains separately available. */
+  preview?: boolean;
   /** Query the durable ClickHouse history instead of only the hot dashboard window. */
   durable?: boolean;
   noise?: "hide" | "include";
@@ -330,16 +589,24 @@ export interface AgentEventQuery extends SecurityTimeFilter {
   collectorId?: string;
   agentId?: string;
   agentAssetId?: string;
+  subjectAssetId?: string;
+  agentInstanceId?: string;
   sessionId?: string;
   workspacePath?: string;
   traceId?: string;
+  /** Independent trusted-invocation predicate; traceId keeps its legacy meaning. */
+  invocationId?: string;
+  /** Independent authenticated ToolCall predicate; it never aliases taskId. */
+  toolCallId?: string;
   runId?: string;
   eventKind?: string;
   eventCategory?: AgentEventCategory;
+  activityContext?: ActivityContext;
   verdict?: SecurityVerdict;
   tier?: "Rules" | "Llm" | "Agent";
   q?: string;
   limit?: number;
+  totalMode?: QueryTotalMode;
 }
 
 export interface AgentEventListItem {
@@ -347,24 +614,57 @@ export interface AgentEventListItem {
   eventId: string;
   sourceEventId?: string;
   at: string;
+  eventAtUnixNs?: string;
+  receivedAtUnixNs?: string;
+  receivedAt?: string;
+  eventTimeQuality?: "collector_calibrated" | "producer_supplied" | "api_received";
+  captureEpoch?: string;
+  captureProfileCode?: number;
+  captureActionCode?: number;
+  captureAuthorityCode?: number;
+  captureDispositionCode?: number;
+  captureSelected?: boolean;
+  captureFlags?: number;
+  capturePolicyVersion?: number;
   eventKind: string;
   eventCategory: AgentEventCategory;
+  activityContext?: ActivityContext;
+  activitySubtype?: ActivitySubtype;
   source: AgentEventSource;
   subject: string;
   workspacePath: string;
   agentId: string;
   agentAssetId: string;
+  agentAssetAliases?: string[];
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  agentRuntimeInstanceAliases?: string[];
+  identityBindingQuality?: "exact" | "weak";
+  identityReasonCode?: string;
+  subjectAssetId?: string;
+  subjectAssetType?: "agent" | "service" | "infrastructure" | "workload" | "ephemeral_process";
+  assetBindingQuality?: "exact" | "logical" | "ephemeral" | "weak" | "conflict" | "unassigned";
+  assetBindingRevision?: number;
+  assetBindingReason?: string;
+  asObservedIdentityRevision?: number;
   displayName?: string;
   detectedName?: string;
   detectedClassification: AgentClassification;
+  asObservedClassification: AgentClassification;
+  currentEffectiveClassification: AgentClassification;
   effectiveClassification: AgentClassification;
+  currentReviewRevision?: number;
+  currentReviewEffectiveAt?: string;
   runtime: "kubernetes" | "docker" | "host" | "unknown";
   locationLabel?: string;
   collectorId?: string;
   sourceId?: string;
   sessionId: string;
+  kernelFactId?: string;
   userId: string;
   traceId: string;
+  invocationId?: string;
+  toolCallId?: string;
   spanId: string;
   parentSpanId?: string;
   runId: string;
@@ -372,6 +672,7 @@ export interface AgentEventListItem {
   decisionStatus?: AgentDecisionStatus;
   evaluationId?: string;
   policyVersion?: string;
+  decisionRevision?: number;
   decisionUpdatedAt?: number;
   verdict: SecurityVerdict;
   tier: "Rules" | "Llm" | "Agent";
@@ -384,6 +685,7 @@ export interface AgentEventListItem {
   tokenCount: number;
   latencyMs: number;
   attributes: Record<string, AgentEventAttributeValue>;
+  classificationSemantics?: ClassificationSemanticsV1;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
@@ -395,6 +697,14 @@ export interface AgentEventListItem {
 export interface AgentEventList {
   items: AgentEventListItem[];
   total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  /** Compatibility signal emitted by the bounded hot-ring query path. */
+  totalApproximate?: boolean;
+  storageFallback?: "hot_ring";
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
   updateTime: string;
 }
 
@@ -409,6 +719,7 @@ export interface StreamRiskProfileFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId: string;
   agentType: string;
   windowStart: number;
   windowEnd: number;
@@ -488,6 +799,7 @@ export interface StreamCompositeRiskFinding {
   workspaceId: string;
   workspacePath: string;
   agentCorrelationId: string;
+  agentInstanceId?: string;
   agentType: string;
   sessionId?: string;
   traceId?: string;
@@ -577,6 +889,7 @@ export interface SupplyChainFinding {
   component: SupplyChainComponent;
   vulnerability: {
     id: string;
+    canonicalId?: string;
     modified: string;
     published?: string;
     withdrawn?: string;
@@ -601,7 +914,23 @@ export interface SupplyChainFinding {
   lastObservedAt: number;
   priority: "P0" | "P1" | "P2" | "P3";
   priorityScore: number;
+  priorityFactors: Array<{
+    code: "severity" | "deployed" | "direct_dependency" | "runtime_scope";
+    score: number;
+    reason: string;
+  }>;
   deploymentStatus: "confirmed" | "unknown";
+  remediation: {
+    action:
+      | "upgrade_direct_dependency"
+      | "upgrade_parent_dependency"
+      | "upgrade_component"
+      | "update_deployed_artifact"
+      | "monitor_advisory";
+    summary: string;
+    candidateFixedVersion?: string;
+    requiresArtifactRebuild: boolean;
+  };
   shadow: true;
 }
 
@@ -609,6 +938,13 @@ export interface SupplyChainOverview {
   enabled: boolean;
   runtimeCorrelationEnabled: boolean;
   workspaces: number;
+  workspaceOptions: Array<{
+    workspaceId: string;
+    repositoryId: string;
+    displayName: string;
+    sourceId?: string;
+    environmentId?: string;
+  }>;
   activeSnapshots: number;
   openFindings: number;
   staleFindings: number;
@@ -616,11 +952,1034 @@ export interface SupplyChainOverview {
   findings: SupplyChainFinding[];
 }
 
+export interface SupplyChainScanTask {
+  taskId: string;
+  workspaceId: string;
+  scannerId: string;
+  reason: "initial" | "dependency_descriptor_changed" | "runtime_install" | "manual" | "retry";
+  status: "pending" | "leased" | "completed" | "failed";
+  createdAt: number;
+  updatedAt: number;
+  attempt: number;
+}
+
+export interface SupplyChainControlConfig {
+  schemaVersion: "anysentry.supply_chain_control.v1";
+  enabled: boolean;
+  dailyRefreshEnabled: boolean;
+  runtimeCorrelationEnabled: boolean;
+  selectedWorkspaceIds: string[];
+  updatedAt: number;
+}
+
+export interface SupplyChainRuntimeReadiness {
+  serviceReady: boolean;
+  scannerAuthConfigured: boolean;
+  assessmentWorkerOnline: boolean;
+  runtimeCorrelationAvailable: boolean;
+  readyForInitialScan: boolean;
+  scanners: Array<{
+    scannerId: string;
+    online: boolean;
+    lastSeenAt?: number;
+    workspaceIds: string[];
+  }>;
+  issues: string[];
+}
+
+export interface SupplyChainControlResponse {
+  config: SupplyChainControlConfig;
+  readiness: SupplyChainRuntimeReadiness;
+  workspaceOptions: Array<{
+    workspaceId: string;
+    repositoryId: string;
+    displayName: string;
+    sourceId?: string;
+    environmentId?: string;
+    scannerId: string;
+  }>;
+  scanTasks?: SupplyChainScanTask[];
+  runtimeAssessmentsQueued?: number;
+}
+
 export interface AgentTimeline {
   traceId: string;
   runId?: string;
   sessionId?: string;
   items: AgentEventListItem[];
+  total: number;
+  hasMore: boolean;
+  coverage: QueryCoverage;
+  classificationView: ClassificationView;
+  reviewRevision: number;
+  assetBindingRevision?: number;
+  updateTime: string;
+}
+
+export type AgentActionOrigin = "semantic" | "kernel_inferred";
+export type AgentActionStatus = "running" | "succeeded" | "failed" | "incomplete";
+export interface AgentActionItem {
+  actionId: string;
+  origin: AgentActionOrigin;
+  status: AgentActionStatus;
+  agentAssetId: string;
+  agentAssetAliases?: string[];
+  sourceId?: string;
+  agentProduct?: string;
+  agentRuntimeInstanceId?: string;
+  invocationId?: string;
+  toolCallId?: string;
+  toolName: string;
+  operation: "execute_tool" | "kernel_exec" | "file_access" | "file_read" | "file_write" | "file_delete" | "network_connect";
+  targetSummary?: string;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  semanticEventIds: string[];
+  fallbackEventId?: string;
+  evidenceState: "available_on_demand" | "runtime_level";
+}
+export interface AgentActionList extends ClassifiedResponseMeta {
+  items: AgentActionItem[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+export type AgentInteractionCompleteness = "complete" | "partial" | "truncated" | "redacted" | "reference_only" | "unavailable" | "unsupported";
+export interface AgentInteractionMessage {
+  role: string;
+  content: unknown;
+  name?: string;
+  toolCallId?: string;
+  sourceItemId?: string;
+  turnId?: string;
+  contentItemKinds?: string[];
+  messageOrigin?: "human_input" | "agent_context" | "developer_instruction" | "assistant_history" | "tool_history";
+}
+export interface AgentConversationAnchor {
+  kind: "provider_conversation" | "response_id" | "previous_response_id" | "continuity_key" | "message_item_id" | "turn_id" | "tool_call_id";
+  namespace: string;
+  valueHash: string;
+  strength: "exact" | "strong" | "supporting";
+  sourcePath: string;
+}
+export interface AgentInteractionToolCall {
+  toolCallId: string;
+  name: string;
+  arguments: unknown;
+  issuedAtUnixNs?: string;
+}
+export interface AgentInteractionToolResult {
+  toolCallId: string;
+  name?: string;
+  content: unknown;
+  isError?: boolean;
+  observedAtUnixNs?: string;
+}
+export type AgentInteractionSemanticActor = "user" | "model" | "tool";
+export type AgentInteractionSemanticKind = "user_message" | "model_progress" | "model_final" | "tool_call" | "tool_result";
+export interface AgentInteractionSemanticItem {
+  semanticItemId: string;
+  actor: AgentInteractionSemanticActor;
+  kind: AgentInteractionSemanticKind;
+  phase?: "progress" | "final";
+  origin: "request" | "response";
+  atUnixNs: string;
+  content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  sourceItemId?: string;
+  turnId?: string;
+  contentItemKinds?: string[];
+  messageOrigin?: AgentInteractionMessage["messageOrigin"];
+  outputIndex?: number;
+  contentIndex?: number;
+  sequenceNumber?: number;
+  completeness: "complete" | "partial" | "missing";
+  partialReasons: string[];
+}
+export interface AgentInteractionContent {
+  body: string;
+  encoding: "utf8" | "base64";
+  contentType: string;
+  capturedBytes: number;
+  decodedBytes: number;
+  sha256: string;
+  completeness: AgentInteractionCompleteness;
+  messages?: AgentInteractionMessage[];
+  text?: string;
+  structured?: unknown;
+}
+export interface AgentInteractionTokenUsage {
+  source: "provider_reported";
+  completeness: "complete" | "partial";
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokensDerived: boolean;
+}
+export interface AgentInteractionRecord {
+  schemaVersion: "anysentry.agent_interaction.v1";
+  interactionId: string;
+  interactionType: "model" | "tool" | "remote_agent" | "unparsed";
+  at: number;
+  workspacePath: string;
+  tenantId?: string;
+  ownerId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  agentAssetId: string;
+  agentInstanceId?: string;
+  agentProduct?: string;
+  runtimeSessionId?: string;
+  traceId?: string;
+  runId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionIdentityQuality?: "confirmed" | "strong" | "inferred" | "ephemeral" | "unknown" | "conflict";
+  sessionIdSource?: "provider" | "authenticated_adapter" | "legacy_observer_session" | "legacy_agent_fallback" | "legacy_task_fallback" | "per_request" | "unresolved";
+  sessionMode?: "resumable" | "conversation" | "per_request" | "ephemeral" | "unknown";
+  sessionLifecycle?: "new" | "resume" | "fork";
+  parentSessionId?: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  agentIdHeader?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  logicalDefinitionFingerprint?: string;
+  rawObservationId?: string;
+  rawObservationRevision?: number;
+  kernelFactId?: string;
+  sourceObservationIds?: string[];
+  runIdSource?: "producer" | "derived_ephemeral" | "legacy";
+  invocationId?: string;
+  providerConversationId?: string;
+  providerResponseId?: string;
+  providerPreviousResponseId?: string;
+  trafficRole?: "conversation" | "bootstrap" | "control" | "context_replay"
+    | "tool_backend" | "derived_metadata" | "retry" | "background" | "delegation" | "unclassified";
+  conversationAnchors?: AgentConversationAnchor[];
+  evidenceEventIds?: string[];
+  conversationId?: string;
+  conversationIdSource?: "provider" | "runtime" | "inferred";
+  turnId?: string;
+  modelCallId?: string;
+  attemptId?: string;
+  runtimeRole?: "agent_root" | "network_runtime" | "tool_runtime";
+  correlationQuality?: "exact" | "strong" | "inferred" | "unlinked";
+  detectedClassification: AgentClassification;
+  currentEffectiveClassification: AgentClassification;
+  process?: ProcessContext;
+  connectionId: string;
+  transport: "http" | "tls";
+  protocol: string;
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: "parsed" | "partial" | "unparsed" | "ambiguous";
+  llmLikelihood?: "confirmed" | "likely" | "unknown" | "unlikely";
+  schemaFingerprint?: string;
+  transportCompleteness?: "complete" | "partial";
+  wireCompleteness?: "complete" | "error" | "unknown" | "partial";
+  conversationCompleteness?: "complete" | "tool_pending" | "response_pending" | "partial";
+  endpoint: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  model?: string;
+  startedAtUnixNs: string;
+  requestCompleteAtUnixNs: string;
+  firstResponseAtUnixNs: string;
+  endedAtUnixNs: string;
+  durationNs: string;
+  timeQuality: string;
+  request: AgentInteractionContent;
+  response: AgentInteractionContent;
+  usage?: AgentInteractionTokenUsage;
+  toolCalls: AgentInteractionToolCall[];
+  toolResults: AgentInteractionToolResult[];
+  semanticParserId?: string;
+  semanticParserVersion?: number;
+  semanticItems?: AgentInteractionSemanticItem[];
+  completeness: AgentInteractionCompleteness;
+  partialReasons: string[];
+  captureSource: string;
+  receivedAt: number;
+}
+export interface AgentInteractionQuery extends SecurityTimeFilter {
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  interactionId?: string;
+  interactionType?: "model" | "tool" | "remote_agent" | "unparsed";
+  model?: string;
+  transport?: "http" | "tls";
+  tlsAdapterId?: string;
+  transportProtocol?: string;
+  wireTemplateId?: string;
+  parseState?: "parsed" | "partial" | "unparsed" | "ambiguous";
+  completeness?: AgentInteractionCompleteness;
+  limit?: number;
+}
+export interface AgentInteractionList extends ClassifiedResponseMeta {
+  items: AgentInteractionRecord[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: "clickhouse" | "hot_ring";
+  updateTime: string;
+}
+export type AgentConversationCoverageStatus = "complete" | "partial" | "attach_pending" | "unsupported_tls_profile" | "unsupported_protocol" | "discovery_pending" | "metadata_only" | "transport_unparsed" | "template_unparsed" | "budget_limited" | "no_final_response" | "asset_only" | "no_activity";
+export interface AgentConversationCoverage {
+  status: AgentConversationCoverageStatus;
+  reasons: string[];
+  completeInteractions: number;
+  partialInteractions: number;
+  lastEvidenceAt?: string;
+}
+export interface AgentConversationQuery extends SecurityTimeFilter {
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  conversationId?: string;
+  product?: string;
+  classification?: AgentClassification;
+  coverageStatus?: AgentConversationCoverageStatus;
+  model?: string;
+  q?: string;
+  limit?: number;
+}
+export interface AgentConversationSummary {
+  conversationId: string;
+  idSource: "provider" | "runtime" | "inferred";
+  tenantId?: string;
+  ownerId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  logicalDefinitionFingerprint?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  terminalContextIds?: string[];
+  sessionIdentityQuality?: "confirmed" | "strong" | "inferred" | "ephemeral" | "unknown" | "conflict";
+  sessionMode?: "resumable" | "conversation" | "per_request" | "ephemeral" | "unknown";
+  parentSessionId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionLifecycle?: "new" | "resume" | "fork";
+  hasContent: boolean;
+  agentAssetId: string;
+  agentInstanceIds: string[];
+  agentProduct: string;
+  displayName: string;
+  environment: "kubernetes" | "docker" | "host" | "unknown";
+  classification: AgentClassification;
+  workspacePath: string;
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  firstPromptPreview?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  models: string[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
+  coverage: AgentConversationCoverage;
+  relatedConversations?: AgentRelatedConversation[];
+}
+export interface AgentRelatedConversation {
+  conversationId: string;
+  relation: "delegates_to" | "delegated_from" | "same_run";
+  runId: string;
+  hop?: string;
+  workflowNode?: string;
+  delegationId?: string;
+  peer?: { host?: string; port?: number; agentAssetId?: string };
+  strength: "exact" | "strong";
+}
+export interface AgentUsageSummary {
+  modelCallCount: number;
+  successfulModelCallCount: number;
+  failedModelCallCount: number;
+  tokenReportedModelCallCount: number;
+  tokenCoverage: "complete" | "partial" | "unavailable";
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  totalDurationMs: number;
+  averageDurationMs?: number;
+}
+export interface AgentInstanceUsageSummary extends AgentUsageSummary {
+  agentInstanceId: string;
+}
+export interface AgentConversationList extends ClassifiedResponseMeta {
+  items: AgentConversationSummary[];
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: "clickhouse" | "hot_ring";
+  updateTime: string;
+}
+export interface AgentConversationDirectoryQuery extends AgentConversationQuery {
+  lifecycleScope?: "running" | "history" | "all";
+}
+export interface LogicalAgentConversationDirectoryItem {
+  logicalAgentId: string;
+  groupingQuality: "exact" | "strong" | "inferred" | "unresolved";
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  definitionFingerprint?: string;
+  candidateId?: string;
+  terminalContextIds?: string[];
+  product: string;
+  displayName: string;
+  environment: "kubernetes" | "docker" | "host" | "unknown";
+  workspacePath: string;
+  lifecycleState: "running" | "unobserved" | "historical";
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  lastActivityAtUnixNs?: string;
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  conversations: AgentConversationSummary[];
+  usage: AgentUsageSummary;
+  instanceUsage: AgentInstanceUsageSummary[];
+  coverage: AgentConversationCoverage;
+}
+export interface AgentConversationDirectoryList extends ClassifiedResponseMeta {
+  items: LogicalAgentConversationDirectoryItem[];
+  runningCount: number;
+  historicalCount: number;
+  total: number;
+  totalMode: QueryTotalMode;
+  coverage: QueryCoverage;
+  dataSource: "clickhouse" | "hot_ring";
+  updateTime: string;
+}
+export interface LogicalAgentConversationDirectoryItemV2 extends LogicalAgentConversationDirectoryItem {
+  instanceCounts: {
+    active: number;
+    idle: number;
+    unobserved: number;
+    exited: number;
+    lost: number;
+    total: number;
+  };
+  conversationCounts: {
+    active: number;
+    dormant: number;
+    incomplete: number;
+    total: number;
+  };
+  recentInstances: AgentRuntimeInstanceRecord[];
+}
+export interface AgentConversationDirectoryListV2 extends Omit<AgentConversationDirectoryList, "items"> {
+  apiVersion: 2;
+  items: LogicalAgentConversationDirectoryItemV2[];
+}
+export interface AgentRunTechnicalActivitySummary {
+  technicalActivityId: string;
+  agentAssetId: string;
+  agentInstanceId?: string;
+  role: "bootstrap" | "control" | "tool_backend" | "derived_metadata"
+    | "retry" | "background" | "unclassified";
+  interactionIds: string[];
+  startedAtUnixNs: string;
+  endedAtUnixNs: string;
+  methods: string[];
+  paths: string[];
+  status: "complete" | "partial" | "failed";
+}
+export interface LogicalAgentConversationDirectoryItemV3 extends LogicalAgentConversationDirectoryItemV2 {
+  userThreads: AgentConversationSummary[];
+  technicalActivities: AgentRunTechnicalActivitySummary[];
+  technicalActivityCount: number;
+}
+export interface AgentConversationDirectoryListV3 extends Omit<AgentConversationDirectoryListV2, "apiVersion" | "items"> {
+  apiVersion: 3;
+  resolutionRevision: number;
+  items: LogicalAgentConversationDirectoryItemV3[];
+}
+export type AgentRuntimeDirectoryInstance = Pick<AgentRuntimeInstanceRecord,
+  | "agentInstanceId"
+  | "canonicalAgentInstanceId"
+  | "agentInstanceAliases"
+  | "runtimeState"
+  | "activityState"
+  | "rootPid"
+  | "rootStartTimeTicks"
+  | "lastSeenAt"
+  | "lastActivityAt"
+  | "workspacePath"
+  | "workloadRef"
+>;
+export type LogicalAgentConversationDirectoryItemV4 = Omit<LogicalAgentConversationDirectoryItemV3, "conversations" | "recentInstances"> & {
+  recentInstances: AgentRuntimeDirectoryInstance[];
+};
+export interface AgentConversationDirectoryListV4 extends Omit<AgentConversationDirectoryListV3, "apiVersion" | "items"> {
+  apiVersion: 4;
+  items: LogicalAgentConversationDirectoryItemV4[];
+}
+export type AgentConversationEventKind = "tool_result" | "model_request" | "model_response" | "tool_call" | "external_tool" | "retry" | "error";
+export interface AgentConversationEvent {
+  eventId: string;
+  kind: AgentConversationEventKind;
+  sequence: number;
+  atUnixNs: string;
+  turnId: string;
+  modelCallId?: string;
+  attemptId?: string;
+  attemptNumber?: number;
+  interactionId?: string;
+  parentEventId?: string;
+  toolCallId?: string;
+  title: string;
+  contentPreview?: string;
+  model?: string;
+  toolName?: string;
+  arguments?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  statusCode?: number;
+  durationNs?: string;
+  completeness: AgentInteractionCompleteness;
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
+  evidenceEventIds: string[];
+}
+export interface AgentConversationTimeline extends ClassifiedResponseMeta {
+  conversation?: AgentConversationSummary;
+  items: AgentConversationEvent[];
+  interactionIds: string[];
+  total: number;
+  coverage: QueryCoverage;
+  dataSource: "clickhouse" | "hot_ring";
+  updateTime: string;
+}
+export type AgentConversationActor = "user" | "model" | "tool" | "agent";
+export type AgentSemanticEventKind =
+  | "user_message"
+  | "model_progress"
+  | "model_final"
+  | "tool_call"
+  | "tool_result"
+  | "delegation_send"
+  | "delegation_reply";
+export type AgentToolKind = "bash" | "read" | "write" | "search" | "mcp" | "skill" | "http" | "code" | "other";
+export interface AgentSemanticEvent {
+  semanticEventId: string;
+  conversationId: string;
+  segmentId: string;
+  turnId: string;
+  actor: AgentConversationActor;
+  kind: AgentSemanticEventKind;
+  phase?: "progress" | "final";
+  atUnixNs: string;
+  endedAtUnixNs?: string;
+  content?: unknown;
+  contentPreview?: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolKind?: AgentToolKind;
+  status?: "pending" | "running" | "succeeded" | "failed" | "unknown";
+  sourceInteractionIds: string[];
+  sourceItemIds?: string[];
+  sequenceNumber?: number;
+  evidenceEventIds: string[];
+  parserId: string;
+  parserVersion: number;
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
+  completeness: "complete" | "partial" | "missing";
+  partialReasons: string[];
+  workflowNode?: string;
+  hop?: string;
+  delegationId?: string;
+  relatedConversationId?: string;
+  peer?: { host?: string; port?: number };
+}
+export interface AgentTimelineDiagnostic {
+  diagnosticId: string;
+  type: "retry" | "capture_gap" | "parse_gap" | "correlation_gap";
+  severity: "info" | "warning" | "error";
+  message: string;
+  attachedToEventId?: string;
+  interactionId?: string;
+}
+export interface ConversationInstanceSegment {
+  schemaVersion: "anysentry.agent_conversation_segment.v1";
+  segmentId: string;
+  conversationId: string;
+  agentInstanceId: string;
+  ordinal: number;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  firstInteractionId: string;
+  lastInteractionId: string;
+  interactionCount: number;
+  correlationQuality: "exact" | "strong" | "inferred" | "ambiguous" | "coverage_gap" | "unlinked";
+  resolverVersion: number;
+  updatedAt: number;
+}
+export interface AgentConversationTurnV2 {
+  turnId: string;
+  ordinal: number;
+  state: "active" | "complete" | "incomplete";
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  events: AgentSemanticEvent[];
+  diagnostics: AgentTimelineDiagnostic[];
+}
+export interface AgentConversationTimelineV2 extends ClassifiedResponseMeta {
+  thread?: AgentConversationSummary;
+  segments: ConversationInstanceSegment[];
+  turns: AgentConversationTurnV2[];
+  interactionIds: string[];
+  parserId: string;
+  parserVersion: number;
+  dataSource: "clickhouse" | "hot_ring";
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+export interface AgentContextReplaySummary {
+  interactionId: string;
+  segmentId?: string;
+  atUnixNs: string;
+  replayedUserMessages: number;
+  replayedToolCalls: number;
+  replayedToolResults: number;
+  newUserMessages: number;
+}
+export interface AgentConversationTimelineV3 extends AgentConversationTimelineV2 {
+  apiVersion: 3;
+  requestKey: string;
+  requestedConversationId: string;
+  canonicalConversationId?: string;
+  aliasFrom?: string;
+  resolutionRevision: number;
+  timelineVersion: 3;
+  contextReplaySummaries: AgentContextReplaySummary[];
+  technicalActivitySummaries: AgentRunTechnicalActivitySummary[];
+  redirectTarget?: { type: "conversation" | "technical_activity"; id: string };
+}
+export type AgentSemanticKernelRelationStatus = "linked_exact" | "linked_strong" | "semantic_only" | "ambiguous" | "coverage_gap";
+export interface AgentSemanticKernelRelation {
+  schemaVersion: "anysentry.agent_semantic_kernel_relation.v1";
+  relationId: string;
+  stableSemanticEventId: string;
+  conversationId: string;
+  turnId: string;
+  toolInvocationId: string;
+  kernelEventId?: string;
+  kernelFactId?: string;
+  kernelEventAt?: string;
+  kernelEventKind?: string;
+  kernelEventDecisionRevision?: number;
+  status: AgentSemanticKernelRelationStatus;
+  linkMethod?: "command" | "resource" | "network" | "network_endpoint" | "shell_bootstrap" | "process_lineage";
+  lineageMethod?: "direct_runtime" | "generation_parent" | "legacy_pid_parent" | "delegated_runtime";
+  competingToolInvocationIds?: string[];
+  competingKernelEventIds?: string[];
+  timeQuality?: "exact" | "bounded";
+  confidence: number;
+  authority: "attested_tls_plaintext" | "authenticated_adapter" | "inferred";
+  relationVersion: 1 | 2 | 3;
+  resolutionRevision: number;
+  evidenceLinkId?: string;
+  algorithmVersion?: string;
+  sourceRefs?: string[];
+  validFromUnixNs?: string;
+  relationRevision?: number;
+  risk?: {
+    verdict: SecurityVerdict;
+    tier: "Rules" | "Llm" | "Agent";
+    severity: SecuritySeverity;
+    riskScore: number;
+    riskName: string;
+    riskCategory: string;
+    reason: string;
+  };
+}
+export interface AgentSemanticEvidenceResponse extends ClassifiedResponseMeta {
+  schemaVersion: "anysentry.agent_semantic_evidence.v1";
+  semanticEventId: string;
+  conversationId: string;
+  toolInvocationId?: string;
+  interactionIds: string[];
+  interactionEvidenceEventIds: string[];
+  relations: AgentSemanticKernelRelation[];
+  kernelEvents: AgentEventListItem[];
+  relationStatus: AgentSemanticKernelRelationStatus;
+  evidenceBundleEventIds: string[];
+  canonicalEvidenceLinks?: CanonicalEvidenceLink[];
+  canonicalEvidenceLinksSource?: "canonical_store" | "canonical_store+hot_delta" | "memory_hot_ring" | "computed_compatibility";
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
+  coverage: QueryCoverage;
+  updateTime: string;
+}
+export interface AgentKernelSemanticContextResponse {
+  schemaVersion: "anysentry.agent_kernel_semantic_context.v1";
+  eventId: string;
+  relations: AgentSemanticKernelRelation[];
+  conversationLinks: Array<{
+    conversationId: string;
+    turnId: string;
+    semanticEventId: string;
+  }>;
+  canonicalEvidenceLinks?: CanonicalEvidenceLink[];
+  canonicalEvidenceLinksSource?: "canonical_store" | "canonical_store+hot_delta" | "memory_hot_ring" | "computed_compatibility";
+  canonicalEvidenceLinksCoverage?: { partial: boolean; reasons: string[] };
+  updateTime: string;
+}
+
+export interface CanonicalEvidenceLink {
+  schemaVersion: "anysentry.evidence_link.v1";
+  linkId: string;
+  fromType: string;
+  fromId: string;
+  toType: string;
+  toId: string;
+  relation: string;
+  method: string;
+  confidence: number;
+  authority: string;
+  evidenceRefs: string[];
+  algorithmVersion: string;
+  status: string;
+  validFromUnixNs: string;
+  validToUnixNs?: string;
+  resolutionRevision: number;
+}
+
+export interface CanonicalSessionMembership {
+  schemaVersion: "anysentry.session_membership.v1";
+  membershipId: string;
+  sessionId: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  interactionId?: string;
+  semanticRecordId?: string;
+  logicalAgentId?: string;
+  agentInstanceId?: string;
+  runtimeInstanceId?: string;
+  segmentId?: string;
+  role: string;
+  confidence: string;
+  evidence: string[];
+  resolverVersion: string;
+  resolutionRevision: number;
+  validFromUnixNs: string;
+  validToUnixNs?: string;
+  sourceRefs: string[];
+}
+
+export interface CanonicalResourceEnvelope<T> {
+  schemaVersion: string;
+  item: T;
+  revision?: number;
+  coverage?: CanonicalEntityCoverage;
+  dataSource?: string;
+  updateTime?: string;
+}
+
+/** Additive Canonical entity GET contracts.  These metadata-only resources deliberately omit
+ * message bodies; callers must follow the legacy bounded timeline/evidence projection for
+ * human-readable content and retain its coverage metadata when unavailable. */
+export interface CanonicalEntityCoverage {
+  status: "complete" | "partial" | "unknown";
+  reasons: string[];
+  source: string;
+}
+export interface CanonicalEntityPagination {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+export interface CanonicalEntityList<T> {
+  schemaVersion: string;
+  items: T[];
+  total: number;
+  pagination: CanonicalEntityPagination;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalLogicalAgentResource {
+  schemaVersion: "anysentry.logical_agent.v1";
+  logicalAgentId: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: "registered_definition" | "workflow_definition" | "service_definition" | "terminal" | "unresolved";
+  logicalIdentityAuthority?: "management_registration" | "authenticated_adapter" | "inferred" | "unknown";
+  definitionFingerprint?: string;
+  identityQuality: "confirmed" | "strong" | "inferred" | "candidate" | "unresolved";
+  family: string;
+  product: string;
+  displayName: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath: string;
+  environment: "kubernetes" | "docker" | "host" | "unknown";
+  collectorIds?: string[];
+  sourceIds?: string[];
+  lifecycleState: "running" | "unobserved" | "historical";
+  terminalContextIds: string[];
+  agentAssetIds: string[];
+  agentInstanceIds: string[];
+  sessionIds: string[];
+  activeInstanceCount: number;
+  totalInstanceCount: number;
+  conversationCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+export interface CanonicalAgentInstanceResource {
+  schemaVersion: "anysentry.agent_instance.v1";
+  agentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  agentProduct?: string;
+  displayName?: string;
+  environment?: CanonicalLogicalAgentResource["environment"];
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  environmentId?: string;
+  collectorId?: string;
+  sourceId?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
+  terminalContextIds: string[];
+  runtimeInstanceIds: string[];
+  sessionIds: string[];
+  state: string;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+export interface CanonicalRuntimeInstanceResource {
+  schemaVersion: "anysentry.runtime_instance.v1";
+  runtimeInstanceId: string;
+  agentInstanceId?: string;
+  legacyAgentInstanceId: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  agentProduct?: string;
+  displayName?: string;
+  environment: CanonicalLogicalAgentResource["environment"];
+  tenantId?: string;
+  ownerId?: string;
+  environmentId?: string;
+  profile?: string;
+  profileVersion?: string;
+  deploymentId?: string;
+  deploymentRevision?: string;
+  collectorId: string;
+  sourceId?: string;
+  hostId: string;
+  bootId: string;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  processGenerationKeys: string[];
+  workspacePath?: string;
+  physicalWorkloadId?: string;
+  terminalContextId?: string;
+  sshConnectionId?: string;
+  state: string;
+  activityState?: string;
+  startedAtUnixNs: string;
+  endedAtUnixNs?: string;
+  lastSeenAtUnixNs: string;
+  sourceRefs: string[];
+  coverage: CanonicalEntityCoverage;
+  detectedClassification?: AgentClassification;
+  effectiveClassification?: AgentClassification;
+  candidateAutoPromoted?: boolean;
+  resolutionRevision: number;
+}
+export interface CanonicalSessionResource {
+  schemaVersion: "anysentry.session.v1";
+  sessionId: string;
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  conversationId?: string;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  logicalDefinitionId?: string;
+  logicalScopeMode?: CanonicalLogicalAgentResource["logicalScopeMode"];
+  logicalIdentityAuthority?: CanonicalLogicalAgentResource["logicalIdentityAuthority"];
+  tenantId?: string;
+  ownerId?: string;
+  agentProduct?: string;
+  environment?: CanonicalLogicalAgentResource["environment"];
+  workspacePath?: string;
+  collectorIds?: string[];
+  sourceIds?: string[];
+  agentInstanceIds: string[];
+  segmentIds: string[];
+  interactionIds: string[];
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sessionIdentityQuality?: string;
+  sessionMode?: string;
+  sessionLifecycle?: string;
+  startedAtUnixNs?: string;
+  lastActivityAtUnixNs?: string;
+  turnCount: number;
+  modelCallCount: number;
+  toolCallCount: number;
+  toolResultCount: number;
+  errorCount: number;
+  usage: AgentUsageSummary;
+  coverage: AgentConversationCoverage;
+  sourceRefs: string[];
+  resolutionRevision: number;
+}
+export interface CanonicalLogicalAgentList extends CanonicalEntityList<CanonicalLogicalAgentResource> {
+  schemaVersion: "anysentry.logical_agent.list.v1";
+}
+export interface CanonicalAgentInstanceList extends CanonicalEntityList<CanonicalAgentInstanceResource> {
+  schemaVersion: "anysentry.agent_instance.list.v1";
+}
+export interface CanonicalRuntimeInstanceList extends CanonicalEntityList<CanonicalRuntimeInstanceResource> {
+  schemaVersion: "anysentry.runtime_instance.list.v1";
+}
+export interface CanonicalSessionList extends CanonicalEntityList<CanonicalSessionResource> {
+  schemaVersion: "anysentry.session.list.v1";
+}
+export interface CanonicalEntityQuery extends SecurityTimeFilter {
+  limit?: number;
+  offset?: number;
+  cursor?: string;
+  revision?: number;
+  includeShadow?: boolean;
+  includeCoverage?: boolean;
+  logicalAgentId?: string;
+  logicalAgentCandidateId?: string;
+  tenantId?: string;
+  ownerId?: string;
+  workspacePath?: string;
+  product?: string;
+  environment?: string;
+  environmentId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
+  runtimeInstanceId?: string;
+  sessionId?: string;
+  sourceId?: string;
+  collectorId?: string;
+  coverageStatus?: string;
+  lifecycleScope?: "running" | "history" | "all";
+  q?: string;
+}
+export interface CanonicalSessionTimelineResponse {
+  schemaVersion: "anysentry.session.timeline.v1";
+  session: CanonicalSessionResource;
+  timeline: AgentConversationTimelineV3;
+  revision: number;
+  coverage: CanonicalEntityCoverage;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalSessionCoverageResponse {
+  schemaVersion: "anysentry.session.coverage.v1";
+  sessionId: string;
+  coverage: AgentConversationCoverage;
+  revision: number;
+  dataSource: string;
+  updateTime: string;
+}
+export interface CanonicalSemanticEventEvidenceResponse {
+  schemaVersion: "anysentry.evidence_link.semantic_event.v1";
+  requestedSemanticEventId: string;
+  resolvedSemanticEventId?: string;
+  aliasOf?: string;
+  aliasCandidates?: string[];
+  semanticRecord?: Record<string, unknown>;
+  evidence?: AgentSemanticEvidenceResponse;
+  relationStatus: AgentSemanticKernelRelationStatus | "coverage_gap" | "ambiguous";
+  coverage: CanonicalEntityCoverage;
+  revision: number;
+  dataSource: string;
+  updateTime: string;
+}
+export interface ToolEvidenceItem {
+  invocationId: string;
+  toolCallId: string;
+  toolName: string;
+  startedAt?: number;
+  endedAt?: number;
+  status: "linked" | "semantic_only" | "ambiguous";
+  reason: "exact_process_and_resource" | "exact_child_and_command" | "delegated_command" | "network_witness" | "overlapping_exact_claims" | "kernel_read_not_captured" | "no_matching_kernel_evidence" | "no_kernel_event_expected" | "candidates_truncated";
+  adapterEventIds: string[];
+  kernelEvidence: Array<{
+    eventId: string;
+    eventKind: string;
+    at: number;
+    linkMethod: "same_process_resource" | "direct_child_command" | "delegated_command" | "network";
+    confidence: number;
+  }>;
+  ambiguousKernelEventIds?: string[];
+}
+export interface ToolEvidenceResponse {
+  schemaVersion: "anysentry.tool_evidence.v1";
+  items: ToolEvidenceItem[];
+  ignoredUntrustedAdapterEvents: number;
+  truncated: boolean;
+  invocationId: string;
+  toolCallId?: string;
+  dataSource: "clickhouse_relation" | "clickhouse+hot_delta" | "memory_hot_ring";
+  partial: boolean;
+  partialReasons?: Array<"trusted_correlation_off" | "storage_unavailable" | "scan_limit" | "process_scope_limit">;
+  coverageLayers?: {
+    schemaVersion: "anysentry.observability_coverage_layers.v1";
+    plaintext: { status: string; reasons: string[]; count: number };
+    kernel: { status: string; reasons: string[]; count: number; factCount: number };
+    session: { status: string; reasons: string[]; count: number; canonicalSessionIds: string[] };
+    run: { status: string; reasons: string[]; count: number; runIds: string[] };
+  };
   updateTime: string;
 }
 
@@ -639,6 +1998,7 @@ export interface EvidenceBundleQuery extends SecurityTimeFilter {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -662,6 +2022,7 @@ export interface EvidenceBundleScope {
   windowId?: string;
   workspacePath?: string;
   agentId?: string;
+  subjectAssetId?: string;
   collectorId?: string;
   sourceId?: string;
   traceId?: string;
@@ -695,7 +2056,7 @@ export interface EvidenceBundleSummary {
   riskCategories: EvidenceBundleRiskCategory[];
 }
 
-export interface EvidenceBundle {
+export interface EvidenceBundle extends ClassifiedResponseMeta {
   schemaVersion: "anysentry.evidence_bundle.v1";
   bundleId: string;
   generatedAt: string;
@@ -736,7 +2097,7 @@ export interface EvidenceBundleExportQuery extends EvidenceBundleQuery {
   format?: EvidenceBundleExportFormat;
 }
 
-export interface EvidenceBundleExport {
+export interface EvidenceBundleExport extends ClassifiedResponseMeta {
   schemaVersion: "anysentry.evidence_export.v1";
   bundleId: string;
   generatedAt: string;
@@ -1145,7 +2506,82 @@ export interface IncidentUpdateRequest {
   note?: string;
 }
 
+/** Root-process lifecycle, kept separate from event-derived AgentHealthState. */
+export type AgentRuntimeState = "running" | "exited" | "lost" | "unobserved";
+export type AgentActivityState = "active" | "idle";
+
+export interface AgentRuntimeInstanceRecord {
+  agentScopeId: string;
+  agentDisplayName?: string;
+  agentInstanceId: string;
+  canonicalAgentInstanceId?: string;
+  agentInstanceAliases?: string[];
+  physicalWorkloadId?: string;
+  classification?: AgentClassification;
+  runtimeState: AgentRuntimeState;
+  activityState?: AgentActivityState;
+  rootPid: number;
+  rootStartTimeTicks: string;
+  rootGeneration: number;
+  hostId: string;
+  bootId: string;
+  comm?: string;
+  exe?: string;
+  workspacePath?: string;
+  discoveredAt: number;
+  lastSeenAt: number;
+  lastActivityAt?: number;
+  endedAt?: number;
+  exitCode?: number;
+  signal?: number;
+  confidence?: number;
+  source?: AgentAttributionSource;
+  evidence?: string[];
+  workloadRef?: AgentWorkloadRef;
+  collectorId: string;
+  forwarderInstanceId: string;
+  leaseEpoch: number;
+  snapshotVersion: number;
+  snapshotHash: string;
+  filterMode: "shadow" | "enforce";
+  registryVersion?: number;
+  registryHash?: string;
+  registryMatcherHash?: string;
+  receivedAt: number;
+}
+
+export interface AgentRuntimeStateQuery {
+  collectorId?: string;
+  forwarderInstanceId?: string;
+  agentScopeId?: string;
+  agentInstanceId?: string;
+  physicalWorkloadId?: string;
+  runtimeState?: AgentRuntimeState | "all";
+  activityState?: AgentActivityState | "all";
+  includeShadow?: boolean;
+  limit?: number;
+}
+
+export interface AgentRuntimeStateSummary {
+  totalInstances: number;
+  runningInstances: number;
+  activeInstances: number;
+  idleInstances: number;
+  exitedInstances: number;
+  lostInstances: number;
+  unobservedInstances: number;
+  shadowInstances: number;
+}
+
+export interface AgentRuntimeStateList {
+  items: AgentRuntimeInstanceRecord[];
+  total: number;
+  summary: AgentRuntimeStateSummary;
+  updateTime: string;
+}
+
 export interface AgentInventoryQuery extends SecurityTimeFilter {
+  assetRange?: "current" | "recent" | "historical" | "archived" | "all";
   healthState?: AgentHealthState | "all";
   criticality?: AgentCriticality | "all";
   owner?: string;
@@ -1154,6 +2590,7 @@ export interface AgentInventoryQuery extends SecurityTimeFilter {
   q?: string;
   agentId?: string;
   agentAssetId?: string;
+  agentInstanceId?: string;
   workspacePath?: string;
   userId?: string;
   includeUnclassified?: boolean;
@@ -1164,6 +2601,7 @@ export interface AgentInventoryItem {
   agentId: string;
   agentAssetId: string;
   agentAssetAliases?: string[];
+  agentProduct?: string;
   workspacePath: string;
   userId: string;
   displayName?: string;
@@ -1185,6 +2623,14 @@ export interface AgentInventoryItem {
   attributionEvidence: string[];
   physicalWorkloadId?: string;
   agentInstanceId?: string;
+  agentInstanceAliases?: string[];
+  identityBindingQuality?: "exact" | "weak";
+  identityReasonCode?: string;
+  logicalInstanceCount?: number;
+  hostId?: string;
+  bootId?: string;
+  rootPid?: number;
+  rootStartTime?: string;
   workloadRef?: AgentWorkloadRef;
   reviewDecision?: AgentReviewDecision;
   reviewedBy?: string;
@@ -1193,6 +2639,8 @@ export interface AgentInventoryItem {
   reviewIdentityKeys: string[];
   firstSeen: string;
   lastSeen: string;
+  lifecycleState: AgentLifecycleState;
+  terminatedAt?: string;
   healthState: AgentHealthState;
   riskLevel: SecurityRiskLevel;
   riskLevelText: string;
@@ -1289,7 +2737,294 @@ export interface AgentInventory {
   items: AgentInventoryItem[];
   total: number;
   summary: AgentInventorySummary;
+  coverage: QueryCoverage;
+  directory?: {
+    source: "observed_asset_lifecycle";
+    snapshotRevision: number;
+    totalAssets: number;
+    partial: boolean;
+    reasons: string[];
+    reconciledAt: string;
+  };
   updateTime: string;
+}
+
+export type SubjectAssetType = "agent" | "service" | "infrastructure" | "workload" | "ephemeral_process";
+export type AssetExistenceState = "discovered" | "active" | "inactive" | "retired";
+export type AssetBindingQuality = "exact" | "logical" | "ephemeral" | "weak" | "conflict" | "unassigned";
+export type ObservationState = "full" | "structural" | "aggregate" | "sample" | "suppressed" | "degraded" | "gap";
+export type ObservedRuntimeState = "starting" | "current" | "idle" | "exited" | "lost" | "unknown";
+
+export interface ObservedAsset {
+  schemaVersion: "anysentry.observed_asset.v1";
+  subjectAssetId: string;
+  subjectAssetType: SubjectAssetType;
+  displayName: string;
+  aliases: string[];
+  scope: {
+    workspacePath?: string;
+    clusterId?: string;
+    namespace?: string;
+    ownerKind?: string;
+    ownerName?: string;
+    containerName?: string;
+    hostId?: string;
+    systemdUnit?: string;
+  };
+  existenceState: AssetExistenceState;
+  identity: { classification: AgentClassification; revision: number; source: string; effectiveAt: string };
+  role: { role: WorkloadRole; revision: number; source: string; effectiveAt: string };
+  bindingQuality: AssetBindingQuality;
+  bindingRevision: number;
+  observationState: ObservationState;
+  captureProfile?: string;
+  runtimeSummary: Record<ObservedRuntimeState | "total", number>;
+  eventSummary: { eventCount: number; lastEventAt?: string; eventKindCounts: Record<string, number> };
+  firstSeenAt: string;
+  lastInventoryAt?: string;
+  lastActivityAt?: string;
+  sources: string[];
+  modelRevision: number;
+  updatedAt: string;
+}
+
+export interface ObservedAssetReadStatus {
+  schemaVersion: "anysentry.observed_asset_read_status.v1";
+  partial: boolean;
+  reasons: string[];
+  modelRevision: number;
+  reconciledAt: string;
+}
+
+export interface ObservedAssetListQuery {
+  subjectAssetType?: SubjectAssetType | "all";
+  existenceState?: AssetExistenceState | "all";
+  identity?: AgentClassification | "all";
+  role?: WorkloadRole | "all";
+  observationState?: ObservationState | "all";
+  bindingQuality?: AssetBindingQuality | "all";
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface ObservedAssetSummary {
+  totalAssets: number;
+  byType: Record<SubjectAssetType, number>;
+  byExistence: Record<AssetExistenceState, number>;
+  byIdentity: Record<AgentClassification, number>;
+  byRole: Record<WorkloadRole, number>;
+  byObservation: Record<ObservationState, number>;
+  byBindingQuality: Record<AssetBindingQuality, number>;
+  runtimeStates: Record<ObservedRuntimeState, number>;
+  totalEvents: number;
+  unassignedEvents: number;
+  degradedOrGapAssets: number;
+  modelRevision: number;
+  updateTime: string;
+}
+
+export interface ObservedAssetList extends ClassifiedResponseMeta {
+  schemaVersion: "anysentry.observed_asset_list.v1";
+  items: ObservedAsset[];
+  total: number;
+  nextCursor?: string;
+  snapshotRevision: number;
+  summary: ObservedAssetSummary;
+  readStatus: ObservedAssetReadStatus;
+  updateTime: string;
+}
+
+export interface ObservedRuntime {
+  runtimeInstanceId: string;
+  subjectAssetId: string;
+  placement: "kubernetes" | "docker" | "host" | "process" | "unknown";
+  state: ObservedRuntimeState;
+  physicalWorkloadId?: string;
+  processInstanceKey?: string;
+  startedAt: string;
+  lastInventoryAt: string;
+  endedAt?: string;
+  reasonCode: string;
+  revision: number;
+  updatedAt: string;
+}
+
+export interface AssetLifecycleFact {
+  factId: string;
+  factKind: string;
+  subjectAssetId: string;
+  runtimeInstanceId?: string;
+  effectiveAt: string;
+  source: string;
+  reasonCode: string;
+  previousState?: string;
+  nextState?: string;
+  capturePolicyVersion?: number;
+  captureEpoch?: string;
+}
+
+export interface ObservationCoverageInterval {
+  intervalId: string;
+  subjectAssetId: string;
+  runtimeInstanceId?: string;
+  state: "active" | "closed";
+  startAt: string;
+  endAt?: string;
+  captureProfile: string;
+  observationState: ObservationState;
+  completeness: "complete" | "bounded" | "partial" | "degraded" | "gap";
+  signalCoverage: Record<"exec" | "exit" | "security" | "file" | "network" | "llm", string> & { fileRead?: string };
+  reasonCode: string;
+  ruleRefs: string[];
+}
+
+export interface ObservedAssetDetail extends ClassifiedResponseMeta {
+  schemaVersion: "anysentry.observed_asset_detail.v1";
+  asset: ObservedAsset;
+  runtimes: ObservedRuntime[];
+  bindings: Array<{
+    bindingId: string;
+    quality: AssetBindingQuality;
+    revision: number;
+    physicalWorkloadId?: string;
+    processInstanceKey?: string;
+    source: string;
+    reasonCode: string;
+    validFrom: string;
+    validTo?: string;
+  }>;
+  lifecycleFacts: AssetLifecycleFact[];
+  observationCoverage: ObservationCoverageInterval[];
+  readStatus: ObservedAssetReadStatus;
+  updateTime: string;
+}
+
+export interface ObservedAssetReviewImpact {
+  schemaVersion: "anysentry.observed_asset_review_impact.v1";
+  assetId: string;
+  assetRevision: number;
+  bindingRevision: number;
+  reviewRevision: number;
+  canReview: boolean;
+  reasons: string[];
+  scopeLabel: string;
+  bindingQuality: string;
+  currentIdentity: AgentClassification;
+  runtimeInstances: number;
+  recentWindowEvents: number;
+  observationState: ObservationState;
+  matchedRules: number;
+  actions: { markNonAgent: boolean; setPending: boolean; restoreAutomatic: boolean };
+  warning: string;
+  updateTime: string;
+}
+
+export interface ObservedAssetReviewResult {
+  review: {
+    assetId: string;
+    revision: number;
+    globalRevision: number;
+    decision: "non_agent" | "unknown" | "clear";
+    effectiveAt: number;
+    reviewedAt: number;
+    reviewedBy: string;
+    reason: string;
+    durable: boolean;
+  };
+  asset?: ObservedAsset;
+  impact?: ObservedAssetReviewImpact;
+}
+
+export interface AgentInstanceMetricsQuery extends SecurityTimeFilter {
+  agentAssetId: string;
+  agentInstanceId?: string;
+  seriesPoints?: number;
+}
+
+export interface AgentInstanceMetricPoint {
+  statTime: string;
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  toolCount: number;
+  fileCount: number;
+  networkCount: number;
+  processCount: number;
+  llmCount: number;
+  l1Count: number;
+  l2Count: number;
+  l3Count: number;
+  failedCount: number;
+  timeoutCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  maxRiskScore: number;
+}
+
+export interface AgentInstanceMetrics {
+  agentAssetId: string;
+  points: AgentInstanceMetricPoint[];
+  eventCount: number;
+  riskyEventCount: number;
+  blockedCount: number;
+  escalatedCount: number;
+  tokenCount: number;
+  avgLatencyMs: number;
+  failedCount: number;
+  timeoutCount: number;
+  coverage?: QueryCoverage;
+  updateTime: string;
+}
+
+export interface AgentRuntimeLookup {
+  byAgentInstanceId: ReadonlyMap<string, AgentRuntimeInstanceRecord>;
+  /** null means more than one Agent instance occupies the same physical workload. */
+  byPhysicalWorkloadId: ReadonlyMap<string, AgentRuntimeInstanceRecord | null>;
+}
+
+function runtimeIdentity(value?: string) {
+  return value?.trim() ?? "";
+}
+
+/**
+ * Build an instance-safe join index. Agent scope is intentionally absent: two Codex roots are two
+ * lifecycles, even when their display/type scope is identical.
+ */
+export function buildAgentRuntimeLookup(
+  items: AgentRuntimeInstanceRecord[],
+  options: { complete?: boolean } = {},
+): AgentRuntimeLookup {
+  const byAgentInstanceId = new Map<string, AgentRuntimeInstanceRecord>();
+  const byPhysicalWorkloadId = new Map<string, AgentRuntimeInstanceRecord | null>();
+  for (const item of items) {
+    const instanceId = runtimeIdentity(item.agentInstanceId);
+    if (instanceId && !byAgentInstanceId.has(instanceId)) byAgentInstanceId.set(instanceId, item);
+
+    // Physical identity is only a safe fallback over a complete result set. If the API response
+    // was truncated, another root in the omitted tail may occupy the same Pod/container.
+    if (options.complete === false) continue;
+    const physicalId = runtimeIdentity(item.physicalWorkloadId);
+    if (!physicalId) continue;
+    const previous = byPhysicalWorkloadId.get(physicalId);
+    if (previous === undefined) byPhysicalWorkloadId.set(physicalId, item);
+    else if (previous && previous.agentInstanceId !== item.agentInstanceId) {
+      byPhysicalWorkloadId.set(physicalId, null);
+    }
+  }
+  return { byAgentInstanceId, byPhysicalWorkloadId };
+}
+
+export function matchAgentRuntimeInstance(
+  agent: Pick<AgentInventoryItem, "agentInstanceId" | "physicalWorkloadId">,
+  lookup: AgentRuntimeLookup,
+): AgentRuntimeInstanceRecord | undefined {
+  const instanceId = runtimeIdentity(agent.agentInstanceId);
+  const exact = instanceId ? lookup.byAgentInstanceId.get(instanceId) : undefined;
+  if (exact) return exact;
+  const physicalId = runtimeIdentity(agent.physicalWorkloadId);
+  return physicalId ? lookup.byPhysicalWorkloadId.get(physicalId) ?? undefined : undefined;
 }
 
 export type IdentityAiReviewTargetType = "event" | "agent";
@@ -1313,7 +3048,11 @@ export interface IdentityAiReviewRecord {
   evidenceRefs: string[];
   evidenceDigest: string;
   model?: string;
-  provider: "a3s-code-sdk";
+  provider: "direct-llm" | "a3s-code-sdk";
+  automatic?: boolean;
+  logicalIdentityKey?: string;
+  appliedDecision?: AgentReviewDecision;
+  appliedAt?: string;
   error?: string;
   createdAt: string;
   completedAt?: string;
@@ -1334,6 +3073,7 @@ export interface WorkspaceInventoryQuery extends SecurityTimeFilter {
 }
 
 export interface WorkspaceInventoryItem {
+  workspaceId?: string;
   workspacePath: string;
   owner?: string;
   team?: string;
@@ -1391,8 +3131,11 @@ export interface WorkspaceInventory {
 }
 
 export interface AgentTopologyQuery extends SecurityTimeFilter {
+  scope?: "agent" | "raw";
   edgeId?: string;
   eventId?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
   workspacePath?: string;
   collectorId?: string;
@@ -1407,7 +3150,10 @@ export interface AgentTopologyNode {
   type: TopologyNodeType;
   label: string;
   subtitle?: string;
+  agentAssetId?: string;
+  agentInstanceId?: string;
   agentId?: string;
+  classification?: AgentClassification;
   workspacePath?: string;
   collectorId?: string;
   riskLevel: SecurityRiskLevel;
@@ -1456,7 +3202,30 @@ export interface AgentTopology {
   nodes: AgentTopologyNode[];
   edges: AgentTopologyEdge[];
   summary: AgentTopologySummary;
+  coverage: QueryCoverage;
   updateTime: string;
+}
+
+export interface CollectorExecEvidenceMetrics {
+  exec: number;
+  execTruncated: number;
+  execIncomplete: number;
+  execReassemblyTimeout: number;
+}
+
+export interface CollectorExecEvidenceReport extends CollectorExecEvidenceMetrics {
+  shutdownFinal: boolean;
+}
+
+export interface CollectorExecEvidenceHealth {
+  reported: boolean;
+  lastReportedAt?: string;
+  latest?: CollectorExecEvidenceReport & { intervalSecs: number };
+  window: CollectorExecEvidenceMetrics & {
+    heartbeatCount: number;
+    intervalSecs: number;
+    shutdownFinalCount: number;
+  };
 }
 
 export interface CollectorHeartbeatRequest {
@@ -1482,12 +3251,15 @@ export interface CollectorHeartbeatRequest {
   errorCount?: number;
   observedAgents?: number;
   filterMetrics?: CollectorFilterMetrics;
+  fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
 }
 
 export interface CollectorFilterMetrics {
   /** @deprecated Compatibility marker for pre-decoupling forwarders. */
   scope: "all" | "shadow" | "agent" | "decoupled";
+  /** True only for the Forwarder heartbeat emitted after its final snapshot and event drain. */
+  shutdownFinal?: boolean;
   filterMode?: "enforce" | "shadow";
   retainUnknown?: boolean;
   retainNonAgent?: boolean;
@@ -1497,17 +3269,77 @@ export interface CollectorFilterMetrics {
   confirmedAgent: number;
   probableAgent: number;
   unknown: number;
+  unknownReasonCounts?: Partial<Record<UnknownReason, number>>;
   nonAgent: number;
   filteredNonAgent: number;
   wouldFilterNonAgent: number;
+  filteredUnknown: number;
+  wouldFilterUnknown: number;
   filteredNoise: number;
   wouldFilterNoise: number;
   discoveryBudgetDropped: number;
   wouldDiscoveryBudgetDrop: number;
+  /** Test-only and absent unless a lifecycle E2E run explicitly arms the forwarder. */
+  e2eFilterReceipts?: Array<{
+    schema: "anysentry.e2e_filter_receipt.v1";
+    eventKind: "ToolExec";
+    markerSha256: string;
+    lineSha256: string;
+    physicalWorkloadId?: string;
+    classification: string;
+    filterReason: string;
+    filteredAt: string;
+  }>;
   deduplicated: number;
   queueDropped: number;
+  queueParked?: number;
+  protectedQueueDropped?: number;
+  queueDroppedByClass?: Partial<Record<
+    "tool_exec" | "process_exit" | "security" | "collector_heartbeat" | "capture_aggregate" | "agent" | "other",
+    number
+  >>;
   batches: number;
   batchEvents: number;
+  retryQueued?: number;
+  retryAttempts?: number;
+  retryRecovered?: number;
+  retryExhausted?: number;
+  retryParked?: number;
+  spoolReplayAttempts?: number;
+  spoolReplayAdmitted?: number;
+  spoolReplayDeferred?: number;
+  heartbeatDeliveryFailures?: number;
+  controlPlaneState?: "starting" | "healthy" | "degraded";
+  controlPlaneFailedLanes?: Array<"identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot">;
+  controlPlaneStartingLanes?: Array<"identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot">;
+  controlPlaneLanes?: Partial<Record<
+    "identity" | "filter_rules" | "infrastructure_policy" | "runtime_snapshot",
+    { lastSuccessAt?: string; lastFailureAt?: string; lastFailure?: string }
+  >>;
+  spoolRecords?: number;
+  spoolActiveRecords?: number;
+  spoolParkedRecords?: number;
+  spoolBytes?: number;
+  spoolWalBytes?: number;
+  spoolOldestAgeMs?: number;
+  spoolAtCapacity?: boolean;
+  spoolFsyncMode?: "always" | "periodic";
+  queueBytes?: number;
+  inflightEvents?: number;
+  inflightBytes?: number;
+  inflightOldestAgeMs?: number;
+  retryQueueDepth?: number;
+  retryQueueBytes?: number;
+  retryOutstandingEvents?: number;
+  retryOutstandingBytes?: number;
+  retryOldestAgeMs?: number;
+  outstandingEvents?: number;
+  outstandingBytes?: number;
+  outstandingOldestAgeMs?: number;
+  outstandingEventLimit?: number;
+  outstandingByteLimit?: number;
+  protectedReserveEvents?: number;
+  protectedReserveBytes?: number;
   identitySnapshotReady: boolean;
   identitySnapshotVersion: number;
   identitySnapshotAgeSeconds: number;
@@ -1541,6 +3373,31 @@ export interface CollectorFilterMetrics {
   processBootstrapProcReads: number;
   processFallbackProcReads: number;
   processAncestryProcReads: number;
+  runtimeSnapshotRetries?: number;
+  runtimeSnapshotRecovered?: number;
+  lastRuntimeSnapshotFailureAt?: string;
+  lastRuntimeSnapshotFailure?: string;
+  lastRuntimeSnapshotFailureVersion?: number;
+  lastRuntimeSnapshotRetryAt?: string;
+  lastRuntimeSnapshotRetryReason?: string;
+}
+
+export interface CollectorFileFilterMetrics {
+  fileAccess: number;
+  fileDelete: number;
+  accessKept: number;
+  accessSampled: number;
+  accessDropped: number;
+  accessSuppressed: number;
+  deleteKept: number;
+  deleteDropped: number;
+  ruleHits: number;
+  ruleMisses: number;
+  staleRules: number;
+  accessRingDropped: number;
+  deleteRingDropped: number;
+  enabled: boolean;
+  epoch: number;
 }
 
 export interface CollectorHeartbeatAck {
@@ -1568,6 +3425,11 @@ export interface CollectorHealthItem {
   mode?: string;
   state: CollectorHealthState;
   stateText: string;
+  healthChannels: {
+    capture: CollectorHealthChannel;
+    delivery: CollectorHealthChannel;
+    control: CollectorHealthChannel;
+  };
   firstSeen?: string;
   lastEventAt?: string;
   lastHeartbeatAt?: string;
@@ -1583,7 +3445,16 @@ export interface CollectorHealthItem {
   droppedEvents: number;
   outputDropped: number;
   errorCount: number;
+  windowErrorMaxima: {
+    droppedEvents: number;
+    outputDropped: number;
+    errorCount: number;
+  };
+  execEvidence: CollectorExecEvidenceHealth;
+  filterMetricsReported: boolean;
   filterMetrics: CollectorFilterMetrics;
+  fileFilterMetricsReported: boolean;
+  fileFilterMetrics: CollectorFileFilterMetrics;
   message?: string;
   eventCategoryCounts: Record<AgentEventCategory, number>;
 }
@@ -1592,6 +3463,7 @@ export interface CollectorHealthSummary {
   totalCollectors: number;
   healthyCollectors: number;
   quietCollectors: number;
+  warningCollectors: number;
   degradedCollectors: number;
   staleCollectors: number;
   downCollectors: number;
@@ -1604,6 +3476,7 @@ export interface CollectorHealth {
   items: CollectorHealthItem[];
   total: number;
   summary: CollectorHealthSummary;
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -1768,13 +3641,17 @@ export interface AlertListItem {
   riskName?: string;
   sourceSummary: string;
   occurrenceCount: number;
+  evidenceEventCount?: number;
+  evidenceEventIds?: string[];
   lastNotificationAt?: string;
   labels: Record<string, string>;
+  monitored?: boolean;
+  agentScopeId?: string;
 }
 
 export interface AlertListQuery extends SecurityTimeFilter {
   alertId?: string;
-  status?: AlertStatus | "all";
+  status?: AlertStatus | "active" | "all";
   severity?: SecuritySeverity | "all";
   kind?: AlertKind | "all";
   q?: string;
@@ -1787,6 +3664,7 @@ export interface AlertListQuery extends SecurityTimeFilter {
   taskId?: string;
   objectiveId?: string;
   issueId?: string;
+  timeMode?: AlertTimeMode;
   limit?: number;
 }
 
@@ -1799,10 +3677,13 @@ export interface AlertListSummary {
   resolvedAlerts: number;
   criticalAlerts: number;
   highAlerts: number;
+  urgentActiveAlerts: number;
+  unassignedActiveAlerts: number;
   incidentAlerts: number;
   collectorAlerts: number;
   agentAlerts: number;
   eventAlerts: number;
+  judgmentAlerts: number;
   sourceAlerts: number;
   coverageAlerts: number;
   objectiveAlerts: number;
@@ -2070,6 +3951,7 @@ export interface IngestionSourceQuery {
   workspacePath?: string;
   status?: IngestionSourceStatus | "all";
   type?: IngestionSourceType | "all";
+  includeVerification?: boolean;
   q?: string;
   limit?: number;
 }
@@ -2194,11 +4076,18 @@ export interface PolicySimulationSummary {
   affectedWorkspaces: number;
 }
 
-export interface PolicySimulationResult {
+export interface PolicySimulationResult extends ClassifiedResponseMeta {
   summary: PolicySimulationSummary;
   diffs: PolicySimulationDiff[];
   byAgent: PolicySimulationGroup[];
   byWorkspace: PolicySimulationGroup[];
+  sampling: {
+    strategy: "latest_event_sample";
+    sampleLimit: number;
+    sampledEvents: number;
+    truncated: boolean;
+  };
+  coverage: QueryCoverage;
   updateTime: string;
 }
 
@@ -2239,6 +4128,7 @@ export interface RemediationListItem {
 }
 
 export interface RemediationQuery extends SecurityTimeFilter {
+  includeBacklog?: boolean;
   taskId?: string;
   incidentId?: string;
   alertId?: string;
@@ -2287,6 +4177,64 @@ export interface RemediationUpdateRequest {
   completedStepIds?: string[];
 }
 
+export interface PlatformUserItem {
+  schemaVersion: "anysentry.platform_user.v1";
+  userId: string;
+  username: string;
+  displayName: string;
+  email?: string;
+  team?: string;
+  role: PlatformUserRole;
+  status: PlatformUserStatus;
+  source: PlatformUserSource;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface PlatformRoleDefinition {
+  role: PlatformUserRole;
+  label: string;
+  description: string;
+  permissions: string[];
+  userCount: number;
+}
+
+export interface PlatformUserQuery {
+  q?: string;
+  role?: PlatformUserRole | "all";
+  status?: PlatformUserStatus | "all";
+  limit?: number;
+}
+
+export interface PlatformUserSummary {
+  totalUsers: number;
+  activeUsers: number;
+  disabledUsers: number;
+  administratorUsers: number;
+}
+
+export interface PlatformUserList {
+  items: PlatformUserItem[];
+  roles: PlatformRoleDefinition[];
+  total: number;
+  summary: PlatformUserSummary;
+  authenticationRequired: false;
+  authorizationEnforced: false;
+  updateTime: string;
+}
+
+export interface PlatformUserUpdateRequest {
+  username?: string;
+  displayName?: string;
+  email?: string;
+  team?: string;
+  role?: PlatformUserRole;
+  status?: PlatformUserStatus;
+  note?: string;
+}
+
 export interface AuditActor {
   type: AuditActorType;
   id: string;
@@ -2326,6 +4274,7 @@ export interface AuditSummary {
   notificationActions: number;
   objectiveActions: number;
   sourceActions: number;
+  userActions: number;
   incidentActions: number;
   alertActions: number;
   remediationActions: number;
@@ -2425,6 +4374,11 @@ export interface ModelConnectionStatus {
   profile: ModelConnectionProfile;
   state: "active" | "missing_credential";
   keyConfigured: boolean;
+  callable: boolean;
+  connectivityStatus?: PolicyConnectivityStatus;
+  checkedAt?: string;
+  latencyMs?: number;
+  message?: string;
   source?: "runtime" | "environment";
   endpoint?: string;
   model?: string;
@@ -2457,6 +4411,9 @@ export interface PlatformHealth {
     mode: "clickhouse" | "memory";
     clickhouseConfigured: boolean;
     clickhouseReady: boolean;
+    /** Added in the bounded hot-ring API; optional while older API images are rolling out. */
+    hotRingSize?: number;
+    hotRingCapacity?: number;
   };
   managementAuth?: {
     enabled: boolean;
@@ -2469,31 +4426,185 @@ export interface PlatformHealth {
     distinctAgents: number;
     distinctSessions: number;
   };
+  historyFactCache?: {
+    schemaVersion: "anysentry.history-cache.v1";
+    caches: Array<{
+      name: string;
+      buckets: number;
+      facts: number;
+      estimatedBytes: number;
+      evictions: number;
+      budgetRejects: number;
+      journalResets: number;
+    }>;
+    totals: {
+      buckets: number;
+      facts: number;
+      estimatedBytes: number;
+      evictions: number;
+      budgetRejects: number;
+      journalResets: number;
+    };
+  };
+  dashboardBucketSnapshots?: {
+    schemaVersion: "anysentry.dashboard-bucket-snapshots.v1";
+    enabled: boolean;
+    hits: number;
+    misses: number;
+    invalidated: number;
+    exactRanges: number;
+    writtenBuckets: number;
+    fallbackErrors: number;
+    rangeRejects: number;
+  };
   policy: PolicyStatus;
 }
 
+const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000;
+const dashboardPost = <T>(endpoint: string, body: unknown) =>
+  apiClient.postLong<T>(endpoint, body, DASHBOARD_HISTORY_TIMEOUT_MS);
+
 export const securityCenterApi = {
-  healthz: () => apiClient.get<PlatformHealth>("/security-center/healthz"),
+  healthz: (signal?: AbortSignal) =>
+    apiClient.get<PlatformHealth>("/security-center/healthz", { signal }),
+  platformMetrics: (range: SecurityTimeType = "last_1h") =>
+    apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
+  assistantQuery: (body: SecurityAssistantQuery, timeoutMs?: number) =>
+    apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body, timeoutMs),
   healthCard: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityHealthCard>("/security-center/top/healthCard", filter),
+    dashboardPost<SecurityHealthCard>("/security-center/top/healthCard", filter),
   explainabilityScan: (filter: SecurityExplainabilityScanRequest) =>
-    apiClient.post<SecurityExplainabilityScan>("/security-center/top/explainabilityScan", filter),
+    dashboardPost<SecurityExplainabilityScan>("/security-center/top/explainabilityScan", filter),
   performanceCard: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityPerformanceCard>("/security-center/top/performanceCard", filter),
+    dashboardPost<SecurityPerformanceCard>("/security-center/top/performanceCard", filter),
   riskSummary: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityRiskSummary>("/security-center/risks/summary", filter),
+    dashboardPost<SecurityRiskSummary>("/security-center/risks/summary", filter),
   riskBreakdown: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityRiskBreakdown>("/security-center/risks/breakdown", filter),
+    dashboardPost<SecurityRiskBreakdown>("/security-center/risks/breakdown", filter),
   highestRiskSession: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityHighestRiskSession>("/security-center/sessions/highestRisk", filter),
+    dashboardPost<SecurityHighestRiskSession>("/security-center/sessions/highestRisk", filter),
   decisionFunnel: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityDecisionFunnel>("/security-center/sessions/decisionFunnel", filter),
+    dashboardPost<SecurityDecisionFunnel>("/security-center/sessions/decisionFunnel", filter),
   agentObservability: (filter: SecurityTimeFilter) =>
     apiClient.post<AgentObservability>("/security-center/sessions/agentObservability", filter),
   workspaceRiskDistribution: (filter: SecurityTimeFilter) =>
-    apiClient.post<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
+    dashboardPost<SecurityWorkspaceRiskDistribution>("/security-center/sessions/workspaceRiskDistribution", filter),
   agentEvents: (filter: AgentEventQuery) =>
-    apiClient.post<AgentEventList>("/security-center/events/list", filter),
+    dashboardPost<AgentEventList>("/security-center/events/list", filter),
+  agentActions: (filter: AgentEventQuery) =>
+    apiClient.post<AgentActionList>("/security-center/agents/actions", filter),
+  agentInteractions: (filter: AgentInteractionQuery) =>
+    apiClient.postLong<AgentInteractionList>("/security-center/agents/interactions", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversations: (filter: AgentConversationQuery) =>
+    apiClient.postLong<AgentConversationList>("/security-center/agents/conversations", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationDirectory: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.postLong<AgentConversationDirectoryList>("/security-center/agents/conversation-directory", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationDirectoryV2: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.postLong<AgentConversationDirectoryListV2>("/security-center/agents/conversation-directory-v2", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationDirectoryV3: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.postLong<AgentConversationDirectoryListV3>("/security-center/agents/conversation-directory-v3", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationDirectoryV4: (filter: AgentConversationDirectoryQuery) =>
+    apiClient.postLong<AgentConversationDirectoryListV4>("/security-center/agents/conversation-directory-v4", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationTimeline: (filter: AgentConversationQuery & { conversationId: string }) =>
+    apiClient.postLong<AgentConversationTimeline>("/security-center/agents/conversations/timeline", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationTimelineV2: (filter: AgentConversationQuery & { conversationId: string }) =>
+    apiClient.postLong<AgentConversationTimelineV2>("/security-center/agents/conversations/timeline-v2", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentConversationTimelineV3: (filter: AgentConversationQuery & { conversationId: string }) =>
+    apiClient.postLong<AgentConversationTimelineV3>("/security-center/agents/conversations/timeline-v3", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  agentSemanticEvidence: (filter: AgentConversationQuery & { conversationId: string; semanticEventId: string }) =>
+    apiClient.postLong<AgentSemanticEvidenceResponse>("/security-center/agents/semantic-events/evidence", filter, DASHBOARD_HISTORY_TIMEOUT_MS),
+  /** Canonical metadata/entity reads.  Keep these additive to the legacy POST projections so a
+   * temporarily unavailable timeline does not erase identity or coverage from the UI. */
+  canonicalLogicalAgents: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalLogicalAgentList>(`/security-center/v1/logical-agents${querySuffix(query)}`),
+  canonicalLogicalAgent: (logicalAgentId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalLogicalAgentResource>>(
+      `/security-center/v1/logical-agents/${encodeURIComponent(logicalAgentId)}${querySuffix(query)}`,
+    ),
+  canonicalLogicalAgentInstances: (logicalAgentId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalAgentInstanceList>(
+      `/security-center/v1/logical-agents/${encodeURIComponent(logicalAgentId)}/instances${querySuffix(query)}`,
+    ),
+  canonicalAgentInstances: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalAgentInstanceList>(`/security-center/v1/agent-instances${querySuffix(query)}`),
+  canonicalAgentInstance: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalAgentInstanceResource>>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}${querySuffix(query)}`,
+    ),
+  canonicalAgentInstanceRuntimes: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalRuntimeInstanceList>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}/runtimes${querySuffix(query)}`,
+    ),
+  canonicalAgentInstanceSessions: (agentInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionList>(
+      `/security-center/v1/agent-instances/${encodeURIComponent(agentInstanceId)}/sessions${querySuffix(query)}`,
+    ),
+  canonicalRuntimeInstances: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalRuntimeInstanceList>(`/security-center/v1/runtime-instances${querySuffix(query)}`),
+  canonicalRuntimeInstance: (runtimeInstanceId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalRuntimeInstanceResource>>(
+      `/security-center/v1/runtime-instances/${encodeURIComponent(runtimeInstanceId)}${querySuffix(query)}`,
+    ),
+  canonicalSessions: (query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionList>(`/security-center/v1/sessions${querySuffix(query)}`),
+  canonicalSession: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalSessionResource>>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}${querySuffix(query)}`,
+    ),
+  canonicalSessionTimeline: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionTimelineResponse>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}/timeline${querySuffix(query)}`,
+    ),
+  canonicalSessionCoverage: (sessionId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSessionCoverageResponse>(
+      `/security-center/v1/sessions/${encodeURIComponent(sessionId)}/coverage${querySuffix(query)}`,
+    ),
+  canonicalSemanticEventEvidence: (semanticEventId: string, query: CanonicalEntityQuery = {}) =>
+    apiClient.get<CanonicalSemanticEventEvidenceResponse>(
+      `/security-center/v1/semantic-events/${encodeURIComponent(semanticEventId)}/evidence${querySuffix(query)}`,
+    ),
+  canonicalEvidenceLink: (linkId: string, resolutionRevision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalEvidenceLink>>(
+      `/security-center/v1/evidence-links/${encodeURIComponent(linkId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
+    ),
+  canonicalRawObservation: (observationId: string, revision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/raw-observations/${encodeURIComponent(observationId)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  canonicalKernelFact: (factId: string) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/kernel-facts/${encodeURIComponent(factId)}`,
+    ),
+  canonicalSemanticRecord: (semanticRecordId: string, revision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<Record<string, unknown>>>(
+      `/security-center/v1/semantic-records/${encodeURIComponent(semanticRecordId)}${revision === undefined ? "" : `?revision=${revision}`}`,
+    ),
+  canonicalSessionMembership: (membershipId: string, resolutionRevision?: number) =>
+    apiClient.get<CanonicalResourceEnvelope<CanonicalSessionMembership>>(
+      `/security-center/v1/session-memberships/${encodeURIComponent(membershipId)}${resolutionRevision === undefined ? "" : `?resolutionRevision=${resolutionRevision}`}`,
+    ),
+  agentKernelSemanticContext: (eventId: string, factId?: string) =>
+    apiClient.post<AgentKernelSemanticContextResponse>("/security-center/agents/kernel-events/semantic-context", {
+      eventId,
+      ...(factId ? { factId } : {}),
+    }),
+  agentToolEvidence: (filter: AgentEventQuery & { invocationId: string }) =>
+    apiClient.post<ToolEvidenceResponse>("/security-center/events/tool-evidence", filter),
+  observedAssets: (query: ObservedAssetListQuery) =>
+    apiClient.post<ObservedAssetList>("/security-center/assets/list", query),
+  observedAsset: (assetId: string) =>
+    apiClient.get<ObservedAssetDetail>(`/security-center/assets/${encodeURIComponent(assetId)}`),
+  observedAssetReviewImpact: (assetId: string) =>
+    apiClient.post<ObservedAssetReviewImpact>(`/security-center/assets/${encodeURIComponent(assetId)}/review-impact`, {}),
+  reviewObservedAsset: (
+    assetId: string,
+    body: {
+      decision: "non_agent" | "unknown" | "clear";
+      expectedReviewRevision: number;
+      expectedBindingRevision: number;
+      reason: string;
+    },
+  ) => apiClient.put<ObservedAssetReviewResult>(`/security-center/assets/${encodeURIComponent(assetId)}/review`, body),
   runIdentityAiReview: (body: IdentityAiReviewRequest) =>
     apiClient.post<IdentityAiReviewRecord>("/security-center/identity/ai-review", body),
   identityAiReviews: (query: { targetType?: IdentityAiReviewTargetType; eventId?: string; agentAssetId?: string }) => {
@@ -2509,6 +4620,15 @@ export const securityCenterApi = {
     apiClient.post<StreamFindingList>("/security-center/stream/findings", filter),
   supplyChainOverview: (limit = 100) =>
     apiClient.get<SupplyChainOverview>(`/security-center/supply-chain/overview?limit=${limit}`),
+  supplyChainConfig: () =>
+    apiClient.get<SupplyChainControlResponse>("/security-center/supply-chain/config"),
+  updateSupplyChainConfig: (body: Partial<SupplyChainControlConfig> & { runInitialScan?: boolean }) =>
+    apiClient.put<SupplyChainControlResponse>("/security-center/supply-chain/config", body),
+  scanSupplyChainWorkspace: (workspaceId: string) =>
+    apiClient.post<{ task: SupplyChainScanTask }>(
+      `/security-center/supply-chain/workspaces/${encodeURIComponent(workspaceId)}/scan`,
+      { reason: "manual" },
+    ),
   evidenceBundle: (filter: EvidenceBundleQuery) =>
     apiClient.post<EvidenceBundle>("/security-center/evidence/bundle", filter),
   evidenceExport: (filter: EvidenceBundleExportQuery) =>
@@ -2586,8 +4706,8 @@ export const securityCenterApi = {
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/metadata`, body),
   reviewAgent: (agentId: string, body: AgentReviewRequest) =>
     apiClient.put<AgentMetadataListItem>(`/security-center/agents/${encodeURIComponent(agentId)}/review`, body),
-  alerts: (filter: AlertListQuery) =>
-    apiClient.post<AlertList>("/security-center/alerts/list", filter),
+  alerts: (filter: AlertListQuery, signal?: AbortSignal) =>
+    apiClient.post<AlertList>("/security-center/alerts/list", filter, { signal }),
   updateAlert: (alertId: string, body: AlertUpdateRequest) =>
     apiClient.put<AlertListItem>(`/security-center/alerts/${encodeURIComponent(alertId)}`, body),
   alertConfig: () => apiClient.get<AlertConfig>("/security-center/alerts/config"),
@@ -2607,6 +4727,12 @@ export const securityCenterApi = {
     apiClient.post<ObjectiveItem>("/security-center/objectives", body),
   updateObjective: (objectiveId: string, body: ObjectiveUpdateRequest) =>
     apiClient.put<ObjectiveItem>(`/security-center/objectives/${encodeURIComponent(objectiveId)}`, body),
+  platformUsers: (filter: PlatformUserQuery = {}) =>
+    apiClient.post<PlatformUserList>("/security-center/users/list", filter),
+  createPlatformUser: (body: PlatformUserUpdateRequest) =>
+    apiClient.post<PlatformUserItem>("/security-center/users", body),
+  updatePlatformUser: (userId: string, body: PlatformUserUpdateRequest) =>
+    apiClient.put<PlatformUserItem>(`/security-center/users/${encodeURIComponent(userId)}`, body),
   ingestionSources: (filter: IngestionSourceQuery) =>
     apiClient.post<IngestionSourceList>("/security-center/sources/list", filter),
   createIngestionSource: (body: IngestionSourceUpdateRequest) =>
@@ -2623,6 +4749,12 @@ export const securityCenterApi = {
     apiClient.put<RemediationListItem>(`/security-center/remediations/${encodeURIComponent(taskId)}`, body),
   agentInventory: (filter: AgentInventoryQuery) =>
     apiClient.post<AgentInventory>("/security-center/agents/inventory", filter),
+  agentDirectory: (filter: AgentInventoryQuery) =>
+    apiClient.post<AgentInventory>("/security-center/agents/directory", filter),
+  agentInstanceMetrics: (filter: AgentInstanceMetricsQuery) =>
+    apiClient.post<AgentInstanceMetrics>("/security-center/agents/instance-metrics", filter),
+  agentRuntimeInstances: (query: AgentRuntimeStateQuery = {}) =>
+    apiClient.post<AgentRuntimeStateList>("/security-center/runtime/instances", query),
   workspaceInventory: (filter: WorkspaceInventoryQuery) =>
     apiClient.post<WorkspaceInventory>("/security-center/workspaces/inventory", filter),
   agentTopology: (filter: AgentTopologyQuery) =>
@@ -2639,8 +4771,8 @@ export const securityCenterApi = {
     apiClient.post<MaintenanceWindowItem>("/security-center/maintenance/windows", body),
   updateMaintenanceWindow: (windowId: string, body: MaintenanceWindowUpdateRequest) =>
     apiClient.put<MaintenanceWindowItem>(`/security-center/maintenance/windows/${encodeURIComponent(windowId)}`, body),
-  auditLog: (filter: AuditQuery) =>
-    apiClient.post<AuditList>("/security-center/audit/list", filter),
+  auditLog: (filter: AuditQuery, signal?: AbortSignal) =>
+    apiClient.post<AuditList>("/security-center/audit/list", filter, { signal }),
   explainabilityHealth: () => apiClient.get<SecurityExplainabilityHealth>("/open/security/explainability/health"),
   explainabilityAudit: (body: SecurityExplainabilityAuditRequest) =>
     apiClient.post<SecurityExplainabilityAuditResult>("/open/security/explainability/audit", body),
@@ -2676,6 +4808,7 @@ export function streamAgentObservability(
   if (filter.timeType) qs.set("timeType", filter.timeType);
   if (filter.startTime) qs.set("startTime", filter.startTime);
   if (filter.endTime) qs.set("endTime", filter.endTime);
+  if (filter.scope) qs.set("scope", filter.scope);
   const url = `/security-center/sessions/agentObservability/stream${qs.toString() ? `?${qs.toString()}` : ""}`;
 
   const consumeBlock = (block: string) => {

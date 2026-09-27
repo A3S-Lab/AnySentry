@@ -99,6 +99,17 @@ function isWrappedResponse(value: unknown): value is ApiResponse<unknown> {
   );
 }
 
+function unwrappedErrorMessage(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const message = (value as { message?: unknown }).message;
+  if (typeof message === "string" && message.trim()) return message.trim().slice(0, 500);
+  if (Array.isArray(message)) {
+    const joined = message.filter((item): item is string => typeof item === "string" && Boolean(item.trim())).join("; ");
+    return joined ? joined.slice(0, 500) : undefined;
+  }
+  return undefined;
+}
+
 /**
  * Low-level fetch against the backend. Relative paths only (the dev proxy
  * forwards `/security-center`, `/open`, `/api`). Kept public for the SSE
@@ -108,25 +119,31 @@ export async function apiRawFetch(endpoint: string, init?: RequestInit): Promise
   return fetch(withBase(endpoint), init);
 }
 
-async function request<T>(endpoint: string, init: RequestInit): Promise<T> {
+async function request<T>(endpoint: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const externalSignal = init.signal;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) controller.abort();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
 
   let response: Response;
   try {
     response = await fetch(withBase(endpoint), {
       ...init,
       headers: { "Content-Type": "application/json", ...adminAuthHeader(endpoint), ...(init.headers ?? {}) },
-      signal: init.signal ?? controller.signal,
+      signal: controller.signal,
     });
   } catch (error) {
     clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
     if ((error as Error).name === "AbortError") {
-      throw new ApiError("请求超时", 408);
+      throw new ApiError(externalSignal?.aborted ? "请求已取消" : "请求超时", externalSignal?.aborted ? 499 : 408);
     }
     throw new ApiError("网络连接异常", 0);
   }
   clearTimeout(timeoutId);
+  externalSignal?.removeEventListener("abort", abortFromExternal);
 
   if (response.status === 204) {
     return undefined as T;
@@ -150,21 +167,31 @@ async function request<T>(endpoint: string, init: RequestInit): Promise<T> {
   }
 
   if (!response.ok) {
-    throw new ApiError("请求失败", response.status);
+    // Nest's framework-level 401/400 responses are intentionally not wrapped by the normal API
+    // interceptor. Preserve their bounded message so management pages can distinguish a missing
+    // token from an unavailable rule service instead of reporting every failure as "请求失败".
+    throw new ApiError(unwrappedErrorMessage(body) ?? "请求失败", response.status);
   }
 
   return body as T;
 }
 
 export const apiClient = {
-  get<T>(endpoint: string): Promise<T> {
-    return request<T>(endpoint, { method: "GET" });
+  get<T>(endpoint: string, init: RequestInit = {}): Promise<T> {
+    return request<T>(endpoint, { ...init, method: "GET" });
   },
-  post<T>(endpoint: string, body?: unknown): Promise<T> {
+  post<T>(endpoint: string, body?: unknown, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, {
+      ...init,
       method: "POST",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+  },
+  postLong<T>(endpoint: string, body?: unknown, timeoutMs = 95000): Promise<T> {
+    return request<T>(endpoint, {
+      method: "POST",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }, timeoutMs);
   },
   postWithHeaders<T>(endpoint: string, body: unknown, headers: HeadersInit): Promise<T> {
     return request<T>(endpoint, {
@@ -173,8 +200,9 @@ export const apiClient = {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   },
-  put<T>(endpoint: string, body?: unknown): Promise<T> {
+  put<T>(endpoint: string, body?: unknown, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, {
+      ...init,
       method: "PUT",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });

@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  namespace: anysentry
+spec:
+  template:
+    spec:
+      containers:
+        - name: clickhouse
+          # The full-probe local profile sustains event ingestion while Flink and the dashboard
+          # read the same store. Keep query memory bounded in the API, and leave enough cgroup
+          # headroom for MergeTree page cache/writeback so it does not throttle at 4 GiB.
+          resources:
+            requests: { cpu: 500m, memory: 2Gi }
+            limits: { cpu: "3", memory: 6Gi }

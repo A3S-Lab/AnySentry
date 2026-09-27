@@ -5,6 +5,7 @@
 - [AnySentry 部署手册](./AnySentry部署手册.md)：环境校验、安装、升级和基础排错。
 - [AnySentry 使用手册](./AnySentry使用手册.md)：页面访问、监控对象和状态说明。
 - [AnySentry 脚本说明](./AnySentry脚本说明.md)：发布包内各 Shell 脚本的用途和参数。
+- [现场问题采集](./现场问题采集.md)：现场日志、模型配置状态和资源占用的采集方法。
 
 ## 1. 路径规则
 
@@ -43,7 +44,7 @@
 ### `RUN_HEALTH_SMOKE.sh`
 
 用途：生成统一健康报告。默认报告目录为
-`/tmp/anysentry-health-smoke-0.3.0-compat1`，该目录在脚本运行时创建并覆盖。
+`/tmp/anysentry-health-smoke-0.4.0-compat1`，该目录在脚本运行时创建并覆盖。
 
 ```bash
 /opt/anysentry/RUN_HEALTH_SMOKE.sh --passive
@@ -55,6 +56,17 @@
 - `--passive`：只读检查服务、接口、Source、Collector 和日志；
 - `--safe`：默认模式，增加本地安全操作及带唯一标识的模拟事件；
 - `--extended`：增加多类别 Sentry 摄取模拟。
+
+### `collect-support-bundle.sh`
+
+用途：在出现安装失败、页面报错、模型未连通、采集中断或服务占用过高之后，把主机、服务、日志和模型配置状态打成一个压缩包。密钥和令牌只记录是否已设置、长度和指纹，不写入原文。
+
+```bash
+sudo /opt/anysentry/collect-support-bundle.sh
+sudo ./collect-support-bundle.sh /tmp/anysentry-support.tar.gz
+```
+
+未安装完成时，在解压目录执行 `./collect-support-bundle.sh`。默认输出 `/tmp/anysentry-support-主机名-时间.tar.gz`。把这一个文件拷回，不要编辑或截断。
 
 ### `inspect-host.sh`
 

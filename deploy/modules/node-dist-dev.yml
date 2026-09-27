@@ -1,0 +1,24 @@
+# Optional fastest local loop: compile TypeScript on the host, then recreate only the Node service
+# whose process must load the new files. The immutable component image remains the dependency/base
+# contract; this read-only mount replaces only compiled application output.
+x-anysentry-dist-volume: &anysentry-dist-volume
+  - ./apps/api/dist:/app/dist:ro
+
+services:
+  anysentry:
+    volumes: *anysentry-dist-volume
+
+  fast-judge:
+    volumes: *anysentry-dist-volume
+
+  l3-worker:
+    volumes: *anysentry-dist-volume
+
+  stream-worker:
+    volumes: *anysentry-dist-volume
+
+  composite-judge:
+    volumes: *anysentry-dist-volume
+
+  supply-chain-assessment:
+    volumes: *anysentry-dist-volume

@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anysentry
+  namespace: anysentry
+spec:
+  template:
+    spec:
+      containers:
+        - name: anysentry
+          # The shared development node receives short Exec/Exit bursts while CLI agents fan out
+          # helpers. Give the API enough CPU and heap to drain one bounded batch without making
+          # the Observer/WAL retry the same immutable events.
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "4", memory: 4Gi }

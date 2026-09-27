@@ -1,8 +1,12 @@
 # Agent 身份审核、资产聚合与 UI 展示设计
 
 状态：实现基线
+
 适用分支：`feat/agent-discovery-filter`
+
 上位设计：`../AnySentry-Agent-Discovery-High-Performance-Design.md`、`docs/agent-discovery-filter.md`
+
+后续设计：涉及统一资产、恢复自动识别、受保护生命周期、双分类口径和规则管理时，以 [统一资产生命周期、人工身份审核与采集规则治理优化设计](./anysentry-unified-asset-lifecycle-and-capture-rule-governance.md) 为准。
 
 ## 1. 目的
 

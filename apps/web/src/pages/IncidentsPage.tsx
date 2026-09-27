@@ -1,7 +1,6 @@
 import { useRequest } from "ahooks";
-import dayjs from "dayjs";
+import { formatSecurityDateTime } from "@/lib/date-time";
 import {
-  ArrowLeft,
   CheckCircle2,
   Clock3,
   FileText,
@@ -17,6 +16,7 @@ import {
 import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
+import { OperationalEmptyState } from "@/components/custom/operational-empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -31,6 +31,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS: Array<{ value: SecurityTimeType; label: string }> = [
+  { value: "last_30m", label: "近30分钟" },
+  { value: "last_1h", label: "近1小时" },
+  { value: "last_2h", label: "近2小时" },
   { value: "last_3h", label: "近3小时" },
   { value: "last_1d", label: "近一天" },
   { value: "last_7d", label: "近一周" },
@@ -72,9 +75,7 @@ function clean(value: string) {
 }
 
 function formatDate(value?: string) {
-  if (!value) return "--";
-  const parsed = dayjs(value);
-  return parsed.isValid() ? parsed.format("MM-DD HH:mm:ss") : value;
+  return formatSecurityDateTime(value, "MM-DD HH:mm:ss", value || "--");
 }
 
 function toneBySeverity(severity?: SecuritySeverity) {
@@ -294,6 +295,7 @@ function IncidentDetail({
 
 export default function IncidentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
   const [status, setStatus] = useState<IncidentStatus | "all">((searchParams.get("status") as IncidentStatus) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");
@@ -310,6 +312,7 @@ export default function IncidentsPage() {
 
   const query = useMemo<IncidentQuery>(() => ({
     timeType,
+    scope,
     incidentId: clean(selectedIncidentId),
     status,
     severity,
@@ -320,7 +323,7 @@ export default function IncidentsPage() {
     sessionId: clean(sessionId),
     traceId: clean(traceId),
     limit: 120,
-  }), [agentId, collectorId, selectedIncidentId, sessionId, severity, sourceId, status, timeType, traceId, workspacePath]);
+  }), [agentId, collectorId, scope, selectedIncidentId, sessionId, severity, sourceId, status, timeType, traceId, workspacePath]);
 
   const { data, loading, refresh } = useRequest(() => securityCenterApi.incidents(query), {
     refreshDeps: [query],
@@ -339,6 +342,7 @@ export default function IncidentsPage() {
     setNote(incident.note ?? "");
     const next = new URLSearchParams();
     next.set("timeType", timeType);
+    next.set("scope", scope);
     if (status !== "all") next.set("status", status);
     if (severity !== "all") next.set("severity", severity);
     if (clean(workspacePath)) next.set("workspacePath", clean(workspacePath)!);
@@ -389,12 +393,6 @@ export default function IncidentsPage() {
       <header className="shrink-0 border-b border-white/10 bg-[#0b0f0c] px-4 py-3">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
-            <Button asChild variant="secondary" size="sm" className="h-9 shrink-0 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              <Link to="/">
-                <ArrowLeft className="size-3.5" />
-                返回
-              </Link>
-            </Button>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <Siren className="size-5 shrink-0 text-rose-300" />
@@ -410,7 +408,11 @@ export default function IncidentsPage() {
           </div>
         </div>
 
-        <div className="mt-3 grid gap-2 md:grid-cols-2 2xl:grid-cols-[120px_130px_130px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(160px,1fr)_minmax(140px,1fr)_minmax(140px,1fr)_minmax(180px,1.2fr)_auto_auto]">
+        <div className="mt-3 grid gap-2 md:grid-cols-2 2xl:grid-cols-[auto_120px_130px_130px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(160px,1fr)_minmax(140px,1fr)_minmax(140px,1fr)_minmax(180px,1.2fr)_auto_auto]">
+          <div className="flex h-9 items-center rounded-md border border-white/10 bg-white/[0.03] p-1">
+            <button type="button" onClick={() => { setScope("agent"); setSelectedIncidentId(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "agent" && "bg-teal-500/15 text-teal-100")}>Agent Incident</button>
+            <button type="button" onClick={() => { setScope("raw"); setSelectedIncidentId(""); }} className={cn("h-7 rounded px-3 text-xs text-zinc-500", scope === "raw" && "bg-white/10 text-zinc-100")}>全部 Incident</button>
+          </div>
           <Select value={timeType} onValueChange={(next) => setTimeType(next as SecurityTimeType)}>
             <SelectTrigger className="h-9 border-white/10 bg-white/5 text-xs text-zinc-100"><SelectValue /></SelectTrigger>
             <SelectContent>{TIME_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
@@ -463,7 +465,13 @@ export default function IncidentsPage() {
                   加载 Incident...
                 </div>
               ) : (data?.items?.length ?? 0) === 0 ? (
-                <div className="flex min-h-40 items-center justify-center text-sm text-zinc-500">暂无 Incident</div>
+                <OperationalEmptyState
+                  icon={ShieldAlert}
+                  title={scope === "agent" ? "当前没有 Agent Incident" : "当前没有 Incident"}
+                  description="高风险事件会按 Agent、Session、Trace 和风险类型归并为 Incident；你也可以从告警中心查看尚未归并的运行告警。"
+                  primary={{ label: "查看告警", href: "/alerts" }}
+                  secondary={{ label: "查看运行链路", href: "/events" }}
+                />
               ) : (
                 <div className="max-h-[calc(100vh-270px)] overflow-y-auto">
                   {data?.items.map((incident) => (

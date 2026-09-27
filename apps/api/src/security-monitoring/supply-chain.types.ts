@@ -1,4 +1,8 @@
 export const SUPPLY_CHAIN_ASSESSMENT_QUEUE = 'anysentry-supply-chain-assessments';
+export const SUPPLY_CHAIN_ASSESSMENT_WORKER_HEARTBEAT_KEY =
+  'anysentry:supply-chain:assessment-worker:heartbeat';
+export const SUPPLY_CHAIN_SCANNER_HEARTBEAT_PREFIX =
+  'anysentry:supply-chain:scanner-heartbeat:';
 
 export type SupplyChainStatus = 'complete' | 'partial' | 'failed';
 export type WorkspaceSnapshotState = 'active' | 'snapshot_pending' | 'stale' | 'historical';
@@ -6,6 +10,30 @@ export type DependencyScope = 'runtime' | 'development' | 'optional' | 'build' |
 export type VulnerabilitySeverity = 'critical' | 'high' | 'medium' | 'low' | 'unknown';
 export type VulnerabilityPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type DeploymentStatus = 'confirmed' | 'unknown';
+export type VulnerabilityPriorityFactorCode =
+  | 'severity'
+  | 'deployed'
+  | 'direct_dependency'
+  | 'runtime_scope';
+export type VulnerabilityRemediationAction =
+  | 'upgrade_direct_dependency'
+  | 'upgrade_parent_dependency'
+  | 'upgrade_component'
+  | 'update_deployed_artifact'
+  | 'monitor_advisory';
+
+export interface VulnerabilityPriorityFactor {
+  code: VulnerabilityPriorityFactorCode;
+  score: number;
+  reason: string;
+}
+
+export interface VulnerabilityRemediation {
+  action: VulnerabilityRemediationAction;
+  summary: string;
+  candidateFixedVersion?: string;
+  requiresArtifactRebuild: boolean;
+}
 
 export interface DeploymentImageEvidence {
   reference: string;
@@ -126,6 +154,7 @@ export interface WorkspaceSnapshotBinding {
 
 export interface OsvVulnerabilitySummary {
   id: string;
+  canonicalId?: string;
   modified: string;
   published?: string;
   withdrawn?: string;
@@ -160,7 +189,9 @@ export interface VulnerabilityFinding {
   lastObservedAt: number;
   priority: VulnerabilityPriority;
   priorityScore: number;
+  priorityFactors: VulnerabilityPriorityFactor[];
   deploymentStatus: DeploymentStatus;
+  remediation: VulnerabilityRemediation;
   shadow: true;
 }
 
@@ -197,10 +228,49 @@ export interface SupplyChainAssessmentJob {
   queuedAt: number;
 }
 
+export interface SupplyChainControlConfig {
+  schemaVersion: 'anysentry.supply_chain_control.v1';
+  enabled: boolean;
+  dailyRefreshEnabled: boolean;
+  runtimeCorrelationEnabled: boolean;
+  selectedWorkspaceIds: string[];
+  updatedAt: number;
+}
+
+export interface SupplyChainRuntimeReadiness {
+  serviceReady: boolean;
+  scannerAuthConfigured: boolean;
+  assessmentWorkerOnline: boolean;
+  runtimeCorrelationAvailable: boolean;
+  readyForInitialScan: boolean;
+  scanners: Array<{
+    scannerId: string;
+    online: boolean;
+    lastSeenAt?: number;
+    workspaceIds: string[];
+  }>;
+  issues: string[];
+}
+
+export interface SupplyChainControlResponse {
+  config: SupplyChainControlConfig;
+  readiness: SupplyChainRuntimeReadiness;
+  workspaceOptions: Array<Pick<
+    WorkspaceRegistration,
+    'workspaceId' | 'repositoryId' | 'displayName' | 'sourceId' | 'environmentId'
+  > & { scannerId: string }>;
+  scanTasks?: WorkspaceScanTask[];
+  runtimeAssessmentsQueued?: number;
+}
+
 export interface SupplyChainOverview {
   enabled: boolean;
   runtimeCorrelationEnabled: boolean;
   workspaces: number;
+  workspaceOptions: Array<Pick<
+    WorkspaceRegistration,
+    'workspaceId' | 'repositoryId' | 'displayName' | 'sourceId' | 'environmentId'
+  >>;
   activeSnapshots: number;
   openFindings: number;
   staleFindings: number;

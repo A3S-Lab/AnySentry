@@ -23,9 +23,9 @@ import java.util.Objects;
 public class RiskCorrelationFunction extends KeyedProcessFunction<String, CanonicalEvent, StreamFinding> {
     private static final long MINUTE = 60_000L;
     private static final long FIVE_MINUTES = 5 * MINUTE;
-    private static final long HOUR = 60 * MINUTE;
     private static final long COMPOSITE_WINDOW = 3 * MINUTE;
-    private static final String PROFILE_RULE_VERSION = "risk-profile-v1";
+    private static final String PROFILE_RULE_VERSION = "risk-profile-v2";
+    private static final int MAX_HISTORY_EVENTS = 10_000;
 
     private transient MapState<String, Long> seenEvents;
     private transient MapState<String, Long> emittedCorrelations;
@@ -67,6 +67,9 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         List<CanonicalEvent> events = retainedEvents(maximum);
         events.add(event);
         events.sort(Comparator.comparingLong(candidate -> candidate.eventTime));
+        if (events.size() > MAX_HISTORY_EVENTS) {
+            events = new ArrayList<>(events.subList(events.size() - MAX_HISTORY_EVENTS, events.size()));
+        }
         history.update(events);
 
         output.collect(profile(event, events, maximum));
@@ -74,7 +77,9 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
 
     private List<CanonicalEvent> retainedEvents(long maximum) throws Exception {
         List<CanonicalEvent> retained = new ArrayList<>();
-        long cutoff = maximum - HOUR;
+        // Every current profile feature has a maximum five-minute lookback. Retaining a full hour
+        // multiplied ordinary high-rate telemetry into heap state without changing the result.
+        long cutoff = maximum - FIVE_MINUTES;
         for (CanonicalEvent candidate : history.get()) {
             if (candidate.eventTime >= cutoff) retained.add(candidate);
         }
@@ -102,7 +107,12 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         long windowEnd = (maximum / MINUTE) * MINUTE + MINUTE;
         long calculatedAt = System.currentTimeMillis();
         StreamFinding finding = base(current, "risk_profile", calculatedAt);
-        finding.profileId = hash("profile", current.agentCorrelationId, String.valueOf(windowEnd), PROFILE_RULE_VERSION);
+        finding.profileId = hash(
+                "profile",
+                profileEntityId(current),
+                String.valueOf(windowEnd),
+                PROFILE_RULE_VERSION
+        );
         finding.findingId = finding.profileId;
         finding.windowStart = maximum - FIVE_MINUTES;
         finding.windowEnd = windowEnd;
@@ -182,14 +192,30 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
 
     private static boolean sameProcess(CanonicalEvent... events) {
         if (events[0].processIdentity == null || events[0].processIdentity.pid == null) return false;
+        String processInstanceId = events[0].processIdentity.processInstanceId;
         for (int i = 1; i < events.length; i++) {
-            if (events[i].processIdentity == null
-                    || !Objects.equals(events[0].processIdentity.hostId, events[i].processIdentity.hostId)
+            if (events[i].processIdentity == null) return false;
+            if (processInstanceId != null && !processInstanceId.isBlank()
+                    && events[i].processIdentity.processInstanceId != null
+                    && !events[i].processIdentity.processInstanceId.isBlank()) {
+                if (!processInstanceId.equals(events[i].processIdentity.processInstanceId)) return false;
+                continue;
+            }
+            if (!Objects.equals(events[0].processIdentity.hostId, events[i].processIdentity.hostId)
                     || !Objects.equals(events[0].processIdentity.containerId, events[i].processIdentity.containerId)
+                    || !Objects.equals(events[0].processIdentity.cgroupId, events[i].processIdentity.cgroupId)
                     || !Objects.equals(events[0].processIdentity.pid, events[i].processIdentity.pid)
-                    || !Objects.equals(events[0].processIdentity.startTimeNs, events[i].processIdentity.startTimeNs)) return false;
+                    || !Objects.equals(processStart(events[0]), processStart(events[i]))) return false;
         }
         return true;
+    }
+
+    private static String processStart(CanonicalEvent event) {
+        if (event.processIdentity == null) return null;
+        if (event.processIdentity.startTimeTicks != null && !event.processIdentity.startTimeTicks.isBlank()) {
+            return "ticks:" + event.processIdentity.startTimeTicks;
+        }
+        return event.processIdentity.startTimeNs == null ? null : "ns:" + event.processIdentity.startTimeNs;
     }
 
     private static boolean same(String first, String second, String third) {
@@ -206,8 +232,15 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
         finding.workspaceId = event.workspaceId;
         finding.workspacePath = event.workspacePath;
         finding.agentCorrelationId = event.agentCorrelationId;
+        finding.agentInstanceId = event.agentInstanceId;
         finding.agentType = event.agentType;
         return finding;
+    }
+
+    private static String profileEntityId(CanonicalEvent event) {
+        return event.agentInstanceId == null || event.agentInstanceId.isBlank()
+                ? event.agentCorrelationId
+                : event.agentInstanceId;
     }
 
     private static int count(List<CanonicalEvent> events, long cutoff, Predicate predicate) {
@@ -227,6 +260,15 @@ public class RiskCorrelationFunction extends KeyedProcessFunction<String, Canoni
 
     private static boolean transform(String operation) {
         return "encode".equals(operation) || "compress".equals(operation) || "copy".equals(operation);
+    }
+
+    static boolean relevant(CanonicalEvent event) {
+        if (event.platformRuntime || event.synthetic) return false;
+        if ("ToolExec".equals(event.eventKind) || event.dangerous || event.failed || event.sensitiveResource) {
+            return true;
+        }
+        return transform(event.operation)
+                || ("egress".equals(event.operation) && event.externalDestination);
     }
 
     private static String riskLevel(int score) {

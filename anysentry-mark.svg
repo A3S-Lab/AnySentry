@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">AnySentry mark</title>
+  <desc id="desc">A canonical evidence node enclosed by three progressive judgment rails and a runtime gate.</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M98 29 90 21H38L19 40v48l19 19h52l8-8" stroke="#0B2B23" stroke-width="10"/>
+    <path d="M87 42 80 35H46L33 48v32l13 13h34l7-7" stroke="#145541" stroke-width="9"/>
+    <path d="M76 54 71 49H57L47 59v10l10 10h14l5-5" stroke="#1A7A5A" stroke-width="8"/>
+  </g>
+  <path d="M105 44v40" fill="none" stroke="#2DD4BF" stroke-width="10" stroke-linecap="round"/>
+  <path d="m64 57 7 7-7 7-7-7 7-7Z" fill="#2DD4BF"/>
+</svg>

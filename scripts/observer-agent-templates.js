@@ -207,9 +207,12 @@ function compileTemplate(raw, index) {
   if (!raw || typeof raw !== 'object') return undefined;
   const deployment = text(raw.deployment || 'any').toLowerCase();
   if (!DEPLOYMENTS.has(deployment)) return undefined;
-  const classification = text(raw.classification).toLowerCase() === 'non_agent'
+  const rawClassification = text(raw.classification).toLowerCase();
+  const classification = rawClassification === 'non_agent'
     ? 'non_agent'
-    : 'confirmed_agent';
+    : rawClassification === 'probable_agent'
+      ? 'probable_agent'
+      : 'confirmed_agent';
   const agentId = text(raw.agentId || raw.agent || raw.name);
   if (classification !== 'non_agent' && !agentId) return undefined;
   const id = text(raw.id) || `${deployment}:${agentId || 'non-agent'}:${index}`;
@@ -345,9 +348,13 @@ class AgentTemplateRegistry {
     const classification =
       best.template.classification === 'non_agent'
         ? 'non_agent'
-        : best.score >= 0.8
-          ? 'confirmed_agent'
-          : 'probable_agent';
+        // A template that declares probable_agent stays a review-gated candidate no matter how
+        // explicit its fields are; plaintext admission still requires a confirmed identity.
+        : best.template.classification === 'probable_agent'
+          ? 'probable_agent'
+          : best.score >= 0.8
+            ? 'confirmed_agent'
+            : 'probable_agent';
     this.stats.matches++;
     if (classification === 'probable_agent') this.stats.probableMatches++;
     if (classification === 'non_agent') this.stats.nonAgentMatches++;

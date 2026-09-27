@@ -1,0 +1,1492 @@
+import { createHash } from 'node:crypto';
+
+import type * as T from './types';
+import {
+  canonicalParentSessionIdForMembership,
+  resolveLogicalAgentDefinition,
+} from './canonical-observability';
+import {
+  boundHopRemintConversationId,
+  hopConversationFenceValue,
+  repairEmptyRouteAliasConversationId,
+} from './agent-conversation-route-alias-repair';
+
+export {
+  boundHopRemintConversationId,
+  conversationHopScopeSuffix,
+  hopAlignedConversationId,
+  hopFromLogicalScopeKey,
+  hopConversationFenceValue,
+  hopLocalProjectionRecord,
+  persistedMembershipConversationId,
+  pointReadCanonicalConversationId,
+  repairEmptyRouteAliasConversationId,
+  shouldProjectHopLocal,
+} from './agent-conversation-route-alias-repair';
+
+export const AGENT_CONVERSATION_RESOLVER_V2 = 2;
+
+export type ConversationMembershipRole =
+  | 'conversation'
+  | 'bootstrap'
+  | 'control'
+  | 'context_replay'
+  | 'tool_backend'
+  | 'derived_metadata'
+  | 'retry'
+  | 'background'
+  | 'unclassified';
+
+export interface ConversationRouteAliasV1 {
+  schemaVersion: 'anysentry.agent_conversation_route_alias.v1';
+  aliasConversationId: string;
+  targetType: 'conversation' | 'technical_activity';
+  targetId: string;
+  canonicalConversationId?: string;
+  technicalActivityId?: string;
+  reason:
+    | 'provider_chain_merge'
+    | 'continuity_anchor_merge'
+    | 'replay_lineage_merge'
+    | 'control_activity_fold'
+    | 'hop_fence_bound_thread';
+  evidence: string[];
+  resolverVersion: typeof AGENT_CONVERSATION_RESOLVER_V2;
+  resolutionRevision: number;
+  createdAt: number;
+}
+
+export interface TechnicalActivityProjection {
+  technicalActivityId: string;
+  agentAssetId: string;
+  agentInstanceId?: string;
+  role: Exclude<ConversationMembershipRole, 'conversation' | 'context_replay'>;
+  interactionIds: string[];
+  startedAtUnixNs: string;
+  endedAtUnixNs: string;
+  methods: string[];
+  paths: string[];
+  status: 'complete' | 'partial' | 'failed';
+}
+
+export interface ConversationMembershipV2 {
+  schemaVersion: 'anysentry.agent_conversation_membership.v2';
+  membershipId: string;
+  interactionId: string;
+  canonicalConversationId?: string;
+  technicalActivityId?: string;
+  segmentId?: string;
+  role: ConversationMembershipRole;
+  logicalScopeKey: string;
+  resolutionRevision: number;
+  resolverVersion: typeof AGENT_CONVERSATION_RESOLVER_V2;
+  confidence: 'exact' | 'strong' | 'inferred' | 'ambiguous' | 'coverage_gap' | 'unlinked';
+  evidence: string[];
+  decidedAt: number;
+  /** Canonical Session provenance; legacy conversation fields remain above for compatibility. */
+  sessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionIdentityQuality?: T.SessionIdentityQuality;
+  parentSessionId?: string;
+  canonicalParentSessionId?: string;
+  sourceRefs?: string[];
+}
+
+export interface ConversationResolutionV2 {
+  records: T.AgentInteractionRecord[];
+  conversationRecords: T.AgentInteractionRecord[];
+  technicalRecords: T.AgentInteractionRecord[];
+  aliases: ConversationRouteAliasV1[];
+  technicalActivities: TechnicalActivityProjection[];
+  memberships: ConversationMembershipV2[];
+  resolutionRevision: number;
+  /** Legacy route IDs that had competing isolated targets; no arbitrary redirect is emitted. */
+  aliasConflicts?: string[];
+}
+
+interface HumanMessageIdentity {
+  sourceItemId?: string;
+  turnId?: string;
+  content: unknown;
+}
+
+const CONTROL_METHODS = new Set([
+  'initialize',
+  'notifications/initialized',
+  'ping',
+  'tools/list',
+  'resources/list',
+  'resources/templates/list',
+  'prompts/list',
+  'completion/complete',
+  'logging/setLevel',
+]);
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function text(value: unknown, limit = 512): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= limit && !normalized.includes('\u0000')
+    ? normalized
+    : undefined;
+}
+
+function normalized(value?: string): string {
+  return value?.trim().toLowerCase().replace(/\s+/gu, ' ') ?? '';
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  const object = value as Record<string, unknown>;
+  return '{' + Object.keys(object).sort().map((key) =>
+    JSON.stringify(key) + ':' + canonicalJson(object[key])).join(',') + '}';
+}
+
+function stableId(prefix: string, value: string): string {
+  return prefix + '_' + sha256(value).slice(0, 24);
+}
+
+function anchorHash(kind: T.AgentConversationAnchorKind, value: string): string {
+  return sha256(kind + '\u0000' + value);
+}
+
+function requestObject(interaction: T.AgentInteractionRecord): Record<string, unknown> | undefined {
+  const structured = record(interaction.request.structured);
+  if (structured) return structured;
+  if (interaction.request.encoding !== 'utf8' || !interaction.request.body.trim().startsWith('{')) {
+    return undefined;
+  }
+  try {
+    return record(JSON.parse(interaction.request.body));
+  } catch {
+    return undefined;
+  }
+}
+
+function responseObject(interaction: T.AgentInteractionRecord): Record<string, unknown> | undefined {
+  return record(interaction.response.structured);
+}
+
+function valueContainsText(value: unknown, expected: string, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (typeof value === 'string') return value.toLowerCase().includes(expected);
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).some((item) => valueContainsText(item, expected, depth + 1));
+  }
+  const object = record(value);
+  return Boolean(object && Object.entries(object).slice(0, 256).some(([key, item]) =>
+    key.toLowerCase().includes(expected) || valueContainsText(item, expected, depth + 1)));
+}
+
+function modelSearchBackendExchange(
+  request: Record<string, unknown> | undefined,
+  response: Record<string, unknown> | undefined,
+): boolean {
+  return Boolean(
+    request
+    && response
+    && Array.isArray(request.commands)
+    && Array.isArray(request.input)
+    && record(request.settings)
+    && text(request.model)
+    && request.type === undefined
+    && response.results !== undefined
+    && response.output !== undefined
+    && response.encrypted_output !== undefined,
+  );
+}
+
+function sessionTitleRequest(request: Record<string, unknown> | undefined): boolean {
+  if (!request) return false;
+  const messageInput = request.messages ?? request.input;
+  const wrappedSession = valueContainsText(messageInput, '<session>')
+    && valueContainsText(messageInput, '</session>');
+  if (!wrappedSession) return false;
+  const titleInstruction = valueContainsText(request.system, 'title')
+    && valueContainsText(request.system, '<session>')
+    && (
+      valueContainsText(request.system, 'return json')
+      || valueContainsText(request.system, 'single "title" field')
+    );
+  return titleInstruction || valueContainsText(request.output_config, 'title');
+}
+
+function metadataObject(item: Record<string, unknown>): Record<string, unknown> | undefined {
+  return record(item.internal_chat_message_metadata_passthrough)
+    ?? record(item.metadata)
+    ?? record(item._meta);
+}
+
+function contentItemKinds(item: Record<string, unknown>): string[] {
+  const values = metadataObject(item)?.content_item_kinds;
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values
+    .map((value) => text(value, 160))
+    .filter((value): value is string => Boolean(value)))]
+    .slice(0, 32);
+}
+
+function messageOrigin(
+  role: string,
+  kinds: string[],
+  content: unknown,
+): T.AgentInteractionMessage['messageOrigin'] {
+  const normalizedRole = role.toLowerCase();
+  if (normalizedRole === 'user' || normalizedRole === 'human') {
+    if (Array.isArray(content) && content.length > 0 && content.every((part) =>
+      record(part)?.type === 'tool_result')) return 'tool_history';
+    if (kinds.length === 0 || kinds.some((kind) =>
+      kind === 'user.text' || kind.startsWith('user.'))) return 'human_input';
+    return 'agent_context';
+  }
+  if (normalizedRole === 'developer' || normalizedRole === 'system') {
+    return 'developer_instruction';
+  }
+  if (normalizedRole === 'assistant') return 'assistant_history';
+  if (normalizedRole === 'tool' || normalizedRole === 'function') return 'tool_history';
+  return undefined;
+}
+
+function runtimeContextPart(value: unknown): boolean {
+  const item = record(value);
+  const valueText = typeof value === 'string'
+    ? value.trim()
+    : typeof item?.text === 'string' ? item.text.trim() : undefined;
+  return Boolean(valueText && ['environment_context', 'system-reminder'].some((tag) =>
+    valueText.startsWith('<' + tag + '>') && valueText.endsWith('</' + tag + '>')));
+}
+
+function humanContent(value: unknown): unknown {
+  if (!Array.isArray(value)) return runtimeContextPart(value) ? undefined : value;
+  const visible = value.filter((part) =>
+    record(part)?.type !== 'tool_result' && !runtimeContextPart(part));
+  return visible.length ? visible : undefined;
+}
+
+function structuredMessages(interaction: T.AgentInteractionRecord): T.AgentInteractionMessage[] {
+  const request = requestObject(interaction);
+  const input = request?.messages ?? request?.input;
+  if (!Array.isArray(input)) return interaction.request.messages ?? [];
+  const messages: T.AgentInteractionMessage[] = [];
+  for (const raw of input.slice(0, 4_096)) {
+    const item = record(raw);
+    if (!item) continue;
+    const itemType = text(item.type, 80);
+    const role = text(item.role, 80)
+      ?? (itemType === 'message' ? 'user' : itemType ?? 'input');
+    const content = item.content ?? item.output ?? raw;
+    const kinds = contentItemKinds(item);
+    const metadata = metadataObject(item);
+    const sourceItemId = text(item.id);
+    const turnId = text(item.turn_id) ?? text(metadata?.turn_id);
+    const toolCallId = text(item.tool_call_id) ?? text(item.call_id);
+    messages.push({
+      role,
+      content,
+      ...(text(item.name, 240) ? { name: text(item.name, 240) } : {}),
+      ...(toolCallId ? { toolCallId } : {}),
+      ...(sourceItemId ? { sourceItemId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(kinds.length ? { contentItemKinds: kinds } : {}),
+      ...(messageOrigin(role, kinds, content)
+        ? { messageOrigin: messageOrigin(role, kinds, content) }
+        : {}),
+    });
+  }
+  return messages.length ? messages : interaction.request.messages ?? [];
+}
+
+export function interactionHumanMessages(
+  interaction: T.AgentInteractionRecord,
+): HumanMessageIdentity[] {
+  return structuredMessages(interaction)
+    .filter((message) => {
+      if (message.messageOrigin) return message.messageOrigin === 'human_input';
+      return ['user', 'human'].includes(message.role.toLowerCase());
+    })
+    .map((message) => ({ message, content: humanContent(message.content) }))
+    .filter((item): item is { message: T.AgentInteractionMessage; content: unknown } =>
+      item.content !== undefined)
+    .map(({ message, content }) => ({
+      sourceItemId: message.sourceItemId,
+      turnId: message.turnId,
+      content,
+    }));
+}
+
+function providerConversationValue(
+  request: Record<string, unknown> | undefined,
+  depth = 0,
+): string | undefined {
+  if (!request || depth > 3) return undefined;
+  for (const key of ['conversation_id', 'thread_id', 'session_id']) {
+    const direct = text(request[key]);
+    if (direct) return direct;
+  }
+  const conversation = request.conversation;
+  const conversationText = text(conversation)
+    ?? text(record(conversation)?.id);
+  if (conversationText) return conversationText;
+
+  // Some clients send a resumable session inside metadata/user_id or a serialized turn metadata
+  // envelope. Parse only these bounded, generic metadata containers; never scan arbitrary prompt
+  // text for UUIDs. Product-specific aliases belong in an Agent Adapter manifest, not this
+  // resolver.
+  for (const containerKey of ['metadata', 'client_metadata']) {
+    const container = record(request[containerKey]);
+    if (!container) continue;
+    const direct = providerConversationValue(container, depth + 1);
+    if (direct) return direct;
+  }
+  for (const encodedKey of ['user_id', 'turn_metadata']) {
+    const encoded = request[encodedKey];
+    if (record(encoded)) {
+      const nested = providerConversationValue(record(encoded), depth + 1);
+      if (nested) return nested;
+    }
+    if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4 * 1024) {
+      try {
+        const nested = providerConversationValue(record(JSON.parse(encoded)), depth + 1);
+        if (nested) return nested;
+      } catch {
+        // Auxiliary metadata is optional; malformed values do not invalidate a conversation.
+      }
+    }
+  }
+  return undefined;
+}
+
+function providerTurnValue(
+  request: Record<string, unknown> | undefined,
+  depth = 0,
+): string | undefined {
+  if (!request || depth > 3) return undefined;
+  const direct = text(request.turn_id);
+  if (direct) return direct;
+  for (const containerKey of ['metadata', 'client_metadata']) {
+    const container = record(request[containerKey]);
+    const nested = providerTurnValue(container, depth + 1);
+    if (nested) return nested;
+  }
+  for (const encodedKey of ['turn_metadata']) {
+    const encoded = request[encodedKey];
+    if (record(encoded)) {
+      const nested = providerTurnValue(record(encoded), depth + 1);
+      if (nested) return nested;
+    }
+    if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4 * 1024) {
+      try {
+        const nested = providerTurnValue(record(JSON.parse(encoded)), depth + 1);
+        if (nested) return nested;
+      } catch {
+        // Optional auxiliary metadata must not invalidate an otherwise valid request.
+      }
+    }
+  }
+  return undefined;
+}
+
+function continuityValue(request: Record<string, unknown> | undefined): string | undefined {
+  if (!request) return undefined;
+  return text(request.prompt_cache_key)
+    ?? text(request.cache_key)
+    ?? text(record(request.metadata)?.prompt_cache_key)
+    ?? text(record(request.metadata)?.cache_key);
+}
+
+export function conversationAnchorsForInteraction(
+  interaction: T.AgentInteractionRecord,
+): T.AgentConversationAnchor[] {
+  const anchors: T.AgentConversationAnchor[] = [];
+  const seen = new Set<string>();
+  const push = (
+    kind: T.AgentConversationAnchorKind,
+    value: string | undefined,
+    strength: T.AgentConversationAnchor['strength'],
+    sourcePath: string,
+  ) => {
+    if (!value || anchors.length >= 512) return;
+    const valueHash = anchorHash(kind, value);
+    const key = kind + '\u0000provider\u0000' + valueHash;
+    if (seen.has(key)) return;
+    seen.add(key);
+    anchors.push({ kind, namespace: 'provider', valueHash, strength, sourcePath });
+  };
+  for (const anchor of interaction.conversationAnchors ?? []) {
+    const key = anchor.kind + '\u0000' + anchor.namespace + '\u0000' + anchor.valueHash;
+    if (seen.has(key) || anchors.length >= 512) continue;
+    seen.add(key);
+    anchors.push({ ...anchor });
+  }
+  const request = requestObject(interaction);
+  push(
+    'provider_conversation',
+    interaction.providerConversationId ?? providerConversationValue(request),
+    'exact',
+    'conversation_id|thread_id|session_id',
+  );
+  push('response_id', interaction.providerResponseId, 'exact', 'response.id');
+  push(
+    'previous_response_id',
+    interaction.providerPreviousResponseId ?? text(request?.previous_response_id),
+    'exact',
+    'previous_response_id',
+  );
+  push('continuity_key', continuityValue(request), 'strong', 'prompt_cache_key|cache_key');
+  push('continuity_key', interaction.runId, 'strong', 'http.x-anysentry-run-id');
+  push('continuity_key', interaction.traceId, 'strong', 'http.traceparent.trace-id');
+  push('turn_id', interaction.runId, 'exact', 'http.x-anysentry-run-id');
+  push(
+    'turn_id',
+    providerTurnValue(request),
+    'exact',
+    'client_metadata.turn_id',
+  );
+  for (const message of structuredMessages(interaction)) {
+    push('message_item_id', message.sourceItemId, 'strong', 'input[].id|messages[].id');
+    push('turn_id', message.turnId, 'strong', 'message.metadata.turn_id');
+    push('tool_call_id', message.toolCallId, 'exact', 'request.tool_result.call_id');
+  }
+  for (const call of interaction.toolCalls) {
+    push('tool_call_id', call.toolCallId, 'exact', 'response.tool_call.id');
+  }
+  for (const result of interaction.toolResults) {
+    push('tool_call_id', result.toolCallId, 'exact', 'request.tool_result.call_id');
+  }
+  return anchors;
+}
+
+function jsonRpcMethod(interaction: T.AgentInteractionRecord): string | undefined {
+  return text(requestObject(interaction)?.method, 160);
+}
+
+export function trafficRoleForInteraction(
+  interaction: T.AgentInteractionRecord,
+): ConversationMembershipRole {
+  const request = requestObject(interaction);
+  if (interaction.interactionType === 'model'
+    && modelSearchBackendExchange(request, responseObject(interaction))) {
+    return 'tool_backend';
+  }
+  if (interaction.interactionType === 'model' && sessionTitleRequest(request)) {
+    return 'derived_metadata';
+  }
+  if (interaction.interactionType === 'model' && request?.generate === false) {
+    return 'bootstrap';
+  }
+  // Cross-agent RPC stays in the conversation lane so timeline can project
+  // delegation_send / delegation_reply (not folded into technical-activity summaries).
+  if (interaction.interactionType === 'remote_agent'
+    || interaction.trafficRole === 'delegation') {
+    return 'conversation';
+  }
+  if (interaction.trafficRole && interaction.trafficRole !== 'unclassified') {
+    return interaction.trafficRole;
+  }
+  if (interaction.interactionType === 'tool') {
+    const method = jsonRpcMethod(interaction);
+    return method && CONTROL_METHODS.has(method) ? 'control' : 'conversation';
+  }
+  if (interaction.interactionType === 'model') {
+    if (interactionHumanMessages(interaction).length > 0 || interaction.toolResults.length > 0) {
+      return 'conversation';
+    }
+    if (structuredMessages(interaction).some((message) => message.messageOrigin)) {
+      return 'bootstrap';
+    }
+    return 'conversation';
+  }
+  return 'unclassified';
+}
+
+export function conversationLogicalScopeKeyV2(record: T.AgentInteractionRecord): string {
+  const resolved = canonicalDefinitionForRecord(record);
+  // Stable registered/workflow/service definitions own the scope.  Unresolved observations keep a
+  // candidate namespace so they can be reviewed without masquerading as a durable LogicalAgent.
+  const scopeParts = resolved.stable
+    ? [resolved.logicalScopeKey, normalized(record.tenantId), 'stable']
+    : [
+        resolved.logicalScopeKey,
+        normalized(record.tenantId),
+        normalized(record.environmentId),
+        normalized(record.process?.hostId),
+        'candidate',
+      ];
+  return stableId('ls', [
+    ...scopeParts,
+  ].join('\u0000'));
+}
+
+/**
+ * Keep parent / child Conversations independent even when a delegation reuses the
+ * same runId / sessionId / providerConversationId across the hop. Projection and resolver must
+ * use the same fence or route aliases collapse parent+child into one empty canonical Thread.
+ */
+export function hopConversationFence(record: T.AgentInteractionRecord): string {
+  return hopConversationFenceValue(record.hop, record.agentIdHeader);
+}
+
+export const GENERIC_SESSION_IDS = new Set([
+  '', '-', 'none', 'null', 'unknown', 'legacy', 'default',
+  'tokio-rt-worker', 'reqwest-internal', 'mainthread',
+]);
+
+function durableSessionLabel(value: string | undefined): string | undefined {
+  const session = value?.trim();
+  if (!session || session.length > 512 || GENERIC_SESSION_IDS.has(session.toLowerCase())) {
+    return undefined;
+  }
+  return session;
+}
+
+/** Same scope string the directory uses for hop-fenced session-key Thread ids. */
+export function conversationDirectoryScopeKey(record: T.AgentInteractionRecord): string {
+  const logicalScopeKey = conversationLogicalScopeKeyV2(record);
+  const deploymentScopeKey = conversationDeploymentScopeKey(record);
+  const hopFence = hopConversationFence(record);
+  return `${deploymentScopeKey
+    ? `${logicalScopeKey}|deployment:${deploymentScopeKey}`
+    : logicalScopeKey}${hopFence}`;
+}
+
+/**
+ * Directory and v2 persist must mint the same Canonical Thread id for a hop-fenced
+ * durable Session. The formula is `session-key\\0scopeKey\\0session` — not a later
+ * remint of a provider/stamp hash, and not `bound\\0id\\0hop`.
+ */
+export function hopScopedSessionConversationId(
+  record: T.AgentInteractionRecord,
+): string | undefined {
+  const session = durableSessionLabel(record.sessionKey)
+    ?? (['confirmed', 'strong'].includes(record.sessionIdentityQuality ?? '')
+      && ['conversation', 'resumable'].includes(record.sessionMode ?? '')
+      ? durableSessionLabel(record.sessionId)
+      : undefined);
+  if (!session) return undefined;
+  return stableId('cv', `session-key\0${conversationDirectoryScopeKey(record)}\0${session}`);
+}
+
+function conversationHopScopeKey(record: T.AgentInteractionRecord): string {
+  return `${conversationLogicalScopeKeyV2(record)}${hopConversationFence(record)}`;
+}
+
+export function conversationDeploymentScopeKey(record: T.AgentInteractionRecord): string {
+  const applicationMode = ['workflow_definition', 'service_definition'].includes(record.logicalScopeMode ?? '');
+  if (!applicationMode) return '';
+  const attributes = (record as T.AgentInteractionRecord & { attributes?: Record<string, unknown> }).attributes ?? {};
+  const attribute = (...keys: string[]): string => {
+    for (const key of keys) {
+      const value = attributes[key];
+      if (typeof value === 'string' && value.trim()) return value.trim().toLowerCase();
+    }
+    return '';
+  };
+  // LogicalAgent remains shared across deployments, but a workflow/service Session cannot cross
+  // an environment, profile, or deployment revision. CLI sessions intentionally omit this fence
+  // so resume across terminal/process instances remains possible.
+  const parts = [
+    record.environment,
+    record.environmentId,
+    record.profile,
+    record.profileVersion,
+    record.deploymentId ?? attribute('deploymentId', 'deployment_id'),
+    record.deploymentRevision ?? attribute('revision', 'deploymentRevision', 'deployment_revision'),
+  ].map((value) => normalized(value));
+  if (parts.every((value) => !value)) return '';
+  // This value is persisted in PostgreSQL TEXT and used in URLs/logical indexes.  Do not expose
+  // the raw deployment tuple or embed NUL separators; an opaque printable digest preserves the
+  // fence while remaining safe for every storage/transport boundary.
+  return stableId('dps', parts.join('\u0000'));
+}
+
+function providerSessionAnchorKey(record: T.AgentInteractionRecord): string | undefined {
+  return record.providerSessionIdHash
+    ?? record.providerConversationId
+    ?? (record.sessionIdentityQuality === 'confirmed' ? record.sessionId : undefined);
+}
+
+function resumeLogicalScopeKey(record: T.AgentInteractionRecord): string {
+  return stableId('resume-scope', [
+    normalized(record.tenantId),
+    normalized(record.ownerId),
+    normalized(record.logicalAgentId),
+    normalized(record.logicalDefinitionId),
+    normalized(record.logicalScopeMode),
+    // Keep separate explicitly registered definitions that intentionally reuse a logical ID in
+    // different repositories/workspaces, while omitting deployment/profile fences.
+    normalized(explicitWorkspace(record)),
+  ].join('\u0000'));
+}
+
+function anchorScopeKey(
+  record: T.AgentInteractionRecord,
+  resumeBridgeKeys: ReadonlySet<string> = new Set<string>(),
+): string {
+  // An explicitly unresolved/ephemeral Session is intentionally isolated to this interaction.
+  // Provider conversation/response anchors are still retained as evidence, but must not merge
+  // events when no trusted namespace exists (otherwise the same native ID in two tenants could
+  // create a false Conversation).
+  if (perRequestRecord(record)) {
+    return stableId('as', `ephemeral\0${record.interactionId}`);
+  }
+  const definition = canonicalDefinitionForRecord(record);
+  const hopFence = hopConversationFence(record);
+  if (definition.stable) {
+    const applicationResumeBridge = record.logicalScopeMode === 'service_definition'
+      && providerSessionAnchorKey(record)
+      && resumeBridgeKeys.has(providerSessionAnchorKey(record)!);
+    if (applicationResumeBridge) {
+      return stableId('as', [resumeLogicalScopeKey(record), hopFence].join('\u0000'));
+    }
+    return stableId('as', [
+      conversationLogicalScopeKeyV2(record),
+      conversationDeploymentScopeKey(record),
+      hopFence,
+    ].join('\u0000'));
+  }
+  return stableId('as', [
+    // Continuity anchors must be able to bridge one synthetic/missing workspace during resume.
+    // Stable registered definitions may use their canonical key; unresolved candidates retain the
+    // legacy product/host search domain and are still subject to the explicit-workspace barrier.
+    normalized(record.agentProduct),
+    normalized(record.tenantId),
+    normalized(record.environmentId),
+    normalized(record.process?.hostId),
+    hopFence,
+  ].join('\u0000'));
+}
+
+function canonicalDefinitionForRecord(record: T.AgentInteractionRecord) {
+  const attributes = record as T.AgentInteractionRecord & { attributes?: Record<string, unknown> };
+  const attr = attributes.attributes ?? {};
+  return resolveLogicalAgentDefinition({
+    logicalAgentId: record.logicalAgentId,
+    family: record.agentProduct,
+    tenantId: record.tenantId ?? (typeof attr.tenantId === 'string' ? attr.tenantId : undefined),
+    ownerId: record.ownerId ?? (typeof attr.ownerId === 'string' ? attr.ownerId : undefined),
+    workspacePath: record.workspacePath,
+    repositoryId: record.logicalDefinitionId,
+    profile: record.profile ?? (typeof attr.profile === 'string' ? attr.profile : undefined),
+    profileVersion: record.profileVersion ?? (typeof attr.profileVersion === 'string' ? attr.profileVersion : undefined),
+    definitionId: record.logicalDefinitionId,
+    definitionType: record.logicalScopeMode === 'workflow_definition'
+      ? 'workflow'
+      : record.logicalScopeMode === 'service_definition' ? 'service'
+        : record.logicalDefinitionId ? 'registered' : undefined,
+    logicalScopeMode: record.logicalScopeMode,
+    terminalContextId: record.terminalContextId,
+    sourceRefs: [
+      record.rawObservationId,
+      ...(record.sourceObservationIds ?? []),
+      ...(record.evidenceEventIds ?? []),
+    ].filter((value): value is string => Boolean(value)),
+    authority: record.logicalIdentityAuthority === 'management_registration'
+      || record.logicalIdentityAuthority === 'authenticated_adapter'
+      ? record.logicalIdentityAuthority : 'inferred',
+  });
+}
+
+function decorateCanonicalDefinition(record: T.AgentInteractionRecord): T.AgentInteractionRecord {
+  const resolved = canonicalDefinitionForRecord(record);
+  return {
+    ...record,
+    ...(resolved.definition.logicalAgentId
+      ? { logicalAgentId: resolved.definition.logicalAgentId }
+      : { logicalAgentId: undefined }),
+    ...(!resolved.stable && resolved.candidateId
+      ? { logicalAgentCandidateId: resolved.candidateId } : {}),
+    logicalScopeMode: resolved.definition.logicalScopeMode,
+    logicalIdentityAuthority: resolved.definition.logicalIdentityAuthority,
+    logicalDefinitionFingerprint: resolved.definition.definitionFingerprint,
+    ...(resolved.definition.terminalContextId
+      ? { terminalContextId: resolved.definition.terminalContextId } : {}),
+  };
+}
+
+function perRequestRecord(record: T.AgentInteractionRecord): boolean {
+  return record.sessionMode === 'per_request'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'per_request'
+    || Boolean(
+      record.providerConversationId
+      && (record.sessionIdentityQuality === 'unknown'
+        || record.sessionIdentityQuality === 'unresolved')
+      && !record.sessionKey,
+    );
+}
+
+/** Stable projection key shared by V2 and the legacy conversation read model for stateless calls. */
+export function canonicalPerRequestConversationId(
+  records: readonly T.AgentInteractionRecord[],
+): string {
+  const first = records[0];
+  if (!first) return stableId('cv', 'v2\0per_request\0empty');
+  const scope = conversationLogicalScopeKeyV2(first);
+  const canonicalSessions = [...new Set(records
+    .map((record) => record.canonicalSessionId)
+    .filter((value): value is string => Boolean(value)))].sort();
+  const producerRuns = [...new Set(records
+    .filter((record) => record.runIdSource === 'producer')
+    .map((record) => record.runId)
+    .filter((value): value is string => Boolean(value)))].sort();
+  const key = canonicalSessions.length === 1
+    ? `session\0${canonicalSessions[0]}`
+    : producerRuns.length === 1
+      ? `run\0${producerRuns[0]}`
+      : `interaction\0${records.map((record) => record.interactionId).sort().join('\0')}`;
+  return stableId('cv', `v2\0${scope}\0per_request\0${key}`);
+}
+
+function explicitWorkspace(record: T.AgentInteractionRecord): string | undefined {
+  const workspace = normalized(record.workspacePath).replace(/\/+$/u, '');
+  if (
+    !workspace
+    || workspace === 'workspace:unknown'
+    || workspace.startsWith('agent://')
+    || workspace.startsWith('agent-scope:')
+  ) return undefined;
+  return workspace;
+}
+
+class DisjointSet {
+  private readonly parents: number[];
+
+  constructor(size: number) {
+    this.parents = Array.from({ length: size }, (_, index) => index);
+  }
+
+  find(index: number): number {
+    const parent = this.parents[index];
+    if (parent !== index) this.parents[index] = this.find(parent);
+    return this.parents[index];
+  }
+
+  union(left: number, right: number): void {
+    const leftRoot = this.find(left);
+    const rightRoot = this.find(right);
+    if (leftRoot !== rightRoot) this.parents[rightRoot] = leftRoot;
+  }
+}
+
+function explicitProviderIds(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+): Set<string> {
+  return new Set(indexes
+    .map((index) => records[index].providerConversationId)
+    .filter((value): value is string => Boolean(value)));
+}
+
+/** Session resume anchors only. Ephemeral / per-request IDs are not durable Thread keys. */
+export function durableSessionAnchor(record: {
+  canonicalSessionId?: string;
+  sessionKey?: string;
+  providerSessionIdHash?: string;
+  sessionId?: string;
+  sessionIdSource?: string;
+  sessionIdentityQuality?: string;
+  sessionMode?: string;
+}): string | undefined {
+  if (record.sessionMode === 'per_request'
+    || record.sessionMode === 'ephemeral'
+    || record.sessionIdentityQuality === 'ephemeral'
+    || record.sessionIdSource === 'per_request') {
+    return undefined;
+  }
+  const canonical = record.canonicalSessionId?.trim()
+    || record.sessionKey?.trim()
+    || record.providerSessionIdHash?.trim();
+  if (canonical) return canonical;
+  if (record.sessionIdentityQuality === 'unknown'
+    || record.sessionIdentityQuality === 'unresolved'
+    || record.sessionIdSource === 'unresolved') {
+    return undefined;
+  }
+  return record.sessionId?.trim() || undefined;
+}
+
+function properSubset(left: Set<string>, right: Set<string>): boolean {
+  return left.size > 0 && left.size < right.size && [...left].every((value) => right.has(value));
+}
+
+function properPrefix(left: string[], right: string[]): boolean {
+  return left.length > 0
+    && left.length < right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function humanContentHashes(record: T.AgentInteractionRecord): string[] {
+  return interactionHumanMessages(record).map((message) => sha256(canonicalJson(message.content)));
+}
+
+function anchorValues(
+  record: T.AgentInteractionRecord,
+  kind: T.AgentConversationAnchorKind,
+): Set<string> {
+  return new Set((record.conversationAnchors ?? [])
+    .filter((anchor) => anchor.kind === kind)
+    .map((anchor) => anchor.valueHash));
+}
+
+function groupAnchorValues(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+  kinds: T.AgentConversationAnchorKind[],
+): Set<string> {
+  return new Set(indexes.flatMap((index) =>
+    (records[index].conversationAnchors ?? [])
+      .filter((anchor) => kinds.includes(anchor.kind))
+      .map((anchor) => `${anchor.kind}\u0000${anchor.valueHash}`)));
+}
+
+function setsIntersect(left: Set<string>, right: Set<string>): boolean {
+  return [...left].some((value) => right.has(value));
+}
+
+function representativeHumanHistory(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+): string[] {
+  return indexes
+    .map((index) => humanContentHashes(records[index]))
+    .filter((history) => history.length > 0)
+    .sort((left, right) => right.length - left.length)[0] ?? [];
+}
+
+function historyPrefix(left: string[], right: string[]): boolean {
+  return left.length <= right.length && left.every((value, index) => value === right[index]);
+}
+
+function continuityHistoriesCompatible(
+  left: number[],
+  right: number[],
+  records: T.AgentInteractionRecord[],
+): boolean {
+  const stableKinds: T.AgentConversationAnchorKind[] = [
+    'message_item_id',
+    'turn_id',
+    'tool_call_id',
+  ];
+  if (setsIntersect(
+    groupAnchorValues(left, records, stableKinds),
+    groupAnchorValues(right, records, stableKinds),
+  )) return true;
+
+  const leftHistory = representativeHumanHistory(left, records);
+  const rightHistory = representativeHumanHistory(right, records);
+  if (leftHistory.length === 0 || rightHistory.length === 0) return true;
+  return historyPrefix(leftHistory, rightHistory) || historyPrefix(rightHistory, leftHistory);
+}
+
+function canMerge(
+  left: number[],
+  right: number[],
+  records: T.AgentInteractionRecord[],
+): boolean {
+  const leftPerRequest = left.some((index) => perRequestRecord(records[index]));
+  const rightPerRequest = right.some((index) => perRequestRecord(records[index]));
+  if (leftPerRequest || rightPerRequest) {
+    // Stateless service calls are separate Sessions by default. They may still share one execution
+    // Run when an explicit run/invocation ID is present; a container/runtime or identical prompt
+    // alone is not enough to merge them.
+    const leftRuns = new Set(left
+      .filter((index) => records[index].runIdSource === 'producer')
+      .map((index) => records[index].runId).filter(Boolean));
+    const rightRuns = new Set(right
+      .filter((index) => records[index].runIdSource === 'producer')
+      .map((index) => records[index].runId).filter(Boolean));
+    if (leftRuns.size === 0 || rightRuns.size === 0 || !setsIntersect(leftRuns as Set<string>, rightRuns as Set<string>)) {
+      return false;
+    }
+  }
+  const leftProvider = explicitProviderIds(left, records);
+  const rightProvider = explicitProviderIds(right, records);
+  const providerCompatible = leftProvider.size === 0
+    || rightProvider.size === 0
+    || [...leftProvider].some((value) => rightProvider.has(value));
+  if (!providerCompatible) return false;
+  const leftSessions = new Set(left
+    .map((index) => durableSessionAnchor(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  const rightSessions = new Set(right
+    .map((index) => durableSessionAnchor(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  if (leftSessions.size > 0 && rightSessions.size > 0 && !setsIntersect(leftSessions, rightSessions)) {
+    return false;
+  }
+  // Design-B parent/worker hops share run/session/provider IDs by design. Never fold them into one
+  // Canonical Thread — relatedConversations + EvidenceLink express the hop, not route aliases.
+  const hopFences = new Set([...left, ...right]
+    .map((index) => hopConversationFence(records[index]))
+    .filter((value) => Boolean(value)));
+  if (hopFences.size > 1) return false;
+  // A synthetic/unknown workspace is missing evidence, not a contradictory identity. Strong
+  // provider, response-chain, continuity, tool or replay anchors may bridge it to one explicit
+  // workspace. Two different explicit workspaces remain a hard conflict so an anchor collision
+  // cannot merge unrelated projects.
+  const explicitWorkspaces = new Set([...left, ...right]
+    .map((index) => explicitWorkspace(records[index]))
+    .filter((value): value is string => Boolean(value)));
+  return explicitWorkspaces.size <= 1;
+}
+
+function groupIndexes(set: DisjointSet, indexes: number[]): Map<number, number[]> {
+  const groups = new Map<number, number[]>();
+  for (const index of indexes) {
+    const root = set.find(index);
+    const members = groups.get(root) ?? [];
+    members.push(index);
+    groups.set(root, members);
+  }
+  return groups;
+}
+
+function unionGroupsIfAllowed(
+  set: DisjointSet,
+  leftIndex: number,
+  rightIndex: number,
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
+): boolean {
+  const groups = groupIndexes(set, indexes);
+  const left = groups.get(set.find(leftIndex)) ?? [leftIndex];
+  const right = groups.get(set.find(rightIndex)) ?? [rightIndex];
+  if (!canMerge(left, right, records)) return false;
+  if (continuityConflictIndexes && !continuityHistoriesCompatible(left, right, records)) {
+    for (const index of [...left, ...right]) continuityConflictIndexes.add(index);
+    return false;
+  }
+  set.union(leftIndex, rightIndex);
+  return true;
+}
+
+function rememberIndex(map: Map<string, number[]>, key: string, index: number): void {
+  const indexes = map.get(key) ?? [];
+  indexes.push(index);
+  map.set(key, indexes);
+}
+
+function unionCompatiblePrior(
+  set: DisjointSet,
+  map: Map<string, number[]>,
+  key: string,
+  index: number,
+  visibleIndexes: number[],
+  records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
+): boolean {
+  const candidates = map.get(key) ?? [];
+  for (let offset = candidates.length - 1; offset >= 0; offset -= 1) {
+    if (unionGroupsIfAllowed(
+      set,
+      candidates[offset],
+      index,
+      visibleIndexes,
+      records,
+      continuityConflictIndexes,
+    )) return true;
+  }
+  return false;
+}
+
+function canonicalConversationId(
+  indexes: number[],
+  records: T.AgentInteractionRecord[],
+  continuityConflictIndexes?: Set<number>,
+): { conversationId: string; idSource: T.AgentConversationSummary['idSource'] } {
+  const first = records[indexes[0]];
+  const scope = conversationHopScopeKey(first);
+  // A stateless service creates one Session per POST. Provider payloads may still repeat the same
+  // native-looking conversation/session value across requests, so that value is evidence only and
+  // must not become the canonical Conversation key for an ephemeral group. Prefer the server-
+  // derived canonical Session (or an explicit producer Run for several exchanges in one request),
+  // then fall back to sorted interaction IDs. This check runs before legacy conversation IDs and
+  // provider anchors so a stale compatibility field cannot re-merge separate requests.
+  const isolated = indexes.some((index) => {
+    const item = records[index];
+    return perRequestRecord(item)
+      || item.sessionIdSource === 'per_request'
+      || Boolean(
+        item.providerConversationId
+        && (item.sessionIdentityQuality === 'ephemeral'
+          || item.sessionIdentityQuality === 'unknown'
+          || item.sessionIdentityQuality === 'unresolved')
+        && !item.sessionKey,
+      );
+  });
+  if (isolated) {
+    return {
+      conversationId: canonicalPerRequestConversationId(indexes.map((index) => records[index])),
+      idSource: 'inferred',
+    };
+  }
+  const existing = new Map<string, { at: number; human: boolean; source: T.AgentConversationSummary['idSource'] }>();
+  const sourceRank: Record<T.AgentConversationSummary['idSource'], number> = {
+    provider: 3,
+    runtime: 2,
+    inferred: 1,
+  };
+  for (const index of indexes) {
+    const item = records[index];
+    if (!item.conversationId) continue;
+    const previous = existing.get(item.conversationId);
+    const observedSource: T.AgentConversationSummary['idSource'] = item.providerConversationId
+      || item.conversationAnchors?.some((anchor) => anchor.kind === 'provider_conversation')
+      ? 'provider'
+      : item.conversationAnchors?.some((anchor) => anchor.kind === 'continuity_key')
+        ? 'runtime'
+        : item.conversationIdSource ?? 'inferred';
+    existing.set(item.conversationId, {
+      at: Math.min(previous?.at ?? Number.MAX_SAFE_INTEGER, item.at),
+      human: Boolean(previous?.human || interactionHumanMessages(item).length > 0),
+      source: previous && sourceRank[previous.source] > sourceRank[observedSource]
+        ? previous.source
+        : observedSource,
+    });
+  }
+  const preferred = [...existing.entries()]
+    .sort((left, right) =>
+      Number(right[1].human) - Number(left[1].human)
+      || left[1].at - right[1].at
+      || left[0].localeCompare(right[0]))[0];
+  const hop = hopConversationFence(first);
+  const directoryId = hopScopedSessionConversationId(first);
+  const alreadyBound = indexes.some((index) => Boolean(records[index].conversationBindingVersion));
+  if (preferred) {
+    // Keep a persisted id when it is already the directory session-key, when
+    // there is no hop fence (Design A bound durable Threads stay as stored),
+    // or when v2 already bound the group (do not remint a durable Thread).
+    if (!hop || !directoryId || preferred[0] === directoryId || alreadyBound) {
+      return { conversationId: preferred[0], idSource: preferred[1].source };
+    }
+  }
+  if (hop && directoryId) {
+    return {
+      conversationId: directoryId,
+      idSource: preferred?.[1].source
+        ?? (first.sessionIdSource === 'provider' ? 'provider' : 'runtime'),
+    };
+  }
+  if (preferred) return { conversationId: preferred[0], idSource: preferred[1].source };
+
+  const provider = indexes
+    .map((index) => records[index].conversationAnchors?.find((anchor) =>
+      anchor.kind === 'provider_conversation'))
+    .find(Boolean);
+  if (provider) {
+    return {
+      conversationId: stableId('cv', 'v2\u0000' + scope + '\u0000provider\u0000' + provider.valueHash),
+      idSource: 'provider',
+    };
+  }
+  const continuity = indexes
+    .map((index) => records[index].conversationAnchors?.find((anchor) =>
+      anchor.kind === 'continuity_key'))
+    .find(Boolean);
+  if (continuity && !indexes.some((index) => continuityConflictIndexes?.has(index))) {
+    return {
+      conversationId: stableId('cv', 'v2\u0000' + scope + '\u0000continuity\u0000' + continuity.valueHash),
+      idSource: 'runtime',
+    };
+  }
+  const human = indexes
+    .flatMap((index) => interactionHumanMessages(records[index]))
+    .find((message) => message.turnId || message.sourceItemId);
+  return {
+    conversationId: stableId(
+      'cv',
+      'v2\u0000' + scope + '\u0000human\u0000'
+        + (human?.turnId ?? human?.sourceItemId ?? first.interactionId),
+    ),
+    idSource: 'inferred',
+  };
+}
+
+function technicalActivityId(record: T.AgentInteractionRecord): string {
+  return stableId(
+    'ta',
+    [
+      record.agentInstanceId ?? record.agentAssetId,
+      trafficRoleForInteraction(record),
+      record.endpoint,
+      record.path,
+    ].join('\u0000'),
+  );
+}
+
+function projectTechnicalActivities(
+  records: T.AgentInteractionRecord[],
+): TechnicalActivityProjection[] {
+  const grouped = new Map<string, T.AgentInteractionRecord[]>();
+  for (const record of records) {
+    const id = technicalActivityId(record);
+    const items = grouped.get(id) ?? [];
+    items.push(record);
+    grouped.set(id, items);
+  }
+  return [...grouped.entries()].map(([technicalActivityId, items]) => {
+    items.sort((left, right) => left.at - right.at || left.interactionId.localeCompare(right.interactionId));
+    const first = items[0];
+    const last = items.at(-1)!;
+    const failed = items.some((item) => item.statusCode >= 400);
+    const partial = items.some((item) => item.completeness !== 'complete');
+    const status: TechnicalActivityProjection['status'] = failed
+      ? 'failed'
+      : partial ? 'partial' : 'complete';
+    return {
+      technicalActivityId,
+      agentAssetId: first.agentAssetId,
+      agentInstanceId: first.agentInstanceId,
+      role: trafficRoleForInteraction(first) as TechnicalActivityProjection['role'],
+      interactionIds: items.map((item) => item.interactionId),
+      startedAtUnixNs: first.startedAtUnixNs,
+      endedAtUnixNs: last.endedAtUnixNs,
+      methods: [...new Set(items.map((item) => item.method))],
+      paths: [...new Set(items.map((item) => item.path))],
+      status,
+    };
+  }).sort((left, right) => BigInt(left.startedAtUnixNs) < BigInt(right.startedAtUnixNs) ? -1 : 1);
+}
+
+export function resolveAgentConversationsV2(
+  interactions: T.AgentInteractionRecord[],
+  // Resolution revisions are logical projection versions, not Unix timestamps. The binding
+  // service advances this value only when its bounded input fingerprint changes; keeping the pure
+  // resolver default at 1 prevents a millisecond-derived number from colliding with the canonical
+  // SessionMembership ingest revision or overflowing a BIGINT-backed compatibility table.
+  resolutionRevision = 1,
+): ConversationResolutionV2 {
+  const records = interactions
+    .map((item) => {
+      const request = requestObject(item);
+      const providerConversationId = item.providerConversationId
+        ?? providerConversationValue(request);
+      const providerPreviousResponseId = item.providerPreviousResponseId
+        ?? text(request?.previous_response_id);
+      const normalizedItem: T.AgentInteractionRecord = {
+        ...item,
+        ...(providerConversationId ? { providerConversationId } : {}),
+        ...(providerPreviousResponseId ? { providerPreviousResponseId } : {}),
+      };
+      return {
+        ...decorateCanonicalDefinition(normalizedItem),
+        trafficRole: trafficRoleForInteraction(normalizedItem),
+        conversationAnchors: conversationAnchorsForInteraction(normalizedItem),
+      };
+    })
+    .sort((left, right) => left.at - right.at || left.interactionId.localeCompare(right.interactionId));
+  const decidedAt = Math.max(1, ...records.map((record) => record.receivedAt));
+  const visibleIndexes = records
+    .map((record, index) => ({ record, index }))
+    .filter(({ record }) => ['conversation', 'context_replay'].includes(record.trafficRole ?? ''))
+    .map(({ index }) => index);
+  const visibleSet = new Set(visibleIndexes);
+  const technicalRecords = records.filter((_, index) => !visibleSet.has(index));
+  const set = new DisjointSet(records.length);
+
+  // A service restart may explicitly resume a provider Session under a new deployment revision.
+  // Precompute those anchors so the earlier `new` record uses the same bridge scope. Workflow
+  // (Dify) deployments keep their test/prod/revision fence by default; management can still emit
+  // a future explicit continuity relation without changing the generic resolver.
+  const resumeBridgeKeys = new Set(
+    records
+      .filter((record) => record.logicalScopeMode === 'service_definition'
+        && record.sessionLifecycle === 'resume')
+      .map(providerSessionAnchorKey)
+      .filter((value): value is string => Boolean(value)),
+  );
+
+  const existing = new Map<string, number[]>();
+  const provider = new Map<string, number[]>();
+  const response = new Map<string, number[]>();
+  const continuity = new Map<string, number[]>();
+  const toolCalls = new Map<string, number[]>();
+  const continuityConflictIndexes = new Set<number>();
+
+  for (const index of visibleIndexes) {
+    const item = records[index];
+    const scope = anchorScopeKey(item, resumeBridgeKeys);
+    if (item.conversationId) {
+      const key = scope + '\u0000' + item.conversationId;
+      unionCompatiblePrior(set, existing, key, index, visibleIndexes, records);
+      rememberIndex(existing, key, index);
+    }
+    if (item.providerConversationId) {
+      const key = scope + '\u0000' + item.providerConversationId;
+      unionCompatiblePrior(set, provider, key, index, visibleIndexes, records);
+      rememberIndex(provider, key, index);
+    }
+    if (item.providerPreviousResponseId) {
+      const key = scope + '\u0000' + item.providerPreviousResponseId;
+      unionCompatiblePrior(set, response, key, index, visibleIndexes, records);
+    }
+    if (item.providerResponseId) {
+      rememberIndex(response, scope + '\u0000' + item.providerResponseId, index);
+    }
+    for (const anchor of item.conversationAnchors ?? []) {
+      if (anchor.kind !== 'continuity_key') continue;
+      const key = scope + '\u0000' + anchor.namespace + '\u0000' + anchor.valueHash;
+      unionCompatiblePrior(
+        set,
+        continuity,
+        key,
+        index,
+        visibleIndexes,
+        records,
+        continuityConflictIndexes,
+      );
+      rememberIndex(continuity, key, index);
+    }
+    for (const call of item.toolCalls) {
+      rememberIndex(toolCalls, scope + '\u0000' + call.toolCallId, index);
+    }
+    for (const result of item.toolResults) {
+      const key = scope + '\u0000' + result.toolCallId;
+      unionCompatiblePrior(set, toolCalls, key, index, visibleIndexes, records);
+    }
+  }
+
+  const byScope = new Map<string, number[]>();
+  for (const index of visibleIndexes) {
+    const scope = anchorScopeKey(records[index], resumeBridgeKeys);
+    const indexes = byScope.get(scope) ?? [];
+    indexes.push(index);
+    byScope.set(scope, indexes);
+  }
+  for (const indexes of byScope.values()) {
+    for (let currentOffset = 0; currentOffset < indexes.length; currentOffset += 1) {
+      const currentIndex = indexes[currentOffset];
+      const currentMessages = anchorValues(records[currentIndex], 'message_item_id');
+      const currentTurns = anchorValues(records[currentIndex], 'turn_id');
+      const currentHuman = humanContentHashes(records[currentIndex]);
+      if (currentMessages.size === 0 && currentTurns.size === 0 && currentHuman.length === 0) continue;
+      for (let priorOffset = currentOffset - 1; priorOffset >= 0; priorOffset -= 1) {
+        const priorIndex = indexes[priorOffset];
+        const priorMessages = anchorValues(records[priorIndex], 'message_item_id');
+        const priorTurns = anchorValues(records[priorIndex], 'turn_id');
+        const priorHuman = humanContentHashes(records[priorIndex]);
+        const replayExtendsPrior = properSubset(priorMessages, currentMessages)
+          || properSubset(priorTurns, currentTurns)
+          || properPrefix(priorHuman, currentHuman);
+        if (!replayExtendsPrior) continue;
+        if (unionGroupsIfAllowed(set, priorIndex, currentIndex, visibleIndexes, records)) break;
+      }
+    }
+  }
+
+  const aliases: ConversationRouteAliasV1[] = [];
+  const memberships: ConversationMembershipV2[] = [];
+  const userConversationRouteIds = new Set<string>();
+  for (const indexes of groupIndexes(set, visibleIndexes).values()) {
+    indexes.sort((left, right) =>
+      records[left].at - records[right].at
+      || records[left].interactionId.localeCompare(records[right].interactionId));
+    const canonical = canonicalConversationId(indexes, records, continuityConflictIndexes);
+    const existingIds = [...new Set(indexes
+      .map((index) => records[index].conversationId)
+      .filter((value): value is string => Boolean(value)))];
+    userConversationRouteIds.add(canonical.conversationId);
+    for (const existingId of existingIds) userConversationRouteIds.add(existingId);
+    const evidence = indexes.flatMap((index) =>
+      (records[index].conversationAnchors ?? []).map((anchor) => anchor.kind));
+    // Persist an authoritative self-route so a newer resolution can repair an older control-flow
+    // alias that accidentally reused this now-proven Canonical Thread id.
+    aliases.push({
+      schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+      aliasConversationId: canonical.conversationId,
+      targetType: 'conversation',
+      targetId: canonical.conversationId,
+      canonicalConversationId: canonical.conversationId,
+      reason: 'provider_chain_merge',
+      evidence: ['canonical_thread'],
+      resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+      resolutionRevision,
+      createdAt: decidedAt,
+    });
+    for (const alias of existingIds) {
+      if (alias === canonical.conversationId) continue;
+      aliases.push({
+        schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+        aliasConversationId: alias,
+        targetType: 'conversation',
+        targetId: canonical.conversationId,
+        canonicalConversationId: canonical.conversationId,
+        reason: evidence.includes('continuity_key')
+          ? 'continuity_anchor_merge'
+          : evidence.includes('message_item_id') || evidence.includes('turn_id')
+            ? 'replay_lineage_merge'
+            : 'provider_chain_merge',
+        evidence: [...new Set(evidence)].sort(),
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        resolutionRevision,
+        createdAt: decidedAt,
+      });
+    }
+    const remintIds = new Set<string>();
+    for (const index of indexes) {
+      const remintId = boundHopRemintConversationId(
+        canonical.conversationId,
+        records[index].hop,
+        records[index].agentIdHeader,
+      );
+      if (!remintId || remintId === canonical.conversationId || remintIds.has(remintId)) continue;
+      remintIds.add(remintId);
+      aliases.push({
+        schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+        aliasConversationId: remintId,
+        targetType: 'conversation',
+        targetId: canonical.conversationId,
+        canonicalConversationId: canonical.conversationId,
+        reason: 'hop_fence_bound_thread',
+        evidence: ['durable_thread', 'hop_fence'],
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        resolutionRevision,
+        createdAt: decidedAt,
+      });
+    }
+    for (const index of indexes) {
+      const continuityConflict = continuityConflictIndexes.has(index);
+      const itemEvidence = [
+        ...(records[index].conversationAnchors ?? []).map((anchor) => anchor.kind),
+        ...(continuityConflict ? ['continuity_collision_without_shared_history'] : []),
+      ];
+      records[index] = {
+        ...records[index],
+        conversationId: canonical.conversationId,
+        conversationIdSource: canonical.idSource,
+        conversationBindingVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        // The collision only rejects this continuity edge. It must not erase an independent
+        // exact Provider/message binding that already proves membership inside this group.
+        correlationQuality: records[index].correlationQuality === 'exact'
+          ? 'exact'
+          : continuityConflict
+            ? 'unlinked'
+            : evidence.includes('continuity_key') ? 'strong' : 'inferred',
+      };
+      memberships.push({
+        schemaVersion: 'anysentry.agent_conversation_membership.v2',
+        membershipId: stableId(
+          'cm',
+          records[index].interactionId + '\u0000' + String(resolutionRevision),
+        ),
+        interactionId: records[index].interactionId,
+        canonicalConversationId: canonical.conversationId,
+        role: records[index].trafficRole === 'context_replay' ? 'context_replay' : 'conversation',
+        logicalScopeKey: conversationLogicalScopeKeyV2(records[index]),
+        resolutionRevision,
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        confidence: records[index].correlationQuality ?? 'inferred',
+        evidence: [...new Set(itemEvidence)].sort(),
+        decidedAt: records[index].receivedAt,
+        ...(records[index].sessionId ? { sessionId: records[index].sessionId } : {}),
+        ...(records[index].sessionKey ? { sessionKey: records[index].sessionKey } : {}),
+        ...(records[index].providerSessionIdHash
+          ? { providerSessionIdHash: records[index].providerSessionIdHash } : {}),
+        ...(records[index].sessionIdentityQuality
+          ? { sessionIdentityQuality: records[index].sessionIdentityQuality } : {}),
+        ...(records[index].parentSessionId ? { parentSessionId: records[index].parentSessionId } : {}),
+        ...((records[index].canonicalParentSessionId
+          ?? canonicalParentSessionIdForMembership(
+            records[index].parentSessionId,
+            records[index].sessionNamespaceKey,
+          ))
+          ? {
+              canonicalParentSessionId: records[index].canonicalParentSessionId
+                ?? canonicalParentSessionIdForMembership(
+                  records[index].parentSessionId,
+                  records[index].sessionNamespaceKey,
+                ),
+            }
+          : {}),
+        sourceRefs: [...new Set([
+          records[index].rawObservationId,
+          records[index].interactionId,
+        ].filter((value): value is string => Boolean(value)))],
+      });
+    }
+  }
+
+  for (const item of technicalRecords) {
+    const activityId = technicalActivityId(item);
+    if (item.conversationId && !userConversationRouteIds.has(item.conversationId)) {
+      aliases.push({
+        schemaVersion: 'anysentry.agent_conversation_route_alias.v1',
+        aliasConversationId: item.conversationId,
+        targetType: 'technical_activity',
+        targetId: activityId,
+        technicalActivityId: activityId,
+        reason: 'control_activity_fold',
+        evidence: [item.trafficRole ?? 'unclassified'],
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+        resolutionRevision,
+        createdAt: decidedAt,
+      });
+    }
+    memberships.push({
+      schemaVersion: 'anysentry.agent_conversation_membership.v2',
+      membershipId: stableId('cm', item.interactionId + '\u0000' + String(resolutionRevision)),
+      interactionId: item.interactionId,
+      technicalActivityId: activityId,
+      role: trafficRoleForInteraction(item),
+      logicalScopeKey: conversationLogicalScopeKeyV2(item),
+      resolutionRevision,
+      resolverVersion: AGENT_CONVERSATION_RESOLVER_V2,
+      confidence: item.correlationQuality ?? 'inferred',
+      evidence: (item.conversationAnchors ?? []).map((anchor) => anchor.kind),
+      decidedAt: item.receivedAt,
+      ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+      ...(item.sessionIdentityQuality
+        ? { sessionIdentityQuality: item.sessionIdentityQuality } : {}),
+      ...(item.parentSessionId ? { parentSessionId: item.parentSessionId } : {}),
+      ...((item.canonicalParentSessionId
+        ?? canonicalParentSessionIdForMembership(item.parentSessionId, item.sessionNamespaceKey))
+        ? {
+            canonicalParentSessionId: item.canonicalParentSessionId
+              ?? canonicalParentSessionIdForMembership(item.parentSessionId, item.sessionNamespaceKey),
+          }
+        : {}),
+      sourceRefs: [...new Set([
+        item.rawObservationId,
+        item.interactionId,
+      ].filter((value): value is string => Boolean(value)))],
+    });
+  }
+
+  const aliasTargets = new Map<string, ConversationRouteAliasV1>();
+  const ambiguousAliasIds = new Set<string>();
+  for (const alias of aliases) {
+    if (ambiguousAliasIds.has(alias.aliasConversationId)) continue;
+    const prior = aliasTargets.get(alias.aliasConversationId);
+    if (prior && (prior.targetType !== alias.targetType || prior.targetId !== alias.targetId)) {
+      // A reused legacy/provider route can point to two isolated per-request Conversations. Do not
+      // pick whichever group happened to be processed last; omit the redirect and leave both
+      // immutable Membership decisions queryable. The caller can surface this as a coverage gap.
+      aliasTargets.delete(alias.aliasConversationId);
+      ambiguousAliasIds.add(alias.aliasConversationId);
+      continue;
+    }
+    if (!prior) aliasTargets.set(alias.aliasConversationId, alias);
+  }
+  return {
+    records,
+    conversationRecords: records.filter((_, index) => visibleSet.has(index)),
+    technicalRecords,
+    aliases: [...aliasTargets.values()],
+    technicalActivities: projectTechnicalActivities(technicalRecords),
+    memberships,
+    resolutionRevision,
+    ...(ambiguousAliasIds.size ? { aliasConflicts: [...ambiguousAliasIds].sort() } : {}),
+  };
+}

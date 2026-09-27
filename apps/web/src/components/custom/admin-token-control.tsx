@@ -1,20 +1,35 @@
-import { useRequest } from "ahooks";
+import { useQuery } from "@tanstack/react-query";
 import { KeyRound, LockKeyhole } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getAdminToken, hasAdminToken, setAdminToken } from "@/lib/api/client";
 import { securityCenterApi } from "@/lib/api/security-center";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
-export function AdminTokenControl({ compact = false }: { compact?: boolean }) {
+export function AdminTokenControl({
+  compact = false,
+  navigation = false,
+  inlineNavigationPanel = false,
+}: {
+  compact?: boolean;
+  navigation?: boolean;
+  inlineNavigationPanel?: boolean;
+}) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [saved, setSaved] = useState(false);
-  const { data: platformHealth } = useRequest(() => securityCenterApi.healthz(), {
-    pollingInterval: 30000,
-    pollingWhenHidden: false,
-    refreshOnWindowFocus: true,
+  const [navigationPanelPosition, setNavigationPanelPosition] = useState({ left: 228, top: 12 });
+  const panelId = useId();
+  const { data: platformHealth } = useQuery({
+    queryKey: ["platform-health"],
+    queryFn: ({ signal }) => securityCenterApi.healthz(signal),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
   });
   const enabled = platformHealth?.managementAuth?.enabled;
 
@@ -49,6 +64,46 @@ export function AdminTokenControl({ compact = false }: { compact?: boolean }) {
       : saved
         ? "border-teal-300/30 bg-teal-400/10 text-teal-100 hover:bg-teal-400/15"
         : "border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10";
+  const panel = (
+    <div
+      className={cn(
+        "z-[100] w-[360px] max-w-[calc(100vw-2rem)] rounded-[7px] border border-white/10 bg-[#101511] p-3 text-zinc-100 shadow-2xl shadow-black/40",
+        inlineNavigationPanel
+          ? "relative mt-2 w-full max-w-none"
+          : navigation ? "fixed" : "absolute right-0 top-11",
+      )}
+      id={panelId}
+      style={navigation && !inlineNavigationPanel ? navigationPanelPosition : undefined}
+    >
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold">{t("控制面密钥")}</div>
+          <div className={cn("mt-0.5 text-[11px]", enabled ? "text-amber-200" : "text-zinc-500")}>
+            {t(enabled ? "服务端已启用" : "服务端未启用")}
+          </div>
+        </div>
+        <span className={cn("rounded-full border px-2 py-0.5 text-[11px] font-medium", saved ? "border-teal-300/25 bg-teal-400/10 text-teal-100" : "border-zinc-500/25 bg-zinc-500/10 text-zinc-300")}>
+          {t(saved ? "已保存" : "未保存")}
+        </span>
+      </div>
+      <Input
+        type="password"
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        autoFocus={inlineNavigationPanel}
+        placeholder="ANYSENTRY_ADMIN_TOKEN"
+        className="h-9 border-white/10 bg-white/5 font-mono text-xs text-zinc-100"
+      />
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <Button type="button" variant="secondary" size="sm" onClick={clear} className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
+          {t("清除")}
+        </Button>
+        <Button type="button" size="sm" onClick={save} className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
+          {t("保存")}
+        </Button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="relative">
@@ -56,42 +111,39 @@ export function AdminTokenControl({ compact = false }: { compact?: boolean }) {
         type="button"
         variant="secondary"
         size={compact ? "icon-sm" : "sm"}
-        title={enabled ? (saved ? "管理密钥已设置" : "需要管理密钥") : "管理密钥"}
+        title={t(enabled ? (saved ? "管理密钥已设置" : "需要管理密钥") : "管理密钥")}
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-        className={cn(compact ? "h-8 w-8" : "h-9", tone)}
+        aria-controls={panelId}
+        onClick={(event) => {
+          if (navigation && !inlineNavigationPanel && !open) {
+            const rect = event.currentTarget.getBoundingClientRect();
+            const panelHeight = 174;
+            const panelWidth = Math.min(360, window.innerWidth - 24);
+            const preferredLeft = rect.right + 8;
+            setNavigationPanelPosition({
+              left: Math.max(12, Math.min(preferredLeft, window.innerWidth - panelWidth - 12)),
+              top: Math.max(12, Math.min(rect.top, window.innerHeight - panelHeight - 12)),
+            });
+          }
+          setOpen((value) => !value);
+        }}
+        className={cn(
+          compact ? "h-11 w-11 sm:h-8 sm:w-8" : "h-9",
+          navigation && "h-auto w-full justify-start gap-2.5 rounded-md border-transparent bg-transparent px-2.5 py-2 text-left shadow-none hover:bg-[#151a23]",
+          inlineNavigationPanel && "min-h-12",
+          tone,
+        )}
       >
-        {saved ? <LockKeyhole className={compact ? "size-3.5" : "mr-1.5 size-3.5"} /> : <KeyRound className={compact ? "size-3.5" : "mr-1.5 size-3.5"} />}
-        {compact ? null : "管理密钥"}
+        {saved ? (
+          <LockKeyhole className={cn("size-3.5", !compact && !navigation && "mr-1.5", navigation && "ml-0.5 shrink-0")} />
+        ) : (
+          <KeyRound className={cn("size-3.5", !compact && !navigation && "mr-1.5", navigation && "ml-0.5 shrink-0")} />
+        )}
+        {compact ? null : (
+          <span className={cn(navigation && "text-xs font-semibold leading-[1.45]")}>{t("管理密钥")}</span>
+        )}
       </Button>
-      {open ? (
-        <div className="absolute right-0 top-11 z-30 w-[360px] max-w-[calc(100vw-2rem)] rounded-[7px] border border-white/10 bg-[#101511] p-3 text-zinc-100 shadow-2xl shadow-black/40">
-          <div className="mb-2 flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold">控制面密钥</div>
-              <div className={cn("mt-0.5 text-[11px]", enabled ? "text-amber-200" : "text-zinc-500")}>{enabled ? "服务端已启用" : "服务端未启用"}</div>
-            </div>
-            <span className={cn("rounded-full border px-2 py-0.5 text-[11px] font-medium", saved ? "border-teal-300/25 bg-teal-400/10 text-teal-100" : "border-zinc-500/25 bg-zinc-500/10 text-zinc-300")}>
-              {saved ? "已保存" : "未保存"}
-            </span>
-          </div>
-          <Input
-            type="password"
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="ANYSENTRY_ADMIN_TOKEN"
-            className="h-9 border-white/10 bg-white/5 font-mono text-xs text-zinc-100"
-          />
-          <div className="mt-3 flex items-center justify-end gap-2">
-            <Button type="button" variant="secondary" size="sm" onClick={clear} className="h-8 border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10">
-              清除
-            </Button>
-            <Button type="button" size="sm" onClick={save} className="h-8 bg-teal-500 text-[#07100c] hover:bg-teal-400">
-              保存
-            </Button>
-          </div>
-        </div>
-      ) : null}
+      {open ? (navigation && !inlineNavigationPanel ? createPortal(panel, document.body) : panel) : null}
     </div>
   );
 }

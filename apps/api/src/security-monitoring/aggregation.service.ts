@@ -1,27 +1,153 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
+import { createHash } from 'node:crypto';
 import {
+  DashboardAggregateBucketFact,
+  DashboardWindowBucketRow,
+  DashboardWindowDimensionRow,
+  DashboardWindowHistory,
+  StoredAgentBucketFact,
+  StoredAgentMetricBucketFact,
+  StoredAgentObservabilityFact,
+  StoredAgentWindowFact,
+  StoredEventQuery,
+  StoredEventSearchResult,
+  StoredTopologyBucketFact,
+  StoredTopologyWindowFact,
+  StoredWorkspaceBucketFact,
+  StoredWorkspaceWindowFact,
+} from './clickhouse-store';
+import {
+  agentRuntimeInstanceIdForEvent,
+  agentRuntimeInstanceIdsEquivalent,
+  agentRuntimeInstanceIdsForEvent,
   detectedAgentIdentity,
+  hasAgentRuntimeLineageEvidence,
+  hasDirectAgentRootEvidence,
+  isInternalAgentHelperRootEvent,
   isAgentAssetClassification,
 } from './agent-identity';
 import { AgentMetadataService } from './agent-metadata.service';
+import { ObservedAssetReviewService } from './observed-asset-review.service';
+import { WorkspaceDirectoryService } from './workspace-directory.service';
 import { isEventClassificationVisible } from './event-visibility';
 import { IngestionSourceService } from './ingestion-source.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
 import { buildAcl, policyConfigError, sanitizePolicy } from './policy-config';
 import { SentryJudgeService } from './sentry-judge.service';
+import { planDashboardRead } from './dashboard-query-plan';
+import { DashboardHistoryBucketCache } from './dashboard-history-cache';
+import {
+  observedDurableThrough,
+  relevantCommitProgress,
+} from './query-coverage';
+import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
+import { foldLatestEventRevisions } from './event-revision';
+import { eventActivityContext, eventActivitySubtype } from './activity-context';
+import { resolveTimeWindow } from './time-window';
+import {
+  collectorHeartbeatFailureDelta,
+  summarizePipelineAccounting,
+} from './pipeline-accounting';
+import { correlationCaptureRollout } from './correlation-rollout';
+import {
+  visibleClassificationSemantics,
+  visibleProcessContext,
+  visibleUnknownReasonCounts,
+} from './classification-semantics';
+import { captureClassificationDecision } from './identity-judgment-routing';
+import { parseTrustedCorrelation } from './trusted-correlation';
+import {
+  buildToolEvidenceBundle,
+  toolEvidenceIndexFields,
+  type ToolEvidenceItem,
+  ToolEvidenceResponse,
+} from './tool-evidence-linker';
+import {
+  conversationCoverage,
+  projectAgentConversations,
+  projectConversationTimeline,
+} from './agent-conversation';
+import { AgentConversationBindingService } from './agent-conversation-binding.service';
+import {
+  boundHopRemintConversationId,
+  pointReadCanonicalConversationId,
+  trafficRoleForInteraction,
+  repairEmptyRouteAliasConversationId,
+} from './agent-conversation-resolution-v2';
+import { RelationalBusinessStore } from './relational-business-store.service';
+import { CanonicalObservabilityService } from './canonical-observability.service';
+import {
+  AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
+  buildSemanticKernelRelationBatch,
+  buildSemanticKernelRelations,
+  semanticKernelRelationBatchWindow,
+  canonicalEvidenceLinksForRelations,
+  toolInvocationId,
+  type SemanticKernelRelationInput,
+} from './agent-semantic-kernel-relation';
+import {
+  OBSERVED_KERNEL_EVENT_KINDS,
+  observedKernelSearchWindow,
+  projectObservedToolEvidence,
+} from './observed-tool-evidence';
+import { bindInferredProducerRun } from './agent-run-projection';
+import { expectedNoKernelTool } from './agent-tool-shape';
+import {
+  observabilityCoverageLayers,
+  toolEvidenceForInteractions,
+  unifiedFilterRuleLineage,
+} from './observability-coverage';
+import {
+  projectContextReplaySummaries,
+  projectSemanticConversationTimeline,
+  SEMANTIC_PROJECTION_PARSER_ID,
+  SEMANTIC_PROJECTION_PARSER_VERSION,
+} from './agent-semantic-timeline';
 import * as T from './types';
 
-const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
-
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+const MAX_HISTORY_CACHE_ENTRIES = 64;
+const MAX_HISTORY_CACHE_BYTES = 8 * 1024 * 1024;
+const WIN_CACHE_TTL_MS = 1_500;
+const MAX_WIN_CACHE_ENTRIES = 64;
+const MAX_WIN_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES = 256;
+const MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES = 16 * 1024 * 1024;
+const AGENT_INSTANCE_METRICS_CACHE_TTL_MS = 15_000;
+const MAX_AGENT_INVENTORY_IN_FLIGHT = 128;
+const MAX_AGENT_OBSERVABILITY_IN_FLIGHT = 128;
+const MAX_CONVERSATION_PROJECTION_IN_FLIGHT = 128;
+const IN_FLIGHT_OPERATION_TIMEOUT_MS = 30_000;
+const MAX_RECENT_OBSERVABILITY_ENTRIES = 64;
+const MAX_RECENT_OBSERVABILITY_BYTES = 8 * 1024 * 1024;
+const RECENT_OBSERVABILITY_TTL_MS = 15_000;
+const MAX_LAST_GOOD_INVENTORY_ENTRIES = 32;
+const MAX_LAST_GOOD_INVENTORY_BYTES = 8 * 1024 * 1024;
+const LAST_GOOD_INVENTORY_TTL_MS = 15 * 60_000;
+const INTERACTION_HOT_TTL_MS = 30 * 60_000;
+const RELATION_PROJECTION_TIMEOUT_MS = 60_000;
 const LEVEL_BY_RANK = ['safe', 'low', 'medium', 'high', 'critical'];
 const LEVEL_TEXT: Record<string, string> = { safe: '安全', low: '低危', medium: '中危', high: '高危', critical: '严重', unknown: '未知' };
+const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
+const TOOL_EVIDENCE_INCREMENTAL_LOOKBACK_MS = 60_000;
+const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
+const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
+const CONVERSATION_PROJECTION_CONCURRENCY = 4;
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
   communication_risk: '#38bdf8', systemic_risk: '#f43f5e', privilege_escalation: '#fb7185', other: '#94a3b8',
 };
+
+function visibleCollectorFilterMetrics(
+  metrics: T.CollectorFilterMetrics,
+): T.CollectorFilterMetrics {
+  const { unknownReasonCounts: _hiddenUnknownReasons, ...legacyMetrics } = metrics;
+  const unknownReasonCounts = visibleUnknownReasonCounts(metrics.unknownReasonCounts);
+  return unknownReasonCounts
+    ? { ...legacyMetrics, unknownReasonCounts }
+    : legacyMetrics;
+}
 // The monitored risk taxonomy, grouped by risk type. Always listed on the dashboard (with 0 counts
 // when nothing fired) so operators see WHAT is watched, not a blank panel. Names mirror `deriveRisk`.
 const RISK_TAXONOMY: Record<T.RiskType, Array<{ code: string; name: string }>> = {
@@ -57,7 +183,309 @@ const ACTIVE_MS = 5 * 60_000;
 const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
+// Without an explicit de-registration fact, retain a silent Collector as down for one operational
+// day, then archive it from the default summary. Explicit collectorId deep links remain queryable.
+const COLLECTOR_ARCHIVE_MS = 24 * 60 * 60_000;
 const COMPACT_WINDOW_MS = 3_000;
+
+function matchesAgentRuntimeInstance(event: T.JudgedEvent, requested?: string): boolean {
+  if (!requested) return true;
+  return agentRuntimeInstanceIdsForEvent(event).some((value) =>
+    agentRuntimeInstanceIdsEquivalent(value, requested));
+}
+const HOUR = 3_600_000;
+const REUSABLE_BUCKET_MS = 10_000;
+const DASHBOARD_EXACT_COMPARISON_MAX_BUCKETS = 360;
+// One absolute bucket is enough to merge not-yet-visible hot events with durable revisions. A
+// minute-wide SELECT-* tail expanded thousands of large evidence rows in the API heap.
+const DASHBOARD_HOT_TAIL_MS = REUSABLE_BUCKET_MS;
+const FINAL_DECISION_STATUSES = new Set<T.DecisionStatus>(['succeeded', 'failed', 'timeout']);
+const TOOL_KERNEL_EVENT_KINDS = new Set(['FileAccess', 'FileDelete', 'ToolExec']);
+
+function legacyEphemeralCollector(collectorId: string): boolean {
+  // S3 privileged E2E runs created two heartbeat-only collector IDs before explicit archival
+  // metadata existed. Match only that exact generated contract; arbitrary names containing
+  // "test"/"e2e" must never disappear from operational health.
+  return /^s3-enforce-\d{10,}-\d+-(?:collector|untrusted-heartbeat)$/u.test(collectorId);
+}
+
+type CollectorChannelEvaluation = { severity: 0 | 1 | 2; reasons: string[] };
+
+const CHANNEL_STATE_TEXT: Record<T.CollectorHealthChannelState, string> = {
+  healthy: '健康', warning: '提醒', degraded: '降级', unknown: '未知',
+};
+
+function recentHeartbeatLane(
+  heartbeats: readonly T.CollectorHeartbeatRecord[],
+  origin: T.CollectorHeartbeatOrigin,
+  limit = 4,
+): T.CollectorHeartbeatRecord[] {
+  const unique = new Map<string, T.CollectorHeartbeatRecord>();
+  for (const heartbeat of heartbeats) {
+    if (heartbeat.origin !== origin) continue;
+    const accounting = heartbeat.pipelineAccounting;
+    const key = accounting?.producerInstanceId && Number.isSafeInteger(accounting.sequence)
+      ? `${accounting.producerInstanceId}:${accounting.sequence}`
+      : `${heartbeat.at}:${heartbeat.filterMetricsReportedAt ?? ''}`;
+    const current = unique.get(key);
+    if (!current || heartbeat.at > current.at) unique.set(key, heartbeat);
+  }
+  return [...unique.values()].sort((left, right) => right.at - left.at).slice(0, limit);
+}
+
+export function stabilizeCollectorHealthChannel(
+  evaluations: readonly CollectorChannelEvaluation[],
+  recoveryReason: string,
+): T.CollectorHealthChannel {
+  if (!evaluations.length) {
+    return { state: 'unknown', stateText: CHANNEL_STATE_TEXT.unknown, reasons: ['heartbeat_unavailable'], consecutiveBad: 0, consecutiveClean: 0 };
+  }
+  const consecutiveBad = evaluations.findIndex((item) => item.severity === 0);
+  const bad = consecutiveBad < 0 ? evaluations.length : consecutiveBad;
+  const consecutiveClean = evaluations.findIndex((item) => item.severity > 0);
+  const clean = consecutiveClean < 0 ? evaluations.length : consecutiveClean;
+  const current = evaluations[0];
+  let state: T.CollectorHealthChannelState;
+  let reasons = [...current.reasons];
+  if (current.severity === 2) state = 'degraded';
+  else if (current.severity === 1) state = bad >= 2 ? 'degraded' : 'warning';
+  else if (clean < 2 && evaluations.slice(clean).some((item) => item.severity > 0)) {
+    state = 'warning';
+    reasons = [recoveryReason];
+  } else state = 'healthy';
+  return { state, stateText: CHANNEL_STATE_TEXT[state], reasons, consecutiveBad: bad, consecutiveClean: clean };
+}
+
+export function evaluateCollectorCaptureHeartbeat(
+  heartbeat: T.CollectorHeartbeatRecord,
+  previous?: T.CollectorHeartbeatRecord,
+): CollectorChannelEvaluation {
+  const reasons: string[] = [];
+  const rings = heartbeat.pipelineAccounting?.rings ?? [];
+  const ringLoss = rings.some((ring) =>
+    ring.ringDropped > 0 || (ring.collectorDropped ?? 0) > 0 || ring.queueDropped > 0);
+  // Raw Collector compatibility counters are process-lifetime cumulative, while Forwarder
+  // compatibility counters are per-window deltas. Reuse the same source-aware arithmetic as
+  // collector quality alerting so an old, unchanged raw drop count does not keep the current
+  // capture channel degraded forever. The typed ring accounting remains window-scoped evidence.
+  const { droppedDelta } = collectorHeartbeatFailureDelta(heartbeat, previous);
+  const capture = heartbeat.captureProfileMetrics;
+  if (heartbeat.status !== 'ok') reasons.push(`raw_status_${heartbeat.status}`);
+  if (droppedDelta > 0 || ringLoss) reasons.push('capture_pipeline_loss');
+  if (capture?.aggregateLedgerDegraded) reasons.push('capture_aggregate_ledger_degraded');
+  if (capture?.decisionConserved === false || capture?.payloadConserved === false) reasons.push('capture_accounting_not_conserved');
+  return { severity: reasons.length ? 2 : 0, reasons };
+}
+
+function deliveryEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+  const metrics = heartbeat.filterMetrics ?? {} as T.CollectorFilterMetrics;
+  const hard: string[] = [];
+  const soft: string[] = [];
+  if (heartbeat.outputDropped > 0) hard.push('permanent_output_loss');
+  if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
+  if (metrics.spoolAtCapacity || metrics.spoolWalAtCapacity) hard.push('spool_at_capacity');
+  if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
+    hard.push('spool_backlog_over_slo');
+  }
+  if ((metrics.queueParked ?? 0) > 0) soft.push('queue_parked');
+  if ((metrics.retryParked ?? 0) > 0) soft.push('retry_parked');
+  if ((metrics.heartbeatDeliveryFailures ?? 0) > 0) soft.push('heartbeat_delivery_failed');
+  if ((metrics.spoolParkedRecords ?? 0) > 0) soft.push('spool_backlog');
+  if (metrics.spoolWalPutAtCapacity) soft.push('spool_wal_ack_headroom');
+  if ((metrics.outstandingOldestAgeMs ?? 0) >= 30_000) soft.push('delivery_backlog_aged');
+  return hard.length
+    ? { severity: 2, reasons: hard }
+    : soft.length
+      ? { severity: 1, reasons: soft }
+      : { severity: 0, reasons: [] };
+}
+
+function controlEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+  const metrics = heartbeat.filterMetrics ?? {} as T.CollectorFilterMetrics;
+  const reasons: string[] = [];
+  if (metrics.controlPlaneState === 'degraded') {
+    reasons.push(...(metrics.controlPlaneFailedLanes ?? []).map((lane) => `control_${lane}_failed`));
+    if (!reasons.length) reasons.push('control_plane_degraded');
+  }
+  if (metrics.controlPlaneState === 'starting') reasons.push('control_plane_starting');
+  if (metrics.controlPlaneState === undefined && heartbeat.errorCount > 0) reasons.push('legacy_forwarder_error');
+  if (metrics.captureProfileControlPlaneState === 'lkg_degraded') reasons.push('capture_profile_lkg_degraded');
+  if (metrics.unifiedProjectionState === 'degraded') reasons.push('filter_projection_degraded');
+  if (metrics.controlPlaneLanes?.identity && !metrics.identitySnapshotReady) reasons.push('identity_snapshot_not_ready');
+  return { severity: reasons.includes('capture_profile_lkg_degraded') ? 2 : reasons.length ? 1 : 0, reasons };
+}
+
+export function resolvedClassificationView(
+  filter: Pick<T.SecurityTimeFilter, 'classificationView'>,
+): T.ClassificationView {
+  return filter.classificationView === 'current_effective' ? 'current_effective' : 'as_observed';
+}
+
+function processStartKey(process: T.ProcessContext | undefined): string | undefined {
+  return process?.startTimeTicks
+    ? `ticks:${process.startTimeTicks}`
+    : process?.startTimeNs
+      ? `ns:${process.startTimeNs}`
+      : undefined;
+}
+
+/**
+ * Coarse, strong-process prefilter for the hot-ring ToolEvidence fallback.
+ *
+ * This only limits which facts reach the bounded linker; it never establishes a link. Resource or
+ * command equality, root generation, time bounds, trust authority, and ambiguity rejection remain
+ * enforced by buildToolEvidenceBundle().
+ */
+function toolKernelEventInProcessScope(
+  event: T.JudgedEvent,
+  scopes: readonly NonNullable<T.JudgedEvent['process']>[],
+): boolean {
+  if (!TOOL_KERNEL_EVENT_KINDS.has(event.eventKind) || !event.process?.bootId) return false;
+  const eventStart = processStartKey(event.process);
+  return scopes.some((scope) => {
+    if (!scope.bootId || event.process!.bootId !== scope.bootId) return false;
+    const scopeStart = processStartKey(scope);
+    const sameHostProcess = Boolean(
+      eventStart && scopeStart && eventStart === scopeStart &&
+      event.process!.hostId && scope.hostId && event.process!.hostId === scope.hostId &&
+      event.process!.pid === scope.pid,
+    );
+    const hostDirectChild = Boolean(
+      event.process!.hostId && scope.hostId && event.process!.hostId === scope.hostId &&
+      Number.isSafeInteger(scope.pid) && event.process!.ppid === scope.pid,
+    );
+    const sameNamespaceProcess = Boolean(
+      eventStart && scopeStart && eventStart === scopeStart &&
+      event.process!.pidNamespace && scope.pidNamespace &&
+      event.process!.pidNamespace === scope.pidNamespace &&
+      Number.isSafeInteger(scope.namespacePid) && event.process!.namespacePid === scope.namespacePid,
+    );
+    const namespaceDirectChild = Boolean(
+      event.process!.pidNamespace && scope.pidNamespace &&
+      event.process!.pidNamespace === scope.pidNamespace &&
+      Number.isSafeInteger(scope.namespacePid) && event.process!.namespacePpid === scope.namespacePid,
+    );
+    return sameHostProcess || hostDirectChild || sameNamespaceProcess || namespaceDirectChild;
+  });
+}
+
+function semanticKernelEventCategory(
+  event: T.AgentSemanticEvent,
+): T.EventCategory | undefined {
+  const kind = [event.toolKind, event.toolName]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase();
+  if (/(?:^|[\s._-])(?:bash|exec|shell)(?:$|[\s._-])/u.test(kind)) return 'tool';
+  if (/(?:^|[\s._-])(?:read|write|edit|file)(?:$|[\s._-])/u.test(kind)) return 'file';
+  if (/(?:^|[\s._-])(?:search|http|fetch|network)(?:$|[\s._-])/u.test(kind)) return 'network';
+  return undefined;
+}
+
+function semanticAtMs(event: T.AgentSemanticEvent): number {
+  try {
+    return Number(BigInt(event.atUnixNs) / 1_000_000n);
+  } catch {
+    return Number.NaN;
+  }
+}
+
+function interactionEndedAtMs(interaction: T.AgentInteractionRecord): number {
+  try {
+    return Number(BigInt(interaction.endedAtUnixNs) / 1_000_000n);
+  } catch {
+    return interaction.at;
+  }
+}
+
+function semanticRelationInputNearTrigger(
+  input: SemanticKernelRelationInput,
+  trigger: T.AgentInteractionRecord,
+): boolean {
+  const exactSource = input.event.sourceInteractionIds.includes(trigger.interactionId)
+    || input.result?.sourceInteractionIds.includes(trigger.interactionId) === true;
+  if (exactSource) return true;
+  const eventAt = semanticAtMs(input.event);
+  if (!Number.isFinite(eventAt)) return false;
+  const resultAt = input.result ? semanticAtMs(input.result) : eventAt;
+  const triggerStart = trigger.at - TOOL_EVIDENCE_INCREMENTAL_LOOKBACK_MS;
+  const triggerEnd = Math.max(
+    trigger.at,
+    trigger.receivedAt,
+    interactionEndedAtMs(trigger),
+  ) + TOOL_EVIDENCE_RELATION_SETTLE_MS;
+  return eventAt <= triggerEnd
+    && (Number.isFinite(resultAt) ? resultAt : eventAt) >= triggerStart;
+}
+
+export const toolEvidenceHotPathTesting = {
+  toolKernelEventInProcessScope,
+  semanticKernelEventCategory,
+};
+
+export interface ReusableFactSlices {
+  fullStartMs: number;
+  fullEndExclusiveMs: number;
+  head?: { startMs: number; endMs: number };
+  tail?: { startMs: number; endMs: number };
+}
+
+/**
+ * Split the persisted closed interval into exact partial boundaries and reusable full buckets.
+ *
+ * Public Dashboard snapshots carry millisecond precision and are almost never bucket-aligned.
+ * Refusing those ranges silently disabled the Agent, Workspace and topology caches. The split
+ * preserves the exact closed-interval contract without letting a partial bucket enter the cache.
+ */
+export function reusableFactSlices(
+  startMs: number,
+  persistedUntilMs: number,
+  hotFromMs: number,
+  bucketMs = REUSABLE_BUCKET_MS,
+): ReusableFactSlices {
+  const size = Math.max(1, Math.trunc(bucketMs));
+  const endExclusiveMs = Math.max(startMs, persistedUntilMs + 1);
+  const firstFullBucket = Math.ceil(startMs / size) * size;
+  const safeFullEnd = Math.min(
+    Math.floor(endExclusiveMs / size) * size,
+    Math.floor(hotFromMs / size) * size,
+  );
+  const fullEndExclusiveMs = Math.max(firstFullBucket, safeFullEnd);
+  const headEndMs = Math.min(persistedUntilMs, firstFullBucket - 1);
+  const tailStartMs = Math.max(startMs, fullEndExclusiveMs);
+  return {
+    fullStartMs: firstFullBucket,
+    fullEndExclusiveMs,
+    head: startMs <= headEndMs ? { startMs, endMs: headEndMs } : undefined,
+    tail: tailStartMs <= persistedUntilMs
+      ? { startMs: tailStartMs, endMs: persistedUntilMs }
+      : undefined,
+  };
+}
+
+export class BoundedHistoryQueryGate {
+  private active = 0;
+  private rejected = 0;
+
+  constructor(private readonly concurrency: number) {}
+
+  async run<V>(operation: () => Promise<V>): Promise<V | null> {
+    if (this.active >= this.concurrency) {
+      this.rejected += 1;
+      return null;
+    }
+    this.active += 1;
+    try {
+      return await operation();
+    } finally {
+      this.active -= 1;
+    }
+  }
+
+  status(): { active: number; concurrency: number; rejected: number } {
+    return { active: this.active, concurrency: this.concurrency, rejected: this.rejected };
+  }
+}
 
 const now = () => Date.now();
 const iso = (t = now()) => new Date(t).toISOString().slice(0, 19).replace('T', ' ');
@@ -71,6 +499,10 @@ function mode(values: Array<string | undefined>): string | undefined {
     counts.set(value, (counts.get(value) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+}
+
+function agentInventoryGroupKey(agentAssetId: string, agentInstanceId: string): string {
+  return `${agentAssetId}\0${agentInstanceId}`;
 }
 function worstCriticality(values: Array<T.AgentCriticality | undefined>): T.AgentCriticality | undefined {
   const rank: Record<T.AgentCriticality, number> = { low: 1, medium: 2, high: 3, critical: 4 };
@@ -99,7 +531,7 @@ function eventCategory(kind: string): T.EventCategory {
   if (kind === 'ToolExec') return 'tool';
   if (kind === 'Egress' || kind === 'Dns' || kind === 'SslContent') return 'network';
   if (kind === 'FileAccess' || kind === 'FileDelete') return 'file';
-  if (kind === 'LlmCall' || kind === 'LlmApi') return 'llm';
+  if (kind === 'LlmCall' || kind === 'LlmApi' || kind === 'LlmInteraction' || kind === 'AgentPlaintextEvidence') return 'llm';
   if (kind === 'SecurityAction') return 'security';
   if (kind === 'ProcessExit') return 'process';
   if (kind === 'RuntimeEvent') return 'runtime';
@@ -147,12 +579,95 @@ function eventSessionLabel(e: T.JudgedEvent): string {
   return e.attribution?.agentSessionId?.trim() || eventAgentLabel(e);
 }
 
+function dashboardFactForEvent(e: T.JudgedEvent): DashboardAggregateBucketFact {
+  const final = e.decisionStatus !== undefined && FINAL_DECISION_STATUSES.has(e.decisionStatus);
+  const risky = e.verdict !== 'allow';
+  return {
+    bucketStartMs: Math.floor(e.at / REUSABLE_BUCKET_MS) * REUSABLE_BUCKET_MS,
+    monitored: isMonitoredAgentEvent(e),
+    decisionStatus: e.decisionStatus ?? '',
+    verdict: e.verdict,
+    tier: e.tier,
+    riskType: e.riskType,
+    riskCategory: e.riskCategory,
+    riskName: e.riskName,
+    severityRank: SEV_RANK[e.severity],
+    sessionKey: eventSessionLabel(e),
+    userId: e.userId,
+    workspacePath: attributionWorkspacePath(e),
+    eventCount: 1,
+    blockedCount: final && e.verdict === 'block' ? 1 : 0,
+    escalatedCount: final && e.verdict === 'escalate' ? 1 : 0,
+    l2Count: final && (e.tier === 'Llm' || e.tier === 'Agent') ? 1 : 0,
+    l3Count: final && e.tier === 'Agent' ? 1 : 0,
+    riskActivationCount: final && risky ? 1 : 0,
+    riskyEventCount: risky ? 1 : 0,
+    tokenCount: final ? e.tokenCount : 0,
+    latencyTotal: final ? e.latencyMs : 0,
+    riskScoreTotal: final ? e.riskScore : 0,
+    lastEventAt: e.at,
+    commandDangerCount: risky && e.riskCategory === 'command_danger' ? 1 : 0,
+    promptInjectionCount: risky && e.riskCategory === 'prompt_injection' ? 1 : 0,
+    dataLeakCount: risky && (e.riskCategory === 'data_leak' || e.riskCategory === 'secret_exfil') ? 1 : 0,
+    communicationRiskCount: risky && e.riskCategory === 'communication_risk' ? 1 : 0,
+    systemicRiskCount: risky && (
+      e.riskCategory === 'systemic_risk' ||
+      e.riskCategory === 'privilege_escalation'
+    ) ? 1 : 0,
+  };
+}
+
 function isLoopbackPeer(peer: string): boolean {
   return peer === '127.0.0.1' || peer === '::1' || peer === 'localhost';
 }
 
 function normalizedCommand(e: T.JudgedEvent): string {
   return (attrString(e, 'argv') || e.subject).trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function kernelExecTargetSummary(item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>): string | undefined {
+  const argv = typeof item.attributes?.argv === 'string' ? item.attributes.argv.trim() : '';
+  if (argv) return argv.slice(0, 500);
+  const subject = typeof item.subject === 'string' ? item.subject.trim() : '';
+  return subject ? subject.slice(0, 500) : undefined;
+}
+
+/** Rank kernel-inferred actions so ToolExec evidence is not buried under /proc and home-cache noise. */
+function kernelInferredActionPriority(
+  operation: T.AgentActionItem['operation'],
+  item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>,
+): number {
+  if (operation === 'kernel_exec') return 0;
+  if (operation === 'file_delete') return 1;
+  if (operation === 'file_write') return 2;
+  if (operation === 'file_read' || operation === 'file_access') {
+    const path = typeof item.attributes?.path === 'string' ? item.attributes.path : '';
+    if (/^\/(?:proc|sys|dev)\b/u.test(path)) return 6;
+    if (/\/\.(?:claude|codex|cache|nvm)\b/u.test(path)) return 5;
+    return 3;
+  }
+  if (operation === 'network_connect') {
+    const peer = String(item.attributes?.peer ?? item.subject ?? '');
+    if (/(?:^|[^\d])127\.0\.0\.\d+(?:[^\d]|$)|::1|localhost/u.test(peer)) return 7;
+    return 4;
+  }
+  return 8;
+}
+
+function isLowValueKernelInferredAction(
+  operation: T.AgentActionItem['operation'],
+  item: Pick<T.AgentEventListItem, 'subject' | 'attributes'>,
+): boolean {
+  if (operation === 'file_read' || operation === 'file_access') {
+    const path = typeof item.attributes?.path === 'string' ? item.attributes.path : '';
+    return /^\/(?:proc|sys|dev)\b/u.test(path);
+  }
+  if (operation === 'network_connect') {
+    const peer = String(item.attributes?.peer ?? '');
+    const port = Number(item.attributes?.port ?? 0);
+    return isLoopbackPeer(peer) && (port === 53 || port === 7890 || port === 7897 || port === 29653);
+  }
+  return false;
 }
 
 function isLowValueAgentNoise(e: T.JudgedEvent): boolean {
@@ -180,8 +695,64 @@ function eventCollectorId(e: T.JudgedEvent): string {
   return e.collectorId?.trim() || attrString(e, 'collectorId');
 }
 
+function requiresCollectorCoverage(e: T.JudgedEvent): boolean {
+  // SDK/Adapter semantic facts deliberately reach the API without traversing the eBPF Collector.
+  // Kernel/observer facts still require collector provenance; exempting only the closed semantic
+  // kinds prevents a healthy dual-source Agent from generating a false partial-coverage alert.
+  return e.eventKind !== 'AgentTool'
+    && e.eventKind !== 'AgentInvocation'
+    && e.eventKind !== 'SystemContext';
+}
+
+function missingCollectorCoverage(e: T.JudgedEvent): boolean {
+  return requiresCollectorCoverage(e) && !eventCollectorId(e);
+}
+
 function eventSourceId(e: T.JudgedEvent): string {
   return e.sourceId?.trim() || attrString(e, 'sourceId');
+}
+
+function durableEventSearchKey(filter: T.AgentEventQuery, reviewRevision = 0): string {
+  const text = (value?: string): string => value?.trim() ?? '';
+  return JSON.stringify({
+    timeType: filter.timeType ?? 'last_3h',
+    // Preserve the raw custom boundaries: a date-only end includes the whole day, while an ISO
+    // midnight ends at that instant even though Date.parse yields the same millisecond value.
+    startTime: filter.startTime ?? '',
+    endTime: filter.endTime ?? '',
+    snapshotAsOf: filter.snapshotAsOf ?? '',
+    // Omitted scope compacts events; explicit raw scope does not, so these are not equivalent.
+    scope: filter.scope ?? '',
+    classificationView: resolvedClassificationView(filter),
+    reviewRevision,
+    includeUnknown: filter.includeUnknown !== false,
+    noise: filter.noise ?? 'hide',
+    eventId: text(filter.eventId),
+    sourceId: text(filter.sourceId),
+    collectorId: text(filter.collectorId),
+    agentId: text(filter.agentId),
+    agentAssetId: text(filter.agentAssetId),
+    subjectAssetId: text(filter.subjectAssetId),
+    agentInstanceId: text(filter.agentInstanceId),
+    sessionId: text(filter.sessionId),
+    workspacePath: text(filter.workspacePath),
+    traceId: text(filter.traceId),
+    invocationId: correlationCaptureRollout().trustedCorrelation === 'off'
+      ? ''
+      : text(filter.invocationId),
+    toolCallId: correlationCaptureRollout().trustedCorrelation === 'off'
+      ? ''
+      : text(filter.toolCallId),
+    runId: text(filter.runId),
+    // eventKind and limit are used without text/round normalization by filterEvents/slice.
+    eventKind: filter.eventKind ?? '',
+    eventCategory: filter.eventCategory ?? '',
+    activityContext: filter.activityContext ?? '',
+    verdict: filter.verdict ?? '',
+    tier: filter.tier ?? '',
+    q: text(filter.q).toLowerCase(),
+    limit: String(filter.limit ?? 40),
+  });
 }
 
 function basename(path: string): string {
@@ -200,7 +771,15 @@ function compactEventKey(e: T.JudgedEvent): string {
   const peer = e.eventKind === 'Egress' ? attrString(e, 'peer') + ':' + attrString(e, 'port') : '';
   const file = e.eventKind === 'FileAccess' || e.eventKind === 'FileDelete' ? attrString(e, 'path') : '';
   const subject = command || peer || file || e.subject;
-  return [agent, e.eventKind, e.verdict, e.riskCategory, subject].join('\0');
+  return [
+    agent,
+    e.eventKind,
+    eventActivityContext(e) ?? '',
+    eventActivitySubtype(e) ?? '',
+    e.verdict,
+    e.riskCategory,
+    subject,
+  ].join('\0');
 }
 
 function compactEvents(events: T.JudgedEvent[]): Array<{ event: T.JudgedEvent; repeatCount: number; lastAt: number }> {
@@ -219,6 +798,7 @@ function compactEvents(events: T.JudgedEvent[]): Array<{ event: T.JudgedEvent; r
 }
 
 function topologyTarget(e: T.JudgedEvent): { type: T.TopologyNodeType; key: string; label: string; subtitle?: string; edgeType: T.TopologyEdgeType; edgeLabel: string } | null {
+  if (eventActivityContext(e) === 'platform_healthcheck') return null;
   if (e.eventKind === 'ToolExec') {
     const argv = attrString(e, 'argv') || e.subject;
     const cmd = commandName(argv) || 'exec';
@@ -255,6 +835,145 @@ function compactIssueId(type: T.CoverageIssueType, ...parts: Array<string | numb
 
 type SimulatedDecision = { verdict: string; tier: string; severity: string; reason: string };
 
+type AgentConversationProjectionResult = {
+  projection: ReturnType<typeof projectAgentConversations>;
+  interactions: T.AgentInteractionList;
+  inventory: T.AgentInventory;
+  routeAlias?: ReturnType<AgentConversationBindingService['routeAlias']>;
+  requestedConversationId?: string;
+  canonicalConversationId?: string;
+};
+
+function relationStatusFromCanonicalLink(
+  status: T.EvidenceLink['status'],
+): T.AgentSemanticKernelRelationStatus {
+  if (status === 'confirmed') return 'linked_exact';
+  if (status === 'strong') return 'linked_strong';
+  if (status === 'ambiguous') return 'ambiguous';
+  if (status === 'coverage_gap') return 'coverage_gap';
+  return 'semantic_only';
+}
+
+function relationMethodFromCanonicalLink(
+  method: T.EvidenceLink['method'],
+): T.AgentSemanticKernelRelation['linkMethod'] | undefined {
+  if (method === 'command' || method === 'resource' || method === 'network') return method;
+  // The legacy relation enum has no generic process-generation member. Do not relabel a
+  // non-shell process edge as `shell_bootstrap`; the canonical link remains authoritative.
+  return undefined;
+}
+
+/** Rehydrate the additive canonical link into the legacy relation shape used by existing UI/API
+ * clients.  No semantic status is invented: missing Kernel row details remain absent and the
+ * canonical EvidenceLink itself stays available in the response. */
+function relationFromCanonicalLink(
+  link: T.EvidenceLink,
+  event: T.AgentSemanticEvent,
+  interaction: T.AgentInteractionRecord,
+  kernelItems: readonly T.AgentEventListItem[],
+): T.AgentSemanticKernelRelation {
+  const targetId = link.toId.startsWith('unmatched:') ? undefined : link.toId;
+  const kernel = targetId
+    ? kernelItems.find((item) => item.eventId === targetId || item.kernelFactId === targetId)
+    : undefined;
+  const targetLooksLikeFact = Boolean(targetId && /^kf_[a-f0-9]{24}$/u.test(targetId));
+  const kernelEventId = kernel?.eventId ?? (!targetLooksLikeFact ? targetId : undefined);
+  const kernelFactId = targetLooksLikeFact ? targetId : kernel?.kernelFactId;
+  const relationId = `skr_${createHash('sha256')
+    .update(`${event.semanticEventId}\0canonical\0${link.linkId}\0${link.resolutionRevision}`)
+    .digest('hex').slice(0, 24)}`;
+  const authority: T.AgentSemanticKernelRelation['authority'] = interaction.semanticOnly === true
+    || interaction.captureSource === 'authenticated_application_event'
+    ? 'authenticated_adapter'
+    : link.authority === 'authenticated_adapter' ? 'authenticated_adapter'
+      : link.authority === 'inferred' ? 'attested_tls_plaintext' : 'inferred';
+  return {
+    schemaVersion: 'anysentry.agent_semantic_kernel_relation.v1',
+    relationId,
+    stableSemanticEventId: event.semanticEventId,
+    conversationId: event.conversationId,
+    turnId: event.turnId,
+    toolInvocationId: link.fromId,
+    ...(kernelEventId ? { kernelEventId } : {}),
+    ...(kernelFactId ? { kernelFactId } : {}),
+    ...(kernel?.at ? { kernelEventAt: kernel.at } : {}),
+    ...(kernel?.eventKind ? { kernelEventKind: kernel.eventKind } : {}),
+    status: relationStatusFromCanonicalLink(link.status),
+    ...(relationMethodFromCanonicalLink(link.method) ? { linkMethod: relationMethodFromCanonicalLink(link.method) } : {}),
+    timeQuality: kernel ? 'exact' : 'bounded',
+    confidence: link.confidence,
+    authority,
+    relationVersion: AGENT_SEMANTIC_KERNEL_RELATION_VERSION,
+    resolutionRevision: link.resolutionRevision,
+    evidenceLinkId: link.linkId,
+    algorithmVersion: link.algorithmVersion,
+    sourceRefs: link.evidenceRefs,
+    validFromUnixNs: link.validFromUnixNs,
+    relationRevision: link.resolutionRevision,
+    ...(kernel ? {
+      risk: {
+        verdict: kernel.verdict,
+        tier: kernel.tier,
+        severity: kernel.severity,
+        riskScore: kernel.riskScore,
+        riskName: kernel.riskName,
+        riskCategory: kernel.riskCategory,
+        reason: kernel.reason,
+      },
+    } : {}),
+  };
+}
+
+function semanticResultForCall(
+  call: T.AgentSemanticEvent,
+  events: readonly T.AgentSemanticEvent[],
+): T.AgentSemanticEvent | undefined {
+  if (!call.toolCallId) return undefined;
+  let callAt: bigint;
+  try { callAt = BigInt(call.atUnixNs); } catch { callAt = 0n; }
+  return events
+    .filter((candidate) => candidate.kind === 'tool_result' && candidate.toolCallId === call.toolCallId)
+    .filter((candidate) => {
+      try { return BigInt(candidate.atUnixNs) >= callAt; } catch { return false; }
+    })
+    .sort((left, right) => {
+      try { return BigInt(left.atUnixNs) === BigInt(right.atUnixNs) ? left.semanticEventId.localeCompare(right.semanticEventId) : BigInt(left.atUnixNs) < BigInt(right.atUnixNs) ? -1 : 1; }
+      catch { return 0; }
+    })
+    .at(0);
+}
+
+async function boundedRelationRead<T>(
+  operation: Promise<T>,
+  fallback: T,
+  timeoutMs = 1_500,
+): Promise<{ value: T; failed: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ value: fallback, failed: true });
+    }, timeoutMs);
+    operation.then((value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ value, failed: false });
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ value: fallback, failed: true });
+    });
+  });
+}
+
+// ClickHouse is a secondary durable projection for interactions. A slow read must not hide
+// records already admitted to the bounded hot ring; callers can return a truthful partial view
+// and retry instead of blocking the API request until the database recovers.
+const AGENT_INTERACTION_QUERY_TIMEOUT_MS = 2_000;
+
 function normalizeSimulationDecision(decision: SimulatedDecision | null): T.PolicySimulationDecision {
   if (!decision) return { verdict: 'allow', tier: 'Rules', severity: 'info', reason: 'observed' };
   let verdict = decision.verdict as T.Verdict;
@@ -279,42 +998,865 @@ function simulationChange(current: T.PolicySimulationDecision, simulated: T.Poli
 }
 
 @Injectable()
-export class AggregationService {
+export class AggregationService implements OnModuleDestroy {
   constructor(
     private readonly judge: SentryJudgeService,
     private readonly agentMetadata: AgentMetadataService,
+    private readonly workspaceDirectory: WorkspaceDirectoryService,
     private readonly maintenance: MaintenanceWindowService,
     private readonly sources: IngestionSourceService,
+    @Optional() private readonly assetReviews?: ObservedAssetReviewService,
+    @Optional() private readonly conversationBindings?: AgentConversationBindingService,
+    @Optional() private readonly relationalStore?: RelationalBusinessStore,
+    @Optional() private readonly canonicalObservability?: CanonicalObservabilityService,
   ) {}
+
+  private estimateCacheBytes(value: unknown): number {
+    try {
+      return Math.max(1, Buffer.byteLength(JSON.stringify(value), 'utf8'));
+    } catch {
+      return 1_024;
+    }
+  }
+
+  private pruneWinCache(at = now()): void {
+    for (const [key, entry] of this.winCache) {
+      if (at - entry.at < WIN_CACHE_TTL_MS) continue;
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - entry.bytes);
+      this.winCacheExpired += 1;
+    }
+  }
+
+  private rememberWinCache(
+    key: string,
+    val: ReturnType<AggregationService['computeWin']>,
+    at: number,
+  ): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(val);
+    if (bytes > MAX_WIN_CACHE_BYTES) {
+      this.winCacheDropped += 1;
+      return;
+    }
+    const previous = this.winCache.get(key);
+    if (previous) {
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - previous.bytes);
+    }
+    this.winCache.set(key, { at, val, bytes });
+    this.winCacheBytes += bytes;
+    this.pruneWinCache(at);
+    while (this.winCache.size > MAX_WIN_CACHE_ENTRIES || this.winCacheBytes > MAX_WIN_CACHE_BYTES) {
+      const oldest = this.winCache.entries().next().value as
+        | [string, { at: number; val: ReturnType<AggregationService['computeWin']>; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.winCache.delete(oldest[0]);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - oldest[1].bytes);
+      this.winCacheEvictions += 1;
+    }
+  }
+
+  private pruneHistoryCache(at = now()): void {
+    for (const [key, entry] of this.historyCache) {
+      if (entry.completedAt === undefined) {
+        if (at - entry.startedAt <= IN_FLIGHT_OPERATION_TIMEOUT_MS) continue;
+        this.historyCache.delete(key);
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+        const timeout = this.historyCacheTimeoutsByKey.get(key);
+        if (timeout) clearTimeout(timeout);
+        this.historyCacheTimeoutsByKey.delete(key);
+        this.historyCacheTimeouts += 1;
+        continue;
+      }
+      const ttl = entry.failedAt === undefined ? entry.ttlMs : 30_000;
+      if (at - entry.completedAt < ttl) continue;
+      this.historyCache.delete(key);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+      const timeout = this.historyCacheTimeoutsByKey.get(key);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(key);
+      this.historyCacheExpired += 1;
+    }
+    while (this.historyCache.size > MAX_HISTORY_CACHE_ENTRIES || this.historyCacheBytes > MAX_HISTORY_CACHE_BYTES) {
+      const oldest = [...this.historyCache.entries()]
+        .filter(([, entry]) => entry.completedAt !== undefined)
+        .sort((left, right) =>
+          (left[1].completedAt ?? left[1].startedAt) - (right[1].completedAt ?? right[1].startedAt),
+        )[0];
+      if (!oldest) break;
+      this.historyCache.delete(oldest[0]);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - oldest[1].bytes);
+      this.historyCacheEvictions += 1;
+    }
+  }
+
+  private pruneAgentInstanceMetricsCache(at = now()): void {
+    for (const [key, entry] of this.agentInstanceMetricsCache) {
+      if (at - entry.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) continue;
+      this.agentInstanceMetricsCache.delete(key);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - entry.bytes);
+      this.agentInstanceMetricsCacheExpired += 1;
+    }
+  }
+
+  private rememberAgentInstanceMetrics(key: string, value: T.AgentInstanceMetrics, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES) {
+      this.agentInstanceMetricsCacheDropped += 1;
+      return;
+    }
+    const previous = this.agentInstanceMetricsCache.get(key);
+    if (previous) {
+      this.agentInstanceMetricsCache.delete(key);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - previous.bytes);
+    }
+    this.agentInstanceMetricsCache.set(key, { at, value, bytes });
+    this.agentInstanceMetricsCacheBytes += bytes;
+    this.pruneAgentInstanceMetricsCache(at);
+    while (
+      this.agentInstanceMetricsCache.size > MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES
+      || this.agentInstanceMetricsCacheBytes > MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES
+    ) {
+      const oldest = [...this.agentInstanceMetricsCache.entries()]
+        .sort((left, right) => left[1].at - right[1].at)[0];
+      if (!oldest) break;
+      this.agentInstanceMetricsCache.delete(oldest[0]);
+      this.agentInstanceMetricsCacheBytes = Math.max(0, this.agentInstanceMetricsCacheBytes - oldest[1].bytes);
+      this.agentInstanceMetricsCacheEvictions += 1;
+    }
+  }
+
+  private pruneAgentObservabilityRecent(at = now()): void {
+    for (const [key, entry] of this.agentObservabilityRecent) {
+      if (at - entry.at < RECENT_OBSERVABILITY_TTL_MS) continue;
+      this.agentObservabilityRecent.delete(key);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - entry.bytes);
+      this.agentObservabilityRecentExpired += 1;
+    }
+  }
+
+  private rememberAgentObservabilityRecent(key: string, value: T.AgentObservability, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_RECENT_OBSERVABILITY_BYTES) {
+      this.agentObservabilityRecentDropped += 1;
+      return;
+    }
+    const previous = this.agentObservabilityRecent.get(key);
+    if (previous) {
+      this.agentObservabilityRecent.delete(key);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - previous.bytes);
+    }
+    this.agentObservabilityRecent.set(key, { at, value, bytes });
+    this.agentObservabilityRecentBytes += bytes;
+    this.pruneAgentObservabilityRecent(at);
+    while (
+      this.agentObservabilityRecent.size > MAX_RECENT_OBSERVABILITY_ENTRIES
+      || this.agentObservabilityRecentBytes > MAX_RECENT_OBSERVABILITY_BYTES
+    ) {
+      const oldest = this.agentObservabilityRecent.entries().next().value as
+        | [string, { at: number; value: T.AgentObservability; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.agentObservabilityRecent.delete(oldest[0]);
+      this.agentObservabilityRecentBytes = Math.max(0, this.agentObservabilityRecentBytes - oldest[1].bytes);
+      this.agentObservabilityRecentEvictions += 1;
+    }
+  }
+
+  private pruneAgentInventoryLastGood(at = now()): void {
+    for (const [key, entry] of this.agentInventoryLastGood) {
+      if (at - entry.at < LAST_GOOD_INVENTORY_TTL_MS) continue;
+      this.agentInventoryLastGood.delete(key);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - entry.bytes);
+      this.agentInventoryLastGoodExpired += 1;
+    }
+  }
+
+  private rememberAgentInventoryLastGood(key: string, value: T.AgentInventory, at = now()): void {
+    const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(value);
+    if (bytes > MAX_LAST_GOOD_INVENTORY_BYTES) {
+      this.agentInventoryLastGoodDropped += 1;
+      return;
+    }
+    const previous = this.agentInventoryLastGood.get(key);
+    if (previous) {
+      this.agentInventoryLastGood.delete(key);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - previous.bytes);
+    }
+    this.agentInventoryLastGood.set(key, { at, value: structuredClone(value), bytes });
+    this.agentInventoryLastGoodBytes += bytes;
+    this.pruneAgentInventoryLastGood(at);
+    while (
+      this.agentInventoryLastGood.size > MAX_LAST_GOOD_INVENTORY_ENTRIES
+      || this.agentInventoryLastGoodBytes > MAX_LAST_GOOD_INVENTORY_BYTES
+    ) {
+      const oldest = this.agentInventoryLastGood.entries().next().value as
+        | [string, { at: number; value: T.AgentInventory; bytes: number }]
+        | undefined;
+      if (!oldest) break;
+      this.agentInventoryLastGood.delete(oldest[0]);
+      this.agentInventoryLastGoodBytes = Math.max(0, this.agentInventoryLastGoodBytes - oldest[1].bytes);
+      this.agentInventoryLastGoodEvictions += 1;
+    }
+  }
+
+  private reserveInFlight(
+    map: Map<string, unknown>,
+    key: string,
+    currentBytes: number,
+    maxEntries: number,
+  ): { accepted: boolean; bytes: number } {
+    if (map.has(key)) return { accepted: true, bytes: 0 };
+    const bytes = Buffer.byteLength(key, 'utf8') + 64;
+    const maxBytes = 2 * 1024 * 1024;
+    if (map.size >= maxEntries || currentBytes + bytes > maxBytes) return { accepted: false, bytes };
+    return { accepted: true, bytes };
+  }
+
+  /**
+   * Bound a downstream query/projection Promise independently of its transport implementation.
+   * The timeout callback removes the single-flight key immediately; the original Promise is still
+   * observed so a late result cannot become an unhandled rejection, but it is treated as an orphan
+   * and cannot hold the bounded map indefinitely.
+   */
+  private withInFlightTimeout<T>(
+    request: Promise<T>,
+    onTimeout: () => void,
+    message: string,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const bounded = new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { onTimeout(); } catch { /* cleanup must not mask the timeout */ }
+        reject(new ServiceUnavailableException(message));
+      }, IN_FLIGHT_OPERATION_TIMEOUT_MS);
+      timer.unref();
+      request.then((value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      }).catch((error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      }).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+    });
+    return bounded;
+  }
+
+  private pruneConversationProjectionRecent(at = now()): void {
+    for (const [key, entry] of this.conversationProjectionRecent) {
+      if (at - entry.at < RECENT_OBSERVABILITY_TTL_MS) continue;
+      this.conversationProjectionRecent.delete(key);
+      this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - entry.bytes);
+      this.conversationProjectionRecentExpired += 1;
+    }
+  }
+
+  private pruneInteractionHot(at = now()): void {
+    for (const [key, entry] of this.interactionHot) {
+      if (at - entry.insertedAt < INTERACTION_HOT_TTL_MS) continue;
+      this.interactionHot.delete(key);
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - entry.bytes);
+      this.interactionHotExpired += 1;
+    }
+  }
+
+  onModuleDestroy(): void {
+    for (const entry of this.semanticRelationProjectionTimers.values()) clearTimeout(entry.timer);
+    for (const timer of this.semanticRelationProjectionDeadlines.values()) clearTimeout(timer);
+    this.semanticRelationProjectionTimers.clear();
+    this.semanticRelationProjectionActive.clear();
+    this.semanticRelationProjectionDeadlines.clear();
+    this.semanticRelationRevisionOverrides.clear();
+    for (const timer of this.historyCacheTimeoutsByKey.values()) clearTimeout(timer);
+    this.historyCacheTimeoutsByKey.clear();
+    this.winCache.clear();
+    this.winCacheBytes = 0;
+    this.historyCache.clear();
+    this.historyCacheBytes = 0;
+    this.agentInstanceMetricsCache.clear();
+    this.agentInstanceMetricsCacheBytes = 0;
+    this.agentInventoryInFlight.clear();
+    this.agentInventoryInFlightBytes = 0;
+    this.agentObservabilityInFlight.clear();
+    this.agentObservabilityInFlightBytes = 0;
+    this.agentObservabilityRecent.clear();
+    this.agentObservabilityRecentBytes = 0;
+    this.conversationProjectionInFlight.clear();
+    this.conversationProjectionInFlightBytes = 0;
+    this.conversationProjectionRecent.clear();
+    this.conversationProjectionRecentBytes = 0;
+    this.durableEventSearchInFlight = undefined;
+    this.interactionHot.clear();
+    this.interactionHotBytes = 0;
+    for (const cache of this.agentHistoryBuckets.values()) cache.close();
+    for (const cache of this.topologyHistoryBuckets.values()) cache.close();
+    for (const cache of this.workspaceHistoryBuckets.values()) cache.close();
+    this.agentHistoryBuckets.clear();
+    this.topologyHistoryBuckets.clear();
+    this.workspaceHistoryBuckets.clear();
+  }
 
   // The dashboard polls 9 endpoints with the same filter near-simultaneously; cache the windowed
   // scan for a beat so they share one pass over the 100k ring instead of nine (keeps latency flat).
-  private readonly winCache = new Map<string, { at: number; val: ReturnType<AggregationService['computeWin']> }>();
+  private readonly winCache = new Map<string, { at: number; val: ReturnType<AggregationService['computeWin']>; bytes: number }>();
+  private winCacheBytes = 0;
+  private winCacheEvictions = 0;
+  private winCacheExpired = 0;
+  private winCacheDropped = 0;
+  private readonly historyCache = new Map<string, {
+    startedAt: number;
+    completedAt?: number;
+    failedAt?: number;
+    ttlMs: number;
+    bytes: number;
+    value: Promise<DashboardWindowHistory | null>;
+  }>();
+  private historyCacheBytes = 0;
+  private historyCacheEvictions = 0;
+  private historyCacheExpired = 0;
+  private historyCacheDropped = 0;
+  private historyCacheRejected = 0;
+  private historyCacheTimeouts = 0;
+  private readonly historyCacheTimeoutsByKey = new Map<string, NodeJS.Timeout>();
+  private readonly agentInstanceMetricsCache = new Map<string, {
+    at: number;
+    value: T.AgentInstanceMetrics;
+    bytes: number;
+  }>();
+  private agentInstanceMetricsCacheBytes = 0;
+  private agentInstanceMetricsCacheEvictions = 0;
+  private agentInstanceMetricsCacheExpired = 0;
+  private agentInstanceMetricsCacheDropped = 0;
+  private readonly agentInventoryInFlight = new Map<string, Promise<T.AgentInventory>>();
+  private readonly agentObservabilityInFlight = new Map<string, Promise<T.AgentObservability>>();
+  private agentInventoryInFlightBytes = 0;
+  private agentObservabilityInFlightBytes = 0;
+  private agentInventoryInFlightRejected = 0;
+  private agentObservabilityInFlightRejected = 0;
+  private agentInventoryInFlightTimeouts = 0;
+  private agentObservabilityInFlightTimeouts = 0;
+  private readonly agentObservabilityRecent = new Map<string, { at: number; value: T.AgentObservability; bytes: number }>();
+  private agentObservabilityRecentBytes = 0;
+  private agentObservabilityRecentEvictions = 0;
+  private agentObservabilityRecentExpired = 0;
+  private agentObservabilityRecentDropped = 0;
+  private dashboardHistoryBuckets?: DashboardHistoryBucketCache;
+  private readonly agentHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredAgentBucketFact>
+  >();
+  private readonly topologyHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredTopologyBucketFact>
+  >();
+  private readonly workspaceHistoryBuckets = new Map<
+    'agent' | 'all',
+    CommitAwareFactBucketCache<StoredWorkspaceBucketFact>
+  >();
+  // A cold page can request several historical fact families together. Keep those ClickHouse
+  // aggregates bounded while leaving ingestion and small boundary reads unconstrained.
+  // One exact window may need stable/head/tail reads concurrently. Four slots let one request
+  // complete without self-rejection while still bounding cross-page ClickHouse pressure.
+  private readonly historyQueryGate = new BoundedHistoryQueryGate(4);
+  private readonly agentInventoryLastGood = new Map<string, { at: number; value: T.AgentInventory; bytes: number }>();
+  private agentInventoryLastGoodBytes = 0;
+  private agentInventoryLastGoodEvictions = 0;
+  private agentInventoryLastGoodExpired = 0;
+  private agentInventoryLastGoodDropped = 0;
+  // Two identical HTTP requests otherwise resolve a preset window at slightly different
+  // milliseconds and miss the ClickHouse store's exact-query single-flight key. Coalesce the
+  // complete durable response by request semantics before either request samples Date.now().
+  private durableEventSearchInFlight?: {
+    key: string;
+    value: Promise<T.AgentEventList>;
+  };
+  private durableEventSearchTimeouts = 0;
+  private readonly interactionHot = new Map<string, { record: T.AgentInteractionRecord; bytes: number; insertedAt: number }>();
+  private interactionHotBytes = 0;
+  private readonly interactionHotMaxRecords = 2_000;
+  private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
+  private interactionHotEvictions = 0;
+  private interactionHotExpired = 0;
+  private interactionHotDropped = 0;
+  private readonly conversationProjectionGate = new BoundedHistoryQueryGate(
+    CONVERSATION_PROJECTION_CONCURRENCY,
+  );
+  private readonly conversationProjectionInFlight = new Map<
+    string,
+    Promise<AgentConversationProjectionResult>
+  >();
+  private readonly conversationProjectionRecent = new Map<
+    string,
+    { at: number; value: AgentConversationProjectionResult; bytes: number }
+  >();
+  private conversationProjectionInFlightBytes = 0;
+  private conversationProjectionInFlightRejected = 0;
+  private conversationProjectionInFlightTimeouts = 0;
+  private conversationProjectionRecentBytes = 0;
+  private conversationProjectionRecentEvictions = 0;
+  private conversationProjectionRecentExpired = 0;
+  private conversationProjectionRecentDropped = 0;
+  private conversationInteractionRevision = 0;
+  private readonly semanticRelationProjectionTimers = new Map<string, {
+    timer: NodeJS.Timeout;
+    firstQueuedAt: number;
+    record: T.AgentInteractionRecord;
+  }>();
+  private readonly semanticRelationProjectionActive = new Set<string>();
+  private readonly semanticRelationProjectionDeadlines = new Map<string, NodeJS.Timeout>();
+  private readonly semanticRelationRevisionOverrides = new Map<string, number>();
+  private readonly semanticRelationProjectionMaxKeys = 512;
+  private semanticRelationProjectionScheduled = 0;
+  private semanticRelationProjectionCompleted = 0;
+  private semanticRelationProjectionEvictions = 0;
+  private semanticRelationProjectionDropped = 0;
+  private semanticRelationProjectionTimeouts = 0;
+  private semanticRelationProjectionOrphans = 0;
+
+  historyFactCacheStatus() {
+    const agents = [...this.agentHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
+    const workspaces = [...this.workspaceHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
+    const topology = [...this.topologyHistoryBuckets.entries()].map(([scope, cache]) => ({
+      scope,
+      ...cache.stats(),
+    }));
+    const caches = [
+      ...(this.dashboardHistoryBuckets
+        ? [{ name: 'dashboard', ...this.dashboardHistoryBuckets.stats() }]
+        : []),
+      ...agents.map((stats) => ({ name: `agents:${stats.scope}`, ...stats })),
+      ...workspaces.map((stats) => ({ name: `workspaces:${stats.scope}`, ...stats })),
+      ...topology.map((stats) => ({ name: `topology:${stats.scope}`, ...stats })),
+    ];
+    return {
+      schemaVersion: 'anysentry.history-cache.v1',
+      caches,
+      totals: caches.reduce(
+        (total, cache) => ({
+          buckets: total.buckets + cache.buckets,
+          facts: total.facts + cache.facts,
+          estimatedBytes: total.estimatedBytes + cache.estimatedBytes,
+          evictions: total.evictions + cache.evictions,
+          budgetRejects: total.budgetRejects + cache.budgetRejects,
+          journalResets: total.journalResets + cache.journalResets,
+        }),
+        {
+          buckets: 0,
+          facts: 0,
+          estimatedBytes: 0,
+          evictions: 0,
+          budgetRejects: 0,
+          journalResets: 0,
+        },
+      ),
+    };
+  }
+
+  /**
+   * Operational view of every process-local projection cache. These counters make bounded
+   * degradation auditable without exposing cached prompt/body content.
+   */
+  cacheStateStats() {
+    this.pruneWinCache();
+    this.pruneHistoryCache();
+    this.pruneAgentInstanceMetricsCache();
+    this.pruneAgentObservabilityRecent();
+    this.pruneAgentInventoryLastGood();
+    this.pruneInteractionHot();
+    this.pruneConversationProjectionRecent();
+    return {
+      schemaVersion: 'anysentry.aggregation-cache-state.v1',
+      win: {
+        entries: this.winCache.size,
+        bytes: this.winCacheBytes,
+        maxEntries: MAX_WIN_CACHE_ENTRIES,
+        maxBytes: MAX_WIN_CACHE_BYTES,
+        ttlMs: WIN_CACHE_TTL_MS,
+        evicted: this.winCacheEvictions,
+        expired: this.winCacheExpired,
+        dropped: this.winCacheDropped,
+      },
+      history: {
+        entries: this.historyCache.size,
+        bytes: this.historyCacheBytes,
+        maxEntries: MAX_HISTORY_CACHE_ENTRIES,
+        maxBytes: MAX_HISTORY_CACHE_BYTES,
+        evicted: this.historyCacheEvictions,
+        expired: this.historyCacheExpired,
+        dropped: this.historyCacheDropped,
+        rejected: this.historyCacheRejected,
+        timeouts: this.historyCacheTimeouts,
+      },
+      agentInstanceMetrics: {
+        entries: this.agentInstanceMetricsCache.size,
+        bytes: this.agentInstanceMetricsCacheBytes,
+        maxEntries: MAX_AGENT_INSTANCE_METRICS_CACHE_ENTRIES,
+        maxBytes: MAX_AGENT_INSTANCE_METRICS_CACHE_BYTES,
+        ttlMs: AGENT_INSTANCE_METRICS_CACHE_TTL_MS,
+        evicted: this.agentInstanceMetricsCacheEvictions,
+        expired: this.agentInstanceMetricsCacheExpired,
+        dropped: this.agentInstanceMetricsCacheDropped,
+      },
+      agentInventoryInFlight: {
+        entries: this.agentInventoryInFlight.size,
+        bytes: this.agentInventoryInFlightBytes,
+        maxEntries: MAX_AGENT_INVENTORY_IN_FLIGHT,
+        maxBytes: 2 * 1024 * 1024,
+        rejected: this.agentInventoryInFlightRejected,
+        timeouts: this.agentInventoryInFlightTimeouts,
+      },
+      agentObservabilityInFlight: {
+        entries: this.agentObservabilityInFlight.size,
+        bytes: this.agentObservabilityInFlightBytes,
+        maxEntries: MAX_AGENT_OBSERVABILITY_IN_FLIGHT,
+        maxBytes: 2 * 1024 * 1024,
+        rejected: this.agentObservabilityInFlightRejected,
+        timeouts: this.agentObservabilityInFlightTimeouts,
+      },
+      agentObservabilityRecent: {
+        entries: this.agentObservabilityRecent.size,
+        bytes: this.agentObservabilityRecentBytes,
+        maxEntries: MAX_RECENT_OBSERVABILITY_ENTRIES,
+        maxBytes: MAX_RECENT_OBSERVABILITY_BYTES,
+        ttlMs: RECENT_OBSERVABILITY_TTL_MS,
+        evicted: this.agentObservabilityRecentEvictions,
+        expired: this.agentObservabilityRecentExpired,
+        dropped: this.agentObservabilityRecentDropped,
+      },
+      agentInventoryLastGood: {
+        entries: this.agentInventoryLastGood.size,
+        bytes: this.agentInventoryLastGoodBytes,
+        maxEntries: MAX_LAST_GOOD_INVENTORY_ENTRIES,
+        maxBytes: MAX_LAST_GOOD_INVENTORY_BYTES,
+        ttlMs: LAST_GOOD_INVENTORY_TTL_MS,
+        evicted: this.agentInventoryLastGoodEvictions,
+        expired: this.agentInventoryLastGoodExpired,
+        dropped: this.agentInventoryLastGoodDropped,
+      },
+      interactionHot: {
+        entries: this.interactionHot.size,
+        bytes: this.interactionHotBytes,
+        maxEntries: this.interactionHotMaxRecords,
+        maxBytes: this.interactionHotMaxBytes,
+        ttlMs: INTERACTION_HOT_TTL_MS,
+        evicted: this.interactionHotEvictions,
+        expired: this.interactionHotExpired,
+        dropped: this.interactionHotDropped,
+      },
+      conversationProjection: {
+        recentEntries: this.conversationProjectionRecent.size,
+        recentBytes: this.conversationProjectionRecentBytes,
+        recentMaxEntries: MAX_RECENT_OBSERVABILITY_ENTRIES,
+        recentMaxBytes: MAX_RECENT_OBSERVABILITY_BYTES,
+        recentTtlMs: RECENT_OBSERVABILITY_TTL_MS,
+        recentEvicted: this.conversationProjectionRecentEvictions,
+        recentExpired: this.conversationProjectionRecentExpired,
+        recentDropped: this.conversationProjectionRecentDropped,
+        inFlightEntries: this.conversationProjectionInFlight.size,
+        inFlightBytes: this.conversationProjectionInFlightBytes,
+        inFlightMaxEntries: MAX_CONVERSATION_PROJECTION_IN_FLIGHT,
+        inFlightMaxBytes: 2 * 1024 * 1024,
+        inFlightRejected: this.conversationProjectionInFlightRejected,
+        inFlightTimeouts: this.conversationProjectionInFlightTimeouts,
+      },
+      relationProjection: {
+        queued: this.semanticRelationProjectionTimers.size,
+        active: this.semanticRelationProjectionActive.size,
+        revisionOverrides: this.semanticRelationRevisionOverrides.size,
+        maxKeys: this.semanticRelationProjectionMaxKeys,
+        scheduled: this.semanticRelationProjectionScheduled,
+        completed: this.semanticRelationProjectionCompleted,
+        evicted: this.semanticRelationProjectionEvictions,
+        dropped: this.semanticRelationProjectionDropped,
+        timeouts: this.semanticRelationProjectionTimeouts,
+        orphaned: this.semanticRelationProjectionOrphans,
+      },
+      durableEventSearch: {
+        inFlight: this.durableEventSearchInFlight ? 1 : 0,
+        maxEntries: 1,
+        timeoutMs: IN_FLIGHT_OPERATION_TIMEOUT_MS,
+        timeouts: this.durableEventSearchTimeouts,
+      },
+      historyQueryGate: this.historyQueryGate.status(),
+      conversationProjectionGate: this.conversationProjectionGate.status(),
+    };
+  }
 
   invalidateWindowCache(): void {
     this.winCache.clear();
+    this.winCacheBytes = 0;
+    // Ingestion invalidates the millisecond-scale hot-ring cache, but must not cancel or discard a
+    // multi-second ClickHouse history query. Historical snapshots intentionally refresh on their
+    // own short TTL; clearing them for every event creates a query storm at observer throughput.
+  }
+
+  private history(filter: T.SecurityTimeFilter): Promise<DashboardWindowHistory | null> {
+    const window = resolveTimeWindow(filter);
+    const t = now();
+    const ttlMs = window.custom
+      ? 5 * 60_000
+      : window.spanMs >= 7 * 24 * 60 * 60_000
+        ? 5 * 60_000
+        : window.spanMs >= 24 * 60 * 60_000
+          ? 60_000
+          : 30_000;
+    this.pruneHistoryCache(t);
+    const cached = this.historyCache.get(window.cacheKey);
+    const cachedTtlMs = cached?.failedAt ? 30_000 : ttlMs;
+    if (cached && (cached.completedAt === undefined || t - cached.completedAt < cachedTtlMs)) {
+      // Refresh insertion order so completed entries are evicted least-recently-used.
+      this.historyCache.delete(window.cacheKey);
+      this.historyCache.set(window.cacheKey, cached);
+      return cached.value;
+    }
+    if (cached) {
+      this.historyCache.delete(window.cacheKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - cached.bytes);
+      const timeout = this.historyCacheTimeoutsByKey.get(window.cacheKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(window.cacheKey);
+    }
+    while (this.historyCache.size >= MAX_HISTORY_CACHE_ENTRIES) {
+      const completedKey = [...this.historyCache].find(([, entry]) => entry.completedAt !== undefined)?.[0];
+      if (!completedKey) {
+        this.historyCacheRejected += 1;
+        return Promise.resolve(null);
+      }
+      const completed = this.historyCache.get(completedKey);
+      this.historyCache.delete(completedKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - (completed?.bytes ?? 0));
+      const timeout = this.historyCacheTimeoutsByKey.get(completedKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(completedKey);
+      this.historyCacheEvictions += 1;
+    }
+    const entryBytes = Buffer.byteLength(window.cacheKey, 'utf8') + 256;
+    if (entryBytes > MAX_HISTORY_CACHE_BYTES) {
+      this.historyCacheDropped += 1;
+      return Promise.resolve(null);
+    }
+    while (this.historyCacheBytes + entryBytes > MAX_HISTORY_CACHE_BYTES) {
+      const completedKey = [...this.historyCache]
+        .filter(([, entry]) => entry.completedAt !== undefined)
+        .sort((left, right) =>
+          (left[1].completedAt ?? left[1].startedAt) - (right[1].completedAt ?? right[1].startedAt),
+        )[0]?.[0];
+      if (!completedKey) {
+        this.historyCacheRejected += 1;
+        return Promise.resolve(null);
+      }
+      const completed = this.historyCache.get(completedKey);
+      this.historyCache.delete(completedKey);
+      this.historyCacheBytes = Math.max(0, this.historyCacheBytes - (completed?.bytes ?? 0));
+      this.historyCacheEvictions += 1;
+    }
+    const source = this.loadDashboardHistory(window);
+    let value: Promise<DashboardWindowHistory | null>;
+    value = new Promise<DashboardWindowHistory | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        const current = this.historyCache.get(window.cacheKey);
+        if (current?.value !== value) return;
+        this.historyCache.delete(window.cacheKey);
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - current.bytes);
+        this.historyCacheTimeoutsByKey.delete(window.cacheKey);
+        this.historyCacheTimeouts += 1;
+        resolve(null);
+      }, IN_FLIGHT_OPERATION_TIMEOUT_MS);
+      timeout.unref();
+      this.historyCacheTimeoutsByKey.set(window.cacheKey, timeout);
+      source.then(resolve).catch(() => resolve(null)).finally(() => clearTimeout(timeout));
+    });
+    const entry = {
+      startedAt: t,
+      completedAt: undefined as number | undefined,
+      failedAt: undefined as number | undefined,
+      ttlMs,
+      bytes: entryBytes,
+      value,
+    };
+    this.historyCache.set(window.cacheKey, entry);
+    this.historyCacheBytes += entryBytes;
+    void value.then((result) => {
+      if (this.historyCache.get(window.cacheKey)?.value !== value) return;
+      const timeout = this.historyCacheTimeoutsByKey.get(window.cacheKey);
+      if (timeout) clearTimeout(timeout);
+      this.historyCacheTimeoutsByKey.delete(window.cacheKey);
+      entry.completedAt = now();
+      if (!result) entry.failedAt = entry.completedAt;
+      if (result) {
+        const actualBytes = entryBytes + this.estimateCacheBytes(result);
+        if (actualBytes > MAX_HISTORY_CACHE_BYTES) {
+          this.historyCache.delete(window.cacheKey);
+          this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes);
+          this.historyCacheDropped += 1;
+          return;
+        }
+        this.historyCacheBytes = Math.max(0, this.historyCacheBytes - entry.bytes) + actualBytes;
+        entry.bytes = actualBytes;
+        this.pruneHistoryCache();
+      }
+    });
+    return value;
+  }
+
+  private async loadDashboardHistory(window: ReturnType<typeof resolveTimeWindow>): Promise<DashboardWindowHistory | null> {
+    // The reusable cache currently targets the high-frequency preset ranges whose two-window
+    // footprint is bounded. Long/custom investigations retain the exact legacy query until their
+    // own persisted aggregate tables are available.
+    if (!window.custom && window.spanMs <= 24 * HOUR) {
+      if (Math.ceil((window.spanMs * 2) / REUSABLE_BUCKET_MS) > DASHBOARD_EXACT_COMPARISON_MAX_BUCKETS) {
+        // The current and previous comparison periods would exceed the bounded factsJson read.
+        // Return partial before even materialising the 10-second durable tail; the hot ring already
+        // covers that overlap during healthy ingestion.
+        return null;
+      }
+      this.dashboardHistoryBuckets ??= new DashboardHistoryBucketCache({
+        latestCursor: () => this.judge.latestEventCommitCursor(),
+        earliestCursor: () => this.judge.earliestEventCommitCursor(),
+        changes: (after) => this.judge.eventCommitChanges(after),
+        facts: (startMs, endExclusiveMs, bucketMs) =>
+          this.historyQueryGate.run(() =>
+            this.judge.dashboardAggregateBucketFacts(startMs, endExclusiveMs, bucketMs),
+          ),
+      });
+      const tailStartMs = Math.max(
+        window.startMs,
+        Math.floor((window.endMs - DASHBOARD_HOT_TAIL_MS) / REUSABLE_BUCKET_MS) *
+          REUSABLE_BUCKET_MS,
+      );
+      try {
+        const [persistedTail, hotTail] = await Promise.all([
+          this.judge.dashboardTailEvents(tailStartMs, window.endMs),
+          Promise.resolve(this.judge.queryRange(tailStartMs, window.endMs)),
+        ]);
+        if (persistedTail === null) throw new Error('persisted dashboard tail unavailable');
+        const tailFacts = foldLatestEventRevisions([...persistedTail, ...hotTail])
+          .filter((event) => event.at >= tailStartMs && event.at <= window.endMs)
+          .map(dashboardFactForEvent);
+        const history = await this.dashboardHistoryBuckets.readWithTail(
+          window.startMs,
+          window.endMs,
+          180,
+          tailStartMs,
+          tailFacts,
+        );
+        if (history) return history;
+      } catch (error) {
+        console.warn(
+          `[dashboard] reusable history unavailable; using bounded hot fallback: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      // A failed reusable read has already consumed the bounded historical-query budget. The
+      // caller explicitly falls back to its bounded hot view; launching a second full-window scan
+      // in the same request would turn storage pressure into an API availability failure.
+      return null;
+    }
+    return this.exactDashboardHistory(window);
+  }
+
+  private exactDashboardHistory(
+    window: ReturnType<typeof resolveTimeWindow>,
+  ): Promise<DashboardWindowHistory | null> {
+    const operation = () => this.judge.dashboardWindowHistory(window.startMs, window.endMs, 180);
+    const latestEventCommitCursor = (
+      this.judge as Partial<Pick<SentryJudgeService, 'latestEventCommitCursor'>>
+    ).latestEventCommitCursor;
+    // Production exposes the durable commit journal and shares the two-slot historical-query
+    // budget across dashboard, Agent, workspace and topology aggregates. Minimal/legacy judge
+    // adapters have only the already-bounded dashboard query; call that adapter directly so its
+    // own single-flight/cache contract remains observable and compatible.
+    return typeof latestEventCommitCursor === 'function'
+      ? this.historyQueryGate.run(operation)
+      : operation();
+  }
+
+  private currentDimensions(history: DashboardWindowHistory, filter: T.SecurityTimeFilter): DashboardWindowDimensionRow[] {
+    const agentScoped = filter.scope === 'agent';
+    return history.dimensions.filter((row) => row.period === 'current' && (!agentScoped || row.monitored));
+  }
+
+  private aggregateHistoryBuckets(history: DashboardWindowHistory, filter: T.SecurityTimeFilter, count: number): DashboardWindowBucketRow[] {
+    const agentScoped = filter.scope === 'agent';
+    const size = 180;
+    const out: DashboardWindowBucketRow[] = Array.from({ length: count }, (_, bucketIndex) => ({
+      bucketIndex,
+      monitored: agentScoped,
+      eventCount: 0,
+      blockedCount: 0,
+      escalatedCount: 0,
+      l2Count: 0,
+      l3Count: 0,
+      riskActivationCount: 0,
+      tokenCount: 0,
+      latencyTotal: 0,
+      riskScoreTotal: 0,
+    }));
+    for (const row of history.buckets) {
+      if (agentScoped && !row.monitored) continue;
+      const index = Math.min(count - 1, Math.floor((row.bucketIndex * count) / size));
+      const target = out[index];
+      target.eventCount += row.eventCount;
+      target.blockedCount += row.blockedCount;
+      target.escalatedCount += row.escalatedCount;
+      target.l2Count += row.l2Count;
+      target.l3Count += row.l3Count;
+      target.riskActivationCount += row.riskActivationCount;
+      target.tokenCount += row.tokenCount;
+      target.latencyTotal += row.latencyTotal;
+      target.riskScoreTotal += row.riskScoreTotal;
+    }
+    return out;
   }
 
   private win(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const key = `${filter.timeType ?? 'last_3h'}|${filter.startTime ?? ''}`;
-    const cached = this.winCache.get(key);
+    const window = resolveTimeWindow(filter);
+    const key = window.cacheKey;
     const t = now();
-    if (cached && t - cached.at < 1500) return cached.val;
-    const val = this.computeWin(filter);
-    this.winCache.set(key, { at: t, val });
+    this.pruneWinCache(t);
+    const cached = this.winCache.get(key);
+    if (cached && t - cached.at < WIN_CACHE_TTL_MS) {
+      // Refresh insertion order so moving window keys are evicted least-recently-used.
+      this.winCache.delete(key);
+      this.winCache.set(key, cached);
+      return cached.val;
+    }
+    if (cached) {
+      this.winCache.delete(key);
+      this.winCacheBytes = Math.max(0, this.winCacheBytes - cached.bytes);
+      this.winCacheExpired += 1;
+    }
+    const val = this.computeWin(window.startMs, window.endMs);
+    this.rememberWinCache(key, val, t);
     return val;
   }
 
-  private computeWin(filter: T.SecurityTimeFilter): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
-    const end = now();
-    let sinceMs: number;
-    if (filter.timeType === 'custom' && filter.startTime) sinceMs = Date.parse(filter.startTime) || end - 3 * HOUR;
-    else sinceMs = end - (WINDOW[filter.timeType ?? 'last_3h'] ?? 3 * HOUR);
-    const events = this.judge.query(sinceMs);
+  private computeWin(sinceMs: number, endMs: number): { events: T.JudgedEvent[]; sinceMs: number; spanMs: number; dataSinceMs: number; dataSpanMs: number } {
+    const queryRange = (this.judge as SentryJudgeService & {
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+    }).queryRange;
+    const events = typeof queryRange === 'function'
+      ? queryRange.call(this.judge, sinceMs, endMs)
+      : this.judge.query(sinceMs).filter((event) => event.at <= endMs);
     // The in-memory ring may hold less time than the nominal window. Time-series/rate panels must
     // bucket over the data that actually exists, or everything piles into one bucket (req=100000).
     const dataSinceMs = events.length ? events[0].at : sinceMs;
-    return { events, sinceMs, spanMs: end - sinceMs, dataSinceMs, dataSpanMs: Math.max(1, end - dataSinceMs) };
+    return { events, sinceMs, spanMs: endMs - sinceMs, dataSinceMs, dataSpanMs: Math.max(1, endMs - dataSinceMs) };
   }
 
   // bucketed counts over the window (for time-series + rate panels)
@@ -328,19 +1870,38 @@ export class AggregationService {
     return out;
   }
 
-  healthCard(filter: T.SecurityTimeFilter): T.SecurityHealthCard {
-    const { events } = this.win(filter);
+  healthCard(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityHealthCard {
+    const windowEvents = overlay?.events ?? this.win(filter).events;
+    const events = overlay ? windowEvents : this.scopedEventsForView(windowEvents, filter);
     const total = events.length || 1;
     const blocked = events.filter((e) => e.verdict === 'block').length;
     const escalated = events.filter((e) => e.verdict === 'escalate').length;
     const score = Math.max(1, Math.min(100, Math.round(100 - (blocked / total) * 60 - (escalated / total) * 25)));
     const text = score >= 90 ? '健康' : score >= 75 ? '良好' : score >= 60 ? '注意' : score >= 40 ? '风险偏高' : '高危';
     const tok = fmtTokens(events.reduce((a, e) => a + e.tokenCount, 0));
-    return { healthScore: score, healthStatusText: text, tokenConsumptionTotal: tok.total, tokenConsumptionUnit: tok.unit };
+    return {
+      healthScore: score,
+      healthStatusText: text,
+      tokenConsumptionTotal: tok.total,
+      tokenConsumptionUnit: tok.unit,
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
+    };
   }
 
-  explainabilityScan(filter: T.ExplainabilityScanRequest): T.SecurityExplainabilityScan {
-    const { events, dataSinceMs, dataSpanMs } = this.win(filter);
+  explainabilityScan(
+    filter: T.ExplainabilityScanRequest,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityExplainabilityScan {
+    const window = resolveTimeWindow(filter);
+    const windowed = this.win(filter);
+    const windowEvents = overlay?.events ?? windowed.events;
+    const events = overlay ? windowEvents : this.scopedEventsForView(windowEvents, filter);
+    const dataSinceMs = overlay ? window.startMs : windowed.dataSinceMs;
+    const dataSpanMs = overlay ? window.spanMs : windowed.dataSpanMs;
     const n = Math.max(8, Math.min(72, filter.seriesPoints ?? 24));
     const size = dataSpanMs / n || 1;
     const buckets = this.buckets(events, dataSinceMs, dataSpanMs, n);
@@ -358,43 +1919,248 @@ export class AggregationService {
       waveSeries: [{ safeSeries, riskSeries }],
       threatInterception: `${round1((blocked / (events.length || 1)) * 100)}%`,
       sessionActiveCount: String(distinct(recent.map((e) => e.sessionId))),
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
 
-  private eventItem(e: T.JudgedEvent, repeatCount = 1, lastAt = e.at): T.AgentEventListItem {
+  private classificationResponseMeta(filter: T.SecurityTimeFilter): {
+    classificationView: T.ClassificationView;
+    reviewRevision: number;
+  } {
+    return {
+      classificationView: resolvedClassificationView(filter),
+      reviewRevision: Math.min(
+        Number.MAX_SAFE_INTEGER,
+        this.agentMetadata.identitySnapshotVersion() + (this.assetReviews?.version() ?? 0),
+      ),
+    };
+  }
+
+  private currentEffectiveClassification(
+    event: T.JudgedEvent,
+    agentResolved = this.agentMetadata.resolveEvent(event),
+  ): T.AgentClassification {
+    const assetReview = event.subjectAssetId
+      ? this.assetReviews?.current(event.subjectAssetId)
+      : undefined;
+    if (assetReview) return assetReview.decision;
+    if (event.subjectAssetId && event.subjectAssetType && event.subjectAssetType !== 'agent') {
+      // Service/Infrastructure identity is re-derived from the current asset plane after clear;
+      // never reuse a historical manual non-Agent attribution as the current automatic result.
+      return 'unknown';
+    }
+    // A probable candidate receives the same effective capture/read route as a confirmed Agent by
+    // default.  Keep `detectedClassification` on the event and interaction so this projection is
+    // auditable; this mapping never creates a LogicalAgent or Session identity.
+    return captureClassificationDecision(agentResolved.effectiveClassification).effective;
+  }
+
+  private eventIsAgentForView(event: T.JudgedEvent, filter: T.SecurityTimeFilter): boolean {
+    if (resolvedClassificationView(filter) === 'as_observed') return isMonitoredAgentEvent(event);
+    return isAgentAssetClassification(this.currentEffectiveClassification(event));
+  }
+
+  private scopedEventsForView(
+    events: T.JudgedEvent[],
+    filter: T.SecurityTimeFilter,
+    agentScoped = filter.scope === 'agent',
+  ): T.JudgedEvent[] {
+    return agentScoped ? events.filter((event) => this.eventIsAgentForView(event, filter)) : events;
+  }
+
+  private boundedHotDashboardOverlay(
+    filter: T.SecurityTimeFilter,
+    agentScoped = filter.scope === 'agent',
+  ): { events: T.JudgedEvent[]; coverage: T.QueryCoverage } {
+    const events = this.scopedEventsForView(this.win(filter).events, filter, agentScoped);
+    return {
+      events,
+      coverage: this.queryCoverage(filter, events, {
+        source: 'memory_hot_ring',
+        totalMode: 'estimated',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+    };
+  }
+
+  private needsCurrentAgentOverlay(
+    filter: T.SecurityTimeFilter,
+    agentScoped = filter.scope === 'agent',
+  ): boolean {
+    return agentScoped && resolvedClassificationView(filter) === 'current_effective';
+  }
+
+  private async currentEffectiveOverlay(
+    filter: T.SecurityTimeFilter,
+    agentScoped = filter.scope === 'agent',
+  ): Promise<{ events: T.JudgedEvent[]; coverage: T.QueryCoverage }> {
+    const window = resolveTimeWindow(filter);
+    const limit = 10_000;
+    const page = this.judge.storageStatus().clickhouseReady
+      ? await this.judge.searchStoredEventsPage({
+          sinceMs: window.startMs,
+          untilMs: window.endMs,
+          monitoredOnly: false,
+          limit,
+        })
+      : { events: [], hasMore: false, unavailable: true as const };
+    const hot = this.judge.queryRange(window.startMs, window.endMs);
+    const all = foldLatestEventRevisions([...(page.events ?? []), ...hot]);
+    const events = this.scopedEventsForView(all, filter, agentScoped);
+    const partial = page.unavailable === true || page.hasMore === true;
+    return {
+      events,
+      coverage: this.queryCoverage(filter, events, {
+        source: page.unavailable
+          ? 'memory_hot_ring'
+          : hot.length
+            ? 'clickhouse+hot_delta'
+            : 'clickhouse',
+        totalMode: partial ? 'estimated' : 'exact',
+        partial,
+        partialReason: page.unavailable ? 'hot_ring_only' : page.hasMore ? 'scan_limit' : undefined,
+        committedCutoffMs: page.committedCutoffMs,
+      }),
+    };
+  }
+
+  private eventItem(
+    e: T.JudgedEvent,
+    repeatCount = 1,
+    lastAt = e.at,
+    classificationView: T.ClassificationView = 'as_observed',
+  ): T.AgentEventListItem {
     const detected = detectedAgentIdentity(e);
     const resolved = this.agentMetadata.resolveEvent(e);
+    const asObservedClassification = detected.detectedClassification;
+    const currentEffectiveClassification = this.currentEffectiveClassification(e, resolved);
+    const candidateAutoPromoted = asObservedClassification === 'probable_agent'
+      && currentEffectiveClassification === 'confirmed_agent'
+      && resolved.reviewRevision === undefined;
+    const correlationVisible = correlationCaptureRollout().trustedCorrelation !== 'off';
+    const correlation = correlationVisible
+      ? parseTrustedCorrelation(e.attribution?.correlation)
+      : undefined;
+    const rawClassificationSemantics = visibleClassificationSemantics(e.classificationSemantics);
+    // Producer S3 fields are observational hints. Recompute the effective capture view at the
+    // server boundary so a producer cannot forge promotion, while preserving the original
+    // probable classification and an auditable reason.
+    const classificationSemantics = rawClassificationSemantics
+      ? {
+          ...rawClassificationSemantics,
+          effectiveIdentityClassification: currentEffectiveClassification,
+          classificationSource: candidateAutoPromoted
+            ? 'candidate_auto_promoted' as const
+            : 'observed' as const,
+        }
+      : undefined;
+    const attribution = !e.attribution
+      ? undefined
+      : correlation
+        ? { ...e.attribution, correlation }
+        : (({ correlation: _hiddenCorrelation, ...legacyAttribution }) => legacyAttribution)(e.attribution);
+    const ruleLineage = unifiedFilterRuleLineage({
+      captureEpoch: e.captureEpoch,
+      attributes: e.attributes,
+      filterRuleDecision: e.judgment?.filterRuleDecision,
+    });
     return {
       schemaVersion: e.schemaVersion,
       eventId: e.eventId,
       sourceEventId: e.sourceEventId,
       at: iso(e.at),
+      eventAtUnixNs: e.eventAtUnixNs,
+      receivedAtUnixNs: e.receivedAtUnixNs,
+      receivedAt: e.receivedAt ? iso(e.receivedAt) : undefined,
+      eventTimeQuality: e.eventTimeQuality,
+      captureEpoch: e.captureEpoch,
+      captureProfileCode: e.captureProfileCode,
+      captureActionCode: e.captureActionCode,
+      captureAuthorityCode: e.captureAuthorityCode,
+      captureDispositionCode: e.captureDispositionCode,
+      captureSelected: e.captureSelected,
+      captureFlags: e.captureFlags,
+      capturePolicyVersion: e.capturePolicyVersion,
       eventKind: e.eventKind,
       eventCategory: e.eventCategory,
+      activityContext: eventActivityContext(e),
+      activitySubtype: eventActivitySubtype(e),
       source: e.source,
       subject: e.subject,
       workspacePath: e.workspacePath,
       agentId: e.agentId,
       agentAssetId: resolved.agentAssetId,
+      agentAssetAliases: resolved.agentAssetAliases,
+      agentProduct: resolved.agentProduct,
+      agentRuntimeInstanceId: resolved.agentRuntimeInstanceId,
+      agentRuntimeInstanceAliases: resolved.agentRuntimeInstanceAliases,
+      identityBindingQuality: resolved.bindingQuality,
+      identityReasonCode: resolved.identityReasonCode,
+      subjectAssetId: e.subjectAssetId,
+      subjectAssetType: e.subjectAssetType,
+      assetBindingQuality: e.assetBindingQuality,
+      assetBindingRevision: e.assetBindingRevision,
+      assetBindingReason: e.assetBindingReason,
+      asObservedIdentityRevision: e.identityRevision,
       displayName: resolved.displayName,
       detectedName: resolved.detectedName,
       detectedClassification: resolved.detectedClassification,
-      effectiveClassification: resolved.effectiveClassification,
+      asObservedClassification,
+      currentEffectiveClassification,
+      ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
+      effectiveClassification: classificationView === 'current_effective'
+        ? currentEffectiveClassification
+        : asObservedClassification,
+      currentReviewRevision: resolved.reviewRevision,
+      currentReviewEffectiveAt: resolved.reviewEffectiveAt !== undefined
+        ? iso(resolved.reviewEffectiveAt)
+        : undefined,
       runtime: detected.runtime,
       locationLabel: detected.locationLabel,
       collectorId: eventCollectorId(e) || undefined,
       sourceId: eventSourceId(e) || undefined,
+      rawObservationId: e.rawObservationId,
+      rawObservationRevision: e.rawObservationRevision,
+      kernelFactId: e.kernelFactId,
+      logicalIdentityAuthority: e.logicalIdentityAuthority,
+      logicalAgentId: e.logicalAgentId,
+      logicalDefinitionId: e.logicalDefinitionId,
+      logicalScopeMode: e.logicalScopeMode,
+      logicalDefinitionFingerprint: e.logicalDefinitionFingerprint,
+      canonicalAgentInstanceId: e.canonicalAgentInstanceId,
+      runtimeInstanceId: e.runtimeInstanceId,
+      deploymentId: e.deploymentId,
+      deploymentRevision: e.deploymentRevision,
       sessionId: e.sessionId,
+      sessionIdentityQuality: e.sessionIdentityQuality,
+      sessionIdSource: e.sessionIdSource,
+      legacySessionId: e.legacySessionId,
+      canonicalSessionId: e.canonicalSessionId,
+      sessionKey: e.sessionKey,
+      sessionNamespaceKey: e.sessionNamespaceKey,
+      providerSessionIdHash: e.providerSessionIdHash,
+      parentSessionId: e.parentSessionId,
+      canonicalParentSessionId: e.canonicalParentSessionId,
+      sessionMode: e.sessionMode,
+      sessionLifecycle: e.sessionLifecycle,
+      sessionResolutionRevision: e.sessionResolutionRevision,
       userId: e.userId,
       traceId: e.traceId,
+      ...(correlation?.invocationId ? { invocationId: correlation.invocationId } : {}),
+      ...(correlation?.toolCallId ? { toolCallId: correlation.toolCallId } : {}),
+      ...(correlation ? { correlation } : {}),
       spanId: e.spanId,
       parentSpanId: e.parentSpanId,
       runId: e.runId,
+      runIdSource: e.runIdSource,
       taskId: e.taskId,
       decisionStatus: e.decisionStatus,
       evaluationId: e.evaluationId,
       policyVersion: e.policyVersion,
+      decisionRevision: e.decisionRevision,
       decisionUpdatedAt: e.decisionUpdatedAt,
       verdict: e.verdict,
       tier: e.tier,
@@ -407,12 +2173,90 @@ export class AggregationService {
       tokenCount: e.tokenCount,
       latencyMs: e.latencyMs,
       attributes: e.attributes,
-      process: e.process,
-      attribution: e.attribution,
+      ...(classificationSemantics ? { classificationSemantics } : {}),
+      process: visibleProcessContext(e.process),
+      attribution,
       judgment: e.judgment,
+      ...(ruleLineage ? { ruleLineage } : {}),
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       lastAt: repeatCount > 1 ? iso(lastAt) : undefined,
       rawPreview: e.rawPreview,
+    };
+  }
+
+  private queryCoverage(
+    filter: T.SecurityTimeFilter,
+    events: T.JudgedEvent[],
+    input: {
+      source: T.QueryDataSource;
+      totalMode: T.QueryTotalMode;
+      partial: boolean;
+      partialReason?: T.QueryCoverage['partialReason'];
+      committedCutoffMs?: number;
+      dataFromMs?: number;
+      dataToMs?: number;
+    },
+  ): T.QueryCoverage {
+    const window = resolveTimeWindow(filter);
+    const eventTimes = events.map((event) => event.at);
+    if (input.dataFromMs !== undefined) eventTimes.push(input.dataFromMs);
+    if (input.dataToMs !== undefined) eventTimes.push(input.dataToMs);
+    const snapshotAsOf = new Date(window.endMs).toISOString();
+    const queryIdentity = filter as T.SecurityTimeFilter & {
+      sourceId?: string;
+      collectorId?: string;
+    };
+    // Standalone/local contract tests use the minimal pre-durable judge surface. Treat an absent
+    // progress accessor as an empty durable-progress set; production SentryJudgeService provides
+    // it, while coverage still truthfully reports the hot-ring or fallback source below.
+    const committedEventProgress = (this.judge as SentryJudgeService & {
+      committedEventProgress?: () => ReturnType<SentryJudgeService['committedEventProgress']>;
+    }).committedEventProgress;
+    const progress = relevantCommitProgress(
+      typeof committedEventProgress === 'function'
+        ? this.judge.committedEventProgress()
+        : [],
+      queryIdentity,
+    );
+    const observedThroughMs = observedDurableThrough(
+      input.committedCutoffMs,
+      progress,
+    );
+    const observedThrough = observedThroughMs === undefined
+      ? undefined
+      : new Date(Math.min(observedThroughMs, window.endMs)).toISOString();
+    return {
+      requestedFrom: new Date(window.startMs).toISOString(),
+      requestedTo: snapshotAsOf,
+      snapshotAsOf,
+      asOf: snapshotAsOf,
+      dataFrom: eventTimes.length ? new Date(Math.min(...eventTimes)).toISOString() : undefined,
+      dataTo: eventTimes.length ? new Date(Math.max(...eventTimes)).toISOString() : undefined,
+      observedDurableThrough: observedThrough,
+      committedCutoff: observedThrough,
+      commitBoundaryKind: observedThrough ? 'observed_durable_high_water' : undefined,
+      commitProgress: progress.entries.map((entry) => ({
+        sourceId: entry.sourceId,
+        collectorId: entry.collectorId,
+        committedEventTime: new Date(entry.committedEventTimeMs).toISOString(),
+        committedAt: new Date(entry.committedAtMs).toISOString(),
+      })),
+      commitProgressScope: progress.scope,
+      lateDataPolicy: input.source === 'memory_hot_ring'
+        ? undefined
+        : 'commit_journal_revision_repair',
+      completeness: input.partial
+        ? 'partial'
+        : resolvedClassificationView(filter) === 'current_effective'
+          ? 'exact_current_effective'
+          : 'exact_as_observed',
+      // A real event-time watermark is not yet available from every collector/partition. Do not
+      // present ClickHouse's latest timestamp as a watermark.
+      watermark: undefined,
+      partial: input.partial,
+      partialReason: input.partialReason,
+      source: input.source,
+      totalMode: input.totalMode,
     };
   }
 
@@ -421,24 +2265,33 @@ export class AggregationService {
     const sourceId = filter.sourceId?.trim();
     const collectorId = filter.collectorId?.trim();
     const agentId = filter.agentId?.trim();
+    const subjectAssetId = filter.subjectAssetId?.trim();
     const requestedAgentAssetId = filter.agentAssetId?.trim();
     const agentAssetId = requestedAgentAssetId
       ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
       : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const sessionId = filter.sessionId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const traceId = filter.traceId?.trim();
+    const correlationVisible = correlationCaptureRollout().trustedCorrelation !== 'off';
+    const invocationId = correlationVisible ? filter.invocationId?.trim() : undefined;
+    const toolCallId = correlationVisible ? filter.toolCallId?.trim() : undefined;
     const runId = filter.runId?.trim();
     const q = filter.q?.trim().toLowerCase();
-    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || sessionId || workspacePath || traceId || runId || filter.eventKind || filter.eventCategory || filter.verdict || filter.tier || q);
+    const hasFilter = Boolean(sourceId || collectorId || agentId || agentAssetId || subjectAssetId || agentInstanceId || sessionId || workspacePath || traceId || invocationId || toolCallId || runId || filter.eventKind || filter.eventCategory || filter.activityContext || filter.verdict || filter.tier || q);
     const agentScoped = filter.scope === 'agent' && !pinnedEventId;
     const includeUnknown = filter.includeUnknown !== false;
+    const classificationView = resolvedClassificationView(filter);
     // Process lifecycle rows remain stored for audit/debugging, but are hidden from both the
     // Agent and raw "all events" views by default. An explicit kind filter, noise=include, or a
     // pinned event still makes them accessible.
     const hideNoise = !pinnedEventId && !filter.eventKind && filter.noise !== 'include';
     return events.filter((e) => {
       const matchesEventId = Boolean(pinnedEventId && e.eventId === pinnedEventId);
+      // subjectAssetId is a security/tenant-style scope, not a stale display hint. Even a pinned
+      // event must satisfy it; otherwise a deep link could escape the caller's explicit Asset scope.
+      if (matchesEventId && subjectAssetId && e.subjectAssetId !== subjectAssetId) return false;
       if (pinnedEventId && !hasFilter) return matchesEventId;
 
       const eventSource = eventSourceId(e);
@@ -452,24 +2305,46 @@ export class AggregationService {
         (!sourceId || eventSource === sourceId) &&
         (!collectorId || eventCollector === collectorId) &&
         (agentAssetId || !agentId || e.agentId === agentId) &&
+        (!subjectAssetId || e.subjectAssetId === subjectAssetId) &&
         (!sessionId || e.sessionId === sessionId) &&
         (agentAssetId || !workspacePath || e.workspacePath === workspacePath) &&
         (!traceId || e.traceId === traceId) &&
+        (!invocationId || (
+          correlationVisible &&
+          parseTrustedCorrelation(e.attribution?.correlation)?.invocationId === invocationId
+        )) &&
+        (!toolCallId || (
+          correlationVisible &&
+          parseTrustedCorrelation(e.attribution?.correlation)?.toolCallId === toolCallId
+        )) &&
         (!runId || e.runId === runId) &&
         (!filter.eventKind || e.eventKind === filter.eventKind) &&
         (!filter.eventCategory || e.eventCategory === filter.eventCategory) &&
+        (!filter.activityContext || eventActivityContext(e) === filter.activityContext) &&
         (!filter.verdict || e.verdict === filter.verdict) &&
         (!filter.tier || e.tier === filter.tier) &&
         (!hideNoise || !isHiddenNoise);
       if (!matchesEventId && !matchesDirectFilter) return false;
 
       const resolved = this.agentMetadata.resolveEvent(e);
-      const visibleClassification = isEventClassificationVisible(
-        resolved.effectiveClassification,
-        agentScoped ? 'agent' : 'raw',
-        includeUnknown,
-        matchesEventId,
-      );
+      const visibleIdentity = classificationView === 'current_effective'
+        ? this.currentEffectiveClassification(e, resolved)
+        : detectedAgentIdentity(e).detectedClassification;
+      const visibleClassification = agentScoped && classificationView === 'as_observed'
+        // `monitored` is the legacy occurrence-time Agent membership used by dashboard facts and
+        // authenticated semantic adapters. Identity classification remains an independent field:
+        // an authenticated Agent may intentionally remain unknown while its evidence is retained.
+        ? isMonitoredAgentEvent(e)
+        : classificationView === 'current_effective' && !agentScoped
+        // The current asset view must keep excluded assets inspectable. These are already-retained
+        // historical facts; this does not re-admit future payloads suppressed by capture policy.
+        ? true
+        : isEventClassificationVisible(
+            visibleIdentity,
+            agentScoped ? 'agent' : 'raw',
+            includeUnknown,
+            matchesEventId,
+          );
       const matchesScope =
         visibleClassification &&
         (!hideNoise || !isHiddenNoise);
@@ -477,6 +2352,7 @@ export class AggregationService {
         matchesScope &&
         matchesDirectFilter &&
         (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
+        matchesAgentRuntimeInstance(e, agentInstanceId) &&
         (
           !q ||
           [
@@ -487,7 +2363,15 @@ export class AggregationService {
             e.sessionId,
             e.rawPreview,
             JSON.stringify(e.attributes ?? {}),
-            JSON.stringify(e.attribution ?? {}),
+            JSON.stringify((() => {
+              if (!e.attribution) return {};
+              const visibleCorrelation = correlationVisible
+                ? parseTrustedCorrelation(e.attribution.correlation)
+                : undefined;
+              return visibleCorrelation
+                ? { ...e.attribution, correlation: visibleCorrelation }
+                : (({ correlation: _hiddenCorrelation, ...legacyAttribution }) => legacyAttribution)(e.attribution);
+            })()),
           ].some((value) => value?.toLowerCase().includes(q))
         );
       return matchesEventId || matchesFilter;
@@ -504,56 +2388,2536 @@ export class AggregationService {
     );
     const compacted = filter.scope === 'raw' || pinnedEventId ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at })) : compactEvents(filtered);
     return {
-      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) =>
+        this.eventItem(event, repeatCount, lastAt, resolvedClassificationView(filter))),
       total: compacted.length,
+      totalMode: 'exact',
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  agentEventsPreview(filter: T.AgentEventQuery): T.AgentEventList {
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const scanLimit = Math.min(4_000, Math.max(800, limit * 20));
+    const recent = this.judge.queryRecentRange(window.startMs, window.endMs, scanLimit);
+    const filtered = this.filterEvents(recent, filter).sort((a, b) => b.at - a.at);
+    const compacted = filter.scope === 'raw'
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) =>
+        this.eventItem(event, repeatCount, lastAt, resolvedClassificationView(filter))),
+      total: compacted.length,
+      totalMode: 'estimated',
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'estimated',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentEventsForWindow(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    if (filter.eventId) return this.agentEvents(filter);
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    const persistedLimit = Math.max(1_000, limit * 10);
+    const persisted = await this.judge.recentPersistedEvents(
+      window.startMs,
+      window.endMs,
+      persistedLimit,
+      {
+        monitoredOnly: filter.scope === 'agent' && resolvedClassificationView(filter) === 'as_observed',
+        tier: filter.tier,
+      },
+    );
+    if (!persisted) {
+      const fallback = this.agentEvents(filter);
+      return {
+        ...fallback,
+        totalMode: 'estimated',
+        totalApproximate: true,
+        storageFallback: 'hot_ring',
+        coverage: { ...fallback.coverage, totalMode: 'estimated' },
+      };
+    }
+    const filtered = this.filterEvents(persisted, filter).sort((a, b) => b.at - a.at);
+    const compacted = filter.scope === 'raw'
+      ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
+      : compactEvents(filtered);
+    const hasDetailedFilter = Boolean(
+      filter.sourceId || filter.collectorId || filter.agentId || filter.agentAssetId || filter.agentInstanceId ||
+      filter.subjectAssetId ||
+      filter.sessionId || filter.workspacePath || filter.traceId ||
+      (correlationCaptureRollout().trustedCorrelation !== 'off' && (filter.invocationId || filter.toolCallId)) ||
+      filter.runId || filter.eventKind || filter.eventCategory || filter.activityContext || filter.verdict || filter.q,
+    );
+    // A history aggregate cannot answer a text/identity-filtered total. Avoid an unrelated full
+    // window scan and report the bounded compacted result set already fetched above.
+    const needsCurrentIdentityOverlay = filter.scope === 'agent' &&
+      resolvedClassificationView(filter) === 'current_effective';
+    const history = hasDetailedFilter || needsCurrentIdentityOverlay ? null : await this.history(filter);
+    const rows = history && !hasDetailedFilter
+      ? this.currentDimensions(history, filter).filter((row) => !filter.tier || row.tier === filter.tier)
+      : [];
+    const total = rows.length ? rows.reduce((sum, row) => sum + row.eventCount, 0) : compacted.length;
+    const totalApproximate = hasDetailedFilter || !history ||
+      (rows.length > 0 && history.countsApproximate) || persisted.length >= persistedLimit;
+    const committedEventCutoffMs = (
+      this.judge as Partial<Pick<SentryJudgeService, 'committedEventCutoffMs'>>
+    ).committedEventCutoffMs;
+    return {
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) =>
+        this.eventItem(event, repeatCount, lastAt, resolvedClassificationView(filter))),
+      total,
+      totalMode: totalApproximate ? 'estimated' : 'exact',
+      totalApproximate: totalApproximate ? true : undefined,
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'clickhouse',
+        totalMode: totalApproximate ? 'estimated' : 'exact',
+        partial: persisted.length >= persistedLimit,
+        partialReason: persisted.length >= persistedLimit ? 'scan_limit' : undefined,
+        committedCutoffMs: typeof committedEventCutoffMs === 'function'
+          ? committedEventCutoffMs.call(this.judge)
+          : window.endMs,
+      }),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
 
   async storedAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
-    if (!this.judge.storageStatus().clickhouseReady) return this.agentEvents(filter);
-    const pinnedEventId = filter.eventId?.trim();
-    const { sinceMs } = this.win(filter);
-    const customEnd = filter.timeType === 'custom' && filter.endTime ? Date.parse(filter.endTime) : Number.NaN;
-    const dateOnlyEnd = Boolean(filter.endTime && /^\d{4}-\d{2}-\d{2}$/u.test(filter.endTime));
-    const untilMs = Number.isFinite(customEnd) ? customEnd + (dateOnlyEnd ? 24 * HOUR - 1 : 0) : now();
-    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
-    const persistent = await this.judge.searchStoredEvents({
-      sinceMs: pinnedEventId ? 0 : sinceMs,
-      untilMs,
-      eventId: pinnedEventId,
-      sourceId: filter.sourceId,
-      collectorId: filter.collectorId,
-      agentId: filter.agentId,
-      sessionId: filter.sessionId,
-      workspacePath: filter.workspacePath,
-      traceId: filter.traceId,
-      runId: filter.runId,
-      eventKind: filter.eventKind,
-      eventCategory: filter.eventCategory,
-      verdict: filter.verdict,
-      tier: filter.tier,
-      limit: Math.min(20_000, Math.max(2_000, limit * 50)),
-    });
-    // Buffered writes may not have reached ClickHouse yet. Merge the hot ring and prefer the most
-    // recent lifecycle revision without mutating either immutable source record.
-    const latest = new Map<string, T.JudgedEvent>();
-    for (const event of [...persistent, ...this.judge.query(pinnedEventId ? 0 : sinceMs)]) {
-      const previous = latest.get(event.eventId);
-      if (!previous || (event.decisionUpdatedAt ?? event.at) >= (previous.decisionUpdatedAt ?? previous.at)) {
-        latest.set(event.eventId, event);
-      }
+    const snapshot = { ...filter };
+    const key = durableEventSearchKey(
+      snapshot,
+      Math.min(
+        Number.MAX_SAFE_INTEGER,
+        this.agentMetadata.identitySnapshotVersion() + (this.assetReviews?.version() ?? 0),
+      ),
+    );
+    const current = this.durableEventSearchInFlight;
+    if (current?.key === key) {
+      const shared = await current.value;
+      return structuredClone(shared);
     }
-    const filtered = this.filterEvents([...latest.values()], filter).sort((a, b) =>
+    // A different request is still allowed to reach ClickHouseStore, whose shared wide-read slot
+    // will fail it closed to the explicit hot-ring fallback instead of queueing another query.
+    if (current) return this.computeStoredAgentEvents(snapshot);
+
+    const value = Promise.resolve().then(() => this.computeStoredAgentEvents(snapshot));
+    let boundedValue!: Promise<T.AgentEventList>;
+    boundedValue = this.withInFlightTimeout(
+      value,
+      () => {
+        if (this.durableEventSearchInFlight?.value === boundedValue) {
+          this.durableEventSearchInFlight = undefined;
+        }
+        this.durableEventSearchTimeouts += 1;
+      },
+      'stored Agent event query timed out',
+    );
+    this.durableEventSearchInFlight = { key, value: boundedValue };
+    try {
+      const result = await boundedValue;
+      return structuredClone(result);
+    } finally {
+      if (this.durableEventSearchInFlight?.value === boundedValue) this.durableEventSearchInFlight = undefined;
+    }
+  }
+
+  private async computeStoredAgentEvents(filter: T.AgentEventQuery): Promise<T.AgentEventList> {
+    if (!this.judge.storageStatus().clickhouseReady) {
+      const fallback = this.agentEvents(filter);
+      return {
+        ...fallback,
+        totalMode: 'estimated',
+        totalApproximate: true,
+        storageFallback: 'hot_ring',
+        coverage: { ...fallback.coverage, totalMode: 'estimated' },
+      };
+    }
+    const pinnedEventId = filter.eventId?.trim();
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 40));
+    // ClickHouse late-materialises every selected row into the full evidence payload. Pulling 50x
+    // the requested page made a 120-row Event list parse roughly 80 MiB / 6,001 wide rows in Node.
+    // Stable predicates and as-observed Agent scope are pushed into ClickHouse below, so ordinary
+    // pages only need a small allowance for hidden ProcessExit/noise. Text/current-identity filters
+    // keep a larger but still explicit post-filter budget and report scan_limit when exhausted.
+    const needsWidePostFilter = Boolean(
+      filter.q ||
+      filter.agentAssetId ||
+      filter.agentInstanceId ||
+      (filter.scope === 'agent' && resolvedClassificationView(filter) === 'current_effective'),
+    );
+    const scanLimit = pinnedEventId
+      ? 1
+      : Math.min(
+          needsWidePostFilter ? 2_000 : 1_000,
+          Math.max(limit + 1, limit * (needsWidePostFilter ? 10 : 4)),
+        );
+    const candidateLimit = pinnedEventId
+      ? 3
+      : Math.min(
+          20_000,
+          Math.max(scanLimit * 3, limit * (needsWidePostFilter ? 100 : 12)),
+        );
+    const durableJudge = this.judge as unknown as {
+      committedEventCutoffMs?: () => number | undefined;
+      searchStoredEventsPage?: (query: StoredEventQuery) => Promise<StoredEventSearchResult>;
+      searchStoredEvents?: (query: StoredEventQuery) => Promise<T.JudgedEvent[] | null>;
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+      query?: (sinceMs: number) => T.JudgedEvent[];
+    };
+    const committedCutoffMs = durableJudge.committedEventCutoffMs?.();
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const persistentQuery: StoredEventQuery = {
+      sinceMs: pinnedEventId ? 0 : window.startMs,
+      untilMs: pinnedEventId ? Math.max(window.endMs, now()) : persistedUntilMs,
+      eventId: pinnedEventId,
+      sourceId: pinnedEventId ? undefined : filter.sourceId,
+      collectorId: pinnedEventId ? undefined : filter.collectorId,
+      agentId: pinnedEventId || filter.agentAssetId ? undefined : filter.agentId,
+      subjectAssetId: filter.subjectAssetId,
+      // Canonical Agent views may carry several legacy Runtime encodings. Asset-scoped queries
+      // apply the alias-aware predicate after retrieval instead of pushing one lossy key.
+      agentInstanceId: pinnedEventId || filter.agentAssetId ? undefined : filter.agentInstanceId,
+      sessionId: pinnedEventId ? undefined : filter.sessionId,
+      workspacePath: pinnedEventId || filter.agentAssetId ? undefined : filter.workspacePath,
+      traceId: pinnedEventId ? undefined : filter.traceId,
+      invocationId: pinnedEventId || correlationCaptureRollout().trustedCorrelation === 'off'
+        ? undefined
+        : filter.invocationId,
+      toolCallId: pinnedEventId || correlationCaptureRollout().trustedCorrelation === 'off'
+        ? undefined
+        : filter.toolCallId,
+      runId: pinnedEventId ? undefined : filter.runId,
+      eventKind: pinnedEventId ? undefined : filter.eventKind,
+      eventCategory: pinnedEventId ? undefined : filter.eventCategory,
+      activityContext: pinnedEventId ? undefined : filter.activityContext,
+      verdict: pinnedEventId ? undefined : filter.verdict,
+      tier: pinnedEventId ? undefined : filter.tier,
+      monitoredOnly: !pinnedEventId &&
+        filter.scope === 'agent' &&
+        resolvedClassificationView(filter) === 'as_observed',
+      candidateLimit,
+      limit: scanLimit,
+    };
+    let persistentPage: StoredEventSearchResult;
+    if (typeof durableJudge.searchStoredEventsPage === 'function') {
+      persistentPage = await durableJudge.searchStoredEventsPage(persistentQuery);
+    } else {
+      // Older/minimal judge adapters expose only the row-list search. Preserve that contract while
+      // production uses the page form for explicit availability, scan truncation and commit data.
+      const events = typeof durableJudge.searchStoredEvents === 'function'
+        ? await durableJudge.searchStoredEvents(persistentQuery)
+        : null;
+      persistentPage = {
+        events: events ?? [],
+        hasMore: Boolean(events && events.length >= scanLimit),
+        unavailable: events === null,
+        committedCutoffMs,
+      };
+    }
+    // A collector/partition event-time watermark is not available yet. Query the bounded hot
+    // overlap defensively and remove overlap by stable eventId before aggregation. Splitting only
+    // at max(at) would lose a late event that is buffered with an event time below that maximum.
+    const hotFromMs = pinnedEventId
+      ? 0
+      : persistentPage.unavailable
+        ? window.startMs
+        : plan.hotFromMs;
+    const hot = typeof durableJudge.queryRange === 'function'
+      ? durableJudge.queryRange(hotFromMs, window.endMs)
+      : (durableJudge.query?.(hotFromMs) ?? []).filter((event) => event.at <= window.endMs);
+    const folded = foldLatestEventRevisions([...persistentPage.events, ...hot]);
+    const filtered = this.filterEvents(folded, filter).sort((a, b) =>
       Number(Boolean(pinnedEventId) && b.eventId === pinnedEventId) - Number(Boolean(pinnedEventId) && a.eventId === pinnedEventId) ||
       b.at - a.at,
     );
     const compacted = filter.scope === 'raw' || pinnedEventId
       ? filtered.map((event) => ({ event, repeatCount: 1, lastAt: event.at }))
       : compactEvents(filtered);
+    const totalMode: T.QueryTotalMode = persistentPage.unavailable || persistentPage.hasMore
+      ? 'estimated'
+      : 'exact';
     return {
-      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) => this.eventItem(event, repeatCount, lastAt)),
+      items: compacted.slice(0, limit).map(({ event, repeatCount, lastAt }) =>
+        this.eventItem(event, repeatCount, lastAt, resolvedClassificationView(filter))),
       total: compacted.length,
+      totalMode,
+      totalApproximate: totalMode === 'estimated' ? true : undefined,
+      storageFallback: persistentPage.unavailable ? 'hot_ring' : undefined,
+      coverage: this.queryCoverage(filter, filtered, {
+        source: persistentPage.unavailable
+          ? 'memory_hot_ring'
+          : hot.length
+            ? 'clickhouse+hot_delta'
+            : 'clickhouse',
+        totalMode,
+        partial: persistentPage.unavailable || persistentPage.hasMore,
+        partialReason: persistentPage.unavailable
+          ? 'hot_ring_only'
+          : persistentPage.hasMore
+            ? 'scan_limit'
+            : undefined,
+        committedCutoffMs: persistentPage.committedCutoffMs,
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async storedAgentTimeline(filter: T.AgentEventQuery): Promise<T.AgentTimeline> {
+    if (!this.judge.storageStatus().clickhouseReady) {
+      const fallback = this.agentTimeline(filter);
+      return fallback;
+    }
+    const window = resolveTimeWindow(filter);
+    const limit = Math.max(1, Math.min(5_000, filter.limit ?? 240));
+    const pinnedEventId = filter.eventId?.trim();
+    const pinnedPage = pinnedEventId
+      ? await this.judge.searchStoredEventsPage({
+          sinceMs: 0,
+          untilMs: window.endMs,
+          eventId: pinnedEventId,
+          limit: 1,
+        })
+      : undefined;
+    const pinned = pinnedPage?.events[0] ?? (pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined);
+    const traceId = filter.traceId?.trim() || pinned?.traceId;
+    const invocationId = correlationCaptureRollout().trustedCorrelation === 'off'
+      ? undefined
+      : filter.invocationId?.trim();
+    const toolCallId = correlationCaptureRollout().trustedCorrelation === 'off'
+      ? undefined
+      : filter.toolCallId?.trim();
+    const effectiveFilter: T.AgentEventQuery = {
+      ...filter,
+      eventId: undefined,
+      traceId,
+      invocationId,
+      toolCallId,
+    };
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const persistentPage = await this.judge.searchStoredEventsPage({
+      sinceMs: window.startMs,
+      untilMs: persistedUntilMs,
+      sourceId: filter.sourceId,
+      collectorId: filter.collectorId,
+      agentId: filter.agentAssetId ? undefined : filter.agentId,
+      subjectAssetId: filter.subjectAssetId,
+      traceId,
+      invocationId,
+      toolCallId,
+      runId: traceId ? undefined : filter.runId,
+      sessionId: traceId || filter.runId ? undefined : filter.sessionId,
+      workspacePath: filter.agentAssetId ? undefined : filter.workspacePath,
+      agentInstanceId: traceId || filter.runId || filter.sessionId
+        ? undefined
+        : filter.agentInstanceId,
+      eventKind: filter.eventKind,
+      eventCategory: filter.eventCategory,
+      activityContext: filter.activityContext,
+      verdict: filter.verdict,
+      tier: filter.tier,
+      limit,
+    });
+    if (persistentPage.unavailable) {
+      return this.agentTimeline(filter);
+    }
+    // See storedAgentEvents: until collector-scoped watermarks exist, overlap is safer than
+    // event-time splitting and is removed before building the ordered timeline.
+    const hot = this.judge.queryRange(plan.hotFromMs, window.endMs);
+    const folded = foldLatestEventRevisions([...persistentPage.events, ...hot]);
+    const filtered = this.filterEvents(folded, effectiveFilter).sort((a, b) => a.at - b.at);
+    const visible = filtered.slice(-limit);
+    const head = visible[0];
+    const hasMore = persistentPage.hasMore || filtered.length > limit;
+    return {
+      traceId: traceId ?? head?.traceId ?? '',
+      runId: filter.runId ?? head?.runId,
+      sessionId: filter.sessionId ?? head?.sessionId,
+      items: visible.map((event) => this.eventItem(
+        event,
+        1,
+        event.at,
+        resolvedClassificationView(filter),
+      )),
+      total: filtered.length,
+      hasMore,
+      coverage: this.queryCoverage(filter, visible, {
+        source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: hasMore ? 'estimated' : 'exact',
+        partial: hasMore,
+        partialReason: hasMore ? 'scan_limit' : undefined,
+        committedCutoffMs: persistentPage.committedCutoffMs,
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async storeAgentInteraction(record: T.AgentInteractionRecord): Promise<{ durable: boolean }> {
+    this.pruneInteractionHot();
+    const bytes = Buffer.byteLength(JSON.stringify(record));
+    if (bytes > this.interactionHotMaxBytes) {
+      this.interactionHotDropped += 1;
+    }
+    const previous = this.interactionHot.get(record.interactionId);
+    const projectionChanged = !previous
+      || previous.record.request.sha256 !== record.request.sha256
+      || previous.record.response.sha256 !== record.response.sha256
+      || previous.record.endedAtUnixNs !== record.endedAtUnixNs
+      || previous.record.trafficRole !== record.trafficRole;
+    if (previous) {
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - previous.bytes);
+      this.interactionHot.delete(record.interactionId);
+    }
+    if (bytes <= this.interactionHotMaxBytes) {
+      this.interactionHot.set(record.interactionId, { record, bytes, insertedAt: now() });
+      this.interactionHotBytes += bytes;
+    }
+    while (
+      this.interactionHot.size > this.interactionHotMaxRecords
+      || this.interactionHotBytes > this.interactionHotMaxBytes
+    ) {
+      const oldest = this.interactionHot.entries().next().value as
+        | [string, { record: T.AgentInteractionRecord; bytes: number; insertedAt: number }]
+        | undefined;
+      if (!oldest) break;
+      this.interactionHot.delete(oldest[0]);
+      this.interactionHotBytes = Math.max(0, this.interactionHotBytes - oldest[1].bytes);
+      this.interactionHotEvictions += 1;
+    }
+    if (projectionChanged) {
+      this.conversationInteractionRevision += 1;
+      this.conversationProjectionRecent.clear();
+      this.conversationProjectionRecentBytes = 0;
+    }
+    const durable = await this.judge.persistAgentInteraction(record);
+    // SessionMembership is a canonical ingest-time projection, not a side effect of a later
+    // conversation page read. Keep it available in the memory-only profile as well as PostgreSQL;
+    // failures are recorded by the binding service as a bounded projection gap.
+    await this.conversationBindings?.commitInteractionMembership(record);
+    if (durable || this.canonicalObservability) this.scheduleSemanticRelationProjection(record);
+    return { durable };
+  }
+
+  /** Requeue bounded semantic relations when a Kernel fact arrives after the initial Tool span.
+   * Late Observer events must create a new relation revision rather than leaving an earlier
+   * `unmatched` link as the only conclusion. */
+  observeKernelEvent(event: T.JudgedEvent): void {
+    if (!this.conversationBindings || (!this.relationalStore?.configured?.() && !this.canonicalObservability)) return;
+    if (!new Set(['ToolExec', 'FileAccess', 'FileDelete', 'Egress', 'Dns', 'Tls', 'SecurityAction', 'ProcessExit', 'ProcessFork']).has(event.eventKind)) return;
+    const eventRuntime = event.runtimeInstanceId ?? event.attribution?.agentInstanceId;
+    const eventAsset = event.subjectAssetId;
+    const eventAt = Number(event.eventAtUnixNs
+      ? (() => { try { return BigInt(event.eventAtUnixNs) / 1_000_000n; } catch { return BigInt(Math.max(0, Math.trunc(event.at))); } })()
+      : BigInt(Math.max(0, Math.trunc(event.at))));
+    if (!Number.isFinite(eventAt)) return;
+    let considered = 0;
+    for (const { record } of this.interactionHot.values()) {
+      if (considered >= 256) break;
+      if (!record.toolCalls.length) continue;
+      const sameRuntime = eventRuntime && (record.runtimeInstanceId === eventRuntime
+        || record.agentInstanceId === eventRuntime
+        || record.canonicalAgentInstanceId === eventRuntime);
+      const sameAsset = eventAsset && record.agentAssetId === eventAsset;
+      const sandboxRunnerLate = event.eventKind === 'ToolExec'
+        && /(?:^|[\s/])runner\.py(?:\s|$)/u.test(
+          `${event.subject ?? ''} ${typeof event.attributes?.argv === 'string' ? event.attributes.argv : ''}`,
+        )
+        && record.toolCalls.some((call) => /sandbox/iu.test(call.name ?? ''));
+      if (!sameRuntime && !sameAsset && !sandboxRunnerLate) continue;
+      if (Math.abs(record.at - eventAt) > 30 * 60_000) continue;
+      considered += 1;
+      const key = record.agentInstanceId?.trim() || record.agentAssetId;
+      const nextRevision = Math.max(
+        this.semanticRelationRevisionOverrides.get(key) ?? 0,
+        (this.conversationBindings.currentResolutionRevision() || 1) + 1,
+      );
+      this.semanticRelationRevisionOverrides.set(key, nextRevision);
+      while (this.semanticRelationRevisionOverrides.size > 2_048) {
+        const oldest = this.semanticRelationRevisionOverrides.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.semanticRelationRevisionOverrides.delete(oldest);
+      }
+      this.scheduleSemanticRelationProjection(record);
+    }
+  }
+
+  private scheduleSemanticRelationProjection(record: T.AgentInteractionRecord): void {
+    if (
+      (!this.relationalStore?.configured?.() && !this.canonicalObservability)
+      || trafficRoleForInteraction(record) === 'unclassified'
+    ) return;
+    const key = record.agentInstanceId?.trim() || record.agentAssetId;
+    const now = Date.now();
+    const current = this.semanticRelationProjectionTimers.get(key);
+    if (current) clearTimeout(current.timer);
+    if (
+      !current
+      && !this.semanticRelationProjectionActive.has(key)
+      && this.semanticRelationProjectionTimers.size + this.semanticRelationProjectionActive.size
+        >= this.semanticRelationProjectionMaxKeys
+    ) {
+      const oldest = this.semanticRelationProjectionTimers.entries().next().value as
+        | [string, { timer: NodeJS.Timeout }]
+        | undefined;
+      if (oldest) {
+        clearTimeout(oldest[1].timer);
+        this.semanticRelationProjectionTimers.delete(oldest[0]);
+        this.semanticRelationProjectionEvictions += 1;
+      } else {
+        this.semanticRelationProjectionDropped += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'dropped',
+          record.agentInstanceId?.trim() || record.interactionId,
+          { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
+        );
+        return;
+      }
+    }
+    const firstQueuedAt = current?.firstQueuedAt ?? now;
+    // Debounce a normal Tool loop until Kernel/ToolResult facts settle, but force progress for an
+    // Agent that continuously emits calls so one active session cannot postpone projection forever.
+    const delayMs = this.canonicalObservability && !this.relationalStore?.configured?.()
+      ? 0
+      : Math.max(0, Math.min(
+          TOOL_EVIDENCE_RELATION_SETTLE_MS,
+          60_000 - (now - firstQueuedAt),
+        ));
+    const timer = setTimeout(() => {
+      this.semanticRelationProjectionTimers.delete(key);
+      if (this.semanticRelationProjectionActive.has(key)) {
+        this.scheduleSemanticRelationProjection(record);
+        return;
+      }
+      if (this.semanticRelationProjectionActive.size >= this.semanticRelationProjectionMaxKeys) {
+        this.semanticRelationProjectionDropped += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'dropped',
+          record.agentInstanceId?.trim() || record.interactionId,
+          { projection: 'semantic_kernel_relation', reason: 'active_capacity' },
+        );
+        return;
+      }
+      this.semanticRelationProjectionActive.add(key);
+      const deadline = setTimeout(() => {
+        if (!this.semanticRelationProjectionActive.has(key)) return;
+        this.semanticRelationProjectionTimeouts += 1;
+        // Release the bounded active slot at the deadline. The underlying store operation is
+        // still observed by its `finally` handler, but it is now an orphan and must not prevent a
+        // later event for the same AgentInstance from making progress.
+        this.semanticRelationProjectionActive.delete(key);
+        if (this.semanticRelationProjectionDeadlines.get(key) === deadline) {
+          this.semanticRelationProjectionDeadlines.delete(key);
+        }
+        this.semanticRelationProjectionOrphans += 1;
+        this.canonicalObservability?.recordGap(
+          'correlation',
+          'timeout',
+          record.agentInstanceId?.trim() || record.interactionId,
+          { projection: 'semantic_kernel_relation' },
+        );
+      }, RELATION_PROJECTION_TIMEOUT_MS);
+      deadline.unref();
+      this.semanticRelationProjectionDeadlines.set(key, deadline);
+      void this.projectSemanticKernelRelationsFor(record)
+        .catch((error) => {
+          console.error('[agent-relation] incremental projection failed:', (error as Error).message);
+        })
+        .finally(() => {
+          const activeDeadline = this.semanticRelationProjectionDeadlines.get(key);
+          if (activeDeadline === deadline) {
+            clearTimeout(activeDeadline);
+            this.semanticRelationProjectionDeadlines.delete(key);
+            this.semanticRelationProjectionActive.delete(key);
+          }
+          this.semanticRelationProjectionCompleted += 1;
+        });
+    }, delayMs);
+    timer.unref();
+    this.semanticRelationProjectionTimers.set(key, { timer, firstQueuedAt, record });
+    this.semanticRelationProjectionScheduled += 1;
+  }
+
+  private async projectSemanticKernelRelationsFor(
+    trigger: T.AgentInteractionRecord,
+  ): Promise<void> {
+    if (!this.conversationBindings || (!this.relationalStore?.configured?.() && !this.canonicalObservability)) return;
+    const now = Date.now();
+    const startMs = Math.max(0, trigger.at - 30 * 60_000);
+    const endMs = Math.max(now, trigger.at + TOOL_EVIDENCE_RELATION_SETTLE_MS);
+    const interactionList = await this.readAgentInteractions({
+      timeType: 'custom',
+      startTime: new Date(startMs).toISOString(),
+      endTime: new Date(endMs).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      agentAssetId: trigger.agentAssetId,
+      ...(trigger.agentInstanceId ? { agentInstanceId: trigger.agentInstanceId } : {}),
+      limit: 500,
+    }, { totalLimit: 500 });
+    const bound = await this.conversationBindings.applyPersistedBindings(interactionList.items);
+    const projection = projectAgentConversations(bound, [], {
+      timeType: 'custom',
+      startTime: new Date(startMs).toISOString(),
+      endTime: new Date(endMs).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      agentAssetId: trigger.agentAssetId,
+      limit: 200,
+    });
+    await this.conversationBindings.persistProjection(projection);
+
+    const relationInputs = projection.summaries
+      .filter((summary) => summary.hasContent)
+      .flatMap((summary) => {
+        const records = projection.interactionsByConversation.get(summary.conversationId) ?? [];
+        const segments = this.conversationBindings!.segmentsForConversation(summary.conversationId);
+        const events = projectSemanticConversationTimeline(summary, records, segments)
+          .flatMap((turn) => turn.events);
+        return events
+          .filter((event) => event.kind === 'tool_call')
+          .map((event) => {
+            const owner = event.sourceInteractionIds
+              .map((interactionId) => records.find((item) => item.interactionId === interactionId))
+              .filter((item): item is T.AgentInteractionRecord => Boolean(item))
+              .sort((left, right) =>
+                Number(right.interactionType === 'tool') - Number(left.interactionType === 'tool'))[0];
+            if (!owner) return undefined;
+            const result = semanticResultForCall(event, events);
+            return { event, result, interaction: owner };
+          })
+          .filter((item): item is NonNullable<typeof item> => Boolean(item));
+      })
+      // Incremental work is triggered by one newly durable interaction. Replaying every Tool call
+      // from the 30-minute identity hydration window turns one short command into a 30-minute
+      // Kernel scan and prevents eager persistence under active sessions. Retain exact source
+      // membership plus a bounded overlap for a call/result pair split across adjacent requests.
+      .filter((input) => semanticRelationInputNearTrigger(input, trigger))
+      .slice(0, 200);
+    if (relationInputs.length === 0) return;
+
+    const fallback = relationInputs[0];
+    const window = semanticKernelRelationBatchWindow(relationInputs, fallback);
+    const candidateEnd = Math.min(window.endMs, Date.now());
+    const instanceIds = [...new Set(relationInputs
+      .map((input) => input.interaction.agentInstanceId)
+      .filter((value): value is string => Boolean(value)))];
+    const relationCategories = relationInputs.map(({ event, interaction: owner }) =>
+      owner.interactionType === 'tool' ? undefined : semanticKernelEventCategory(event));
+    const relationEventCategory = relationCategories[0]
+      && relationCategories.every((category) => category === relationCategories[0])
+      ? relationCategories[0]
+      : undefined;
+    let kernel = await this.storedAgentEvents({
+      timeType: 'custom',
+      startTime: new Date(window.startMs).toISOString(),
+      endTime: new Date(Math.max(window.startMs, candidateEnd)).toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      ...(instanceIds.length === 1 ? { agentInstanceId: instanceIds[0] } : {}),
+      ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
+      durable: true,
+      limit: 1_000,
+    });
+    const relationRevisionKey = trigger.agentInstanceId?.trim() || trigger.agentAssetId;
+    const resolutionRevision = Math.max(
+      this.conversationBindings.currentResolutionRevision(),
+      this.semanticRelationRevisionOverrides.get(relationRevisionKey) ?? 0,
+    );
+    let batch = buildSemanticKernelRelationBatch(
+      relationInputs,
+      kernel.items,
+      resolutionRevision,
+      kernel.coverage.partial,
+    );
+    if (!batch.allRelations.some((relation) => relation.kernelEventId)) {
+      const ancestryKernel = await this.storedAgentEvents({
+        timeType: 'custom',
+        startTime: new Date(window.startMs).toISOString(),
+        endTime: new Date(Math.max(window.startMs, candidateEnd)).toISOString(),
+        scope: 'agent',
+        classificationView: 'current_effective',
+        ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
+        durable: true,
+        limit: 1_000,
+      });
+      const ancestryBatch = buildSemanticKernelRelationBatch(
+        relationInputs,
+        ancestryKernel.items,
+        resolutionRevision,
+        ancestryKernel.coverage.partial,
+      );
+      if (ancestryBatch.allRelations.some((relation) => relation.kernelEventId)) {
+        kernel = ancestryKernel;
+        batch = ancestryBatch;
+      }
+    }
+    if (kernel.coverage.partial && !this.canonicalObservability) return;
+    const everyCallClosed = relationInputs.every((input) => Boolean(input.result));
+    const persistable = everyCallClosed
+      ? batch.allRelations
+      : batch.allRelations.filter((relation) => Boolean(relation.kernelEventId));
+    if (persistable.length > 0 && this.relationalStore?.configured?.() && !kernel.coverage.partial) {
+      await this.relationalStore.saveAgentSemanticKernelRelations(persistable);
+    }
+    if (this.canonicalObservability && batch.allRelations.length > 0) {
+      const commit = await this.canonicalObservability.commitEvidenceLinks(
+        canonicalEvidenceLinksForRelations(batch.allRelations),
+      );
+      if (commit.rejected > 0) {
+        this.canonicalObservability.recordGap(
+          'projection',
+          'dropped',
+          trigger.agentInstanceId?.trim() || trigger.interactionId,
+          { projection: 'evidence_link', rejected: commit.rejected },
+        );
+      }
+    }
+  }
+
+  async agentInteractions(filter: T.AgentInteractionQuery): Promise<T.AgentInteractionList> {
+    return this.readAgentInteractions(filter, filter.interactionIds
+      ? { interactionIds: filter.interactionIds, membershipDurable: true, totalLimit: filter.interactionIds.length }
+      : {});
+  }
+
+  /**
+   * Read one interaction from the bounded process-local projection without touching ClickHouse
+   * or PostgreSQL.  Canonical entity GETs use this only after their durable/compatibility read
+   * has timed out.  It is deliberately a metadata bridge: callers must still apply their own
+   * scope checks and must never treat a hot row as durable history.
+   */
+  getAgentInteractionHot(interactionId: string): T.AgentInteractionRecord | undefined {
+    const id = typeof interactionId === 'string' ? interactionId.trim() : '';
+    if (!id) return undefined;
+    this.pruneInteractionHot();
+    const entry = this.interactionHot.get(id);
+    return entry ? structuredClone(entry.record) : undefined;
+  }
+
+  /**
+   * Return a bounded newest-first snapshot of hot interactions for degraded canonical reads.
+   * The snapshot is cloned so a response builder cannot mutate the live projection while a late
+   * ClickHouse/relational operation is still settling.
+   */
+  listAgentInteractionsHot(limit = 256): T.AgentInteractionRecord[] {
+    this.pruneInteractionHot();
+    const bounded = Number.isFinite(limit)
+      ? Math.max(1, Math.min(this.interactionHotMaxRecords, Math.trunc(limit)))
+      : 256;
+    return [...this.interactionHot.values()]
+      .slice(-bounded)
+      .reverse()
+      .map(({ record }) => structuredClone(record));
+  }
+
+  private async readAgentInteractions(
+    filter: T.AgentInteractionQuery,
+    options: {
+      fairPerAgentLimit?: number;
+      totalLimit?: number;
+      interactionIds?: readonly string[];
+      membershipTruncated?: boolean;
+      membershipDurable?: boolean;
+      membershipStoreUnavailable?: boolean;
+    } = {},
+  ): Promise<T.AgentInteractionList> {
+    this.pruneInteractionHot();
+    const window = resolveTimeWindow(filter);
+    const exactInteractionIds = new Set((options.interactionIds ?? [])
+      .map((value) => value.trim())
+      .filter(Boolean));
+    const exactMembershipRead = options.interactionIds !== undefined;
+    const requestedAsset = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAsset
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
+      : undefined;
+    // interactionId is globally unique and is the stronger lookup key. An asset recorded before
+    // identity reconciliation may now resolve to a newer canonical ID, so prefiltering durable
+    // rows by that canonical ID can hide the exact historical interaction. Resolve the strong ID
+    // first, then enforce canonical asset equivalence below.
+    const query = {
+      ...filter,
+      agentAssetId: filter.interactionId || exactMembershipRead ? undefined : agentAssetId,
+      agentInstanceId: exactMembershipRead ? undefined : filter.agentInstanceId,
+      startMs: window.startMs,
+      endMs: window.endMs,
+      ...(exactMembershipRead ? { interactionIds: [...exactInteractionIds] } : {}),
+      ...(options.fairPerAgentLimit
+        ? { fairPerAgentLimit: options.fairPerAgentLimit }
+        : {}),
+      ...(options.totalLimit ? { limit: options.totalLimit } : {}),
+    };
+    // An empty membership selection is still an exact query, never a request for all history.
+    const persisted = exactMembershipRead && exactInteractionIds.size === 0
+      ? (options.membershipDurable === true ? [] : null)
+      : (await boundedRelationRead(
+          this.judge.storedAgentInteractions(query),
+          null,
+          AGENT_INTERACTION_QUERY_TIMEOUT_MS,
+        )).value;
+    const merged = new Map<string, T.AgentInteractionRecord>();
+    for (const item of persisted ?? []) merged.set(item.interactionId, item);
+    for (const { record } of this.interactionHot.values()) {
+      if (exactMembershipRead) {
+        if (!exactInteractionIds.has(record.interactionId)) continue;
+      } else if (record.at < window.startMs || record.at > window.endMs) continue;
+      merged.set(record.interactionId, record);
+    }
+    const currentView = resolvedClassificationView(filter) === 'current_effective';
+    const classified = [...merged.values()].map((item): T.AgentInteractionRecord => {
+        const review = currentView ? this.assetReviews?.current(item.agentAssetId) : undefined;
+        const automatic = captureClassificationDecision(item.detectedClassification);
+        const currentEffectiveClassification = review?.decision ?? automatic.effective;
+        const candidateAutoPromoted = !review
+          && automatic.candidateAutoPromoted;
+        return {
+          ...item,
+          currentEffectiveClassification,
+          ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
+        };
+      });
+    const items = bindInferredProducerRun(classified)
+      .filter((item) =>
+        // `interactionId` is the globally unique immutable fact key. Asset and Runtime instance
+        // ids are mutable attribution hints: a resumed canonical Thread can legitimately contain
+        // Interactions emitted before and after identity reconciliation. Once the exact fact id
+        // matches, stale identity hints must not hide it.
+        (filter.interactionId
+          || exactMembershipRead
+          || !agentAssetId
+          || item.agentAssetId === requestedAsset
+          || this.agentMetadata.canonicalAgentAssetId(item.agentAssetId) === agentAssetId)
+        && (filter.interactionId
+          || exactMembershipRead
+          || !filter.agentInstanceId
+          || item.agentInstanceId === filter.agentInstanceId)
+        && (!exactMembershipRead || exactInteractionIds.has(item.interactionId))
+        && (!filter.interactionId || item.interactionId === filter.interactionId)
+        && (!filter.sessionId || item.sessionId === filter.sessionId || item.canonicalSessionId === filter.sessionId)
+        && (!filter.runId || item.runId === filter.runId || item.producerRunId === filter.runId)
+        && (!filter.traceId || item.traceId === filter.traceId)
+        && (!filter.interactionType || item.interactionType === filter.interactionType)
+        && (!filter.routeShape || item.routeShape === filter.routeShape)
+        && (!filter.model || item.model === filter.model)
+        && (!filter.transport || item.transport === filter.transport)
+        && (!filter.tlsAdapterId || item.tlsAdapterId === filter.tlsAdapterId)
+        && (!filter.transportProtocol || item.transportProtocol === filter.transportProtocol)
+        && (!filter.wireTemplateId || item.wireTemplateId === filter.wireTemplateId)
+        && (!filter.parseState || item.parseState === filter.parseState)
+        && (!filter.completeness || item.completeness === filter.completeness)
+        && (filter.scope === 'raw' || ['confirmed_agent', 'probable_agent'].includes(
+          currentView ? item.currentEffectiveClassification : item.detectedClassification,
+        )))
+      .sort((left, right) => right.at - left.at || right.interactionId.localeCompare(left.interactionId));
+    const limit = options.totalLimit
+      ? Math.max(1, Math.min(CONVERSATION_INTERACTIONS_TOTAL, options.totalLimit))
+      : Math.max(1, Math.min(500, filter.limit ?? 100));
+    const visible = options.fairPerAgentLimit
+      ? (() => {
+          const perAgent = Math.max(1, Math.min(256, options.fairPerAgentLimit));
+          const counts = new Map<string, number>();
+          const selected: T.AgentInteractionRecord[] = [];
+          for (const item of items) {
+            const identity = this.agentMetadata.canonicalAgentAssetId(item.agentAssetId);
+            const count = counts.get(identity) ?? 0;
+            if (count >= perAgent) continue;
+            counts.set(identity, count + 1);
+            selected.push(item);
+            if (selected.length >= limit) break;
+          }
+          return selected;
+        })()
+      : items.slice(0, limit);
+    const snapshotAsOf = new Date(window.endMs).toISOString();
+    const dataTimes = visible.map((item) => item.at);
+    const durable = persisted !== null;
+    const missingMembershipRecords = exactMembershipRead
+      ? [...exactInteractionIds].filter((interactionId) => !merged.has(interactionId)).length
+      : 0;
+    const membershipPartial = exactMembershipRead && (
+      options.membershipDurable === false
+      || options.membershipTruncated === true
+      || missingMembershipRecords > 0
+    );
+    const fairTruncated = Boolean(options.fairPerAgentLimit) && items.length > visible.length;
+    const partial = !durable || fairTruncated || membershipPartial;
+    const partialReason = !durable
+      ? 'hot_ring_only'
+      : options.membershipDurable === false
+        ? (options.membershipStoreUnavailable
+          ? 'membership_store_unavailable'
+          : 'membership_ephemeral')
+        : options.membershipTruncated
+          ? 'membership_limit'
+          : missingMembershipRecords > 0
+            ? 'membership_records_missing'
+            : fairTruncated ? 'scan_limit' : undefined;
+    return {
+      items: visible,
+      total: items.length,
+      totalMode: !partial && items.length <= limit
+        ? 'exact'
+        : 'omitted',
+      coverage: {
+        requestedFrom: new Date(window.startMs).toISOString(),
+        requestedTo: snapshotAsOf,
+        snapshotAsOf,
+        asOf: snapshotAsOf,
+        dataFrom: dataTimes.length ? new Date(Math.min(...dataTimes)).toISOString() : undefined,
+        dataTo: dataTimes.length ? new Date(Math.max(...dataTimes)).toISOString() : undefined,
+        completeness: !partial
+          ? currentView ? 'exact_current_effective' : 'exact_as_observed'
+          : 'partial',
+        partial,
+        partialReason,
+        source: durable ? 'clickhouse+hot_delta' : 'memory_hot_ring',
+        totalMode: !partial && items.length <= limit
+          ? 'exact'
+          : 'omitted',
+      },
+      dataSource: durable ? 'clickhouse' : 'hot_ring',
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  private conversationProjectionKey(filter: T.AgentConversationQuery): string {
+    return JSON.stringify({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      snapshotAsOf: filter.snapshotAsOf,
+      scope: filter.scope,
+      classificationView: filter.classificationView,
+      agentAssetId: filter.agentAssetId,
+      agentInstanceId: filter.agentInstanceId,
+      conversationId: filter.conversationId,
+      product: filter.product,
+      classification: filter.classification,
+      coverageStatus: filter.coverageStatus,
+      model: filter.model,
+      q: filter.q,
+      limit: filter.limit,
+      interactionRevision: this.conversationInteractionRevision,
+      identityRevision: this.agentMetadata.identitySnapshotVersion(),
+      reviewRevision: this.assetReviews?.version() ?? 0,
+      relativeWindowBucket: filter.timeType === 'custom' || filter.snapshotAsOf
+        ? undefined
+        : Math.floor(Date.now() / 60_000),
+    });
+  }
+
+  private async agentConversationProjection(
+    filter: T.AgentConversationQuery,
+  ): Promise<AgentConversationProjectionResult> {
+    const key = this.conversationProjectionKey(filter);
+    this.pruneConversationProjectionRecent();
+    const recent = this.conversationProjectionRecent.get(key);
+    if (recent) {
+      this.conversationProjectionRecent.delete(key);
+      this.conversationProjectionRecent.set(key, recent);
+      return recent.value;
+    }
+    const existing = this.conversationProjectionInFlight.get(key);
+    if (existing) return existing;
+    const reservation = this.reserveInFlight(
+      this.conversationProjectionInFlight,
+      key,
+      this.conversationProjectionInFlightBytes,
+      MAX_CONVERSATION_PROJECTION_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.conversationProjectionInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent conversation projection is busy; retry the latest selection');
+    }
+    const baseOperation = this.conversationProjectionGate
+      .run(() => this.computeAgentConversationProjection(filter))
+      .then((result) => {
+        if (result) {
+          const bytes = Buffer.byteLength(key, 'utf8') + this.estimateCacheBytes(result);
+          if (bytes <= MAX_RECENT_OBSERVABILITY_BYTES) {
+            const previous = this.conversationProjectionRecent.get(key);
+            if (previous) {
+              this.conversationProjectionRecent.delete(key);
+              this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - previous.bytes);
+            }
+            this.conversationProjectionRecent.set(key, { at: now(), value: result, bytes });
+            this.conversationProjectionRecentBytes += bytes;
+            this.pruneConversationProjectionRecent();
+            while (
+              this.conversationProjectionRecent.size > MAX_RECENT_OBSERVABILITY_ENTRIES
+              || this.conversationProjectionRecentBytes > MAX_RECENT_OBSERVABILITY_BYTES
+            ) {
+              const oldest = this.conversationProjectionRecent.entries().next().value as
+                | [string, { at: number; value: AgentConversationProjectionResult; bytes: number }]
+                | undefined;
+              if (!oldest) break;
+              this.conversationProjectionRecent.delete(oldest[0]);
+              this.conversationProjectionRecentBytes = Math.max(0, this.conversationProjectionRecentBytes - oldest[1].bytes);
+              this.conversationProjectionRecentEvictions += 1;
+            }
+          } else {
+            this.conversationProjectionRecentDropped += 1;
+          }
+          return result;
+        }
+        throw new ServiceUnavailableException(
+          'Agent conversation projection is busy; retry the latest selection',
+        );
+      });
+    let operation: Promise<AgentConversationProjectionResult>;
+    operation = this.withInFlightTimeout(
+      baseOperation,
+      () => {
+        if (this.conversationProjectionInFlight.get(key) !== operation) return;
+        this.conversationProjectionInFlight.delete(key);
+        this.conversationProjectionInFlightBytes = Math.max(
+          0,
+          this.conversationProjectionInFlightBytes - reservation.bytes,
+        );
+        this.conversationProjectionInFlightTimeouts += 1;
+      },
+      'Agent conversation projection timed out; retry the latest selection',
+    ).finally(() => {
+        if (this.conversationProjectionInFlight.get(key) === operation) {
+          this.conversationProjectionInFlight.delete(key);
+          this.conversationProjectionInFlightBytes = Math.max(0, this.conversationProjectionInFlightBytes - reservation.bytes);
+        }
+      });
+    this.conversationProjectionInFlight.set(key, operation);
+    this.conversationProjectionInFlightBytes += reservation.bytes;
+    return operation;
+  }
+
+  private async computeAgentConversationProjection(
+    filter: T.AgentConversationQuery,
+  ): Promise<AgentConversationProjectionResult> {
+    // An inferred conversation ID is anchored in the globally ordered projection. Applying an
+    // asset, instance, or model prefilter can change the first record in that projection and thus
+    // produce a different ID. Once a conversationId is present, keep those values as post-
+    // projection consistency filters instead of changing the record set used to resolve the ID.
+    const requestedConversationId = filter.conversationId?.trim();
+    const canonicalSessionRead = Boolean(requestedConversationId
+      && /^sess_[a-f0-9]{24}$/u.test(requestedConversationId));
+    const persistedAlias = requestedConversationId
+      ? await this.conversationBindings?.resolveRouteAlias(requestedConversationId)
+      : undefined;
+    let initialConversationId = persistedAlias?.targetType === 'conversation'
+      ? (persistedAlias.canonicalConversationId || persistedAlias.targetId || requestedConversationId)
+      : requestedConversationId;
+    let resolveConversationId = Boolean(initialConversationId);
+    let membershipSelection = initialConversationId && this.conversationBindings
+      ? await this.conversationBindings.interactionIdsForConversation(
+          initialConversationId,
+          5_000,
+        )
+      : undefined;
+    // A stale route alias can point a still-valid Thread id at an empty canonical target (common
+    // after hop-fence repairs). Prefer the requested conversation's own membership when the alias
+    // target has none, so timeline deep links do not go blank while directory coverage stays complete.
+    if (
+      requestedConversationId
+      && initialConversationId
+      && initialConversationId !== requestedConversationId
+      && this.conversationBindings
+      && !(membershipSelection?.interactionIds.length)
+    ) {
+      const requestedMembership = await this.conversationBindings.interactionIdsForConversation(
+        requestedConversationId,
+        5_000,
+      );
+      const repaired = repairEmptyRouteAliasConversationId({
+        requestedConversationId,
+        aliasCanonicalConversationId: initialConversationId,
+        aliasMembershipIds: membershipSelection?.interactionIds ?? [],
+        requestedMembershipIds: requestedMembership.interactionIds,
+      });
+      if (repaired === requestedConversationId) {
+        initialConversationId = requestedConversationId;
+        membershipSelection = requestedMembership;
+      }
+    }
+    // A hop-fenced remint of a durable Thread id is not stored as its own Thread.
+    // Resolve that key back to the durable id without widening the point-read into a
+    // time-window sample used as the timeline body.
+    if (
+      requestedConversationId
+      && /^cv_[a-f0-9]{24}$/iu.test(requestedConversationId)
+      && this.conversationBindings
+      && !(membershipSelection?.interactionIds.length)
+    ) {
+      const derived = await this.deriveHopFenceBoundConversationId(requestedConversationId);
+      if (derived) {
+        initialConversationId = derived.conversationId;
+        membershipSelection = derived.interactionIds.length
+          ? {
+              interactionIds: derived.interactionIds,
+              truncated: derived.truncated,
+              durable: false,
+            }
+          : await this.conversationBindings.interactionIdsForConversation(
+              derived.conversationId,
+              5_000,
+            );
+      }
+    }
+    resolveConversationId = Boolean(initialConversationId);
+    // A selected Thread id is a point-read, same as a canonical Session id. An empty membership
+    // set must stay empty — never fall through to a last_1h fair sample that marks complete
+    // conversations `scan_limit` or hangs ClickHouse under load.
+    const exactMembershipIds = resolveConversationId
+      ? (membershipSelection?.interactionIds ?? [])
+      : undefined;
+    const pointReadThread = resolveConversationId && this.relationalStore?.configured()
+      ? (await this.relationalStore.loadAgentConversationThreadsByIds([
+          ...new Set([initialConversationId, requestedConversationId].filter((value): value is string => Boolean(value))),
+        ])).find((thread) =>
+          thread.conversationId === initialConversationId
+          || thread.conversationId === requestedConversationId)
+      : undefined;
+    const correlationSessionId = pointReadThread?.sessionId?.trim() ?? '';
+    const keyedSessionRead = Boolean(
+      resolveConversationId
+      && correlationSessionId
+      && !(exactMembershipIds?.length),
+    );
+    // Canonical/deep-link reads may explicitly request the raw compatibility lane so that an
+    // unknown/candidate physical asset can still be resolved and shown with a CoverageGap. The
+    // ordinary Agent dashboard keeps its historical `agent` scope and therefore does not widen
+    // visibility to unrelated traffic.
+    const projectionScope: T.AgentConversationQuery['scope'] = filter.scope === 'raw' ? 'raw' : 'agent';
+    const interactionQuery: T.AgentInteractionQuery = {
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: projectionScope,
+      classificationView: filter.classificationView,
+      agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
+      agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
+      model: resolveConversationId ? undefined : filter.model,
+      // Keep the first semantic read bounded even for raw Session projections. The ClickHouse
+      // interaction query performs GROUP BY/argMax before LIMIT, so a large limit still causes a
+      // wide merge sort and can exceed the node memory budget before pagination happens.
+      limit: CONVERSATION_INTERACTIONS_PER_AGENT,
+      ...(keyedSessionRead ? { runId: correlationSessionId } : {}),
+    };
+    const inventoryQuery: T.AgentInventoryQuery = {
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: projectionScope,
+      classificationView: filter.classificationView,
+      agentAssetId: resolveConversationId ? undefined : filter.agentAssetId,
+      agentInstanceId: resolveConversationId ? undefined : filter.agentInstanceId,
+      includeUnclassified: false,
+      limit: CONVERSATION_INTERACTIONS_PER_AGENT,
+    };
+    const preciseContentQuery = Boolean(
+      filter.agentAssetId
+      || filter.agentInstanceId
+      || filter.conversationId
+      || filter.q
+      || filter.model
+      || filter.product,
+    );
+    let inventoryTimer: NodeJS.Timeout | undefined;
+    const inventoryPromise = preciseContentQuery
+      ? Promise.resolve(this.agentInventory(inventoryQuery))
+      : Promise.race([
+          this.storedAgentInventory(inventoryQuery).catch(() => this.agentInventory(inventoryQuery)),
+          new Promise<T.AgentInventory>((resolve) => {
+            inventoryTimer = setTimeout(() => resolve(this.agentInventory(inventoryQuery)), 1_500);
+            inventoryTimer.unref();
+          }),
+        ]);
+    // Canonical raw projections must report the bounded durable result as-is. The dashboard's
+    // fair-per-agent quota is a presentation safeguard for the ordinary Agent view; applying it
+    // to the raw lane marks a small, complete canonical Session read as `scan_limit` merely because
+    // the fairness adapter was used. Keep the total interaction cap in both lanes.
+    const fairHistoryRead = filter.scope !== 'raw' && exactMembershipIds === undefined && (
+      !filter.agentAssetId
+      && !filter.agentInstanceId
+      && !filter.model
+    );
+    const interactionReadOptions = keyedSessionRead
+      ? { totalLimit: CONVERSATION_INTERACTIONS_TOTAL }
+      : exactMembershipIds
+        ? {
+            interactionIds: exactMembershipIds,
+            membershipTruncated: membershipSelection?.truncated,
+            membershipDurable: membershipSelection?.durable ?? false,
+            membershipStoreUnavailable: membershipSelection?.storeUnavailable === true,
+            totalLimit: exactMembershipIds.length,
+          }
+        : fairHistoryRead
+          ? {
+              fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
+              totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+            }
+          : undefined;
+    const [interactions, inventory] = await Promise.all([
+      this.readAgentInteractions(interactionQuery, interactionReadOptions),
+      inventoryPromise,
+    ]).finally(() => {
+      if (inventoryTimer) clearTimeout(inventoryTimer);
+    });
+    let boundInteractions = this.conversationBindings
+      ? await this.conversationBindings.applyPersistedBindings(interactions.items)
+      : interactions.items;
+    // Membership rows can lag the durable Thread. Expand by the Thread's sessionId — a keyed
+    // correlation read — instead of a last_1h fair sample.
+    if (
+      exactMembershipIds?.length
+      && correlationSessionId
+      && filter.scope !== 'raw'
+    ) {
+      const sessionWindow = await this.readAgentInteractions(
+        { ...interactionQuery, runId: correlationSessionId },
+        { totalLimit: CONVERSATION_INTERACTIONS_TOTAL },
+      );
+      const sessionBound = this.conversationBindings
+        ? await this.conversationBindings.applyPersistedBindings(sessionWindow.items)
+        : sessionWindow.items;
+      const membershipIdSet = new Set(exactMembershipIds);
+      const membershipHops = new Set(
+        boundInteractions
+          .filter((item) => membershipIdSet.has(item.interactionId) && item.hop)
+          .map((item) => item.hop as string),
+      );
+      const byId = new Map(boundInteractions.map((item) => [item.interactionId, item]));
+      for (const item of sessionBound) {
+        if (byId.has(item.interactionId)) continue;
+        // A parent and child hop can share sessionId/runId. Session hydration fills missing
+        // members of the selected Thread; it must not fold the peer hop into this timeline.
+        if (membershipHops.size && item.hop && !membershipHops.has(item.hop)) continue;
+        byId.set(item.interactionId, item);
+      }
+      boundInteractions = [...byId.values()];
+    }
+    // Cross-hop relatedConversations are expressed by directory + EvidenceLink, not by widening a
+    // selected Thread into a last_1h fair sample. That scan was marking complete point-reads
+    // `scan_limit` and timing out conversation timelines under durable load.
+    const routeAlias = requestedConversationId
+      ? this.conversationBindings?.routeAlias(requestedConversationId) ?? persistedAlias
+      : undefined;
+    // Prefer the membership-selected conversation (after empty-alias repair) over a stale route
+    // alias target that would otherwise blank the timeline while directory coverage stays complete.
+    let canonicalConversationId = initialConversationId
+      ?? (routeAlias?.targetType === 'conversation'
+        ? routeAlias.canonicalConversationId
+        : undefined);
+    const projection = projectAgentConversations((
+      resolveConversationId && requestedConversationId
+        ? boundInteractions.map((record) => {
+          const remint = boundHopRemintConversationId(record.conversationId, record.hop);
+          if (!remint || record.conversationId === requestedConversationId) return record;
+          return { ...record, conversationId: remint };
+        })
+        : boundInteractions
+    ), inventory.items, {
+      ...filter,
+      // A selected Thread id is a lookup key, not a hop-fence. Binding stamps the durable id,
+      // then projection may derive a scoped/hop-fenced alias; filtering during grouping would
+      // drop every member and return an empty complete timeline.
+      ...(resolveConversationId ? { conversationId: undefined } : {}),
+    });
+    if (resolveConversationId) {
+      const membershipIdSet = new Set(exactMembershipIds ?? []);
+      const selected = projection.summaries.find((summary) =>
+        summary.conversationId === requestedConversationId
+        || summary.conversationId === initialConversationId)
+        ?? (membershipIdSet.size
+          ? projection.summaries.find((summary) =>
+            (projection.interactionsByConversation.get(summary.conversationId) ?? [])
+              .some((record) => membershipIdSet.has(record.interactionId)))
+          : undefined)
+        ?? (correlationSessionId
+          ? projection.summaries.find((summary) => summary.sessionId === correlationSessionId)
+          : undefined)
+        ?? (canonicalSessionRead
+          ? projection.summaries.find((summary) =>
+            projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
+              (record.canonicalSessionId ?? record.sessionId) === requestedConversationId))
+          : undefined);
+      canonicalConversationId = pointReadCanonicalConversationId({
+        requestedConversationId,
+        initialConversationId,
+        membershipCount: exactMembershipIds?.length ?? 0,
+        selectedConversationId: selected?.conversationId,
+        projectionHasRequested: Boolean(
+          requestedConversationId
+          && projection.interactionsByConversation.has(requestedConversationId),
+        ),
+      }) ?? canonicalConversationId;
+      if (canonicalSessionRead) {
+        projection.summaries = projection.summaries.filter((summary) =>
+          projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
+            (record.canonicalSessionId ?? record.sessionId) === requestedConversationId));
+        if (projection.summaries.length === 1) {
+          canonicalConversationId = projection.summaries[0].conversationId;
+        }
+      }
+    }
+    // Read APIs are pure projections. Durable Thread/Segment/Relation state is updated by the
+    // bounded post-ingest materializer; polling this page must never create PostgreSQL WAL churn.
+    return {
+      projection,
+      interactions,
+      inventory,
+      routeAlias,
+      requestedConversationId,
+      canonicalConversationId,
+    };
+  }
+
+  private async deriveHopFenceBoundConversationId(
+    requestedConversationId: string,
+  ): Promise<{ conversationId: string; interactionIds: string[]; truncated: boolean } | undefined> {
+    const remembered = this.conversationBindings?.routeAlias(requestedConversationId);
+    if (remembered?.targetType === 'conversation') {
+      const conversationId = remembered.canonicalConversationId ?? remembered.targetId;
+      if (!conversationId) return undefined;
+      return { conversationId, interactionIds: [], truncated: false };
+    }
+    const list = await this.readAgentInteractions({
+      timeType: 'last_7d',
+      scope: 'agent',
+      classificationView: 'current_effective',
+      limit: 2_000,
+    }, { totalLimit: 2_000 });
+    if (list.items.length === 0) return undefined;
+    const bound = this.conversationBindings
+      ? await this.conversationBindings.applyPersistedBindings(list.items)
+      : list.items;
+    const projected = projectAgentConversations(bound, [], {
+      timeType: 'last_7d',
+      scope: 'agent',
+      includeBackground: true,
+    });
+    const projectedRecords = projected.interactionsByConversation.get(requestedConversationId) ?? [];
+    if (projectedRecords.length > 0) {
+      return {
+        conversationId: requestedConversationId,
+        interactionIds: [...new Set(projectedRecords
+          .map((record) => record.interactionId)
+          .filter((value): value is string => Boolean(value)))].slice(0, 5_000),
+        truncated: projectedRecords.length > 5_000,
+      };
+    }
+    const matched = bound.filter((record) => {
+      const durable = record.conversationId?.trim();
+      if (!durable) return false;
+      if (durable === requestedConversationId) return true;
+      return boundHopRemintConversationId(durable, record.hop, record.agentIdHeader)
+        === requestedConversationId;
+    });
+    if (matched.length === 0) return undefined;
+    const durable = matched.find((record) =>
+      record.conversationId && record.conversationId !== requestedConversationId)
+      ?.conversationId?.trim() ?? requestedConversationId;
+    if (durable !== requestedConversationId) {
+      this.conversationBindings?.rememberHopFenceBoundAlias(requestedConversationId, durable);
+    }
+    const interactionIds = [...new Set(matched
+      .map((record) => record.interactionId)
+      .filter((value): value is string => Boolean(value)))].slice(0, 5_000);
+    return {
+      conversationId: durable,
+      interactionIds,
+      truncated: matched.length > interactionIds.length,
+    };
+  }
+
+  async agentConversations(filter: T.AgentConversationQuery): Promise<T.AgentConversationList> {
+    const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
+    const limit = Math.max(1, Math.min(200, filter.limit ?? 80));
+    const items = projection.summaries.slice(0, limit);
+    if (items.length) {
+      const pageRecords = items.flatMap((item) =>
+        projection.interactionsByConversation.get(item.conversationId) ?? []);
+      if (pageRecords.length) {
+        // Kernel search must stay hop/conversation-scoped. A page-wide load over last_1h
+        // truncates later Egress rows, so LLM aliases (run_python) cannot fold onto execute.
+        for (const item of items) {
+          const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
+          if (!records.length) continue;
+          const toolItems = await this.toolEvidenceItemsForInteractions(records);
+          item.coverageLayers = observabilityCoverageLayers(
+            records,
+            toolItems,
+            item.coverage,
+          );
+        }
+      }
+    }
+    // Canonical raw Session reads are established by durable semantic interactions plus
+    // SessionMembership. Inventory is an auxiliary identity directory and may be incomplete while
+    // the selected interaction/session rows are already durable; propagating that unrelated gap
+    // downgraded exact Session point-reads to hot_ring_only. Keep inventory coverage visible to
+    // inventory callers, but do not let it mask a complete raw conversation projection.
+    const inventoryRequired = filter.scope !== 'raw' || items.length === 0;
+    const partial = interactions.coverage.partial || (inventoryRequired && inventory.coverage.partial);
+    return {
+      items,
+      total: projection.summaries.length,
+      totalMode: projection.summaries.length > limit || interactions.totalMode === 'omitted'
+        ? 'omitted'
+        : 'exact',
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentConversationTimeline(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimeline> {
+    const {
+      projection,
+      interactions,
+      inventory,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
+    const conversation = projection.summaries.find((item) =>
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
+      : [];
+    const items = conversation?.hasContent
+      ? projectConversationTimeline(conversation, records)
+      : [];
+    const inventoryRequired = !conversation?.hasContent && !filter.conversationId;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
+    return {
+      conversation,
+      items,
+      interactionIds: records.map((item) => item.interactionId),
+      total: items.length,
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async agentConversationTimelineV2(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimelineV2> {
+    const {
+      projection,
+      interactions,
+      inventory,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
+    const thread = projection.summaries.find((item) =>
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
+      : [];
+    const segments = resolvedConversationId && this.conversationBindings
+      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
+      : [];
+    const turns = thread?.hasContent
+      ? projectSemanticConversationTimeline(thread, records, segments)
+      : [];
+    const inventoryRequired = !thread?.hasContent && !filter.conversationId;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
+    return {
+      thread,
+      segments,
+      turns,
+      interactionIds: records.map((item) => item.interactionId),
+      parserId: SEMANTIC_PROJECTION_PARSER_ID,
+      parserVersion: SEMANTIC_PROJECTION_PARSER_VERSION,
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
+      },
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  private async loadObservedKernelCandidates(input: {
+    startMs: number;
+    endMs: number;
+    sourceId?: string;
+    collectorId?: string;
+  }): Promise<{ items: T.AgentEventListItem[]; partial: boolean }> {
+    const kinds = [...OBSERVED_KERNEL_EVENT_KINDS];
+    const durableJudge = this.judge as unknown as {
+      searchStoredEventsPage?: (query: StoredEventQuery) => Promise<StoredEventSearchResult>;
+      queryRange?: (startMs: number, untilMs: number) => T.JudgedEvent[];
+    };
+    let durable: StoredEventSearchResult = {
+      events: [],
+      hasMore: false,
+      unavailable: typeof durableJudge.searchStoredEventsPage !== 'function',
+    };
+    if (typeof durableJudge.searchStoredEventsPage === 'function') {
+      durable = await durableJudge.searchStoredEventsPage({
+        sinceMs: input.startMs,
+        untilMs: input.endMs,
+        sourceId: input.sourceId,
+        collectorId: input.collectorId,
+        eventKinds: kinds,
+        monitoredOnly: false,
+        limit: 2_000,
+        candidateLimit: 8_000,
+      });
+    }
+    const hot = (durableJudge.queryRange?.(input.startMs, input.endMs) ?? [])
+      .filter((event) => kinds.includes(event.eventKind as typeof kinds[number]));
+    const folded = foldLatestEventRevisions([...durable.events, ...hot]);
+    return {
+      items: folded.map((event) => this.eventItem(event, 1, event.at, 'as_observed')),
+      partial: Boolean(durable.unavailable || durable.hasMore),
+    };
+  }
+
+  async toolEvidenceItemsForInteractions(
+    records: readonly T.AgentInteractionRecord[],
+  ): Promise<ToolEvidenceItem[]> {
+    const invocationIds = [...new Set(records
+      .flatMap((record) => [record.invocationId, record.runId, record.producerRunId])
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value)))];
+    const search = observedKernelSearchWindow(records);
+    if (invocationIds.length === 0 || !search) return [];
+    const kernel = await this.loadObservedKernelCandidates({
+      startMs: search.startMs,
+      endMs: search.endMs,
+    });
+    const revision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    const items = invocationIds.flatMap((invocationId) =>
+      projectObservedToolEvidence(
+        invocationId,
+        records,
+        kernel.items,
+        revision,
+        kernel.partial,
+      ).items);
+    return toolEvidenceForInteractions(items, records);
+  }
+
+  async agentConversationTimelineV3(
+    filter: T.AgentConversationQuery,
+  ): Promise<T.AgentConversationTimelineV3> {
+    const {
+      projection,
+      interactions,
+      inventory,
+      routeAlias,
+      requestedConversationId,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(filter);
+    const resolvedConversationId = canonicalConversationId ?? filter.conversationId;
+    const thread = projection.summaries.find((item) =>
+      item.conversationId === resolvedConversationId);
+    const records = resolvedConversationId
+      ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
+      : [];
+    const segments = resolvedConversationId && this.conversationBindings
+      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
+      : [];
+    const turns = thread?.hasContent
+      ? projectSemanticConversationTimeline(thread, records, segments)
+      : [];
+    const instanceIds = new Set(segments.map((segment) => segment.agentInstanceId));
+    const technicalActivitySummaries = this.conversationBindings
+      ? this.conversationBindings.listTechnicalActivities()
+        .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId))
+      : [];
+    const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    const requestKey = createHash('sha256').update([
+      resolvedConversationId ?? requestedConversationId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      filter.snapshotAsOf ?? '',
+      String(resolutionRevision),
+    ].join('\u0000')).digest('hex').slice(0, 32);
+    const inventoryRequired = !thread?.hasContent && !requestedConversationId;
+    const partial = interactions.coverage.partial
+      || (inventoryRequired && inventory.coverage.partial);
+    const toolItems = records.length
+      ? await this.toolEvidenceItemsForInteractions(records)
+      : [];
+    const coverageLayers = records.length
+      ? observabilityCoverageLayers(
+        records,
+        toolItems,
+        thread?.coverage ?? conversationCoverage(records),
+      )
+      : undefined;
+    if (coverageLayers && thread) thread.coverageLayers = coverageLayers;
+    return {
+      apiVersion: 3,
+      requestKey,
+      requestedConversationId: requestedConversationId ?? filter.conversationId ?? '',
+      ...(resolvedConversationId ? { canonicalConversationId: resolvedConversationId } : {}),
+      ...(requestedConversationId && resolvedConversationId
+        && requestedConversationId !== resolvedConversationId
+        ? { aliasFrom: requestedConversationId }
+        : {}),
+      resolutionRevision,
+      timelineVersion: 3,
+      thread,
+      segments,
+      turns,
+      interactionIds: records.map((item) => item.interactionId),
+      parserId: SEMANTIC_PROJECTION_PARSER_ID,
+      parserVersion: SEMANTIC_PROJECTION_PARSER_VERSION,
+      contextReplaySummaries: projectContextReplaySummaries(
+        resolvedConversationId
+          ? projection.sourceInteractionsByConversation.get(resolvedConversationId) ?? records
+          : records,
+        segments,
+      ),
+      technicalActivitySummaries,
+      ...(routeAlias?.targetType === 'technical_activity'
+        ? {
+            redirectTarget: {
+              type: 'technical_activity' as const,
+              id: routeAlias.technicalActivityId ?? routeAlias.targetId,
+            },
+          }
+        : routeAlias?.targetType === 'conversation'
+          ? {
+              redirectTarget: {
+                type: 'conversation' as const,
+                id: routeAlias.canonicalConversationId ?? routeAlias.targetId,
+              },
+            }
+          : {}),
+      coverage: {
+        ...interactions.coverage,
+        partial,
+        partialReason: interactions.coverage.partialReason
+          ?? (inventoryRequired ? inventory.coverage.partialReason : undefined),
+      },
+      ...(coverageLayers ? { coverageLayers } : {}),
+      dataSource: interactions.dataSource,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  agentConversationResolutionRevision(): number {
+    return this.conversationBindings?.currentResolutionRevision() ?? 0;
+  }
+
+  agentRunTechnicalActivities(agentInstanceId?: string): T.AgentRunTechnicalActivitySummary[] {
+    return this.conversationBindings?.listTechnicalActivities(agentInstanceId) ?? [];
+  }
+
+  async agentSemanticEvidence(
+    query: T.AgentSemanticEvidenceQuery,
+  ): Promise<T.AgentSemanticEvidenceResponse | undefined> {
+    const {
+      projection,
+      interactions,
+      canonicalConversationId,
+    } = await this.agentConversationProjection(query);
+    const conversationId = canonicalConversationId ?? query.conversationId;
+    const thread = projection.summaries.find((item) => item.conversationId === conversationId);
+    const records = projection.interactionsByConversation.get(conversationId) ?? [];
+    const segments = this.conversationBindings?.segmentsForConversation(conversationId) ?? [];
+    if (!thread?.hasContent || records.length === 0) return undefined;
+    const turns = projectSemanticConversationTimeline(thread, records, segments);
+    const events = turns.flatMap((turn) => turn.events);
+    const selected = events.find((event) => event.semanticEventId === query.semanticEventId);
+    if (!selected || selected.actor !== 'tool') return undefined;
+    const call = selected.kind === 'tool_result' && selected.toolCallId
+      ? events.find((event) => event.kind === 'tool_call'
+          && event.toolCallId === selected.toolCallId)
+      : selected;
+    if (!call || call.kind !== 'tool_call') return undefined;
+    const result = semanticResultForCall(call, events);
+    const interactionCandidates = call.sourceInteractionIds
+      .map((interactionId) => records.find((record) => record.interactionId === interactionId))
+      .filter((record): record is T.AgentInteractionRecord => Boolean(record));
+    // Prefer the wire/HTTP tool Interaction when present so kernel correlation uses the tool
+    // endpoint (Egress) instead of the model provider host.
+    const interaction = interactionCandidates.find((record) => record.interactionType === 'tool')
+      ?? interactionCandidates[0];
+    if (!interaction) return undefined;
+    // Read the append-only canonical side lane by its semantic evidence reference before relying
+    // on the legacy PostgreSQL relation projection.  This keeps a valid ToolCall→Kernel link
+    // navigable while the compatibility relation projector is delayed or temporarily empty.
+    const canonicalEvidenceRead = this.canonicalObservability
+      ? await this.canonicalObservability.readDurableEvidenceLinksByEvidenceRef(call.semanticEventId, 256)
+      : { items: [], source: 'memory_hot_ring' as const, degraded: false, reasons: [] };
+    const canonicalEvidenceLinks = canonicalEvidenceRead.items;
+    const persistedRelationRead = this.relationalStore?.configured()
+      ? await boundedRelationRead(
+          this.relationalStore.loadAgentSemanticKernelRelations(call.semanticEventId),
+          [],
+        )
+      : { value: [], failed: false };
+    const loadedPersistedRelations = persistedRelationRead.value;
+    const latestPersistedRevision = loadedPersistedRelations.reduce(
+      (latest, relation) => Math.max(latest, relation.resolutionRevision),
+      Number.NEGATIVE_INFINITY,
+    );
+    const persistedRelations = loadedPersistedRelations.filter((relation) =>
+      relation.resolutionRevision === latestPersistedRevision
+      && relation.relationVersion === AGENT_SEMANTIC_KERNEL_RELATION_VERSION);
+    const persistedLinked = persistedRelations.length > 0
+      && persistedRelations.every((relation) =>
+        Boolean(relation.kernelEventId)
+        && ['linked_exact', 'linked_strong'].includes(relation.status));
+    const persistedByLink = new Map(persistedRelations
+      .map((relation) => relation.evidenceLinkId ? [relation.evidenceLinkId, relation] as const : undefined)
+      .filter((entry): entry is readonly [string, T.AgentSemanticKernelRelation] => Boolean(entry)));
+    // A relation can be available from the compatibility projector before the append-only
+    // EvidenceLink side lane has caught up (or while its durable read is timing out).  Keep that
+    // relation navigable, but label the derived links as a hot delta and expose a partial reason;
+    // this is deliberately a read-only projection and must never write the canonical store.
+    const persistedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(persistedRelations)
+      : [];
+    const persistedEffectiveCanonicalLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : persistedCanonicalHotDeltaLinks;
+    const persistedEffectiveCanonicalSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceRead.source
+      : persistedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const persistedCanonicalHotDelta = persistedCanonicalHotDeltaLinks.length > 0;
+    const canonicalSupersedesPersisted = canonicalEvidenceLinks.some((link) => {
+      const previous = persistedByLink.get(link.linkId);
+      return previous !== undefined
+        && (link.resolutionRevision > (previous.resolutionRevision ?? previous.relationRevision ?? 0)
+          || !['confirmed', 'strong'].includes(link.status));
+    });
+    if (persistedLinked && !canonicalSupersedesPersisted) {
+      const linkedEventIds = [...new Set(persistedRelations
+        .map((relation) => relation.kernelEventId)
+        .filter((eventId): eventId is string => Boolean(eventId)))];
+      return {
+        schemaVersion: 'anysentry.agent_semantic_evidence.v1',
+        semanticEventId: selected.semanticEventId,
+        conversationId,
+        toolInvocationId: persistedRelations[0]?.toolInvocationId
+          ?? toolInvocationId(call, interaction),
+        interactionIds: [...new Set([
+          ...call.sourceInteractionIds,
+          ...(result?.sourceInteractionIds ?? []),
+        ])],
+        interactionEvidenceEventIds: [...new Set([
+          ...(interaction.evidenceEventIds ?? []),
+          ...call.evidenceEventIds,
+          ...(result?.evidenceEventIds ?? []),
+        ])],
+        relations: persistedRelations,
+        // The persisted relation already carries the immutable judgment snapshot and exact Event
+        // locator. Hydrating the complete Kernel row belongs to the explicit deep-link request;
+        // doing it here would turn every inspector open back into an Event-table query.
+        kernelEvents: [],
+        relationStatus: persistedRelations.some((relation) => relation.status === 'linked_exact')
+          ? 'linked_exact'
+          : 'linked_strong',
+        evidenceBundleEventIds: linkedEventIds,
+        ...(persistedEffectiveCanonicalLinks.length
+          ? { canonicalEvidenceLinks: persistedEffectiveCanonicalLinks }
+          : {}),
+        ...(persistedEffectiveCanonicalSource
+          ? { canonicalEvidenceLinksSource: persistedEffectiveCanonicalSource }
+          : {}),
+        ...(persistedEffectiveCanonicalLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
+          ? { canonicalEvidenceLinksCoverage: {
+              partial: persistedCanonicalHotDelta || canonicalEvidenceRead.degraded || persistedRelationRead.failed,
+              reasons: [...new Set([
+                ...canonicalEvidenceRead.reasons,
+                ...(persistedCanonicalHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
+                ...(persistedRelationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
+              ])],
+            } }
+          : {}),
+        coverage: canonicalEvidenceRead.degraded || persistedRelationRead.failed
+          ? { ...interactions.coverage, partial: true, partialReason: interactions.coverage.partialReason ?? 'storage_unavailable' }
+          : { ...interactions.coverage },
+        ...this.classificationResponseMeta(query),
+        updateTime: iso(),
+      };
+    }
+    const callAt = Number(BigInt(call.atUnixNs) / 1_000_000n);
+    const resultAt = result ? Number(BigInt(result.atUnixNs) / 1_000_000n) : undefined;
+    const relationInputs = events
+      .filter((event) => event.kind === 'tool_call')
+      .map((event) => {
+        const owner = event.sourceInteractionIds
+          .map((interactionId) => records.find((record) => record.interactionId === interactionId))
+          .filter((record): record is T.AgentInteractionRecord => Boolean(record))
+          .sort((left, right) =>
+            Number(right.interactionType === 'tool') - Number(left.interactionType === 'tool'))[0];
+        if (!owner) return undefined;
+        const eventResult = semanticResultForCall(event, events);
+        const eventAt = Number(BigInt(event.atUnixNs) / 1_000_000n);
+        const eventResultAt = eventResult
+          ? Number(BigInt(eventResult.atUnixNs) / 1_000_000n)
+          : eventAt + 30 * 60_000;
+        const selectedWindowStart = callAt - 2_000;
+        const selectedWindowEnd = (resultAt ?? (callAt + 30 * 60_000)) + 2_000;
+        if (eventAt > selectedWindowEnd || eventResultAt < selectedWindowStart) return undefined;
+        return { event, result: eventResult, interaction: owner };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .slice(0, 1_000);
+    const relationWindow = semanticKernelRelationBatchWindow(
+      relationInputs,
+      { event: call, result, interaction },
+    );
+    const relationEventCategory = interaction.interactionType === 'tool'
+      ? undefined
+      : semanticKernelEventCategory(call);
+    let kernel = await this.storedAgentEvents({
+      timeType: 'custom',
+      startTime: new Date(relationWindow.startMs).toISOString(),
+      endTime: new Date(relationWindow.endMs).toISOString(),
+      scope: 'agent',
+      classificationView: query.classificationView,
+      agentInstanceId: interaction.agentInstanceId,
+      ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
+      durable: true,
+      limit: 1_000,
+    });
+    const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
+    let relationBatch = buildSemanticKernelRelationBatch(
+      relationInputs,
+      kernel.items,
+      resolutionRevision,
+      kernel.coverage.partial,
+    );
+    let relations = relationBatch.relationsBySemanticEventId.get(call.semanticEventId)
+      ?? buildSemanticKernelRelations(
+        call,
+        result,
+        interaction,
+        kernel.items,
+        resolutionRevision,
+        kernel.coverage.partial,
+      );
+    if (!relations.some((relation) => relation.kernelEventId)) {
+      const ancestryKernel = await this.storedAgentEvents({
+        timeType: 'custom',
+        startTime: new Date(relationWindow.startMs).toISOString(),
+        endTime: new Date(relationWindow.endMs).toISOString(),
+        scope: 'agent',
+        classificationView: query.classificationView,
+        ...(relationEventCategory ? { eventCategory: relationEventCategory } : {}),
+        durable: true,
+        limit: 1_000,
+      });
+      const ancestryBatch = buildSemanticKernelRelationBatch(
+        relationInputs,
+        ancestryKernel.items,
+        resolutionRevision,
+        ancestryKernel.coverage.partial,
+      );
+      const ancestryRelations = ancestryBatch.relationsBySemanticEventId.get(call.semanticEventId)
+        ?? [];
+      if (ancestryRelations.some((relation) => relation.kernelEventId)) {
+        kernel = ancestryKernel;
+        relations = ancestryRelations;
+        relationBatch = ancestryBatch;
+      }
+    }
+    if (kernel.coverage.partial
+      && !relations.some((relation) => relation.kernelEventId)
+      && persistedRelations.some((relation) => relation.kernelEventId)) {
+      relations = persistedRelations;
+    }
+    // Prefer durable links.  If the canonical side lane is temporarily empty, derive a bounded
+    // hot-delta view from the already computed relations so the API remains bidirectionally
+    // navigable without pretending those links are durable yet.
+    const computedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(relations)
+      : [];
+    const effectiveCanonicalEvidenceLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : computedCanonicalHotDeltaLinks;
+    const effectiveCanonicalEvidenceSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceRead.source
+      : computedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const canonicalEvidenceHotDelta = computedCanonicalHotDeltaLinks.length > 0;
+    if (effectiveCanonicalEvidenceLinks.length > 0) {
+      const canonicalRelations = effectiveCanonicalEvidenceLinks.map((link) =>
+        relationFromCanonicalLink(link, call, interaction, kernel.items));
+      const byLink = new Map(relations
+        .map((relation, index) => relation.evidenceLinkId ? [relation.evidenceLinkId, index] as const : undefined)
+        .filter((entry): entry is readonly [string, number] => Boolean(entry)));
+      for (const canonicalRelation of canonicalRelations) {
+        const existingIndex = canonicalRelation.evidenceLinkId
+          ? byLink.get(canonicalRelation.evidenceLinkId)
+          : undefined;
+        if (existingIndex === undefined) {
+          byLink.set(canonicalRelation.evidenceLinkId ?? canonicalRelation.relationId, relations.length);
+          relations.push(canonicalRelation);
+          continue;
+        }
+        const existing = relations[existingIndex];
+        // Preserve rich legacy risk/kernel fields when present, but let the durable canonical
+        // link decide status/revision and retain its immutable source references.
+        relations[existingIndex] = {
+          ...canonicalRelation,
+          ...existing,
+          evidenceLinkId: canonicalRelation.evidenceLinkId,
+          resolutionRevision: canonicalRelation.resolutionRevision,
+          relationRevision: canonicalRelation.relationRevision,
+          sourceRefs: canonicalRelation.sourceRefs,
+          validFromUnixNs: canonicalRelation.validFromUnixNs,
+          status: canonicalRelation.status,
+          confidence: canonicalRelation.confidence,
+        };
+      }
+    }
+    const linkedEventIds = new Set(relations
+      .map((relation) => relation.kernelEventId)
+      .filter((eventId): eventId is string => Boolean(eventId)));
+    if (
+      expectedNoKernelTool([call.toolKind, call.toolName].filter(Boolean).join(' '), call.content)
+      && linkedEventIds.size === 0
+    ) {
+      relations = relations.map((relation) => relation.status === 'coverage_gap'
+        ? { ...relation, status: 'semantic_only' }
+        : relation);
+    }
+    const relationStatus = relations.some((relation) => relation.status === 'linked_exact')
+      ? 'linked_exact'
+      : relations.some((relation) => relation.status === 'linked_strong')
+        ? 'linked_strong'
+        : relations[0]?.status ?? 'semantic_only';
+    // Inventory decorates a materialized Thread with display metadata; it is not evidence of
+    // whether this selected Tool call, its result, or the linked Kernel fact is complete.
+    const partial = interactions.coverage.partial || kernel.coverage.partial || persistedRelationRead.failed;
+    return {
+      schemaVersion: 'anysentry.agent_semantic_evidence.v1',
+      semanticEventId: selected.semanticEventId,
+      conversationId,
+      toolInvocationId: toolInvocationId(call, interaction),
+      interactionIds: [...new Set([
+        ...call.sourceInteractionIds,
+        ...(result?.sourceInteractionIds ?? []),
+      ])],
+      interactionEvidenceEventIds: [...new Set([
+        ...(interaction.evidenceEventIds ?? []),
+        ...call.evidenceEventIds,
+        ...(result?.evidenceEventIds ?? []),
+      ])],
+      relations,
+      kernelEvents: kernel.items.filter((event) => linkedEventIds.has(event.eventId)),
+      relationStatus,
+      evidenceBundleEventIds: [...linkedEventIds],
+      ...(effectiveCanonicalEvidenceLinks.length
+        ? { canonicalEvidenceLinks: effectiveCanonicalEvidenceLinks }
+        : {}),
+      ...(effectiveCanonicalEvidenceSource
+        ? { canonicalEvidenceLinksSource: effectiveCanonicalEvidenceSource }
+        : {}),
+      ...(effectiveCanonicalEvidenceLinks.length || canonicalEvidenceRead.degraded || persistedRelationRead.failed
+        ? { canonicalEvidenceLinksCoverage: {
+            partial: canonicalEvidenceHotDelta || canonicalEvidenceRead.degraded || persistedRelationRead.failed,
+            reasons: [...new Set([
+              ...canonicalEvidenceRead.reasons,
+              ...(canonicalEvidenceHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
+              ...(persistedRelationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
+            ])],
+          } }
+        : {}),
+      coverage: {
+        ...kernel.coverage,
+        partial: partial || canonicalEvidenceRead.degraded || canonicalEvidenceHotDelta,
+        partialReason: kernel.coverage.partialReason
+          ?? interactions.coverage.partialReason
+          ?? (canonicalEvidenceHotDelta
+            ? 'canonical_evidence_link_hot_delta_pending'
+            : canonicalEvidenceRead.degraded || persistedRelationRead.failed ? 'storage_unavailable' : undefined),
+      },
+      ...this.classificationResponseMeta(query),
+      updateTime: iso(),
+    };
+  }
+
+  async agentKernelSemanticContext(
+    eventId: string,
+    relatedEventIds: readonly string[] = [],
+  ): Promise<T.AgentKernelSemanticContextResponse> {
+    const lookupIds = [...new Set([eventId, ...relatedEventIds]
+      .map((value) => value.trim())
+      .filter(Boolean))].slice(0, 4);
+    const relationRead = this.relationalStore?.configured()
+      ? await boundedRelationRead(
+          Promise.all(lookupIds.map((id) =>
+            this.relationalStore!.loadAgentSemanticRelationsForKernelEvent(id))).then((rows) => rows.flat()),
+          [],
+        )
+      : { value: [], failed: false };
+    const relations = relationRead.value;
+    const canonicalEvidenceReads = this.canonicalObservability
+      ? await Promise.all(lookupIds.map((id) =>
+          this.canonicalObservability!.readDurableEvidenceLinksForTargetId(id, 256)))
+      : [];
+    const canonicalEvidenceLinks = canonicalEvidenceReads
+      .flatMap((read) => read.items)
+      .filter((link, index, all) => all.findIndex((candidate) =>
+        candidate.linkId === link.linkId && candidate.resolutionRevision === link.resolutionRevision) === index);
+    const canonicalEvidenceReadDegraded = canonicalEvidenceReads.some((read) => read.degraded);
+    const canonicalEvidenceReadReasons = [...new Set(canonicalEvidenceReads.flatMap((read) => read.reasons))];
+    // If the reverse durable lookup races the relation projector, expose the already persisted
+    // compatibility relations as a bounded hot delta.  This preserves the bidirectional deep
+    // link while making the non-durable state explicit; it never mutates either store.
+    const computedCanonicalHotDeltaLinks = canonicalEvidenceLinks.length === 0
+      ? canonicalEvidenceLinksForRelations(relations)
+      : [];
+    const effectiveCanonicalEvidenceLinks = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceLinks
+      : computedCanonicalHotDeltaLinks;
+    const effectiveCanonicalEvidenceSource = canonicalEvidenceLinks.length > 0
+      ? canonicalEvidenceReads.some((read) => read.source === 'canonical_store+hot_delta')
+        ? 'canonical_store+hot_delta' as const
+        : canonicalEvidenceReads.some((read) => read.source === 'canonical_store')
+          ? 'canonical_store' as const : 'memory_hot_ring' as const
+      : computedCanonicalHotDeltaLinks.length > 0
+        ? 'canonical_store+hot_delta' as const
+        : undefined;
+    const canonicalEvidenceHotDelta = computedCanonicalHotDeltaLinks.length > 0;
+    return {
+      schemaVersion: 'anysentry.agent_kernel_semantic_context.v1',
+      eventId,
+      relations,
+      conversationLinks: [...new Map(relations.map((relation) => [
+        [relation.conversationId, relation.turnId, relation.stableSemanticEventId].join('\u0000'),
+        {
+          conversationId: relation.conversationId,
+          turnId: relation.turnId,
+          semanticEventId: relation.stableSemanticEventId,
+        },
+      ])).values()],
+      ...(effectiveCanonicalEvidenceLinks.length
+        ? { canonicalEvidenceLinks: effectiveCanonicalEvidenceLinks }
+        : {}),
+      ...(effectiveCanonicalEvidenceSource
+        ? { canonicalEvidenceLinksSource: effectiveCanonicalEvidenceSource }
+        : {}),
+      ...(effectiveCanonicalEvidenceLinks.length || canonicalEvidenceReadDegraded || relationRead.failed
+        ? { canonicalEvidenceLinksCoverage: {
+            partial: canonicalEvidenceHotDelta || canonicalEvidenceReadDegraded || relationRead.failed,
+            reasons: [...new Set([
+              ...canonicalEvidenceReadReasons,
+              ...(canonicalEvidenceHotDelta ? ['canonical_evidence_link_hot_delta_pending'] : []),
+              ...(relationRead.failed ? ['semantic_relation_projection_unavailable'] : []),
+            ])],
+          } }
+        : {}),
+      updateTime: iso(),
+    };
+  }
+
+  /**
+   * Build the product-neutral Agent behavior feed. Semantic ToolCall rows are collapsed here;
+   * potentially expensive Kernel Evidence linking remains an on-demand action-detail query.
+   */
+  async storedAgentActions(filter: T.AgentEventQuery): Promise<T.AgentActionList> {
+    const limit = Math.max(1, Math.min(100, filter.limit ?? 80));
+    const semantic = await this.storedAgentEvents({
+      ...filter,
+      eventId: undefined,
+      eventKind: 'AgentTool',
+      eventCategory: 'tool',
+      activityContext: undefined,
+      scope: 'agent',
+      durable: true,
+      limit: Math.min(200, Math.max(limit * 4, 80)),
+    });
+    type ActionGroup = {
+      items: T.AgentEventListItem[];
+      start?: T.AgentEventListItem;
+      end?: T.AgentEventListItem;
+    };
+    const groups = new Map<string, ActionGroup>();
+    for (const item of semantic.items) {
+      if (!item.invocationId || !item.toolCallId) continue;
+      const key = [item.sourceId ?? '', item.agentAssetId, item.invocationId, item.toolCallId].join('\0');
+      const group = groups.get(key) ?? { items: [] };
+      group.items.push(item);
+      const phase = String(item.attributes['anysentry.lifecycle.phase'] ?? '').toLowerCase();
+      if (phase === 'start' && (!group.start || Date.parse(item.at) < Date.parse(group.start.at))) group.start = item;
+      if (phase === 'end' && (!group.end || Date.parse(item.at) > Date.parse(group.end.at))) group.end = item;
+      groups.set(key, group);
+    }
+    const actions = [...groups.values()].map((group): T.AgentActionItem => {
+      const ordered = [...group.items].sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+      const representative = group.end ?? group.start ?? ordered.at(-1)!;
+      const startedAt = group.start?.at ?? ordered[0].at;
+      const endedAt = group.end?.at;
+      const error = group.end?.attributes['anysentry.tool.is_error'] === true
+        || group.end?.attributes['anysentry.tool.is_error'] === 'true'
+        || group.end?.attributes['anysentry.tool.is_error'] === 1
+        || Boolean(group.end?.attributes['error.type']);
+      const toolName = String(
+        representative.attributes['gen_ai.tool.name']
+        ?? representative.attributes['anysentry.tool.name']
+        ?? representative.subject.replace(/^.*?tool\s+/iu, '').split(/\s+/u)[0]
+        ?? 'tool',
+      ).slice(0, 160);
+      const targetSummary = ordered
+        .flatMap((item) => [
+          item.attributes['anysentry.tool.resource_path'],
+          item.attributes['anysentry.tool.command'],
+          item.attributes['anysentry.tool.command_executable'],
+        ])
+        .find((value) => typeof value === 'string' && value.trim());
+      const duration = endedAt ? Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)) : undefined;
+      return {
+        actionId: `act_${createHash('sha256')
+          .update([
+            representative.sourceId ?? '',
+            representative.agentRuntimeInstanceId ?? representative.agentAssetId,
+            representative.invocationId,
+            representative.toolCallId,
+          ].join('\0'))
+          .digest('hex').slice(0, 24)}`,
+        origin: 'semantic',
+        status: endedAt ? (error ? 'failed' : 'succeeded') : 'running',
+        agentAssetId: representative.agentAssetId,
+        agentAssetAliases: representative.agentAssetAliases,
+        sourceId: representative.sourceId,
+        agentProduct: representative.agentProduct,
+        agentRuntimeInstanceId: representative.agentRuntimeInstanceId,
+        invocationId: representative.invocationId,
+        toolCallId: representative.toolCallId,
+        toolName,
+        operation: 'execute_tool',
+        targetSummary: typeof targetSummary === 'string' ? targetSummary.slice(0, 500) : undefined,
+        startedAt,
+        endedAt,
+        durationMs: duration,
+        semanticEventIds: ordered.map((item) => item.eventId),
+        evidenceState: 'available_on_demand',
+        evidenceHref: `/security-center/events/tool-evidence`,
+      };
+    }).sort((left, right) => Date.parse(right.endedAt ?? right.startedAt) - Date.parse(left.endedAt ?? left.startedAt));
+
+    if (actions.length > 0) {
+      return {
+        items: actions.slice(0, limit),
+        total: actions.length,
+        totalMode: semantic.total <= semantic.items.length ? semantic.totalMode : 'omitted',
+        coverage: semantic.coverage,
+        ...this.classificationResponseMeta(filter),
+        updateTime: iso(),
+      };
+    }
+
+    const fallback = await this.storedAgentEvents({
+      ...filter,
+      eventId: undefined,
+      eventKind: undefined,
+      eventCategory: undefined,
+      activityContext: undefined,
+      scope: 'agent',
+      durable: true,
+      limit: Math.min(500, Math.max(limit * 4, 80)),
+    });
+    const requestedInstance = filter.agentInstanceId?.trim();
+    type RankedAction = T.AgentActionItem & { _priority: number };
+    const fallbackItems = fallback.items.flatMap((item): RankedAction[] => {
+      if (requestedInstance) {
+        const runtimeIds = [
+          item.agentRuntimeInstanceId,
+          ...(item.agentRuntimeInstanceAliases ?? []),
+        ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+        if (runtimeIds.length > 0
+          && !runtimeIds.some((value) => agentRuntimeInstanceIdsEquivalent(value, requestedInstance))) {
+          return [];
+        }
+        // When the list item carries no runtime id, refuse to treat it as matching an explicit
+        // instance selection—otherwise asset-scoped noise floods every host/docker Agent alike.
+        if (runtimeIds.length === 0) return [];
+      }
+      const accessMode = String(item.attributes.accessMode ?? 'unknown');
+      const path = typeof item.attributes.path === 'string' ? item.attributes.path : undefined;
+      const operation: T.AgentActionItem['operation'] | undefined = item.eventKind === 'ToolExec'
+        ? 'kernel_exec'
+        : item.eventKind === 'FileDelete'
+          ? 'file_delete'
+          : item.eventKind === 'FileAccess'
+            ? accessMode === 'read_only'
+              ? 'file_read'
+              : accessMode === 'write_only' || accessMode === 'read_write' || item.attributes.write === true
+                ? 'file_write'
+                : 'file_access'
+            : ['Egress', 'Dns', 'Tls'].includes(item.eventKind)
+              ? 'network_connect'
+              : undefined;
+      if (!operation) return [];
+      if (isLowValueKernelInferredAction(operation, item)) return [];
+      const toolName = operation === 'kernel_exec'
+        ? String(item.process?.comm ?? item.subject.split(/\s+/u)[0] ?? 'command')
+        : operation === 'file_read'
+          ? 'read file'
+          : operation === 'file_write'
+            ? 'write file'
+            : operation === 'file_access'
+              ? 'file access'
+            : operation === 'file_delete'
+              ? 'delete file'
+              : 'network access';
+      const targetSummary = operation === 'kernel_exec'
+        ? kernelExecTargetSummary(item)
+        : (path ?? item.subject);
+      return [{
+        actionId: `act_${createHash('sha256').update(`kernel\0${item.eventId}`).digest('hex').slice(0, 24)}`,
+        origin: 'kernel_inferred',
+        status: 'incomplete',
+        agentAssetId: item.agentAssetId,
+        agentAssetAliases: item.agentAssetAliases,
+        sourceId: item.sourceId,
+        agentProduct: item.agentProduct,
+        agentRuntimeInstanceId: item.agentRuntimeInstanceId,
+        toolName: toolName.slice(0, 160),
+        operation,
+        targetSummary: typeof targetSummary === 'string' ? targetSummary.slice(0, 500) : undefined,
+        startedAt: item.at,
+        semanticEventIds: [],
+        fallbackEventId: item.eventId,
+        evidenceState: 'runtime_level',
+        _priority: kernelInferredActionPriority(operation, item),
+      }];
+    })
+      .sort((left, right) =>
+        left._priority - right._priority
+        || Date.parse(right.startedAt) - Date.parse(left.startedAt))
+      .slice(0, limit)
+      .map(({ _priority: _ignored, ...action }) => action);
+    return {
+      items: fallbackItems,
+      total: fallbackItems.length,
+      totalMode: fallback.total <= fallback.items.length && fallbackItems.length === fallback.items.length
+        ? fallback.totalMode
+        : 'omitted',
+      coverage: fallback.coverage,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  /**
+   * Build the S6 semantic ToolCall ↔ kernel evidence view without changing legacy Trace grouping.
+   * Durable lookup is bounded first by an authenticated Invocation and then by exact process
+   * tuples. The linker itself still requires resource/command equality and refuses overlapping
+   * claims, so time proximity alone can never create a ToolCall edge.
+   */
+  async agentToolEvidence(filter: T.AgentEventQuery): Promise<ToolEvidenceResponse> {
+    const invocationId = filter.invocationId?.trim() ?? '';
+    const toolCallId = filter.toolCallId?.trim() || undefined;
+    const correlationEnabled = correlationCaptureRollout().trustedCorrelation !== 'off';
+    const empty = buildToolEvidenceBundle([]);
+    const window = resolveTimeWindow(filter);
+    const observedEvidence = async (): Promise<ToolEvidenceResponse | undefined> => {
+      const interactions = await this.agentInteractions({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        snapshotAsOf: filter.snapshotAsOf,
+        invocationId,
+        runId: invocationId,
+        limit: 200,
+      });
+      if (interactions.items.length === 0) return undefined;
+      const search = observedKernelSearchWindow(interactions.items);
+      const evidenceStart = Math.max(window.startMs, search?.startMs ?? window.startMs);
+      const evidenceEnd = Math.min(window.endMs, search?.endMs ?? window.endMs);
+      const kernel = await this.loadObservedKernelCandidates({
+        startMs: evidenceStart,
+        endMs: evidenceEnd,
+        sourceId: filter.sourceId,
+        collectorId: filter.collectorId,
+      });
+      const projected = projectObservedToolEvidence(
+        invocationId,
+        interactions.items,
+        kernel.items,
+        this.conversationBindings?.currentResolutionRevision() ?? 0,
+        kernel.partial || interactions.coverage.partial,
+        toolCallId,
+      );
+      if (projected.items.length === 0) return undefined;
+      return {
+        schemaVersion: 'anysentry.tool_evidence.v1',
+        items: projected.items,
+        ignoredUntrustedAdapterEvents: 0,
+        truncated: Boolean(kernel.partial || interactions.coverage.partial),
+        invocationId,
+        ...(toolCallId ? { toolCallId } : {}),
+        dataSource: interactions.dataSource === 'hot_ring'
+          ? 'memory_hot_ring'
+          : 'clickhouse+hot_delta',
+        partial: Boolean(kernel.partial || interactions.coverage.partial),
+        ...(kernel.partial || interactions.coverage.partial
+          ? { partialReasons: ['scan_limit'] as ToolEvidenceResponse['partialReasons'] }
+          : {}),
+        coverageLayers: observabilityCoverageLayers(
+          interactions.items,
+          projected.items,
+          conversationCoverage(interactions.items),
+        ),
+        updateTime: iso(),
+      };
+    };
+    const coverageLayersFor = async (items: ToolEvidenceResponse['items']) => {
+      const interactions = await this.agentInteractions({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        snapshotAsOf: filter.snapshotAsOf,
+        invocationId,
+        runId: invocationId,
+        limit: 200,
+      });
+      return observabilityCoverageLayers(
+        interactions.items,
+        items,
+        conversationCoverage(interactions.items),
+      );
+    };
+    if (!correlationEnabled) {
+      const observed = await observedEvidence();
+      if (observed) return observed;
+      return {
+        ...empty,
+        invocationId,
+        ...(toolCallId ? { toolCallId } : {}),
+        dataSource: 'memory_hot_ring',
+        partial: true,
+        partialReasons: ['trusted_correlation_off'],
+        updateTime: iso(),
+      };
+    }
+    const storageReady = this.judge.storageStatus().clickhouseReady;
+    const partialReasons = new Set<NonNullable<ToolEvidenceResponse['partialReasons']>[number]>();
+    const durableEvents: T.JudgedEvent[] = [];
+    const semanticLimit = Math.max(100, Math.min(2_000, filter.limit ?? 1_000));
+
+    if (storageReady) {
+      const storedRelation = await this.judge.readStoredToolEvidenceRelations(
+        invocationId,
+        toolCallId,
+        {
+          workspacePath: filter.workspacePath?.trim(),
+          sourceId: filter.sourceId?.trim(),
+          agentInstanceId: filter.agentInstanceId?.trim(),
+        },
+      );
+      const relationItems = storedRelation?.items.filter((item) =>
+        (!toolCallId || item.toolCallId === toolCallId) &&
+        (item.startedAt ?? item.endedAt ?? window.startMs) >= window.startMs &&
+        (item.endedAt ?? item.startedAt ?? window.endMs) <= window.endMs,
+      ) ?? [];
+      if (
+        relationItems.length > 0 &&
+        relationItems.every((item) =>
+          item.endedAt !== undefined && now() - item.endedAt >= TOOL_EVIDENCE_RELATION_SETTLE_MS,
+        )
+      ) {
+        return {
+          schemaVersion: 'anysentry.tool_evidence.v1',
+          items: relationItems,
+          ignoredUntrustedAdapterEvents: 0,
+          truncated: false,
+          invocationId,
+          ...(toolCallId ? { toolCallId } : {}),
+          dataSource: 'clickhouse_relation',
+          partial: false,
+          coverageLayers: await coverageLayersFor(relationItems),
+          updateTime: iso(),
+        };
+      }
+    }
+
+    if (storageReady) {
+      const semanticPage = await this.judge.searchStoredEventsPage({
+        sinceMs: window.startMs,
+        untilMs: window.endMs,
+        sourceId: filter.sourceId,
+        collectorId: filter.collectorId,
+        agentId: filter.agentAssetId ? undefined : filter.agentId,
+        sessionId: filter.sessionId,
+        workspacePath: filter.agentAssetId ? undefined : filter.workspacePath,
+        invocationId,
+        toolCallId,
+        eventKind: 'AgentTool',
+        limit: semanticLimit,
+      });
+      durableEvents.push(...semanticPage.events);
+      if (semanticPage.unavailable) partialReasons.add('storage_unavailable');
+      if (semanticPage.hasMore) partialReasons.add('scan_limit');
+    } else {
+      partialReasons.add('storage_unavailable');
+    }
+
+    const hotEvents = this.judge.queryRange(window.startMs, window.endMs);
+    const semanticEvents = foldLatestEventRevisions([...durableEvents, ...hotEvents]).filter((event) => {
+      if (event.eventKind !== 'AgentTool') return false;
+      const correlation = parseTrustedCorrelation(event.attribution?.correlation);
+      return correlation?.method === 'agent_adapter' &&
+        correlation.authority === 'authenticated_agent_adapter' &&
+        correlation.invocationId === invocationId &&
+        (!toolCallId || correlation.toolCallId === toolCallId);
+    });
+
+    const processScopes = new Map<string, NonNullable<T.JudgedEvent['process']>>();
+    for (const event of semanticEvents) {
+      const process = event.process;
+      const start = process?.startTimeTicks
+        ? `ticks:${process.startTimeTicks}`
+        : process?.startTimeNs
+          ? `ns:${process.startTimeNs}`
+          : undefined;
+      const hostStrong = Boolean(process?.hostId && process.pid);
+      const namespaceStrong = Boolean(process?.pidNamespace && process.namespacePid);
+      if (!process?.bootId || !start || (!hostStrong && !namespaceStrong)) continue;
+      const key = namespaceStrong
+        ? ['ns', process.bootId, process.pidNamespace, process.namespacePid, start].join('\0')
+        : ['host', process.hostId, process.bootId, process.pid, start].join('\0');
+      if (!processScopes.has(key)) processScopes.set(key, process);
+    }
+
+    const selectedScopes = [...processScopes.values()].slice(0, 8);
+    if (processScopes.size > selectedScopes.length) partialReasons.add('process_scope_limit');
+    const resourceHashes = [...new Set(semanticEvents
+      .map((event) => toolEvidenceIndexFields(event).resourceHash)
+      .filter((value): value is string => Boolean(value)))];
+    const commandHashes = [...new Set(semanticEvents
+      .map((event) => toolEvidenceIndexFields(event).commandHash)
+      .filter((value): value is string => Boolean(value)))];
+    const semanticStart = semanticEvents.length
+      ? Math.min(...semanticEvents.map((event) => event.at))
+      : window.startMs;
+    const semanticEnd = semanticEvents.length
+      ? Math.max(...semanticEvents.map((event) => event.at))
+      : window.endMs;
+    const evidenceStart = Math.max(window.startMs, semanticStart - 2_000);
+    const evidenceEnd = Math.min(window.endMs, semanticEnd + 30 * 60_000 + 2_000);
+    const hotKernelEvents = hotEvents.filter((event) =>
+      event.at >= evidenceStart && event.at <= evidenceEnd &&
+      toolKernelEventInProcessScope(event, selectedScopes));
+
+    if (storageReady && semanticEvents.length) {
+      for (const process of selectedScopes) {
+        const namespaceStrong = Boolean(process.pidNamespace && process.namespacePid);
+        const common = {
+          sinceMs: evidenceStart,
+          untilMs: evidenceEnd,
+          processBootId: process.bootId,
+          ...(namespaceStrong
+            ? { processPidNamespace: process.pidNamespace }
+            : { processHostId: process.hostId }),
+          limit: 5_000,
+        };
+        if (resourceHashes.length > 0) {
+          const exactProcessPage = await this.judge.searchStoredEventsPage({
+            ...common,
+            ...(namespaceStrong
+              ? { processNamespacePid: process.namespacePid }
+              : { processPid: process.pid }),
+            ...(process.startTimeTicks ? { processStartTimeTicks: process.startTimeTicks } : {}),
+            ...(process.startTimeNs ? { processStartTimeNs: process.startTimeNs } : {}),
+            evidenceResourceHashes: resourceHashes,
+          });
+          durableEvents.push(...exactProcessPage.events);
+          if (exactProcessPage.unavailable) partialReasons.add('storage_unavailable');
+          if (exactProcessPage.hasMore) partialReasons.add('scan_limit');
+        }
+
+        // Pi's bash tool spawns a direct shell child. Parent PID + exact command hash is the
+        // additional non-temporal evidence; descendants without that equality remain unlinked.
+        if (commandHashes.length > 0) {
+          const directChildPage = await this.judge.searchStoredEventsPage({
+            ...common,
+            ...(namespaceStrong
+              ? { processNamespacePpid: process.namespacePid }
+              : { processPpid: process.pid }),
+            eventKind: 'ToolExec',
+            evidenceCommandHashes: commandHashes,
+          });
+          durableEvents.push(...directChildPage.events);
+          if (directChildPage.unavailable) partialReasons.add('storage_unavailable');
+          if (directChildPage.hasMore) partialReasons.add('scan_limit');
+        }
+      }
+    }
+
+    const evidenceEvents = foldLatestEventRevisions([
+      ...durableEvents,
+      ...semanticEvents,
+      ...hotKernelEvents,
+    ]);
+    const bundle = buildToolEvidenceBundle(evidenceEvents);
+    const items = toolCallId
+      ? bundle.items.filter((item) => item.invocationId === invocationId && item.toolCallId === toolCallId)
+      : bundle.items.filter((item) => item.invocationId === invocationId);
+    if (items.length === 0) {
+      const observed = await observedEvidence();
+      if (observed) return observed;
+    }
+    // Query paths are read-only. Relation materialization is owned by the bounded ingest projector
+    // (`scheduleSemanticRelationProjection`) so opening an Inspector or polling this endpoint can
+    // never create a new fact/revision or generate unbounded write amplification.
+    return {
+      ...bundle,
+      items,
+      invocationId,
+      ...(toolCallId ? { toolCallId } : {}),
+      dataSource: storageReady ? 'clickhouse+hot_delta' : 'memory_hot_ring',
+      partial: bundle.truncated || partialReasons.size > 0,
+      ...(partialReasons.size ? { partialReasons: [...partialReasons] } : {}),
+      coverageLayers: await coverageLayersFor(items),
       updateTime: iso(),
     };
   }
@@ -570,7 +4934,21 @@ export class AggregationService {
       traceId: filter.traceId ?? pinned?.traceId ?? head?.traceId ?? '',
       runId: filter.runId ?? head?.runId,
       sessionId: filter.sessionId ?? head?.sessionId,
-      items: filtered.map((e) => this.eventItem(e)),
+      items: filtered.map((event) => this.eventItem(
+        event,
+        1,
+        event.at,
+        resolvedClassificationView(filter),
+      )),
+      total: filtered.length,
+      hasMore: false,
+      coverage: this.queryCoverage(filter, filtered, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
@@ -609,6 +4987,7 @@ export class AggregationService {
     const filtered = all
       .filter((i) => {
         const matchesIncidentId = Boolean(pinnedIncidentId && i.incidentId === pinnedIncidentId);
+        if (filter.scope === 'agent' && !matchesIncidentId && i.monitored !== true) return false;
         const matchesFilter =
           i.updatedAt >= sinceMs &&
           (!filter.status || filter.status === 'all' || i.status === filter.status) &&
@@ -642,7 +5021,332 @@ export class AggregationService {
   }
 
   agentInventory(filter: T.AgentInventoryQuery): T.AgentInventory {
-    const { events } = this.win(filter);
+    const window = this.win(filter);
+    const events = filter.scope === 'agent'
+      ? window.events.filter((event) => event.attribution?.monitored === true)
+      : window.events;
+    return this.agentInventoryFromEvents(filter, events);
+  }
+
+  private agentFactForEvent(event: T.JudgedEvent): StoredAgentWindowFact {
+    const risky = event.verdict !== 'allow';
+    const instanceKey = agentRuntimeInstanceIdForEvent(event);
+    const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [
+      category,
+      event.eventCategory === category ? 1 : 0,
+    ]));
+    const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [
+      source,
+      event.source === source ? 1 : 0,
+    ]));
+    return {
+      identityKey: event.eventId,
+      representativeEvent: event,
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: risky ? 1 : 0,
+      sessionCount: 1,
+      runCount: 1,
+      traceCount: 1,
+      sessionKeys: [event.sessionId],
+      runKeys: [event.runId],
+      traceKeys: [event.traceId],
+      collectorKeys: eventCollectorId(event) ? [eventCollectorId(event)] : [],
+      eventsWithoutCollector: missingCollectorCoverage(event) ? 1 : 0,
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      instanceCount: 1,
+      instanceKeys: [instanceKey],
+      worstSeverityRank: risky ? SEV_RANK[event.severity] : 0,
+      topRiskAt: risky ? event.at : undefined,
+      topRiskCategory: risky ? event.riskCategory : undefined,
+      topRiskName: risky ? event.riskName : undefined,
+      eventCategoryCounts: categoryCounts,
+      sourceCounts,
+      hasPhysicalIdentity: Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid,
+      ),
+      hasRootIdentity: Boolean(event.attribution?.rootStartTime) && hasDirectAgentRootEvidence(event),
+      hasInternalHelperRoot: isInternalAgentHelperRootEvent(event),
+    };
+  }
+
+  private mergeAgentFacts(a: StoredAgentWindowFact, b: StoredAgentWindowFact): StoredAgentWindowFact {
+    const newest = a.lastSeenAt >= b.lastSeenAt ? a : b;
+    const latestRisk = (b.topRiskAt ?? 0) >= (a.topRiskAt ?? 0) ? b : a;
+    const sessionKeys = [...new Set([...a.sessionKeys, ...b.sessionKeys])];
+    const runKeys = [...new Set([...a.runKeys, ...b.runKeys])];
+    const traceKeys = [...new Set([...a.traceKeys, ...b.traceKeys])];
+    const collectorKeys = [...new Set([...a.collectorKeys, ...b.collectorKeys])];
+    const instanceKeys = [...new Set([...a.instanceKeys, ...b.instanceKeys])];
+    const eventCategoryCounts: Record<string, number> = {};
+    for (const category of EVENT_CATEGORIES) {
+      eventCategoryCounts[category] =
+        (a.eventCategoryCounts[category] ?? 0) +
+        (b.eventCategoryCounts[category] ?? 0);
+    }
+    const sourceCounts: Record<string, number> = {};
+    for (const source of EVENT_SOURCES) {
+      sourceCounts[source] =
+        (a.sourceCounts[source] ?? 0) +
+        (b.sourceCounts[source] ?? 0);
+    }
+    return {
+      identityKey: newest.identityKey,
+      representativeEvent: newest.representativeEvent,
+      firstSeenAt: Math.min(a.firstSeenAt, b.firstSeenAt),
+      lastSeenAt: Math.max(a.lastSeenAt, b.lastSeenAt),
+      eventCount: a.eventCount + b.eventCount,
+      riskyEventCount: a.riskyEventCount + b.riskyEventCount,
+      sessionCount: sessionKeys.length,
+      runCount: runKeys.length,
+      traceCount: traceKeys.length,
+      sessionKeys,
+      runKeys,
+      traceKeys,
+      collectorKeys,
+      eventsWithoutCollector: a.eventsWithoutCollector + b.eventsWithoutCollector,
+      tokenCount: a.tokenCount + b.tokenCount,
+      latencyTotal: a.latencyTotal + b.latencyTotal,
+      instanceCount: instanceKeys.length,
+      instanceKeys,
+      worstSeverityRank: Math.max(a.worstSeverityRank, b.worstSeverityRank),
+      topRiskAt: latestRisk.topRiskAt,
+      topRiskCategory: latestRisk.topRiskCategory,
+      topRiskName: latestRisk.topRiskName,
+      eventCategoryCounts,
+      sourceCounts,
+      hasPhysicalIdentity: a.hasPhysicalIdentity || b.hasPhysicalIdentity,
+      hasRootIdentity: a.hasRootIdentity || b.hasRootIdentity,
+      hasInternalHelperRoot: a.hasInternalHelperRoot || b.hasInternalHelperRoot,
+    };
+  }
+
+  async storedAgentInventory(filter: T.AgentInventoryQuery): Promise<T.AgentInventory> {
+    const window = resolveTimeWindow(filter);
+    const key = JSON.stringify([
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_1h'],
+      filter.scope ?? 'all',
+      filter.healthState ?? 'all',
+      filter.criticality ?? 'all',
+      filter.owner ?? '',
+      filter.environment ?? '',
+      filter.tag ?? '',
+      filter.q ?? '',
+      filter.agentId ?? '',
+      filter.agentAssetId ?? '',
+      filter.agentInstanceId ?? '',
+      filter.workspacePath ?? '',
+      filter.userId ?? '',
+      filter.includeUnclassified === true,
+      filter.limit ?? 120,
+    ]);
+    const current = this.agentInventoryInFlight.get(key);
+    if (current) return current;
+    const reservation = this.reserveInFlight(
+      this.agentInventoryInFlight,
+      key,
+      this.agentInventoryInFlightBytes,
+      MAX_AGENT_INVENTORY_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.agentInventoryInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent inventory query is busy; retry the latest selection');
+    }
+    const baseRequest = this.computeStoredAgentInventory(filter);
+    let request: Promise<T.AgentInventory>;
+    request = this.withInFlightTimeout(
+      baseRequest,
+      () => {
+        if (this.agentInventoryInFlight.get(key) !== request) return;
+        this.agentInventoryInFlight.delete(key);
+        this.agentInventoryInFlightBytes = Math.max(0, this.agentInventoryInFlightBytes - reservation.bytes);
+        this.agentInventoryInFlightTimeouts += 1;
+      },
+      'Agent inventory query timed out; retry the latest selection',
+    );
+    this.agentInventoryInFlight.set(key, request);
+    this.agentInventoryInFlightBytes += reservation.bytes;
+    try {
+      return await request;
+    } finally {
+      if (this.agentInventoryInFlight.get(key) === request) {
+        this.agentInventoryInFlight.delete(key);
+        this.agentInventoryInFlightBytes = Math.max(0, this.agentInventoryInFlightBytes - reservation.bytes);
+      }
+    }
+  }
+
+  private async computeStoredAgentInventory(filter: T.AgentInventoryQuery): Promise<T.AgentInventory> {
+    const lkgKey = JSON.stringify({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: filter.scope,
+      healthState: filter.healthState,
+      criticality: filter.criticality,
+      owner: filter.owner,
+      environment: filter.environment,
+      tag: filter.tag,
+      q: filter.q,
+      agentId: filter.agentId,
+      agentAssetId: filter.agentAssetId,
+      agentInstanceId: filter.agentInstanceId,
+      workspacePath: filter.workspacePath,
+      userId: filter.userId,
+      includeUnclassified: filter.includeUnclassified,
+      limit: filter.limit,
+    });
+    const fallback = (): T.AgentInventory => {
+      this.pruneAgentInventoryLastGood();
+      const lkg = this.agentInventoryLastGood.get(lkgKey);
+      if (lkg && now() - lkg.at <= LAST_GOOD_INVENTORY_TTL_MS) {
+        const value = structuredClone(lkg.value);
+        value.coverage = {
+          ...value.coverage,
+          completeness: 'partial',
+          partial: true,
+          partialReason: 'storage_unavailable',
+        };
+        return value;
+      }
+      return this.agentInventory(filter);
+    };
+    if (!this.judge.storageStatus().clickhouseReady) return fallback();
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      (committedCutoffMs === undefined
+        ? this.judge.pendingStoredEvents(window.startMs, window.endMs)
+        : this.judge.queryRange(plan.hotFromMs, window.endMs))
+        .filter((event) => filter.scope !== 'agent' || event.attribution?.monitored === true),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    let persisted: StoredAgentWindowFact[] | null;
+    // Without a globally complete commit boundary, query the durable window through snapshot end
+    // and overlay only the process-local pending FIFO. Closed buckets remain reusable; the commit
+    // journal invalidates a bucket when one of those pending revisions later becomes durable.
+    const reusableHotFromMs = committedCutoffMs === undefined
+      ? window.endMs + 1
+      : plan.hotFromMs;
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, reusableHotFromMs);
+    if (
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs
+    ) {
+      const scope = filter.scope === 'agent' ? 'agent' : 'all';
+      let cache = this.agentHistoryBuckets.get(scope);
+      if (!cache) {
+        cache = new CommitAwareFactBucketCache<StoredAgentBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (after) => this.judge.eventCommitChanges(after),
+          facts: (startMs, endExclusiveMs, bucketMs) =>
+            this.historyQueryGate.run(() =>
+              this.judge.agentWindowBucketFacts(
+                startMs,
+                endExclusiveMs,
+                bucketMs,
+                scope === 'agent',
+              ),
+            ),
+        });
+        this.agentHistoryBuckets.set(scope, cache);
+      }
+      const [stableFacts, headFacts, tailFacts] = await Promise.all([
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).then((rows) => {
+          if (rows === null) cache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          return rows;
+        }).catch((error) => {
+          console.warn(
+            `[agents] reusable history unavailable; using bounded hot fallback: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.agentWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.agentWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      persisted = stableFacts && headFacts && tailFacts
+        ? [...headFacts, ...stableFacts, ...tailFacts]
+        : null;
+    } else {
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.agentWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          filter.scope === 'agent',
+          overlapEventIds,
+        ),
+      );
+    }
+    if (!persisted) return fallback();
+
+    const allFacts = [
+      ...persisted,
+      ...hotEvents.map((event) => this.agentFactForEvent(event)),
+    ];
+    // Build the bounded strong-alias union before assigning group keys. This makes a batch
+    // independent of whether its physical Observer fact or logical Adapter fact arrived first.
+    for (const fact of allFacts) this.agentMetadata.resolveEvent(fact.representativeEvent);
+    const factsByInstance = new Map<string, StoredAgentWindowFact>();
+    for (const fact of allFacts) {
+      const assetId = this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId;
+      const instanceId = agentRuntimeInstanceIdForEvent(fact.representativeEvent);
+      const groupKey = agentInventoryGroupKey(assetId, instanceId);
+      const current = factsByInstance.get(groupKey);
+      factsByInstance.set(groupKey, current ? this.mergeAgentFacts(current, fact) : fact);
+    }
+    const result = this.agentInventoryFromEvents(
+      filter,
+      [...factsByInstance.values()].map((fact) => fact.representativeEvent),
+      factsByInstance,
+    );
+    result.coverage = this.queryCoverage(filter, [...factsByInstance.values()].map((fact) => fact.representativeEvent), {
+      source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+      totalMode: 'exact',
+      partial: false,
+      committedCutoffMs,
+      dataFromMs: allFacts.length ? Math.min(...allFacts.map((fact) => fact.firstSeenAt)) : undefined,
+      dataToMs: allFacts.length ? Math.max(...allFacts.map((fact) => fact.lastSeenAt)) : undefined,
+    });
+    this.rememberAgentInventoryLastGood(lkgKey, result);
+    return result;
+  }
+
+  private agentInventoryFromEvents(
+    filter: T.AgentInventoryQuery,
+    events: T.JudgedEvent[],
+    factsByInstance?: Map<string, StoredAgentWindowFact>,
+  ): T.AgentInventory {
+    for (const event of events) this.agentMetadata.resolveEvent(event);
     const q = filter.q?.trim().toLowerCase();
     const owner = filter.owner?.trim().toLowerCase();
     const environment = filter.environment?.trim().toLowerCase();
@@ -652,39 +5356,99 @@ export class AggregationService {
     const agentAssetId = requestedAgentAssetId
       ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
       : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || tag || q || filter.userId);
-    const shouldScopeExactAgent = Boolean((agentAssetId || agentId) && !hasFilter);
+    const shouldScopeExactAgent = Boolean((agentAssetId || agentId || agentInstanceId) && !hasFilter);
     const byAgent = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
-      if (shouldScopeExactAgent && !agentAssetId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
+      if (shouldScopeExactAgent && !agentAssetId && agentId && e.agentId !== agentId && e.attribution?.agentScopeId !== agentId) continue;
       // A canonical asset selection identifies the workload. Legacy display fields must not
       // reject its raw events before metadata/alias resolution.
       if (!agentAssetId && workspacePath && e.workspacePath !== workspacePath) continue;
       if (!agentId && filter.userId && e.userId !== filter.userId) continue;
       const resolved = this.agentMetadata.resolveEvent(e);
       if (agentAssetId && resolved.agentAssetId !== agentAssetId) continue;
-      (byAgent.get(resolved.agentAssetId) ?? byAgent.set(resolved.agentAssetId, []).get(resolved.agentAssetId)!).push(e);
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(e);
+      if (!matchesAgentRuntimeInstance(e, agentInstanceId)) continue;
+      const groupKey = agentInventoryGroupKey(resolved.agentAssetId, runtimeInstanceId);
+      (byAgent.get(groupKey) ?? byAgent.set(groupKey, []).get(groupKey)!).push(e);
     }
 
     const openIncidents = new Map<string, number>();
     for (const incident of this.judge.listIncidents(0)) {
       if (incident.status !== 'open') continue;
+      if (filter.scope === 'agent' && incident.monitored !== true) continue;
       const key = `${incident.workspacePath}\0${incident.agentId}`;
       openIncidents.set(key, (openIncidents.get(key) ?? 0) + 1);
     }
 
     const t = now();
-    const eventBackedItems = [...byAgent.entries()].map(([assetId, evs]): T.AgentInventoryItem => {
+    const visibleAgentGroups = [...byAgent.entries()].filter(([groupKey, evs]) => {
+      const identityEvent =
+        [...evs].reverse().find((event) => Boolean(event.attribution?.classification)) ??
+        evs.at(-1);
+      if (!identityEvent) return false;
+      const fact = factsByInstance?.get(groupKey);
+      // Durable aggregate facts are authoritative for one concrete runtime. Falling back to the
+      // representative event's inherited `process_lineage` would resurrect historical helper
+      // processes that the aggregate correctly classified as lacking root evidence.
+      const hasPhysicalRuntime = fact
+        ? fact.hasPhysicalIdentity
+        : evs.some((event) =>
+            Boolean(
+              event.attribution?.physicalWorkloadId ||
+              event.attribution?.agentInstanceId ||
+              event.attribution?.workloadRef?.podUid,
+            )
+          );
+      const hasStrongRootRuntime = fact
+        ? fact.hasRootIdentity
+        : evs.some(hasAgentRuntimeLineageEvidence);
+      if (
+        fact?.hasInternalHelperRoot ||
+        evs.some(isInternalAgentHelperRootEvent)
+      ) return false;
+      // Human/AI review classifies a logical identity; it cannot manufacture a runtime instance.
+      // A concrete row still needs workload identity or a directly observed root lifetime.
+      if (!hasPhysicalRuntime && !hasStrongRootRuntime) return false;
+      if (shouldScopeExactAgent) return true;
+      const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      if (resolved.effectiveClassification !== 'probable_agent') return true;
+      if (resolved.metadata?.reviewDecision) return true;
+      if (
+        resolved.metadata?.displayName ||
+        resolved.metadata?.owner ||
+        resolved.metadata?.team ||
+        resolved.metadata?.environment ||
+        resolved.metadata?.note ||
+        resolved.metadata?.tags?.length
+      ) return true;
+      return hasPhysicalRuntime || hasStrongRootRuntime;
+    });
+
+    const logicalInstanceCounts = new Map<string, number>();
+    for (const [, evs] of visibleAgentGroups) {
+      const identityEvent = evs.at(-1);
+      if (!identityEvent) continue;
+      const assetId = this.agentMetadata.resolveEvent(identityEvent).agentAssetId;
+      logicalInstanceCounts.set(assetId, (logicalInstanceCounts.get(assetId) ?? 0) + 1);
+    }
+
+    const eventBackedItems = visibleAgentGroups.map(([groupKey, evs]): T.AgentInventoryItem => {
       const sorted = [...evs].sort((a, b) => a.at - b.at);
+      const fact = factsByInstance?.get(groupKey);
       const first = sorted[0];
       const last = sorted[sorted.length - 1];
       const risky = sorted.filter((e) => e.verdict !== 'allow');
-      const lvl = worstLevel(sorted);
+      const lvl = fact
+        ? levelByRank(fact.worstSeverityRank)
+        : worstLevel(sorted);
       const identityEvent =
         [...sorted].reverse().find((event) => Boolean(event.attribution?.classification)) ??
         last;
       const resolved = this.agentMetadata.resolveEvent(identityEvent);
+      const assetId = resolved.agentAssetId;
       const detected = detectedAgentIdentity(identityEvent);
       const metadata = resolved.metadata;
       const attribution = identityEvent.attribution;
@@ -701,7 +5465,20 @@ export class AggregationService {
         (total, incidentKey) => total + (openIncidents.get(incidentKey) ?? 0),
         0,
       );
-      const sinceLast = t - last.at;
+      const sinceLast = t - (fact?.lastSeenAt ?? last.at);
+      const rootExit = [...sorted].reverse().find((event) =>
+        event.eventKind === 'ProcessExit' &&
+        Boolean(event.attribution?.rootPid) &&
+        event.process?.pid === event.attribution?.rootPid
+      );
+      const terminatedAt = rootExit && !sorted.some((event) => event.at > rootExit.at)
+        ? rootExit.at
+        : undefined;
+      const lifecycleState: T.AgentLifecycleState = terminatedAt !== undefined
+        ? 'terminated'
+        : sinceLast <= ACTIVE_MS
+          ? 'current'
+          : 'historical';
       const healthState: T.AgentHealthState = openIncidentCount > 0
         ? 'risky'
         : sinceLast <= ACTIVE_MS
@@ -709,35 +5486,47 @@ export class AggregationService {
           : sinceLast <= STALE_MS
             ? 'idle'
             : 'stale';
-      const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
-      const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [source, 0])) as Record<T.EventSource, number>;
+      const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [
+        category,
+        fact?.eventCategoryCounts[category] ?? 0,
+      ])) as Record<T.EventCategory, number>;
+      const sourceCounts = Object.fromEntries(EVENT_SOURCES.map((source) => [
+        source,
+        fact?.sourceCounts[source] ?? 0,
+      ])) as Record<T.EventSource, number>;
       const topRisk = new Map<string, { count: number; name: string }>();
-      for (const e of sorted) {
-        categoryCounts[e.eventCategory] = (categoryCounts[e.eventCategory] ?? 0) + 1;
-        sourceCounts[e.source] = (sourceCounts[e.source] ?? 0) + 1;
-        if (e.verdict !== 'allow') {
-          const cur = topRisk.get(e.riskCategory);
-          topRisk.set(e.riskCategory, { count: (cur?.count ?? 0) + 1, name: e.riskName });
+      if (!fact) {
+        for (const e of sorted) {
+          categoryCounts[e.eventCategory] = (categoryCounts[e.eventCategory] ?? 0) + 1;
+          sourceCounts[e.source] = (sourceCounts[e.source] ?? 0) + 1;
+          if (e.verdict !== 'allow') {
+            const cur = topRisk.get(e.riskCategory);
+            topRisk.set(e.riskCategory, { count: (cur?.count ?? 0) + 1, name: e.riskName });
+          }
         }
       }
       const top = [...topRisk.entries()].sort((a, b) => b[1].count - a[1].count)[0];
-      const instanceCount = distinct(sorted.map((event) =>
-        event.attribution?.agentInstanceId ??
-        event.attribution?.physicalWorkloadId ??
-        (
-          event.attribution?.rootPid
-            ? [
-                event.process?.hostId ?? 'host',
-                event.process?.bootId ?? 'boot',
-                event.attribution.rootPid,
-              ].join(':')
-            : `${event.sessionId}:${event.process?.pid ?? event.agentId}`
-        )
-      ));
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(identityEvent);
       return {
         agentId: itemAgentId,
         agentAssetId: assetId,
-        agentAssetAliases: metadata?.agentAssetAliases,
+        agentAssetAliases: resolved.agentAssetAliases,
+        agentProduct: resolved.agentProduct,
+        logicalAgentId: resolved.logicalAgentId ?? metadata?.logicalAgentId,
+        logicalAgentCandidateId: resolved.logicalAgentCandidateId,
+        logicalDefinitionId: resolved.logicalDefinitionId ?? metadata?.logicalDefinitionId,
+        logicalDefinitionType: metadata?.logicalDefinitionType,
+        logicalScopeMode: resolved.logicalScopeMode ?? metadata?.logicalScopeMode,
+        logicalIdentityAuthority: resolved.logicalIdentityAuthority
+          ?? (metadata?.logicalAgentId || metadata?.logicalDefinitionId ? 'management_registration' : undefined),
+        tenantId: metadata?.tenantId ?? (typeof identityEvent.attributes?.tenantId === 'string' ? identityEvent.attributes.tenantId : undefined),
+        ownerId: metadata?.ownerId ?? metadata?.owner
+          ?? (typeof identityEvent.attributes?.ownerId === 'string' ? identityEvent.attributes.ownerId : undefined),
+        profile: metadata?.profile ?? (typeof identityEvent.attributes?.profile === 'string' ? identityEvent.attributes.profile : undefined),
+        profileVersion: metadata?.profileVersion ?? (typeof identityEvent.attributes?.profileVersion === 'string' ? identityEvent.attributes.profileVersion : undefined),
+        deploymentId: identityEvent.deploymentId,
+        deploymentRevision: identityEvent.deploymentRevision,
+        terminalContextId: resolved.terminalContextId ?? metadata?.terminalContextId,
         workspacePath: itemWorkspacePath,
         userId: last.userId,
         displayName: resolved.displayName,
@@ -753,7 +5542,8 @@ export class AggregationService {
         classification,
         runtime: detected.runtime,
         locationLabel: detected.locationLabel,
-        instanceCount,
+        instanceCount: 1,
+        logicalInstanceCount: logicalInstanceCounts.get(assetId) ?? 1,
         confidence: reviewed ? 1 : attribution?.confidence ?? 0,
         attributionSource: reviewed ? 'manual_review' : attribution?.source ?? 'none',
         attributionEvidence: reviewed
@@ -763,9 +5553,16 @@ export class AggregationService {
               ...(metadata?.reviewedBy ? [`manual_review:reviewer=${metadata.reviewedBy}`] : []),
             ].slice(-16)
           : attribution?.evidence ?? [],
-        physicalWorkloadId: metadata?.reviewPhysicalWorkloadId ?? attribution?.physicalWorkloadId,
-        agentInstanceId: metadata?.reviewAgentInstanceId ?? attribution?.agentInstanceId,
-        workloadRef: metadata?.reviewWorkloadRef ?? attribution?.workloadRef,
+        physicalWorkloadId: attribution?.physicalWorkloadId ?? metadata?.reviewPhysicalWorkloadId,
+        agentInstanceId: runtimeInstanceId,
+        agentInstanceAliases: resolved.agentRuntimeInstanceAliases,
+        identityBindingQuality: resolved.bindingQuality,
+        identityReasonCode: resolved.identityReasonCode,
+        workloadRef: attribution?.workloadRef ?? metadata?.reviewWorkloadRef,
+        hostId: identityEvent.process?.hostId,
+        bootId: identityEvent.process?.bootId,
+        rootPid: attribution?.rootPid,
+        rootStartTime: attribution?.rootStartTime,
         reviewDecision: metadata?.reviewDecision,
         reviewedBy: metadata?.reviewedBy,
         reviewedAt: metadata?.reviewedAt ? iso(metadata.reviewedAt) : undefined,
@@ -774,34 +5571,43 @@ export class AggregationService {
           metadata?.identityKeys ??
           metadata?.reviewIdentityKeys ??
           this.agentMetadata.identityKeysForEvent(identityEvent),
-        firstSeen: iso(first.at),
-        lastSeen: iso(last.at),
+        firstSeen: iso(fact?.firstSeenAt ?? first.at),
+        lastSeen: iso(fact?.lastSeenAt ?? last.at),
+        lifecycleState,
+        terminatedAt: terminatedAt !== undefined ? iso(terminatedAt) : undefined,
         healthState,
         riskLevel: lvl.level,
         riskLevelText: lvl.text,
-        eventCount: sorted.length,
-        riskyEventCount: risky.length,
+        eventCount: fact?.eventCount ?? sorted.length,
+        riskyEventCount: fact?.riskyEventCount ?? risky.length,
         openIncidentCount,
-        sessionCount: distinct(sorted.map((e) => e.sessionId)),
-        runCount: distinct(sorted.map((e) => e.runId)),
-        traceCount: distinct(sorted.map((e) => e.traceId)),
-        tokenCount: sorted.reduce((a, e) => a + e.tokenCount, 0),
-        avgLatencyMs: Math.round(mean(sorted.map((e) => e.latencyMs))),
-        topRiskCategory: top?.[0],
-        topRiskName: top?.[1].name,
+        sessionCount: fact?.sessionCount ?? distinct(sorted.map((e) => e.sessionId)),
+        runCount: fact?.runCount ?? distinct(sorted.map((e) => e.runId)),
+        traceCount: fact?.traceCount ?? distinct(sorted.map((e) => e.traceId)),
+        tokenCount: fact?.tokenCount ?? sorted.reduce((a, e) => a + e.tokenCount, 0),
+        avgLatencyMs: fact
+          ? Math.round(fact.latencyTotal / Math.max(1, fact.eventCount))
+          : Math.round(mean(sorted.map((e) => e.latencyMs))),
+        topRiskCategory: fact?.topRiskCategory ?? top?.[0],
+        topRiskName: fact?.topRiskName ?? top?.[1].name,
         lastEventSubject: last.subject,
+        lastEventId: last.eventId,
+        collectorIds: fact?.collectorKeys ?? [...new Set(sorted.map(eventCollectorId).filter(Boolean))],
+        eventsWithoutCollector: fact?.eventsWithoutCollector ?? sorted.filter(missingCollectorCoverage).length,
         eventCategoryCounts: categoryCounts,
         sourceCounts,
       };
     });
 
+    const eventBackedAssetIds = new Set(eventBackedItems.map((item) => item.agentAssetId));
     const metadataOnlyItems = this.agentMetadata.list()
       .filter((metadata) =>
         (
           isAgentAssetClassification(metadata.reviewDecision ?? 'unknown') ||
           Boolean(filter.includeUnclassified && (agentAssetId || agentId))
         ) &&
-        !byAgent.has(metadata.agentAssetId) &&
+        !eventBackedAssetIds.has(metadata.agentAssetId) &&
+        !agentInstanceId &&
         (
           !shouldScopeExactAgent ||
           (agentAssetId ? metadata.agentAssetId === agentAssetId : metadata.agentId === agentId)
@@ -817,6 +5623,21 @@ export class AggregationService {
           agentId: metadata.agentId,
           agentAssetId: metadata.agentAssetId,
           agentAssetAliases: metadata.agentAssetAliases,
+          logicalAgentId: metadata.logicalAgentId,
+          logicalAgentCandidateId: metadata.logicalAgentId ? undefined : metadata.logicalDefinitionType === 'candidate'
+            ? metadata.logicalDefinitionId : undefined,
+          logicalDefinitionId: metadata.logicalDefinitionId,
+          logicalDefinitionType: metadata.logicalDefinitionType,
+          logicalScopeMode: metadata.logicalScopeMode,
+          logicalIdentityAuthority: metadata.logicalAgentId || metadata.logicalDefinitionId
+            ? 'management_registration' : undefined,
+          tenantId: metadata.tenantId,
+          ownerId: metadata.ownerId,
+          profile: metadata.profile,
+          profileVersion: metadata.profileVersion,
+          deploymentId: undefined,
+          deploymentRevision: undefined,
+          terminalContextId: metadata.terminalContextId,
           workspacePath: metadata.workspacePath,
           userId: '-',
           displayName: metadata.displayName,
@@ -851,6 +5672,7 @@ export class AggregationService {
           reviewIdentityKeys: metadata.identityKeys ?? metadata.reviewIdentityKeys ?? [metadata.agentId.toLowerCase()],
           firstSeen: metadata.updatedAt,
           lastSeen: metadata.updatedAt,
+          lifecycleState: 'historical',
           healthState: 'stale',
           riskLevel: 'safe',
           riskLevelText: LEVEL_TEXT.safe,
@@ -863,6 +5685,8 @@ export class AggregationService {
           tokenCount: 0,
           avgLatencyMs: 0,
           lastEventSubject: 'metadata-only asset',
+          collectorIds: [],
+          eventsWithoutCollector: 0,
           eventCategoryCounts: categoryCounts,
           sourceCounts,
         };
@@ -872,9 +5696,12 @@ export class AggregationService {
 
     const filtered = items
       .filter((item) => {
+        const matchesInstance = !agentInstanceId || item.agentInstanceId === agentInstanceId;
         const matchesAgentId = Boolean(
-          (agentAssetId && item.agentAssetId === agentAssetId) ||
-          (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath)),
+          matchesInstance && (
+            (agentAssetId && item.agentAssetId === agentAssetId) ||
+            (agentId && item.agentId === agentId && (!workspacePath || item.workspacePath === workspacePath))
+          ),
         );
         if (
           !isAgentAssetClassification(item.classification) &&
@@ -891,10 +5718,15 @@ export class AggregationService {
           (!q || [
             item.agentId,
             item.agentAssetId,
+            item.agentInstanceId,
             item.displayName,
             item.detectedName,
             item.locationLabel,
             item.workspacePath,
+            item.hostId,
+            item.bootId,
+            item.rootPid !== undefined ? String(item.rootPid) : undefined,
+            item.rootStartTime,
             item.userId,
             item.owner,
             item.team,
@@ -924,12 +5756,18 @@ export class AggregationService {
           unknown: 0,
         };
         const aSelected = Boolean(
-          (agentAssetId && a.agentAssetId === agentAssetId) ||
-          (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath)),
+          (!agentInstanceId || a.agentInstanceId === agentInstanceId) &&
+          (
+            (agentAssetId && a.agentAssetId === agentAssetId) ||
+            (agentId && a.agentId === agentId && (!workspacePath || a.workspacePath === workspacePath))
+          ),
         );
         const bSelected = Boolean(
-          (agentAssetId && b.agentAssetId === agentAssetId) ||
-          (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath)),
+          (!agentInstanceId || b.agentInstanceId === agentInstanceId) &&
+          (
+            (agentAssetId && b.agentAssetId === agentAssetId) ||
+            (agentId && b.agentId === agentId && (!workspacePath || b.workspacePath === workspacePath))
+          ),
         );
         return Number(bSelected) - Number(aSelected)
           || classificationRank[a.classification] - classificationRank[b.classification]
@@ -938,7 +5776,8 @@ export class AggregationService {
           || b.riskyEventCount - a.riskyEventCount
           || Date.parse(b.lastSeen) - Date.parse(a.lastSeen)
           || (a.displayName ?? a.detectedName ?? a.agentId).localeCompare(b.displayName ?? b.detectedName ?? b.agentId)
-          || a.agentAssetId.localeCompare(b.agentAssetId);
+          || a.agentAssetId.localeCompare(b.agentAssetId)
+          || (a.agentInstanceId ?? '').localeCompare(b.agentInstanceId ?? '');
       });
 
     const summary: T.AgentInventorySummary = {
@@ -955,18 +5794,662 @@ export class AggregationService {
       riskyEventCount: filtered.reduce((a, item) => a + item.riskyEventCount, 0),
     };
     const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
-    return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, events, {
+        source: 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      updateTime: iso(),
+    };
+  }
+
+  agentInstanceMetrics(filter: T.AgentInstanceMetricsQuery): T.AgentInstanceMetrics {
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : '';
+    const agentInstanceId = filter.agentInstanceId?.trim();
+    const cacheKey = [
+      agentAssetId,
+      agentInstanceId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      filter.seriesPoints ?? 36,
+      this.agentMetadata.identitySnapshotVersion(),
+    ].join('\0');
+    this.pruneAgentInstanceMetricsCache();
+    const cached = this.agentInstanceMetricsCache.get(cacheKey);
+    if (cached && now() - cached.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) return cached.value;
+    const window = this.win(filter);
+    const events = agentAssetId
+      ? window.events.filter((event) =>
+          this.agentMetadata.resolveEvent(event).agentAssetId === agentAssetId &&
+          matchesAgentRuntimeInstance(event, agentInstanceId)
+        )
+      : [];
+    const pointCount = Math.max(12, Math.min(72, filter.seriesPoints ?? 36));
+    const bucketSize = window.spanMs / pointCount || 1;
+    const buckets = this.buckets(events, window.sinceMs, window.spanMs, pointCount);
+    const points = buckets.map((bucket, index): T.AgentInstanceMetricPoint => {
+      const latencies = bucket
+        .map((event) => event.latencyMs)
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      return {
+        statTime: iso(window.sinceMs + index * bucketSize),
+        eventCount: bucket.length,
+        riskyEventCount: bucket.filter((event) => event.verdict !== 'allow').length,
+        blockedCount: bucket.filter((event) => event.verdict === 'block').length,
+        escalatedCount: bucket.filter((event) => event.verdict === 'escalate').length,
+        toolCount: bucket.filter((event) => event.eventCategory === 'tool').length,
+        fileCount: bucket.filter((event) => event.eventCategory === 'file').length,
+        networkCount: bucket.filter((event) => event.eventCategory === 'network').length,
+        processCount: bucket.filter((event) => event.eventCategory === 'process' || event.eventCategory === 'runtime').length,
+        llmCount: bucket.filter((event) => event.eventCategory === 'llm').length,
+        l1Count: bucket.filter((event) => event.tier === 'Rules').length,
+        l2Count: bucket.filter((event) => event.tier === 'Llm').length,
+        l3Count: bucket.filter((event) => event.tier === 'Agent').length,
+        failedCount: bucket.filter((event) => event.decisionStatus === 'failed').length,
+        timeoutCount: bucket.filter((event) => event.decisionStatus === 'timeout').length,
+        tokenCount: bucket.reduce((total, event) => total + event.tokenCount, 0),
+        avgLatencyMs: Math.round(mean(latencies)),
+        maxRiskScore: bucket.length ? Math.max(...bucket.map((event) => event.riskScore)) : 0,
+      };
+    });
+    const latencies = events
+      .map((event) => event.latencyMs)
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    const value: T.AgentInstanceMetrics = {
+      agentAssetId,
+      points,
+      eventCount: events.length,
+      riskyEventCount: events.filter((event) => event.verdict !== 'allow').length,
+      blockedCount: events.filter((event) => event.verdict === 'block').length,
+      escalatedCount: events.filter((event) => event.verdict === 'escalate').length,
+      tokenCount: events.reduce((total, event) => total + event.tokenCount, 0),
+      avgLatencyMs: Math.round(mean(latencies)),
+      failedCount: events.filter((event) => event.decisionStatus === 'failed').length,
+      timeoutCount: events.filter((event) => event.decisionStatus === 'timeout').length,
+      updateTime: iso(),
+    };
+    this.rememberAgentInstanceMetrics(cacheKey, value);
+    return value;
+  }
+
+  private metricFactForEvent(
+    event: T.JudgedEvent,
+    bucketIndex: number,
+    recentSinceMs: number,
+  ): StoredAgentMetricBucketFact {
+    const recent = event.at > recentSinceMs;
+    return {
+      bucketIndex,
+      identityKey: event.eventId,
+      agentId: event.agentId,
+      representativeEvent: event,
+      eventCount: 1,
+      riskyEventCount: event.verdict !== 'allow' ? 1 : 0,
+      blockedCount: event.verdict === 'block' ? 1 : 0,
+      escalatedCount: event.verdict === 'escalate' ? 1 : 0,
+      toolCount: event.eventCategory === 'tool' ? 1 : 0,
+      fileCount: event.eventCategory === 'file' ? 1 : 0,
+      networkCount: event.eventCategory === 'network' ? 1 : 0,
+      processCount: event.eventCategory === 'process' || event.eventCategory === 'runtime' ? 1 : 0,
+      llmCount: event.eventCategory === 'llm' ? 1 : 0,
+      l1Count: event.tier === 'Rules' ? 1 : 0,
+      l2Count: event.tier === 'Llm' ? 1 : 0,
+      l3Count: event.tier === 'Agent' ? 1 : 0,
+      failedCount: event.decisionStatus === 'failed' ? 1 : 0,
+      timeoutCount: event.decisionStatus === 'timeout' ? 1 : 0,
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      maxRiskScore: event.riskScore,
+      sessionKeys: [event.sessionId],
+      recentEventCount: recent ? 1 : 0,
+      recentCommCount: recent && (event.eventKind === 'Egress' || event.eventKind === 'Dns') ? 1 : 0,
+      recentSessionKeys: recent ? [event.sessionId] : [],
+    };
+  }
+
+  private observabilityFactForEvents(
+    events: T.JudgedEvent[],
+    recentSinceMs: number,
+  ): StoredAgentObservabilityFact {
+    const recent = events.filter((event) => event.at > recentSinceMs);
+    return {
+      eventCount: events.length,
+      riskyEventCount: events.filter((event) => event.verdict !== 'allow').length,
+      latencyTotal: events.reduce((sum, event) => sum + event.latencyMs, 0),
+      agentIds: [...new Set(events.map((event) => event.agentId).filter(Boolean))],
+      recentEventCount: recent.length,
+      recentCommCount: recent.filter(
+        (event) => event.eventKind === 'Egress' || event.eventKind === 'Dns',
+      ).length,
+      recentSessionKeys: [...new Set(recent.map((event) => event.sessionId).filter(Boolean))],
+    };
+  }
+
+  private async storedAgentObservabilityFact(
+    filter: T.SecurityTimeFilter,
+  ): Promise<{
+    fact: StoredAgentObservabilityFact;
+    coverage: T.QueryCoverage;
+  } | null> {
+    if (!this.judge.storageStatus().clickhouseReady) return null;
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return null;
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || isMonitoredAgentEvent(event)),
+    );
+    const persisted = await this.judge.agentObservabilityFact(
+      window.startMs,
+      persistedUntilMs,
+      filter.scope === 'agent',
+    );
+    if (!persisted) return null;
+    const hot = this.observabilityFactForEvents(
+      hotEvents,
+      Math.max(window.startMs, window.endMs - 60_000),
+    );
+    return {
+      fact: {
+        eventCount: persisted.eventCount + hot.eventCount,
+        riskyEventCount: persisted.riskyEventCount + hot.riskyEventCount,
+        latencyTotal: persisted.latencyTotal + hot.latencyTotal,
+        agentIds: [...new Set([...persisted.agentIds, ...hot.agentIds])],
+        recentEventCount: persisted.recentEventCount + hot.recentEventCount,
+        recentCommCount: persisted.recentCommCount + hot.recentCommCount,
+        recentSessionKeys: [
+          ...new Set([...persisted.recentSessionKeys, ...hot.recentSessionKeys]),
+        ],
+      },
+      coverage: this.queryCoverage(filter, [], {
+        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: 'exact',
+        partial: false,
+        committedCutoffMs,
+        dataFromMs: window.startMs,
+        dataToMs: window.endMs,
+      }),
+    };
+  }
+
+  private async storedAgentMetricFacts(
+    filter: T.SecurityTimeFilter,
+    bucketCount: number,
+    hydrateRepresentatives = true,
+  ): Promise<{
+    facts: StoredAgentMetricBucketFact[];
+    coverage: T.QueryCoverage;
+  } | null> {
+    if (!this.judge.storageStatus().clickhouseReady) return null;
+    const window = resolveTimeWindow(filter);
+    const pointCount = Math.max(1, Math.min(72, Math.round(bucketCount)));
+    const bucketSize = window.spanMs / pointCount || 1;
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return null;
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    // Keep the durable and hot sources disjoint by construction. Passing every overlap event ID
+    // through ClickHouse HTTP eventually exceeds its form-field limit during sustained ingestion;
+    // ending the durable range immediately before the complete hot tail is exact and needs no
+    // exclusion parameter.
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || isMonitoredAgentEvent(event)),
+    );
+    const persisted = await this.judge.agentMetricBucketFacts(
+      window.startMs,
+      persistedUntilMs,
+      pointCount,
+      filter.scope === 'agent',
+      [],
+      hydrateRepresentatives,
+    );
+    if (!persisted) return null;
+    const recentSinceMs = Math.max(window.startMs, window.endMs - 60_000);
+    const hotFacts = hotEvents.map((event) => this.metricFactForEvent(
+      event,
+      Math.min(pointCount - 1, Math.max(0, Math.floor((event.at - window.startMs) / bucketSize))),
+      recentSinceMs,
+    ));
+    const facts = [...persisted, ...hotFacts];
+    return {
+      facts,
+      coverage: this.queryCoverage(
+        filter,
+        facts.flatMap((fact) => fact.representativeEvent ? [fact.representativeEvent] : []),
+        {
+          source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+          totalMode: 'exact',
+          partial: false,
+          committedCutoffMs,
+          dataFromMs: window.startMs,
+          dataToMs: window.endMs,
+        },
+      ),
+    };
+  }
+
+  async storedAgentInstanceMetrics(filter: T.AgentInstanceMetricsQuery): Promise<T.AgentInstanceMetrics> {
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : '';
+    const agentInstanceId = filter.agentInstanceId?.trim();
+    const pointCount = Math.max(12, Math.min(72, filter.seriesPoints ?? 36));
+    const cacheKey = [
+      'durable',
+      agentAssetId,
+      agentInstanceId ?? '',
+      filter.timeType ?? '',
+      filter.startTime ?? '',
+      filter.endTime ?? '',
+      pointCount,
+      this.agentMetadata.identitySnapshotVersion(),
+    ].join('\0');
+    this.pruneAgentInstanceMetricsCache();
+    const cached = this.agentInstanceMetricsCache.get(cacheKey);
+    if (cached && now() - cached.at < AGENT_INSTANCE_METRICS_CACHE_TTL_MS) return cached.value;
+    const durable = await this.storedAgentMetricFacts({ ...filter, scope: 'agent' }, pointCount);
+    if (!durable) return this.agentInstanceMetrics(filter);
+    const window = resolveTimeWindow(filter);
+    const bucketSize = window.spanMs / pointCount || 1;
+    const selected = durable.facts.filter((fact) =>
+      agentAssetId &&
+      fact.representativeEvent &&
+      this.agentMetadata.resolveEvent(fact.representativeEvent).agentAssetId === agentAssetId &&
+      matchesAgentRuntimeInstance(fact.representativeEvent, agentInstanceId),
+    );
+    const bucketFacts = Array.from({ length: pointCount }, () => [] as StoredAgentMetricBucketFact[]);
+    for (const fact of selected) {
+      if (fact.bucketIndex >= 0 && fact.bucketIndex < pointCount) bucketFacts[fact.bucketIndex].push(fact);
+    }
+    const points = bucketFacts.map((facts, index): T.AgentInstanceMetricPoint => {
+      const eventCount = facts.reduce((sum, fact) => sum + fact.eventCount, 0);
+      return {
+        statTime: iso(window.startMs + index * bucketSize),
+        eventCount,
+        riskyEventCount: facts.reduce((sum, fact) => sum + fact.riskyEventCount, 0),
+        blockedCount: facts.reduce((sum, fact) => sum + fact.blockedCount, 0),
+        escalatedCount: facts.reduce((sum, fact) => sum + fact.escalatedCount, 0),
+        toolCount: facts.reduce((sum, fact) => sum + fact.toolCount, 0),
+        fileCount: facts.reduce((sum, fact) => sum + fact.fileCount, 0),
+        networkCount: facts.reduce((sum, fact) => sum + fact.networkCount, 0),
+        processCount: facts.reduce((sum, fact) => sum + fact.processCount, 0),
+        llmCount: facts.reduce((sum, fact) => sum + fact.llmCount, 0),
+        l1Count: facts.reduce((sum, fact) => sum + fact.l1Count, 0),
+        l2Count: facts.reduce((sum, fact) => sum + fact.l2Count, 0),
+        l3Count: facts.reduce((sum, fact) => sum + fact.l3Count, 0),
+        failedCount: facts.reduce((sum, fact) => sum + fact.failedCount, 0),
+        timeoutCount: facts.reduce((sum, fact) => sum + fact.timeoutCount, 0),
+        tokenCount: facts.reduce((sum, fact) => sum + fact.tokenCount, 0),
+        avgLatencyMs: Math.round(facts.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1)),
+        maxRiskScore: Math.max(0, ...facts.map((fact) => fact.maxRiskScore)),
+      };
+    });
+    const eventCount = selected.reduce((sum, fact) => sum + fact.eventCount, 0);
+    const value: T.AgentInstanceMetrics = {
+      agentAssetId,
+      points,
+      eventCount,
+      riskyEventCount: selected.reduce((sum, fact) => sum + fact.riskyEventCount, 0),
+      blockedCount: selected.reduce((sum, fact) => sum + fact.blockedCount, 0),
+      escalatedCount: selected.reduce((sum, fact) => sum + fact.escalatedCount, 0),
+      tokenCount: selected.reduce((sum, fact) => sum + fact.tokenCount, 0),
+      avgLatencyMs: Math.round(selected.reduce((sum, fact) => sum + fact.latencyTotal, 0) / (eventCount || 1)),
+      failedCount: selected.reduce((sum, fact) => sum + fact.failedCount, 0),
+      timeoutCount: selected.reduce((sum, fact) => sum + fact.timeoutCount, 0),
+      coverage: durable.coverage,
+      updateTime: iso(window.endMs),
+    };
+    this.rememberAgentInstanceMetrics(cacheKey, value);
+    return value;
+  }
+
+  private workspaceFactForEvent(event: T.JudgedEvent): StoredWorkspaceWindowFact {
+    const risky = event.verdict !== 'allow';
+    const collectorId = eventCollectorId(event);
+    const resolvedWorkspacePath =
+      this.agentMetadata.resolveEvent(event).metadata?.workspacePath ??
+      attributionWorkspacePath(event);
+    return {
+      workspacePath: resolvedWorkspacePath,
+      representativeEvent: event,
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: risky ? 1 : 0,
+      sessionKeys: [event.sessionId],
+      runKeys: [event.runId],
+      traceKeys: [event.traceId],
+      collectorKeys: collectorId ? [collectorId] : [],
+      tokenCount: event.tokenCount,
+      latencyTotal: event.latencyMs,
+      worstSeverityRank: risky ? SEV_RANK[event.severity] : 0,
+      topRiskAt: risky ? event.at : undefined,
+      topRiskCategory: risky ? event.riskCategory : undefined,
+      topRiskName: risky ? event.riskName : undefined,
+    };
+  }
+
+  private mergeWorkspaceFacts(
+    a: StoredWorkspaceWindowFact,
+    b: StoredWorkspaceWindowFact,
+  ): StoredWorkspaceWindowFact {
+    const newest = a.lastSeenAt >= b.lastSeenAt ? a : b;
+    const latestRisk = (b.topRiskAt ?? 0) >= (a.topRiskAt ?? 0) ? b : a;
+    return {
+      workspacePath: newest.workspacePath,
+      representativeEvent: newest.representativeEvent,
+      firstSeenAt: Math.min(a.firstSeenAt, b.firstSeenAt),
+      lastSeenAt: Math.max(a.lastSeenAt, b.lastSeenAt),
+      eventCount: a.eventCount + b.eventCount,
+      riskyEventCount: a.riskyEventCount + b.riskyEventCount,
+      sessionKeys: [...new Set([...a.sessionKeys, ...b.sessionKeys])],
+      runKeys: [...new Set([...a.runKeys, ...b.runKeys])],
+      traceKeys: [...new Set([...a.traceKeys, ...b.traceKeys])],
+      collectorKeys: [...new Set([...a.collectorKeys, ...b.collectorKeys])],
+      tokenCount: a.tokenCount + b.tokenCount,
+      latencyTotal: a.latencyTotal + b.latencyTotal,
+      worstSeverityRank: Math.max(a.worstSeverityRank, b.worstSeverityRank),
+      topRiskAt: latestRisk.topRiskAt,
+      topRiskCategory: latestRisk.topRiskCategory,
+      topRiskName: latestRisk.topRiskName,
+    };
+  }
+
+  async storedWorkspaceInventory(filter: T.WorkspaceInventoryQuery): Promise<T.WorkspaceInventory> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.workspaceInventory(filter);
+    const window = resolveTimeWindow(filter);
+    const committedCutoffMs = this.judge.committedEventCutoffMs();
+    if (committedCutoffMs === undefined) return this.workspaceInventory(filter);
+    const plan = planDashboardRead(window.startMs, window.endMs, committedCutoffMs);
+    const persistedUntilMs = plan.persistedUntilMs ?? window.endMs;
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs)
+        .filter((event) => filter.scope !== 'agent' || event.attribution?.monitored === true),
+    );
+    const overlapEventIds = hotEvents
+      .filter((event) => event.at <= persistedUntilMs)
+      .map((event) => event.eventId);
+    const scope = filter.scope === 'agent' ? 'agent' : 'all';
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
+    let persisted: StoredWorkspaceWindowFact[] | null = null;
+    const reusablePreset =
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs;
+    if (reusablePreset) {
+      let cache = this.workspaceHistoryBuckets.get(scope);
+      if (!cache) {
+        cache = new CommitAwareFactBucketCache<StoredWorkspaceBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (cursor) => this.judge.eventCommitChanges(cursor),
+          facts: (startMs, endExclusiveMs) => this.historyQueryGate.run(() =>
+            this.judge.workspaceWindowBucketFacts(
+              startMs,
+              endExclusiveMs,
+              REUSABLE_BUCKET_MS,
+              scope === 'agent',
+            ),
+          ),
+        }, REUSABLE_BUCKET_MS);
+        this.workspaceHistoryBuckets.set(scope, cache);
+      }
+      const [reusableFacts, headFacts, tailFacts] = await Promise.all([
+        cache.read(slices.fullStartMs, slices.fullEndExclusiveMs).then((rows) => {
+          if (rows === null) cache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          return rows;
+        }).catch((error) => {
+          console.error('[aggregation] reusable workspace history failed:', (error as Error).message);
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.workspaceWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.workspaceWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                scope === 'agent',
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      if (reusableFacts && headFacts && tailFacts) {
+        persisted = [...headFacts, ...reusableFacts, ...tailFacts];
+      }
+    }
+    if (!persisted && !reusablePreset) {
+      // Only custom/non-reusable ranges retain the exact query path. A failed or busy reusable
+      // preset already consumed its read budget and falls back to the bounded hot view below.
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.workspaceWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          scope === 'agent',
+          overlapEventIds,
+        ),
+      );
+    }
+    if (!persisted) return this.workspaceInventory(filter);
+
+    const factsByWorkspace = new Map<string, StoredWorkspaceWindowFact>();
+    for (const fact of [...persisted, ...hotEvents.map((event) => this.workspaceFactForEvent(event))]) {
+      const resolvedWorkspacePath =
+        this.agentMetadata.resolveEvent(fact.representativeEvent).metadata?.workspacePath ??
+        fact.workspacePath;
+      const canonicalFact = resolvedWorkspacePath === fact.workspacePath
+        ? fact
+        : { ...fact, workspacePath: resolvedWorkspacePath };
+      const current = factsByWorkspace.get(resolvedWorkspacePath);
+      factsByWorkspace.set(
+        resolvedWorkspacePath,
+        current ? this.mergeWorkspaceFacts(current, canonicalFact) : canonicalFact,
+      );
+    }
+
+    const q = filter.q?.trim().toLowerCase();
+    const owner = filter.owner?.trim().toLowerCase();
+    const environment = filter.environment?.trim().toLowerCase();
+    const workspacePath = filter.workspacePath?.trim();
+    const hasFilter = Boolean(
+      (filter.healthState && filter.healthState !== 'all') ||
+      (filter.criticality && filter.criticality !== 'all') ||
+      owner ||
+      environment ||
+      q
+    );
+    const shouldScopeExactWorkspace = Boolean(workspacePath && !hasFilter);
+    const agents = await this.storedAgentInventory({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: filter.scope,
+      workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined,
+      limit: 500,
+    });
+    const byWorkspaceAgents = new Map<string, T.AgentInventoryItem[]>();
+    for (const agent of agents.items) {
+      if (shouldScopeExactWorkspace && agent.workspacePath !== workspacePath) continue;
+      const current = byWorkspaceAgents.get(agent.workspacePath) ?? [];
+      current.push(agent);
+      byWorkspaceAgents.set(agent.workspacePath, current);
+    }
+
+    const workspaceKeys = new Set([...factsByWorkspace.keys(), ...byWorkspaceAgents.keys()]);
+    const items = [...workspaceKeys].flatMap((key): T.WorkspaceInventoryItem[] => {
+      if (shouldScopeExactWorkspace && key !== workspacePath) return [];
+      const fact = factsByWorkspace.get(key);
+      const wsAgents = byWorkspaceAgents.get(key) ?? [];
+      if (!fact && !wsAgents.length) return [];
+      const agentFirstSeen = wsAgents.map((agent) => Date.parse(agent.firstSeen)).filter(Number.isFinite);
+      const agentLastSeen = wsAgents.map((agent) => Date.parse(agent.lastSeen)).filter(Number.isFinite);
+      const firstMs = fact?.firstSeenAt ?? Math.min(...agentFirstSeen);
+      const lastMs = fact?.lastSeenAt ?? Math.max(...agentLastSeen);
+      const lvl = fact?.riskyEventCount
+        ? levelByRank(fact.worstSeverityRank)
+        : { level: 'safe', text: LEVEL_TEXT.safe };
+      const maintenance = this.maintenance.activeFor({ workspacePath: key });
+      const tags = [...new Set(wsAgents.flatMap((agent) => agent.tags ?? []))].slice(0, 24);
+      const healthState: T.AgentHealthState = wsAgents.some((agent) => agent.healthState === 'risky')
+        ? 'risky'
+        : wsAgents.some((agent) => agent.healthState === 'active')
+          ? 'active'
+          : wsAgents.some((agent) => agent.healthState === 'idle')
+            ? 'idle'
+            : 'stale';
+      const byLastSeen = [...wsAgents].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+      const eventCount = fact?.eventCount ?? wsAgents.reduce((sum, agent) => sum + agent.eventCount, 0);
+      return [{
+        workspaceId: this.workspaceDirectory.resolveWorkspaceId(key),
+        workspacePath: key,
+        owner: mode(wsAgents.map((agent) => agent.owner)),
+        team: mode(wsAgents.map((agent) => agent.team)),
+        environment: mode(wsAgents.map((agent) => agent.environment)),
+        criticality: worstCriticality(wsAgents.map((agent) => agent.criticality)),
+        tags,
+        healthState,
+        riskLevel: lvl.level,
+        riskLevelText: lvl.text,
+        agentCount: wsAgents.length,
+        managedAgentCount: wsAgents.filter((agent) => agent.metadataUpdatedAt).length,
+        activeAgentCount: wsAgents.filter((agent) => agent.healthState === 'active').length,
+        idleAgentCount: wsAgents.filter((agent) => agent.healthState === 'idle').length,
+        staleAgentCount: wsAgents.filter((agent) => agent.healthState === 'stale').length,
+        riskyAgentCount: wsAgents.filter((agent) => agent.healthState === 'risky').length,
+        openIncidentCount: wsAgents.reduce((sum, agent) => sum + agent.openIncidentCount, 0),
+        collectorCount: fact?.collectorKeys.length ?? 0,
+        eventCount,
+        riskyEventCount: fact?.riskyEventCount ?? wsAgents.reduce((sum, agent) => sum + agent.riskyEventCount, 0),
+        sessionCount: fact?.sessionKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.sessionCount, 0),
+        runCount: fact?.runKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.runCount, 0),
+        traceCount: fact?.traceKeys.length ?? wsAgents.reduce((sum, agent) => sum + agent.traceCount, 0),
+        tokenCount: fact?.tokenCount ?? wsAgents.reduce((sum, agent) => sum + agent.tokenCount, 0),
+        avgLatencyMs: fact
+          ? Math.round(fact.latencyTotal / (eventCount || 1))
+          : Math.round(mean(wsAgents.map((agent) => agent.avgLatencyMs))),
+        topRiskCategory: fact?.topRiskCategory ?? mode(wsAgents.map((agent) => agent.topRiskCategory)),
+        topRiskName: fact?.topRiskName ?? mode(wsAgents.map((agent) => agent.topRiskName)),
+        firstSeen: iso(Number.isFinite(firstMs) ? firstMs : window.startMs),
+        lastSeen: iso(Number.isFinite(lastMs) ? lastMs : window.endMs),
+        lastEventSubject: fact?.representativeEvent.subject ?? byLastSeen[0]?.lastEventSubject ?? '',
+        maintenanceActive: Boolean(maintenance),
+        maintenanceWindowId: maintenance?.windowId,
+        maintenanceTitle: maintenance?.title,
+      }];
+    });
+
+    const filtered = items
+      .filter((item) => {
+        const matchesWorkspacePath = Boolean(workspacePath && item.workspacePath === workspacePath);
+        const matchesFilter =
+          (!filter.healthState || filter.healthState === 'all' || item.healthState === filter.healthState) &&
+          (!filter.criticality || filter.criticality === 'all' || item.criticality === filter.criticality) &&
+          (!owner || (item.owner ?? '').toLowerCase().includes(owner)) &&
+          (!environment || (item.environment ?? '').toLowerCase().includes(environment)) &&
+          (!q || [
+            item.workspacePath,
+            item.owner,
+            item.team,
+            item.environment,
+            item.criticality,
+            item.topRiskName,
+            item.topRiskCategory,
+            item.lastEventSubject,
+            item.maintenanceTitle,
+            ...item.tags,
+          ].some((value) => (value ?? '').toLowerCase().includes(q)));
+        if (workspacePath && !hasFilter) return matchesWorkspacePath;
+        return matchesWorkspacePath || matchesFilter;
+      })
+      .sort((a, b) => {
+        const rank: Record<T.AgentHealthState, number> = { risky: 0, active: 1, idle: 2, stale: 3 };
+        return Number(Boolean(workspacePath) && b.workspacePath === workspacePath) -
+          Number(Boolean(workspacePath) && a.workspacePath === workspacePath) ||
+          Number(b.maintenanceActive) - Number(a.maintenanceActive) ||
+          rank[a.healthState] - rank[b.healthState] ||
+          b.openIncidentCount - a.openIncidentCount ||
+          b.riskyEventCount - a.riskyEventCount ||
+          Date.parse(b.lastSeen) - Date.parse(a.lastSeen);
+      });
+    const summary: T.WorkspaceInventorySummary = {
+      totalWorkspaces: filtered.length,
+      managedWorkspaces: filtered.filter((item) => item.managedAgentCount > 0).length,
+      productionWorkspaces: filtered.filter((item) => ['prod', 'production'].includes(item.environment?.toLowerCase() ?? '')).length,
+      highCriticalityWorkspaces: filtered.filter((item) => item.criticality === 'high' || item.criticality === 'critical').length,
+      activeWorkspaces: filtered.filter((item) => item.healthState === 'active').length,
+      staleWorkspaces: filtered.filter((item) => item.healthState === 'stale').length,
+      riskyWorkspaces: filtered.filter((item) => item.healthState === 'risky').length,
+      maintainedWorkspaces: filtered.filter((item) => item.maintenanceActive).length,
+      totalAgents: filtered.reduce((sum, item) => sum + item.agentCount, 0),
+      openIncidentCount: filtered.reduce((sum, item) => sum + item.openIncidentCount, 0),
+      observedEventCount: filtered.reduce((sum, item) => sum + item.eventCount, 0),
+      riskyEventCount: filtered.reduce((sum, item) => sum + item.riskyEventCount, 0),
+    };
+    const allFacts = [...factsByWorkspace.values()];
+    const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, allFacts.map((fact) => fact.representativeEvent), {
+        source: hotEvents.length ? 'clickhouse+hot_delta' : 'clickhouse',
+        totalMode: 'exact',
+        partial: false,
+        committedCutoffMs,
+        dataFromMs: allFacts.length ? Math.min(...allFacts.map((fact) => fact.firstSeenAt)) : undefined,
+        dataToMs: allFacts.length ? Math.max(...allFacts.map((fact) => fact.lastSeenAt)) : undefined,
+      }),
+      updateTime: iso(window.endMs),
+    };
   }
 
   workspaceInventory(filter: T.WorkspaceInventoryQuery): T.WorkspaceInventory {
-    const { events } = this.win(filter);
+    const window = this.win(filter);
+    const events = filter.scope === 'agent'
+      ? window.events.filter((event) => event.attribution?.monitored === true)
+      : window.events;
     const q = filter.q?.trim().toLowerCase();
     const owner = filter.owner?.trim().toLowerCase();
     const environment = filter.environment?.trim().toLowerCase();
     const workspacePath = filter.workspacePath?.trim();
     const hasFilter = Boolean((filter.healthState && filter.healthState !== 'all') || (filter.criticality && filter.criticality !== 'all') || owner || environment || q);
     const shouldScopeExactWorkspace = Boolean(workspacePath && !hasFilter);
-    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined, limit: 500 });
+    const agents = this.agentInventory({
+      timeType: filter.timeType,
+      startTime: filter.startTime,
+      endTime: filter.endTime,
+      scope: filter.scope,
+      workspacePath: shouldScopeExactWorkspace ? workspacePath : undefined,
+      limit: 500,
+    });
     const byWorkspaceEvents = new Map<string, T.JudgedEvent[]>();
     for (const e of events) {
       if (shouldScopeExactWorkspace && e.workspacePath !== workspacePath) continue;
@@ -1005,6 +6488,7 @@ export class AggregationService {
             : 'stale';
       const byLastSeen = [...wsAgents].sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
       return {
+        workspaceId: this.workspaceDirectory.resolveWorkspaceId(workspacePath),
         workspacePath,
         owner: mode(wsAgents.map((agent) => agent.owner)),
         team: mode(wsAgents.map((agent) => agent.team)),
@@ -1091,24 +6575,239 @@ export class AggregationService {
     return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
   }
 
-  agentTopology(filter: T.AgentTopologyQuery): T.AgentTopology {
+  async storedAgentTopology(filter: T.AgentTopologyQuery): Promise<T.AgentTopology> {
+    const window = resolveTimeWindow(filter);
+    const committed = this.judge.committedEventCutoffMs();
+    if (committed === undefined) return this.agentTopology(filter);
+    const plan = planDashboardRead(window.startMs, window.endMs, committed);
+    // Topology uses the same single-owner overlap rule as Agent inventory. It avoids oversized
+    // NOT IN parameters when Observer emits thousands of events during one refresh interval.
+    const persistedUntilMs = Math.min(
+      plan.persistedUntilMs ?? window.endMs,
+      Math.max(window.startMs - 1, plan.hotFromMs - 1),
+    );
+    const hotEvents = foldLatestEventRevisions(
+      this.judge.queryRange(plan.hotFromMs, window.endMs),
+    );
+    const monitoredOnly = filter.scope === 'agent';
+    const overlapEventIds: string[] = [];
+    const slices = reusableFactSlices(window.startMs, persistedUntilMs, plan.hotFromMs);
+    let persisted: StoredTopologyWindowFact[] | null;
+    if (
+      !window.custom &&
+      window.spanMs <= 24 * HOUR &&
+      slices.fullEndExclusiveMs > slices.fullStartMs
+    ) {
+      const topologyScope = monitoredOnly ? 'agent' : 'all';
+      let topologyCache = this.topologyHistoryBuckets.get(topologyScope);
+      if (!topologyCache) {
+        topologyCache = new CommitAwareFactBucketCache<StoredTopologyBucketFact>({
+          latestCursor: () => this.judge.latestEventCommitCursor(),
+          earliestCursor: () => this.judge.earliestEventCommitCursor(),
+          changes: (after) => this.judge.eventCommitChanges(after),
+          facts: (startMs, endExclusiveMs, bucketMs) =>
+            this.historyQueryGate.run(() =>
+            this.judge.topologyWindowBucketFacts(
+              startMs,
+              endExclusiveMs,
+              bucketMs,
+              monitoredOnly,
+            ),
+            ),
+        });
+        this.topologyHistoryBuckets.set(topologyScope, topologyCache);
+      }
+      const [stableFacts, headFacts, tailFacts] = await Promise.all([
+        topologyCache.read(
+          slices.fullStartMs,
+          slices.fullEndExclusiveMs,
+        ).then((rows) => {
+          if (rows === null) {
+            topologyCache.continueWarmup(slices.fullStartMs, slices.fullEndExclusiveMs);
+          }
+          return rows;
+        }).catch((error) => {
+          console.warn(
+            `[topology] reusable history unavailable; using bounded hot fallback: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return null;
+        }),
+        slices.head
+          ? this.historyQueryGate.run(() =>
+              this.judge.topologyWindowFacts(
+                slices.head!.startMs,
+                slices.head!.endMs,
+                monitoredOnly,
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+        slices.tail
+          ? this.historyQueryGate.run(() =>
+              this.judge.topologyWindowFacts(
+                slices.tail!.startMs,
+                slices.tail!.endMs,
+                monitoredOnly,
+                overlapEventIds,
+              ),
+            )
+          : Promise.resolve([]),
+      ]);
+      persisted = stableFacts && headFacts && tailFacts
+        ? [...headFacts, ...stableFacts, ...tailFacts]
+        : null;
+    } else {
+      persisted = await this.historyQueryGate.run(() =>
+        this.judge.topologyWindowFacts(
+          window.startMs,
+          persistedUntilMs,
+          monitoredOnly,
+          overlapEventIds,
+        ),
+      );
+    }
+    if (persisted === null) return this.agentTopology(filter);
+    const pinnedEventId = filter.eventId?.trim();
+    const pinnedPage = pinnedEventId
+      ? await this.judge.searchStoredEventsPage({
+          sinceMs: 0,
+          untilMs: window.endMs,
+          eventId: pinnedEventId,
+          limit: 1,
+        })
+      : undefined;
+    const pinnedEvent = pinnedPage?.events[0] ?? (pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined);
+    const hotFacts: StoredTopologyWindowFact[] = hotEvents.map((event) => ({
+      identityKey: event.eventId,
+      instanceKey: agentRuntimeInstanceIdForEvent(event),
+      representativeEvent: event,
+      hasPhysicalIdentity: Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid,
+      ),
+      hasRootIdentity:
+        Boolean(event.attribution?.rootStartTime) &&
+        hasDirectAgentRootEvidence(event),
+      hasInternalHelperRoot: isInternalAgentHelperRootEvent(event),
+      firstSeenAt: event.at,
+      lastSeenAt: event.at,
+      eventCount: 1,
+      riskyEventCount: event.verdict === 'allow' ? 0 : 1,
+      worstSeverityRank: event.verdict === 'allow' ? 0 : SEV_RANK[event.severity],
+      riskCategory: event.riskCategory,
+      riskName: event.riskName,
+    }));
+    const facts = [...persisted, ...hotFacts];
+    if (pinnedEvent && !facts.some((fact) => fact.representativeEvent.eventId === pinnedEvent.eventId)) {
+      facts.push({
+        identityKey: pinnedEvent.eventId,
+        instanceKey: agentRuntimeInstanceIdForEvent(pinnedEvent),
+        representativeEvent: pinnedEvent,
+        hasPhysicalIdentity: Boolean(
+          pinnedEvent.attribution?.physicalWorkloadId ||
+          pinnedEvent.attribution?.agentInstanceId ||
+          pinnedEvent.attribution?.workloadRef?.podUid,
+        ),
+        hasRootIdentity:
+          Boolean(pinnedEvent.attribution?.rootStartTime) &&
+          hasDirectAgentRootEvidence(pinnedEvent),
+        hasInternalHelperRoot: isInternalAgentHelperRootEvent(pinnedEvent),
+        firstSeenAt: pinnedEvent.at,
+        lastSeenAt: pinnedEvent.at,
+        eventCount: 1,
+        riskyEventCount: pinnedEvent.verdict === 'allow' ? 0 : 1,
+        worstSeverityRank: pinnedEvent.verdict === 'allow' ? 0 : SEV_RANK[pinnedEvent.severity],
+        riskCategory: pinnedEvent.riskCategory,
+        riskName: pinnedEvent.riskName,
+      });
+    }
+    return this.agentTopology(filter, {
+      facts,
+      committedCutoffMs: Math.min(committed, window.endMs),
+      source: hotFacts.length ? 'clickhouse+hot_delta' : 'clickhouse',
+    });
+  }
+
+  agentTopology(
+    filter: T.AgentTopologyQuery,
+    durable?: {
+      facts: StoredTopologyWindowFact[];
+      committedCutoffMs: number;
+      source: 'clickhouse' | 'clickhouse+hot_delta';
+    },
+  ): T.AgentTopology {
     const pinnedEdgeId = filter.edgeId?.trim();
     const pinnedEventId = filter.eventId?.trim();
-    const windowedEvents = this.win(filter).events;
+    const agentScoped = filter.scope === 'agent';
+    const resolvedEvents = new Map<string, ReturnType<AgentMetadataService['resolveEvent']>>();
+    const resolveAgent = (event: T.JudgedEvent) => {
+      const cached = resolvedEvents.get(event.eventId);
+      if (cached) return cached;
+      const resolved = this.agentMetadata.resolveEvent(event);
+      resolvedEvents.set(event.eventId, resolved);
+      return resolved;
+    };
+    const topologyFacts = durable?.facts;
+    const factByEventId = new Map((topologyFacts ?? []).map((fact) => [fact.representativeEvent.eventId, fact]));
+    const invalidHelperInstances = new Set(
+      (topologyFacts ?? [])
+        .filter((fact) => fact.hasInternalHelperRoot)
+        .map((fact) => fact.instanceKey),
+    );
+    const isAgentRelatedEvent = (event: T.JudgedEvent) => {
+      if (!isAgentAssetClassification(resolveAgent(event).effectiveClassification)) return false;
+      const fact = factByEventId.get(event.eventId);
+      const instanceKey = fact?.instanceKey ?? agentRuntimeInstanceIdForEvent(event);
+      if (
+        invalidHelperInstances.has(instanceKey) ||
+        fact?.hasInternalHelperRoot ||
+        isInternalAgentHelperRootEvent(event)
+      ) return false;
+      if (fact) {
+        return fact.hasPhysicalIdentity || fact.hasRootIdentity;
+      }
+      return Boolean(
+        event.attribution?.physicalWorkloadId ||
+        event.attribution?.agentInstanceId ||
+        event.attribution?.workloadRef?.podUid ||
+        hasAgentRuntimeLineageEvidence(event)
+      );
+    };
+    const rawWindowedEvents = topologyFacts
+      ? topologyFacts.map((fact) => fact.representativeEvent)
+      : this.win(filter).events;
+    const windowedEvents = agentScoped
+      ? rawWindowedEvents.filter(isAgentRelatedEvent)
+      : rawWindowedEvents;
     const windowedEventIds = new Set(windowedEvents.map((event) => event.eventId));
-    const pinnedEvent = pinnedEventId ? this.judge.findEvent(pinnedEventId) : undefined;
-    const events = pinnedEdgeId
+    const rawPinnedEvent = pinnedEventId
+      ? topologyFacts?.find((fact) => fact.representativeEvent.eventId === pinnedEventId)?.representativeEvent
+        ?? this.judge.findEvent(pinnedEventId)
+      : undefined;
+    const pinnedEvent = rawPinnedEvent && (!agentScoped || isAgentRelatedEvent(rawPinnedEvent))
+      ? rawPinnedEvent
+      : undefined;
+    const rawEvents = pinnedEdgeId && !topologyFacts
       ? this.judge.query(0)
       : pinnedEvent && !windowedEventIds.has(pinnedEvent.eventId)
         ? [...windowedEvents, pinnedEvent]
         : windowedEvents;
+    const events = agentScoped ? rawEvents.filter(isAgentRelatedEvent) : rawEvents;
     const includeBenign = filter.includeBenign !== false;
     const q = filter.q?.trim().toLowerCase();
+    const requestedAgentAssetId = filter.agentAssetId?.trim();
+    const agentAssetId = requestedAgentAssetId
+      ? this.agentMetadata.canonicalAgentAssetId(requestedAgentAssetId)
+      : undefined;
+    const agentInstanceId = filter.agentInstanceId?.trim();
     const agentId = filter.agentId?.trim();
     const workspacePath = filter.workspacePath?.trim();
     const collectorId = filter.collectorId?.trim();
     const sourceId = filter.sourceId?.trim();
-    const hasFilter = Boolean(agentId || workspacePath || collectorId || sourceId || q || !includeBenign);
+    const hasFilter = Boolean(agentAssetId || agentInstanceId || agentId || workspacePath || collectorId || sourceId || q || !includeBenign);
     const exactPinnedMode = Boolean((pinnedEdgeId || pinnedEventId) && !hasFilter);
     const limit = Math.max(20, Math.min(1000, filter.limit ?? 300));
     const pinnedEdgeIds = new Set<string>(pinnedEdgeId ? [pinnedEdgeId] : []);
@@ -1118,7 +6817,7 @@ export class AggregationService {
       type: T.TopologyNodeType;
       label: string;
       subtitle?: string;
-      extra?: Partial<Pick<T.AgentTopologyNode, 'agentId' | 'workspacePath' | 'collectorId'>>;
+      extra?: Partial<Pick<T.AgentTopologyNode, 'agentAssetId' | 'agentInstanceId' | 'agentId' | 'classification' | 'workspacePath' | 'collectorId'>>;
     };
     type EdgeSpec = {
       id: string;
@@ -1136,15 +6835,18 @@ export class AggregationService {
 
     const nodes = new Map<string, NodeAgg>();
     const edges = new Map<string, EdgeAgg>();
+    const rosterAgentNodeIds = new Set<string>();
     const bumpNode = (
       id: string,
       type: T.TopologyNodeType,
       label: string,
       subtitle: string | undefined,
       event: T.JudgedEvent,
-      extra: Partial<Pick<T.AgentTopologyNode, 'agentId' | 'workspacePath' | 'collectorId'>> = {},
+      extra: Partial<Pick<T.AgentTopologyNode, 'agentAssetId' | 'agentInstanceId' | 'agentId' | 'classification' | 'workspacePath' | 'collectorId'>> = {},
     ) => {
-      const risky = event.verdict !== 'allow';
+      const fact = factByEventId.get(event.eventId);
+      const eventCount = fact?.eventCount ?? 1;
+      const riskyEventCount = fact?.riskyEventCount ?? (event.verdict !== 'allow' ? 1 : 0);
       const cur = nodes.get(id);
       const base = cur ?? {
         nodeId: id,
@@ -1157,12 +6859,12 @@ export class AggregationService {
         severityRank: 0,
         ...extra,
       };
-      base.eventCount += 1;
-      if (risky) {
-        base.riskyEventCount += 1;
-        base.severityRank = Math.max(base.severityRank, SEV_RANK[event.severity]);
+      base.eventCount += eventCount;
+      if (riskyEventCount > 0) {
+        base.riskyEventCount += riskyEventCount;
+        base.severityRank = Math.max(base.severityRank, fact?.worstSeverityRank ?? SEV_RANK[event.severity]);
       }
-      base.lastSeenMs = Math.max(base.lastSeenMs, event.at);
+      base.lastSeenMs = Math.max(base.lastSeenMs, fact?.lastSeenAt ?? event.at);
       nodes.set(id, base);
     };
     const bumpEdge = (
@@ -1174,8 +6876,11 @@ export class AggregationService {
     ) => {
       const id = edgeId(sourceNodeId, targetNodeId, type);
       const cur = edges.get(id);
-      const risky = event.verdict !== 'allow';
-      const rank = risky ? SEV_RANK[event.severity] : 0;
+      const fact = factByEventId.get(event.eventId);
+      const eventCount = fact?.eventCount ?? 1;
+      const riskyEventCount = fact?.riskyEventCount ?? (event.verdict !== 'allow' ? 1 : 0);
+      const rank = riskyEventCount > 0 ? (fact?.worstSeverityRank ?? SEV_RANK[event.severity]) : 0;
+      const lastSeenAt = fact?.lastSeenAt ?? event.at;
       const base: EdgeAgg = cur ?? {
         edgeId: id,
         sourceNodeId,
@@ -1191,18 +6896,22 @@ export class AggregationService {
         sampleSubject: event.subject,
         risks: new Map(),
       };
-      base.eventCount += 1;
-      if (risky) {
-        base.riskyEventCount += 1;
+      base.eventCount += eventCount;
+      if (riskyEventCount > 0) {
+        base.riskyEventCount += riskyEventCount;
         if (rank >= base.severityRank) {
           base.severityRank = rank;
-          base.maxSeverity = event.severity;
+          base.maxSeverity = LEVEL_BY_RANK[Math.max(0, Math.min(4, rank))] as T.Severity;
         }
-        const risk = base.risks.get(event.riskCategory);
-        base.risks.set(event.riskCategory, { riskName: event.riskName, eventCount: (risk?.eventCount ?? 0) + 1 });
+        const category = fact?.riskCategory ?? event.riskCategory;
+        const risk = base.risks.get(category);
+        base.risks.set(category, {
+          riskName: fact?.riskName ?? event.riskName,
+          eventCount: (risk?.eventCount ?? 0) + riskyEventCount,
+        });
       }
-      if (event.at >= base.lastSeenMs) {
-        base.lastSeenMs = event.at;
+      if (lastSeenAt >= base.lastSeenMs) {
+        base.lastSeenMs = lastSeenAt;
         base.sampleEventId = event.eventId;
         base.sampleSubject = event.subject;
       }
@@ -1210,24 +6919,63 @@ export class AggregationService {
     };
 
     for (const e of events) {
+      const resolved = resolveAgent(e);
       const collectorRef = eventCollectorId(e);
       const sourceRef = eventSourceId(e);
+      const canonicalWorkspacePath = resolved.metadata?.workspacePath ?? e.workspacePath;
+      const canonicalAgentId =
+        canonicalAgentName(e.attribution?.agentScopeId) ??
+        canonicalAgentName(e.attribution?.agentDisplayName) ??
+        resolved.detectedName ??
+        e.agentId;
+      const canonicalAgentLabel =
+        resolved.displayName ??
+        canonicalAgentName(e.attribution?.agentDisplayName) ??
+        canonicalAgentName(e.attribution?.agentScopeId) ??
+        resolved.detectedName ??
+        e.agentId;
+      const runtimeInstanceId = agentRuntimeInstanceIdForEvent(e);
+      const runtimeLocation = detectedAgentIdentity(e).locationLabel ?? canonicalWorkspacePath;
       const isPinnedEvent = Boolean(pinnedEventId && e.eventId === pinnedEventId);
       const matchesDirectScope =
-        (!agentId || e.agentId === agentId) &&
-        (!workspacePath || e.workspacePath === workspacePath) &&
+        (!agentAssetId || resolved.agentAssetId === agentAssetId) &&
+        matchesAgentRuntimeInstance(e, agentInstanceId) &&
+        (!agentId || [e.agentId, canonicalAgentId, canonicalAgentLabel].includes(agentId)) &&
+        (!workspacePath || canonicalWorkspacePath === workspacePath || e.workspacePath === workspacePath) &&
         (!collectorId || collectorRef === collectorId) &&
-        (!sourceId || sourceRef === sourceId) &&
+        (!sourceId || sourceRef === sourceId);
+      const matchesRelationshipScope =
+        matchesDirectScope &&
         (includeBenign || e.verdict !== 'allow');
       if (!pinnedEdgeId && !isPinnedEvent && !matchesDirectScope) continue;
 
       const target = topologyTarget(e);
-      const agentNodeId = nodeId('agent', `${e.workspacePath}|${e.agentId}`);
-      const workspaceNodeId = nodeId('workspace', e.workspacePath);
+      const agentNodeId = nodeId(
+        'agent',
+        agentInventoryGroupKey(resolved.agentAssetId, runtimeInstanceId),
+      );
+      const workspaceNodeId = nodeId('workspace', canonicalWorkspacePath);
       const collectorNodeId = collectorRef ? nodeId('collector', collectorRef) : '';
       const targetNodeId = target ? nodeId(target.type, target.key) : '';
-      const workspaceNode: NodeSpec = { id: workspaceNodeId, type: 'workspace', label: e.workspacePath, extra: { workspacePath: e.workspacePath } };
-      const agentNode: NodeSpec = { id: agentNodeId, type: 'agent', label: e.agentId, subtitle: e.workspacePath, extra: { agentId: e.agentId, workspacePath: e.workspacePath } };
+      const workspaceNode: NodeSpec = {
+        id: workspaceNodeId,
+        type: 'workspace',
+        label: canonicalWorkspacePath,
+        extra: { workspacePath: canonicalWorkspacePath },
+      };
+      const agentNode: NodeSpec = {
+        id: agentNodeId,
+        type: 'agent',
+        label: canonicalAgentLabel,
+        subtitle: runtimeLocation,
+        extra: {
+          agentAssetId: resolved.agentAssetId,
+          agentInstanceId: runtimeInstanceId,
+          agentId: canonicalAgentId,
+          classification: resolved.effectiveClassification,
+          workspacePath: canonicalWorkspacePath,
+        },
+      };
       const collectorNode: NodeSpec | undefined = collectorRef
         ? { id: collectorNodeId, type: 'collector', label: collectorRef, subtitle: attrString(e, 'collectorNode') || undefined, extra: { collectorId: collectorRef } }
         : undefined;
@@ -1241,13 +6989,31 @@ export class AggregationService {
       if (target && targetNode) eventEdges.push({ id: edgeId(agentNodeId, targetNodeId, target.edgeType), source: agentNode, target: targetNode, type: target.edgeType, label: target.edgeLabel });
       const eventEdgeIds = eventEdges.map((edge) => edge.id);
       const isPinnedEdge = Boolean(pinnedEdgeId && eventEdgeIds.includes(pinnedEdgeId));
-      const normalMatch =
+      const matchesText =
+        !q || [
+          e.agentId,
+          resolved.agentAssetId,
+          runtimeInstanceId,
+          canonicalAgentId,
+          canonicalAgentLabel,
+          canonicalWorkspacePath,
+          e.subject,
+          e.riskCategory,
+          e.riskName,
+          collectorRef,
+          sourceRef,
+          target?.label,
+          target?.subtitle,
+        ].some((v) => (v ?? '').toLowerCase().includes(q));
+      const rosterMatch =
         windowedEventIds.has(e.eventId) &&
         matchesDirectScope &&
-        (!q || [e.agentId, e.workspacePath, e.subject, e.riskCategory, e.riskName, collectorRef, sourceRef, target?.label, target?.subtitle].some((v) => (v ?? '').toLowerCase().includes(q)));
+        matchesText;
+      const normalMatch =
+        rosterMatch &&
+        matchesRelationshipScope;
       const includeAllEventEdges = exactPinnedMode ? isPinnedEvent : normalMatch || isPinnedEvent;
       const includedEdges = includeAllEventEdges ? eventEdges : eventEdges.filter((edge) => pinnedEdgeId && edge.id === pinnedEdgeId);
-      if (!includedEdges.length && !isPinnedEdge) continue;
       if (isPinnedEvent) for (const id of eventEdgeIds) pinnedEdgeIds.add(id);
 
       const bumpedNodeIds = new Set<string>();
@@ -1256,6 +7022,13 @@ export class AggregationService {
         bumpedNodeIds.add(node.id);
         bumpNode(node.id, node.type, node.label, node.subtitle, e, node.extra);
       };
+      // The relationship dropdown filters edges, not the Agent roster. Otherwise a healthy
+      // runtime disappears from topology and looks like an attribution/data-loss bug.
+      if (rosterMatch) {
+        rosterAgentNodeIds.add(agentNode.id);
+        bumpNodeOnce(agentNode);
+      }
+      if (!includedEdges.length && !isPinnedEdge) continue;
       for (const edge of includedEdges) {
         bumpNodeOnce(edge.source);
         bumpNodeOnce(edge.target);
@@ -1272,7 +7045,10 @@ export class AggregationService {
         b.lastSeenMs - a.lastSeenMs,
       )
       .slice(0, limit);
-    const selectedNodeIds = new Set(selectedEdges.flatMap((edge) => [edge.sourceNodeId, edge.targetNodeId]));
+    const selectedNodeIds = new Set([
+      ...selectedEdges.flatMap((edge) => [edge.sourceNodeId, edge.targetNodeId]),
+      ...rosterAgentNodeIds,
+    ]);
     const selectedNodes = [...nodes.values()].filter((node) => selectedNodeIds.has(node.nodeId));
     const nodeItem = (node: NodeAgg): T.AgentTopologyNode => {
       const level = node.riskyEventCount ? levelByRank(node.severityRank) : { level: 'safe', text: LEVEL_TEXT.safe };
@@ -1281,7 +7057,10 @@ export class AggregationService {
         type: node.type,
         label: node.label,
         subtitle: node.subtitle,
+        agentAssetId: node.agentAssetId,
+        agentInstanceId: node.agentInstanceId,
         agentId: node.agentId,
+        classification: node.classification,
         workspacePath: node.workspacePath,
         collectorId: node.collectorId,
         riskLevel: level.level,
@@ -1326,20 +7105,144 @@ export class AggregationService {
         edgeCount: edgeItems.length,
         riskyEdgeCount: edgeItems.filter((edge) => edge.riskyEventCount > 0).length,
       },
-      updateTime: iso(),
+      coverage: this.queryCoverage(filter, events, {
+        source: durable?.source ?? 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: !durable,
+        partialReason: durable ? undefined : 'hot_ring_only',
+        committedCutoffMs: durable?.committedCutoffMs,
+        dataFromMs: topologyFacts?.length
+          ? Math.min(...topologyFacts.map((fact) => fact.firstSeenAt))
+          : undefined,
+        dataToMs: topologyFacts?.length
+          ? Math.max(...topologyFacts.map((fact) => fact.lastSeenAt))
+          : undefined,
+      }),
+      updateTime: iso(resolveTimeWindow(filter).endMs),
     };
   }
 
-  collectorHealth(filter: T.CollectorHealthQuery): T.CollectorHealth {
-    const { sinceMs, spanMs } = this.win(filter);
-    const windowHeartbeats = this.judge.queryCollectorHeartbeats(sinceMs);
+  async storedCollectorHealth(filter: T.CollectorHealthQuery): Promise<T.CollectorHealth> {
+    const window = resolveTimeWindow(filter);
+    const [persistedHeartbeats, persistedLatest, distributedLatest] = await Promise.all([
+      this.judge.storedCollectorHeartbeats(window.startMs, window.endMs),
+      this.judge.storedLatestCollectorHeartbeats(window.endMs),
+      this.judge.distributedLatestCollectorHeartbeats(window.endMs),
+    ]);
+    if (persistedHeartbeats === null || persistedLatest === null) return this.collectorHealth(filter);
+    const hotHeartbeats = this.judge.queryCollectorHeartbeats(window.startMs, window.endMs);
+    const hotLatest = this.judge.latestCollectorHeartbeats(window.endMs);
+    const merge = (items: T.CollectorHeartbeatRecord[]) => {
+      const unique = new Map<string, T.CollectorHeartbeatRecord>();
+      for (const item of items) unique.set(`${item.collectorId}\0${item.at}`, item);
+      return [...unique.values()];
+    };
+    const heartbeats = merge([...persistedHeartbeats, ...hotHeartbeats]);
+    const latest = merge([...persistedLatest, ...distributedLatest, ...hotLatest])
+      .sort((a, b) => a.at - b.at)
+      .reduce((map, item) => map.set(item.collectorId, item), new Map<string, T.CollectorHeartbeatRecord>());
+    const hasRedisCurrent = distributedLatest.some((current) =>
+      !persistedLatest.some((saved) => saved.collectorId === current.collectorId && saved.at >= current.at),
+    );
+    return this.collectorHealth(filter, {
+      heartbeats,
+      latest: [...latest.values()],
+      source: hasRedisCurrent
+        ? 'clickhouse+redis_current'
+        : hotHeartbeats.some((hot) => !persistedHeartbeats.some((saved) => saved.collectorId === hot.collectorId && saved.at === hot.at))
+          ? 'clickhouse+hot_delta'
+          : 'clickhouse',
+    });
+  }
+
+  collectorHealth(
+    filter: T.CollectorHealthQuery,
+    durable?: {
+      heartbeats: T.CollectorHeartbeatRecord[];
+      latest: T.CollectorHeartbeatRecord[];
+      source: 'clickhouse' | 'clickhouse+hot_delta' | 'clickhouse+redis_current';
+    },
+  ): T.CollectorHealth {
+    const window = resolveTimeWindow(filter);
+    const sinceMs = window.startMs;
+    const spanMs = window.spanMs;
+    // Some legacy/minimal judge implementations accept only `sinceMs`; enforce the closed custom
+    // end boundary here as well so a newer live heartbeat cannot leak into an historical snapshot.
+    const windowHeartbeats = (durable?.heartbeats
+      ?? this.judge.queryCollectorHeartbeats(window.startMs, window.endMs))
+      .filter((heartbeat) => heartbeat.at >= window.startMs && heartbeat.at <= window.endMs);
+    const rawHeartbeatHeads = durable
+      ? (() => {
+          // `storedLatestCollectorHeartbeats` intentionally returns one latest row per collector.
+          // Raw Collector and Forwarder heartbeats are independent telemetry channels, so deriving
+          // both heads from that single row loses the older channel whenever the other reports a
+          // few milliseconds later. Rebuild per-origin heads from the durable window plus the
+          // current-state head instead.
+          const candidates = [...durable.heartbeats, ...durable.latest];
+          const latestMatching = (
+            predicate: (heartbeat: T.CollectorHeartbeatRecord) => boolean,
+            timestamp: (heartbeat: T.CollectorHeartbeatRecord) => number = (heartbeat) => heartbeat.at,
+          ): T.CollectorHeartbeatRecord[] => {
+            const heads = new Map<string, T.CollectorHeartbeatRecord>();
+            for (const heartbeat of candidates) {
+              if (!predicate(heartbeat)) continue;
+              const current = heads.get(heartbeat.collectorId);
+              if (!current || timestamp(heartbeat) >= timestamp(current)) {
+                heads.set(heartbeat.collectorId, heartbeat);
+              }
+            }
+            return [...heads.values()];
+          };
+          return {
+            latest: durable.latest,
+            latestMetrics: latestMatching(
+              (heartbeat) => heartbeat.filterMetricsReportedAt !== undefined,
+              (heartbeat) => heartbeat.filterMetricsReportedAt ?? heartbeat.at,
+            ),
+            latestRaw: latestMatching((heartbeat) => heartbeat.origin === 'raw_collector'),
+            latestForwarder: latestMatching((heartbeat) => heartbeat.origin === 'forwarder'),
+            latestCaptureProfile: latestMatching(
+              (heartbeat) => heartbeat.captureProfileMetricsReportedAt !== undefined,
+              (heartbeat) => heartbeat.captureProfileMetricsReportedAt ?? heartbeat.at,
+            ),
+          };
+        })()
+      : this.judge.collectorHeartbeatHeads();
+    const heartbeatHeads = {
+      latest: rawHeartbeatHeads.latest.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestMetrics: rawHeartbeatHeads.latestMetrics.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestRaw: rawHeartbeatHeads.latestRaw.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestForwarder: rawHeartbeatHeads.latestForwarder.filter((heartbeat) => heartbeat.at <= window.endMs),
+      latestCaptureProfile: (rawHeartbeatHeads.latestCaptureProfile ?? [])
+        .filter((heartbeat) => heartbeat.at <= window.endMs),
+    };
+    const latestHeartbeatByCollector = new Map(heartbeatHeads.latest.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestMetricsByCollector = new Map(heartbeatHeads.latestMetrics.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestRawByCollector = new Map(heartbeatHeads.latestRaw.map((heartbeat) => [heartbeat.collectorId, heartbeat]));
+    const latestForwarderByCollector = new Map(
+      heartbeatHeads.latestForwarder.map((heartbeat) => [heartbeat.collectorId, heartbeat]),
+    );
+    const latestCaptureProfileByCollector = new Map(
+      heartbeatHeads.latestCaptureProfile.map((heartbeat) => [heartbeat.collectorId, heartbeat]),
+    );
     const byCollector = new Map<string, T.CollectorHeartbeatRecord[]>();
     for (const hb of windowHeartbeats) (byCollector.get(hb.collectorId) ?? byCollector.set(hb.collectorId, []).get(hb.collectorId)!).push(hb);
-    for (const hb of this.judge.latestCollectorHeartbeats()) {
+    const requestedCollectorId = filter.collectorId?.trim();
+    const collectorArchiveCutoff = window.endMs - COLLECTOR_ARCHIVE_MS;
+    for (const hb of heartbeatHeads.latest) {
+      // `storedLatestCollectorHeartbeats` deliberately retains the last row for every historical
+      // collector. Preserve recently silent Collectors as down beyond the selected chart window,
+      // but archive long-dead one-off/E2E heads after the explicit operational TTL. An exact deep
+      // link remains queryable at any age.
+      if (
+        hb.at < window.startMs &&
+        (hb.at < collectorArchiveCutoff || legacyEphemeralCollector(hb.collectorId)) &&
+        hb.collectorId !== requestedCollectorId
+      ) continue;
       if (!byCollector.has(hb.collectorId)) byCollector.set(hb.collectorId, []);
     }
 
-    const t = now();
+    const t = window.endMs;
     const stateText: Record<T.CollectorHealthState, string> = {
       healthy: '健康',
       quiet: '静默',
@@ -1348,15 +7251,74 @@ export class AggregationService {
       down: '断流',
     };
     const items = [...byCollector.entries()].map(([collectorId, hbs]): T.CollectorHealthItem => {
-      const latest = [...hbs, ...this.judge.latestCollectorHeartbeats().filter((hb) => hb.collectorId === collectorId)]
-        .sort((a, b) => b.at - a.at)[0];
+      const latest = latestHeartbeatByCollector.get(collectorId);
+      const latestMetricsHeartbeat = latestMetricsByCollector.get(collectorId);
+      const latestRawHeartbeat = latestRawByCollector.get(collectorId);
+      const latestForwarderHeartbeat = latestForwarderByCollector.get(collectorId);
+      const latestCaptureProfileHeartbeat = latestCaptureProfileByCollector.get(collectorId);
+      const freshMetricsHeartbeat = latestMetricsHeartbeat?.filterMetricsReportedAt !== undefined &&
+        t - latestMetricsHeartbeat.filterMetricsReportedAt <= COLLECTOR_STALE_MS
+        ? latestMetricsHeartbeat
+        : undefined;
+      // The raw Collector is the sole producer of attached-probe and binary capability metadata.
+      // A co-located Forwarder reports more frequently, but its heartbeat intentionally carries
+      // only delivery/filter state; letting that newer row win would render a healthy 27-probe
+      // Collector as 0/[] every few seconds. Keep the channels independent and use the generic
+      // head only when no fresh raw Collector heartbeat exists.
+      const freshRawHeartbeat = latestRawHeartbeat !== undefined &&
+        t - latestRawHeartbeat.at <= COLLECTOR_STALE_MS
+        ? latestRawHeartbeat
+        : undefined;
+      const freshForwarderHeartbeat = latestForwarderHeartbeat !== undefined &&
+        t - latestForwarderHeartbeat.at <= COLLECTOR_STALE_MS
+        ? latestForwarderHeartbeat
+        : undefined;
+      const collectorMetadataHeartbeat = freshRawHeartbeat ?? latest;
+      const freshFileFilterHeartbeat = latestRawHeartbeat?.fileFilterMetricsReportedAt !== undefined &&
+        t - latestRawHeartbeat.fileFilterMetricsReportedAt <= COLLECTOR_STALE_MS
+        ? latestRawHeartbeat
+        : undefined;
+      const freshCaptureProfileHeartbeat = latestCaptureProfileHeartbeat?.captureProfileMetricsReportedAt !== undefined &&
+        t - latestCaptureProfileHeartbeat.captureProfileMetricsReportedAt <= COLLECTOR_STALE_MS
+        ? latestCaptureProfileHeartbeat
+        : undefined;
       const categoryCounts = Object.fromEntries(EVENT_CATEGORIES.map((category) => [category, 0])) as Record<T.EventCategory, number>;
       let eventCount = 0;
       let observedAgentCount = 0;
       let reportedIntervalSecs = 0;
+      const windowErrorMaxima = { droppedEvents: 0, outputDropped: 0, errorCount: 0 };
+      const windowExecEvidence: T.CollectorExecEvidenceMetrics & {
+        heartbeatCount: number;
+        intervalSecs: number;
+        shutdownFinalCount: number;
+      } = {
+        exec: 0,
+        execTruncated: 0,
+        execIncomplete: 0,
+        execReassemblyTimeout: 0,
+        heartbeatCount: 0,
+        intervalSecs: 0,
+        shutdownFinalCount: 0,
+      };
+      let latestExecEvidenceHeartbeat: T.CollectorHeartbeatRecord | undefined;
       for (const hb of hbs) {
         observedAgentCount = Math.max(observedAgentCount, hb.observedAgents);
         reportedIntervalSecs += hb.intervalSecs;
+        windowErrorMaxima.droppedEvents = Math.max(windowErrorMaxima.droppedEvents, hb.droppedEvents ?? 0);
+        windowErrorMaxima.outputDropped = Math.max(windowErrorMaxima.outputDropped, hb.outputDropped ?? 0);
+        windowErrorMaxima.errorCount = Math.max(windowErrorMaxima.errorCount, hb.errorCount ?? 0);
+        if (hb.origin === 'raw_collector' && hb.execEvidence) {
+          windowExecEvidence.exec += hb.execEvidence.exec ?? 0;
+          windowExecEvidence.execTruncated += hb.execEvidence.execTruncated ?? 0;
+          windowExecEvidence.execIncomplete += hb.execEvidence.execIncomplete ?? 0;
+          windowExecEvidence.execReassemblyTimeout += hb.execEvidence.execReassemblyTimeout ?? 0;
+          windowExecEvidence.heartbeatCount += 1;
+          windowExecEvidence.intervalSecs += hb.intervalSecs ?? 0;
+          if (hb.execEvidence.shutdownFinal) windowExecEvidence.shutdownFinalCount += 1;
+          if (!latestExecEvidenceHeartbeat || hb.at >= latestExecEvidenceHeartbeat.at) {
+            latestExecEvidenceHeartbeat = hb;
+          }
+        }
         for (const [kind, count] of Object.entries(hb.eventKindCounts)) {
           eventCount += count;
           const category = eventCategory(kind);
@@ -1364,7 +7326,70 @@ export class AggregationService {
         }
       }
       const age = latest ? t - latest.at : Infinity;
-      const degraded = latest ? latest.status !== 'ok' || latest.droppedEvents > 0 || latest.outputDropped > 0 || latest.errorCount > 0 : false;
+      const pipelineAccounting = summarizePipelineAccounting(hbs);
+      const laneHeartbeats = [
+        ...hbs,
+        ...(freshRawHeartbeat ? [freshRawHeartbeat] : []),
+        ...(freshForwarderHeartbeat ? [freshForwarderHeartbeat] : []),
+        ...(freshCaptureProfileHeartbeat ? [freshCaptureProfileHeartbeat] : []),
+      ];
+      const recentRaw = freshRawHeartbeat
+        ? recentHeartbeatLane(laneHeartbeats, 'raw_collector')
+        : [];
+      const recentForwarder = freshForwarderHeartbeat
+        ? recentHeartbeatLane(laneHeartbeats, 'forwarder')
+        : [];
+      const captureEvaluations = recentRaw.map((heartbeat, index) =>
+        evaluateCollectorCaptureHeartbeat(heartbeat, recentRaw[index + 1]));
+      if (captureEvaluations.length && freshCaptureProfileHeartbeat?.captureProfileMetrics) {
+        const previousProfileHeartbeat = recentRaw.find((heartbeat) =>
+          heartbeat.at < freshCaptureProfileHeartbeat.at);
+        const profileEvaluation = evaluateCollectorCaptureHeartbeat(
+          freshCaptureProfileHeartbeat,
+          previousProfileHeartbeat,
+        );
+        if (profileEvaluation.severity > captureEvaluations[0].severity) {
+          captureEvaluations[0] = {
+            severity: profileEvaluation.severity,
+            reasons: [...new Set([
+              ...captureEvaluations[0].reasons,
+              ...profileEvaluation.reasons,
+            ])],
+          };
+        }
+      }
+      const healthChannels = {
+        capture: stabilizeCollectorHealthChannel(
+          captureEvaluations,
+          'capture_recovering_after_recent_failure',
+        ),
+        delivery: stabilizeCollectorHealthChannel(
+          recentForwarder.map(deliveryEvaluation),
+          'delivery_recovering_after_recent_failure',
+        ),
+        control: stabilizeCollectorHealthChannel(
+          recentForwarder.map(controlEvaluation),
+          'control_recovering_after_recent_failure',
+        ),
+      };
+      // Raw Collector and enriched Forwarder heartbeats are independent operational producers.
+      // A clean record from one must not erase the latest error/drop reported by the other.
+      const operationalHeads = [latestRawHeartbeat, latestForwarderHeartbeat].filter(
+        (heartbeat): heartbeat is T.CollectorHeartbeatRecord => heartbeat !== undefined,
+      );
+      const currentDroppedEvents = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.droppedEvents), 0,
+      );
+      const currentOutputDropped = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.outputDropped), 0,
+      );
+      const currentErrorCount = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.errorCount), 0,
+      );
+      const currentQueueDepth = operationalHeads.reduce(
+        (value, heartbeat) => Math.max(value, heartbeat.queueDepth), 0,
+      );
+      const degraded = Object.values(healthChannels).some((channel) => channel.state === 'degraded');
       const state: T.CollectorHealthState = age > COLLECTOR_DOWN_MS
         ? 'down'
         : age > COLLECTOR_STALE_MS
@@ -1376,13 +7401,14 @@ export class AggregationService {
               : 'healthy';
       return {
         collectorId,
-        nodeName: latest?.nodeName,
-        namespace: latest?.namespace,
-        podName: latest?.podName,
-        version: latest?.version,
-        mode: latest?.mode,
+        nodeName: collectorMetadataHeartbeat?.nodeName,
+        namespace: collectorMetadataHeartbeat?.namespace,
+        podName: collectorMetadataHeartbeat?.podName,
+        version: collectorMetadataHeartbeat?.version,
+        mode: collectorMetadataHeartbeat?.mode,
         state,
         stateText: stateText[state],
+        healthChannels,
         firstSeen: hbs.length ? iso(Math.min(...hbs.map((hb) => hb.at))) : undefined,
         lastHeartbeatAt: latest ? iso(latest.at) : undefined,
         lastSeenAt: latest ? iso(latest.at) : undefined,
@@ -1391,14 +7417,42 @@ export class AggregationService {
         riskyEventCount: 0,
         observedAgentCount,
         observedWorkspaceCount: 0,
-        attachedProbes: latest?.attachedProbes ?? 0,
-        enabledFeatures: latest?.enabledFeatures ?? [],
-        queueDepth: latest?.queueDepth ?? 0,
-        droppedEvents: latest?.droppedEvents ?? 0,
-        outputDropped: latest?.outputDropped ?? 0,
-        errorCount: latest?.errorCount ?? 0,
-        filterMetrics: latest?.filterMetrics ?? {
-          scope: 'all',
+        attachedProbes: collectorMetadataHeartbeat?.attachedProbes ?? 0,
+        enabledFeatures: collectorMetadataHeartbeat?.enabledFeatures ?? [],
+        queueDepth: currentQueueDepth,
+        droppedEvents: currentDroppedEvents,
+        outputDropped: currentOutputDropped,
+        errorCount: currentErrorCount,
+        windowErrorMaxima,
+        execEvidence: {
+          reported: latestExecEvidenceHeartbeat !== undefined,
+          ...(latestExecEvidenceHeartbeat ? {
+            // Preserve milliseconds for the shutdown barrier; top-level health timestamps are
+            // intentionally second-granular and cannot order two raw heartbeats in one second.
+            lastReportedAt: new Date(latestExecEvidenceHeartbeat.at).toISOString(),
+            latest: {
+              exec: latestExecEvidenceHeartbeat.execEvidence?.exec ?? 0,
+              execTruncated: latestExecEvidenceHeartbeat.execEvidence?.execTruncated ?? 0,
+              execIncomplete: latestExecEvidenceHeartbeat.execEvidence?.execIncomplete ?? 0,
+              execReassemblyTimeout: latestExecEvidenceHeartbeat.execEvidence?.execReassemblyTimeout ?? 0,
+              shutdownFinal: latestExecEvidenceHeartbeat.execEvidence?.shutdownFinal === true,
+              intervalSecs: latestExecEvidenceHeartbeat.intervalSecs ?? 0,
+            },
+          } : {}),
+          window: windowExecEvidence,
+        },
+        ...(pipelineAccounting ? { pipelineAccounting } : {}),
+        ...(latestRawHeartbeat?.interactionReassembly
+          ? { interactionReassembly: latestRawHeartbeat.interactionReassembly }
+          : {}),
+        filterMetricsReported: freshMetricsHeartbeat !== undefined,
+        filterMetrics: visibleCollectorFilterMetrics(freshMetricsHeartbeat?.filterMetrics ?? {
+          scope: 'decoupled',
+          shutdownFinal: false,
+          filterMode: 'shadow',
+          retainUnknown: true,
+          retainNonAgent: false,
+          noisePolicy: 'balanced',
           observed: 0,
           forwarded: 0,
           confirmedAgent: 0,
@@ -1407,6 +7461,8 @@ export class AggregationService {
           nonAgent: 0,
           filteredNonAgent: 0,
           wouldFilterNonAgent: 0,
+          filteredUnknown: 0,
+          wouldFilterUnknown: 0,
           filteredNoise: 0,
           wouldFilterNoise: 0,
           discoveryBudgetDropped: 0,
@@ -1448,13 +7504,35 @@ export class AggregationService {
           processBootstrapProcReads: 0,
           processFallbackProcReads: 0,
           processAncestryProcReads: 0,
+        }),
+        fileFilterMetricsReported: freshFileFilterHeartbeat !== undefined,
+        fileFilterMetrics: freshFileFilterHeartbeat?.fileFilterMetrics ?? {
+          fileAccess: 0,
+          fileDelete: 0,
+          accessKept: 0,
+          accessSampled: 0,
+          accessDropped: 0,
+          accessSuppressed: 0,
+          deleteKept: 0,
+          deleteDropped: 0,
+          ruleHits: 0,
+          ruleMisses: 0,
+          staleRules: 0,
+          accessRingDropped: 0,
+          deleteRingDropped: 0,
+          enabled: false,
+          epoch: 0,
         },
+        captureProfileMetricsReported: freshCaptureProfileHeartbeat !== undefined,
+        ...(freshCaptureProfileHeartbeat?.captureProfileMetrics
+          ? { captureProfileMetrics: freshCaptureProfileHeartbeat.captureProfileMetrics }
+          : {}),
         message: latest?.message,
         eventCategoryCounts: categoryCounts,
       };
     });
 
-    const collectorId = filter.collectorId?.trim();
+    const collectorId = requestedCollectorId;
     const nodeName = filter.nodeName?.trim();
     const q = filter.q?.trim().toLowerCase();
     const hasFilter = Boolean((filter.state && filter.state !== 'all') || nodeName || q);
@@ -1479,6 +7557,9 @@ export class AggregationService {
       totalCollectors: filtered.length,
       healthyCollectors: filtered.filter((item) => item.state === 'healthy').length,
       quietCollectors: filtered.filter((item) => item.state === 'quiet').length,
+      warningCollectors: filtered.filter((item) =>
+        !['degraded', 'stale', 'down'].includes(item.state) &&
+        Object.values(item.healthChannels).some((channel) => channel.state === 'warning')).length,
       degradedCollectors: filtered.filter((item) => item.state === 'degraded').length,
       staleCollectors: filtered.filter((item) => item.state === 'stale').length,
       downCollectors: filtered.filter((item) => item.state === 'down').length,
@@ -1487,14 +7568,70 @@ export class AggregationService {
       observedAgentCount: filtered.reduce((a, item) => a + item.observedAgentCount, 0),
     };
     const limit = Math.max(1, Math.min(500, filter.limit ?? 120));
-    return { items: filtered.slice(0, limit), total: filtered.length, summary, updateTime: iso() };
+    return {
+      items: filtered.slice(0, limit),
+      total: filtered.length,
+      summary,
+      coverage: this.queryCoverage(filter, [], {
+        source: durable?.source ?? 'memory_hot_ring',
+        totalMode: 'exact',
+        partial: !durable,
+        partialReason: durable ? undefined : 'hot_ring_only',
+        dataFromMs: windowHeartbeats.length
+          ? Math.min(...windowHeartbeats.map((heartbeat) => heartbeat.at))
+          : undefined,
+        dataToMs: windowHeartbeats.length
+          ? Math.max(...windowHeartbeats.map((heartbeat) => heartbeat.at))
+          : undefined,
+      }),
+      updateTime: iso(window.endMs),
+    };
   }
 
-  coverageOverview(filter: T.CoverageQuery): T.CoverageOverview {
-    const { events } = this.win(filter);
-    const collectors = this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
-    const agents = this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
-    const sourceList = this.sources.list({ status: 'all', type: 'all', limit: 500 });
+  async storedCoverageOverview(filter: T.CoverageQuery): Promise<T.CoverageOverview> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.coverageOverview(filter);
+    const [collectors, agents] = await Promise.all([
+      this.storedCollectorHealth({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        limit: 500,
+      }),
+      this.storedAgentInventory({
+        timeType: filter.timeType,
+        startTime: filter.startTime,
+        endTime: filter.endTime,
+        scope: 'agent',
+        limit: 500,
+      }),
+      this.sources.refreshDistributedCurrentState(),
+    ]);
+    return this.coverageOverview(filter, { collectors, agents });
+  }
+
+  coverageOverview(
+    filter: T.CoverageQuery,
+    durable?: { collectors: T.CollectorHealth; agents: T.AgentInventory },
+  ): T.CoverageOverview {
+    const events = durable
+      ? []
+      : this.win(filter).events.filter((event) => event.attribution?.monitored === true);
+    const collectors = durable?.collectors ??
+      this.collectorHealth({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, limit: 500 });
+    const agents = durable?.agents ??
+      this.agentInventory({ timeType: filter.timeType, startTime: filter.startTime, endTime: filter.endTime, scope: 'agent', limit: 500 });
+    // A directly scoped source or issue must also participate when it is a verifier
+    // source. IngestionSourceService deliberately hides verifier sources from broad
+    // inventory views, while an exact sourceId/issueId is an explicit operator
+    // selection. The issue list is pinned again below, so enabling verifier inputs for
+    // an exact issue cannot widen the returned issue inventory.
+    const sourceList = this.sources.list({
+      status: 'all',
+      type: 'all',
+      sourceId: filter.sourceId,
+      includeVerification: Boolean(filter.issueId),
+      limit: 500,
+    });
     const collectorById = new Map(collectors.items.map((collector) => [collector.collectorId, collector]));
     const activeCollectorIds = new Set(
       collectors.items
@@ -1657,7 +7794,12 @@ export class AggregationService {
       }
     }
 
-    const collectorIdsFromEvents = new Map<string, { count: number; agents: Set<string>; sample?: T.JudgedEvent }>();
+    const collectorIdsFromEvents = new Map<string, {
+      count: number;
+      agents: Set<string>;
+      sample?: T.JudgedEvent;
+      aggregateOnly?: boolean;
+    }>();
     for (const e of events) {
       const collectorId = eventCollectorId(e);
       if (!collectorId) continue;
@@ -1667,16 +7809,39 @@ export class AggregationService {
       if (!cur.sample || e.at > cur.sample.at) cur.sample = e;
       collectorIdsFromEvents.set(collectorId, cur);
     }
+    if (durable) {
+      for (const agent of agents.items) {
+        for (const collectorId of agent.collectorIds ?? []) {
+          const current = collectorIdsFromEvents.get(collectorId) ?? {
+            count: 0,
+            agents: new Set<string>(),
+            aggregateOnly: true,
+          };
+          current.agents.add(agent.agentId);
+          collectorIdsFromEvents.set(collectorId, current);
+        }
+      }
+    }
     for (const [collectorId, rec] of collectorIdsFromEvents) {
       if (collectorById.has(collectorId)) continue;
       issues.push(issue(
         'missing_collector_heartbeat',
         'high',
         `缺少 Collector 心跳 · ${collectorId}`,
-        `${rec.count} 条事件携带该 collectorId，但没有对应 CollectorHeartbeat。`,
+        rec.aggregateOnly
+          ? `${rec.agents.size} 个持久化 Agent 聚合仍引用该 collectorId，但查询窗口内没有对应 CollectorHeartbeat。`
+          : `${rec.count} 条事件携带该 collectorId，但没有对应 CollectorHeartbeat。`,
         '启用 a3s-observer CollectorHeartbeat，或让 forwarder 定期 POST /security-center/collectors/heartbeat。',
-        { eventCount: String(rec.count), agentCount: String(rec.agents.size) },
-        { collectorId, nodeName: attrString(rec.sample!, 'collectorNode') || undefined, evidenceEventId: rec.sample?.eventId, evidenceSubject: rec.sample?.subject, lastSeenAt: rec.sample ? iso(rec.sample.at) : undefined },
+        rec.aggregateOnly
+          ? { evidenceMode: 'agent_aggregate', agentCount: String(rec.agents.size) }
+          : { evidenceMode: 'event_fact', eventCount: String(rec.count), agentCount: String(rec.agents.size) },
+        {
+          collectorId,
+          nodeName: rec.sample ? attrString(rec.sample, 'collectorNode') || undefined : undefined,
+          evidenceEventId: rec.sample?.eventId,
+          evidenceSubject: rec.sample?.subject,
+          lastSeenAt: rec.sample ? iso(rec.sample.at) : undefined,
+        },
       ));
     }
 
@@ -1688,10 +7853,17 @@ export class AggregationService {
       const key = `${agent.workspacePath}\0${agent.agentId}`;
       const agentEvents = byAgent.get(key) ?? [];
       const latest = [...agentEvents].sort((a, b) => b.at - a.at)[0];
-      const collectorIds = new Set(agentEvents.map(eventCollectorId).filter(Boolean));
+      const collectorIds = new Set(
+        durable
+          ? agent.collectorIds ?? []
+          : agentEvents.map(eventCollectorId).filter(Boolean),
+      );
       const liveCollectorIds = [...collectorIds].filter((collectorId) => activeCollectorIds.has(collectorId));
-      const missingCollectorEvents = agentEvents.filter((e) => !eventCollectorId(e));
-      eventsWithoutCollector += missingCollectorEvents.length;
+      const missingCollectorEvents = agentEvents.filter(missingCollectorCoverage);
+      const missingCollectorEventCount = durable
+        ? agent.eventsWithoutCollector ?? 0
+        : missingCollectorEvents.length;
+      eventsWithoutCollector += missingCollectorEventCount;
       const covered = liveCollectorIds.length > 0;
       if (covered) coveredAgents += 1;
       else uncoveredAgents += 1;
@@ -1705,7 +7877,7 @@ export class AggregationService {
           `最近事件: ${agent.lastSeen}，当前窗口内该 Agent 没有新的旁路活动。`,
           '确认该 Agent 是否仍在运行；若仍运行，检查所在节点 observer/forwarder 覆盖。',
           { openIncidents: String(agent.openIncidentCount), eventCount: String(agent.eventCount) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId, evidenceSubject: latest?.subject, lastSeenAt: agent.lastSeen },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId ?? agent.lastEventId, evidenceSubject: latest?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
       }
 
@@ -1719,18 +7891,18 @@ export class AggregationService {
             ? `事件归属 Collector: ${[...collectorIds].join(', ')}，但当前没有活跃心跳。`
             : '该 Agent 的事件没有 collectorId，无法定位采集链路。',
           '检查 forwarder 是否附加 collectorId/nodeName，并确认对应 CollectorHeartbeat 正常上报。',
-          { collectorIds: [...collectorIds].join(', ') || 'none', missingCollectorEvents: String(missingCollectorEvents.length) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId, evidenceSubject: latest?.subject, lastSeenAt: agent.lastSeen },
+          { collectorIds: [...collectorIds].join(', ') || 'none', missingCollectorEvents: String(missingCollectorEventCount) },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: latest?.eventId ?? agent.lastEventId, evidenceSubject: latest?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
-      } else if (missingCollectorEvents.length > 0) {
+      } else if (missingCollectorEventCount > 0) {
         issues.push(issue(
           'agent_uncovered',
           agent.riskyEventCount > 0 ? 'medium' : 'low',
           `Agent 部分事件缺少 Collector 归属 · ${agent.agentId}`,
-          `${missingCollectorEvents.length}/${agentEvents.length} 条事件没有 collectorId。`,
+          `${missingCollectorEventCount}/${agent.eventCount} 条事件没有 collectorId。`,
           '统一使用 observer forwarder，并在事件 attributes 中附加 collectorId/nodeName。',
-          { missingCollectorEvents: String(missingCollectorEvents.length), eventCount: String(agentEvents.length) },
-          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: missingCollectorEvents[0]?.eventId, evidenceSubject: missingCollectorEvents[0]?.subject, lastSeenAt: agent.lastSeen },
+          { missingCollectorEvents: String(missingCollectorEventCount), eventCount: String(agent.eventCount) },
+          { agentId: agent.agentId, workspacePath: agent.workspacePath, evidenceEventId: missingCollectorEvents[0]?.eventId ?? agent.lastEventId, evidenceSubject: missingCollectorEvents[0]?.subject ?? agent.lastEventSubject, lastSeenAt: agent.lastSeen },
         ));
       }
     }
@@ -1832,11 +8004,60 @@ export class AggregationService {
         observedWorkspaces: distinct(agents.items.map((agent) => agent.workspacePath)),
       },
       issues: filtered.slice(0, limit),
+      coverage: durable
+        ? {
+            ...agents.coverage,
+            source: agents.coverage.source === 'clickhouse+hot_delta' || collectors.coverage?.source === 'clickhouse+hot_delta'
+              ? 'clickhouse+hot_delta'
+              : collectors.coverage?.source === 'clickhouse+redis_current'
+                ? 'clickhouse+redis_current'
+                : 'clickhouse',
+            partial: Boolean(agents.coverage.partial || collectors.coverage?.partial),
+            partialReason: agents.coverage.partialReason ?? collectors.coverage?.partialReason,
+          }
+        : this.queryCoverage(filter, events, {
+            source: 'memory_hot_ring',
+            totalMode: 'exact',
+            partial: true,
+            partialReason: 'hot_ring_only',
+          }),
       updateTime: iso(),
     };
   }
 
-  policySimulation(input: T.PolicySimulationRequest): T.PolicySimulationResult {
+  async storedPolicySimulation(input: T.PolicySimulationRequest): Promise<T.PolicySimulationResult> {
+    if (!this.judge.storageStatus().clickhouseReady) return this.policySimulation(input);
+    const window = resolveTimeWindow(input);
+    const sampleLimit = Math.max(100, Math.min(5_000, input.sampleLimit ?? 2_000));
+    const persisted = await this.judge.searchStoredEventsPage({
+      sinceMs: window.startMs,
+      untilMs: window.endMs,
+      monitoredOnly: input.scope === 'agent' && resolvedClassificationView(input) === 'as_observed',
+      limit: sampleLimit,
+    });
+    const hot = this.judge.queryRange(window.startMs, window.endMs);
+    const scoped = foldLatestEventRevisions([...persisted.events, ...hot])
+      .filter((event) => input.scope !== 'agent' || this.eventIsAgentForView(event, input))
+      .sort((a, b) => b.at - a.at);
+    const truncated = persisted.hasMore || scoped.length > sampleLimit;
+    const events = scoped.slice(0, sampleLimit);
+    const coverage = this.queryCoverage(input, events, {
+      source: hot.length ? 'clickhouse+hot_delta' : 'clickhouse',
+      totalMode: 'omitted',
+      partial: truncated,
+      partialReason: truncated ? 'scan_limit' : undefined,
+      committedCutoffMs: persisted.committedCutoffMs,
+    });
+    return this.policySimulation(input, events, coverage, sampleLimit, truncated);
+  }
+
+  policySimulation(
+    input: T.PolicySimulationRequest,
+    sampledEvents?: T.JudgedEvent[],
+    durableCoverage?: T.QueryCoverage,
+    durableSampleLimit?: number,
+    durableTruncated = false,
+  ): T.PolicySimulationResult {
     const config = sanitizePolicy(input.policy);
     let simulator: Sentry;
     try {
@@ -1846,8 +8067,10 @@ export class AggregationService {
     } catch (error) {
       throw policyConfigError(error);
     }
-    const { events } = this.win(input);
+    const window = sampledEvents ? undefined : this.win(input);
+    const events = sampledEvents ?? window!.events;
     const limit = Math.max(1, Math.min(500, input.limit ?? 120));
+    const sampleLimit = durableSampleLimit ?? Math.max(1, Math.min(100_000, events.length));
     let evaluatedEvents = 0;
     let skippedEvents = 0;
     const diffs: T.PolicySimulationDiff[] = [];
@@ -1929,12 +8152,33 @@ export class AggregationService {
       diffs: diffs.slice(0, limit),
       byAgent: group((diff) => diff.agentId),
       byWorkspace: group((diff) => diff.workspacePath),
+      sampling: {
+        strategy: 'latest_event_sample',
+        sampleLimit,
+        sampledEvents: events.length,
+        truncated: durableTruncated || !sampledEvents,
+      },
+      coverage: durableCoverage ?? this.queryCoverage(input, events, {
+        source: 'memory_hot_ring',
+        totalMode: 'omitted',
+        partial: true,
+        partialReason: 'hot_ring_only',
+      }),
+      ...this.classificationResponseMeta(input),
       updateTime: iso(),
     };
   }
 
-  performanceCard(filter: T.SecurityTimeFilter): T.SecurityPerformanceCard {
-    const { events, dataSinceMs, dataSpanMs } = this.win(filter);
+  performanceCard(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityPerformanceCard {
+    const window = resolveTimeWindow(filter);
+    const windowed = this.win(filter);
+    const windowEvents = overlay?.events ?? windowed.events;
+    const events = overlay ? windowEvents : this.scopedEventsForView(windowEvents, filter);
+    const dataSinceMs = overlay ? window.startMs : windowed.dataSinceMs;
+    const dataSpanMs = overlay ? window.spanMs : windowed.dataSpanMs;
     const n = 60;
     const size = dataSpanMs / n || 1;
     const counts = this.buckets(events, dataSinceMs, dataSpanMs, n).map((b) => b.length);
@@ -1944,23 +8188,39 @@ export class AggregationService {
       componentRequestCount: { current: reqCur, peak: Math.max(0, ...counts), avg: Math.round(mean(counts)) },
       tps: { current: round1(perSec[perSec.length - 1] ?? 0), peak: round1(Math.max(0, ...perSec)), avg: round1(mean(perSec)) },
       avgLatency: { value: Math.round(mean(events.map((e) => e.latencyMs))), unit: 'ms' },
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
 
-  riskSummary(filter: T.SecurityTimeFilter): T.SecurityRiskSummary {
-    const { events } = this.win(filter);
+  riskSummary(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityRiskSummary {
+    const events = overlay?.events ?? this.scopedEventsForView(this.win(filter).events, filter);
     const risky = events.filter((e) => e.verdict !== 'allow');
     const card = (code: T.RiskType, name: string) => ({ riskTypeCode: code, riskTypeName: name, eventCount: risky.filter((e) => e.riskType === code).length });
-    return { summaryCards: [card('system', '系统性风险'), card('communication', '通信风险'), card('atomic', '单体智能体风险')], updateTime: iso() };
+    return {
+      summaryCards: [card('system', '系统性风险'), card('communication', '通信风险'), card('atomic', '单体智能体风险')],
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
   }
 
-  riskBreakdown(filter: T.SecurityTimeFilter): T.SecurityRiskBreakdown {
-    const { events, sinceMs, spanMs } = this.win(filter);
+  riskBreakdown(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+    previousOverlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityRiskBreakdown {
+    const windowed = this.win(filter);
+    const { sinceMs, spanMs } = windowed;
+    const events = overlay?.events ?? windowed.events;
     const agentScoped = filter.scope === 'agent';
-    const scopedEvents = agentScoped ? events.filter(isMonitoredAgentEvent) : events;
-    const prev = this.judge.query(sinceMs - spanMs).filter((e) => e.at < sinceMs);
-    const scopedPrev = agentScoped ? prev.filter(isMonitoredAgentEvent) : prev;
+    const scopedEvents = overlay ? events : this.scopedEventsForView(events, filter, agentScoped);
+    const prev = previousOverlay?.events ?? this.judge.query(sinceMs - spanMs).filter((e) => e.at < sinceMs);
+    const scopedPrev = previousOverlay ? prev : this.scopedEventsForView(prev, filter, agentScoped);
     const cat = (type: T.RiskType): T.RiskCategory => {
       const risky = scopedEvents.filter((e) => e.verdict !== 'allow' && e.riskType === type);
       const prevRisky = scopedPrev.filter((e) => e.verdict !== 'allow' && e.riskType === type);
@@ -1982,12 +8242,22 @@ export class AggregationService {
       const top = items.find((i) => i.eventCount > 0);
       return { totalCount: risky.length, displayColor: CATEGORY_COLOR[top?.riskCode ?? ''] ?? '#94a3b8', items };
     };
-    return { systemRisks: cat('system'), communicationRisks: cat('communication'), singleAgentRisks: cat('atomic'), updateTime: iso() };
+    return {
+      systemRisks: cat('system'),
+      communicationRisks: cat('communication'),
+      singleAgentRisks: cat('atomic'),
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
   }
 
-  highestRiskSession(filter: T.SecurityTimeFilter): T.SecurityHighestRiskSession {
-    const { events } = this.win(filter);
-    const agentEvents = events.filter(isMonitoredAgentEvent);
+  highestRiskSession(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityHighestRiskSession {
+    const events = overlay?.events ?? this.win(filter).events;
+    const agentEvents = overlay ? events : this.scopedEventsForView(events, filter, true);
     const bySession = new Map<string, T.JudgedEvent[]>();
     for (const e of agentEvents) {
       const key = eventSessionLabel(e);
@@ -2000,7 +8270,19 @@ export class AggregationService {
       if (s > topScore) [topScore, top] = [s, evs];
     }
     if (!top.length) {
-      return { sessionId: '-', userId: '-', workspacePath: '-', riskLevel: 'safe', riskLevelText: LEVEL_TEXT.safe, compositeScore: 0, lastEventTime: iso(), riskDimensions: DIMENSIONS.map((d) => ({ dimensionCode: d.code, dimensionName: d.name, score: 0 })), updateTime: iso() };
+      return {
+        sessionId: '-',
+        userId: '-',
+        workspacePath: '-',
+        riskLevel: 'safe',
+        riskLevelText: LEVEL_TEXT.safe,
+        compositeScore: 0,
+        lastEventTime: iso(),
+        riskDimensions: DIMENSIONS.map((d) => ({ dimensionCode: d.code, dimensionName: d.name, score: 0 })),
+        ...(overlay ? { coverage: overlay.coverage } : {}),
+        ...this.classificationResponseMeta(filter),
+        updateTime: iso(),
+      };
     }
     const head = top[0];
     const composite = Math.min(100, Math.round(mean(top.map((e) => e.riskScore)) + Math.sqrt(top.filter((e) => e.verdict !== 'allow').length) * 6));
@@ -2013,12 +8295,17 @@ export class AggregationService {
       sessionId: eventAgentLabel(head), userId: head.userId, workspacePath: attributionWorkspacePath(head),
       riskLevel: lvl.level, riskLevelText: lvl.text, compositeScore: composite,
       lastEventTime: iso(Math.max(...top.map((e) => e.at))), riskDimensions: dims, updateTime: iso(),
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
     };
   }
 
-  decisionFunnel(filter: T.SecurityTimeFilter): T.SecurityDecisionFunnel {
-    const windowEvents = this.win(filter).events;
-    const events = filter.scope === 'agent' ? windowEvents.filter(isMonitoredAgentEvent) : windowEvents;
+  decisionFunnel(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityDecisionFunnel {
+    const windowEvents = overlay?.events ?? this.win(filter).events;
+    const events = overlay ? windowEvents : this.scopedEventsForView(windowEvents, filter);
     const total = events.length || 1;
     const l2 = events.filter((e) => e.tier === 'Llm' || e.tier === 'Agent');
     const l3 = events.filter((e) => e.tier === 'Agent');
@@ -2031,12 +8318,18 @@ export class AggregationService {
         { tierCode: 'L3', tierName: '智能体深判', count: l3.length, percentage: pct(l3.length), slaDesc: 'a3s-code · 深度调查' },
       ],
       finalBlock: { count: blocked, percentage: pct(blocked) },
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
 
-  agentObservability(filter: T.SecurityTimeFilter): T.AgentObservability {
-    const { events } = this.win(filter);
+  agentObservability(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.AgentObservability {
+    const windowEvents = overlay?.events ?? this.win(filter).events;
+    const events = overlay ? windowEvents : this.scopedEventsForView(windowEvents, filter);
     const recent = events.filter((e) => e.at >= now() - 60_000);
     const total = events.length || 1;
     const errorRate = round1((events.filter((e) => e.verdict !== 'allow').length / total) * 100);
@@ -2045,14 +8338,114 @@ export class AggregationService {
       health: { heartbeatOk: recent.length > 0, resourceUtil: Math.min(99, 20 + recent.length * 3), errorRate, decisionLatencyMs: Math.round(mean(events.map((e) => e.latencyMs))) },
       behavioral: { actionRate: recent.length, decisionPattern: errorRate > 25 ? 'drift' : 'baseline', stateTransitions: distinct(recent.map((e) => e.sessionId)), goalProgress: Math.max(0, 100 - Math.round(errorRate)) },
       system: { agentCount: distinct(events.map((e) => e.agentId)), commThroughput: comm, infraHealthy: true },
+      ...(overlay ? { coverage: overlay.coverage } : {}),
+      ...this.classificationResponseMeta(filter),
       updateTime: iso(),
     };
   }
 
-  workspaceRiskDistribution(filter: T.SecurityTimeFilter): T.SecurityWorkspaceRiskDistribution {
-    const { events } = this.win(filter);
+  async agentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.agentObservability(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const durable = await this.storedAgentObservabilityFact(filter);
+    if (!durable) return this.agentObservability(filter);
+    const window = resolveTimeWindow(filter);
+    const fact = durable.fact;
+    const eventCount = fact.eventCount;
+    const errorRate = round1((fact.riskyEventCount / (eventCount || 1)) * 100);
+    return {
+      health: {
+        heartbeatOk: fact.recentEventCount > 0,
+        resourceUtil: Math.min(99, 20 + fact.recentEventCount * 3),
+        errorRate,
+        decisionLatencyMs: Math.round(fact.latencyTotal / (eventCount || 1)),
+      },
+      behavioral: {
+        actionRate: fact.recentEventCount,
+        decisionPattern: errorRate > 25 ? 'drift' : 'baseline',
+        stateTransitions: fact.recentSessionKeys.length,
+        goalProgress: Math.max(0, 100 - Math.round(errorRate)),
+      },
+      system: {
+        agentCount: fact.agentIds.length,
+        commThroughput: fact.recentCommCount,
+        infraHealthy: true,
+      },
+      coverage: durable.coverage,
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(window.endMs),
+    };
+  }
+
+  async sharedAgentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
+    const window = resolveTimeWindow(filter);
+    const key = JSON.stringify([
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_3h'],
+      filter.scope ?? 'all',
+    ]);
+    const effectiveFilter = window.custom || filter.snapshotAsOf
+      ? filter
+      : {
+          ...filter,
+          snapshotAsOf: new Date(Math.floor(now() / 3_000) * 3_000).toISOString(),
+        };
+    const completedKey = JSON.stringify([
+      resolveTimeWindow(effectiveFilter).cacheKey,
+      effectiveFilter.scope ?? 'all',
+    ]);
+    this.pruneAgentObservabilityRecent();
+    const recent = this.agentObservabilityRecent.get(completedKey);
+    if (recent) {
+      this.agentObservabilityRecent.delete(completedKey);
+      this.agentObservabilityRecent.set(completedKey, recent);
+      return recent.value;
+    }
+    const current = this.agentObservabilityInFlight.get(key);
+    if (current) return current;
+    const reservation = this.reserveInFlight(
+      this.agentObservabilityInFlight,
+      key,
+      this.agentObservabilityInFlightBytes,
+      MAX_AGENT_OBSERVABILITY_IN_FLIGHT,
+    );
+    if (!reservation.accepted) {
+      this.agentObservabilityInFlightRejected += 1;
+      throw new ServiceUnavailableException('Agent observability query is busy; retry the latest selection');
+    }
+    const baseRequest = this.agentObservabilityForWindow(effectiveFilter);
+    let request: Promise<T.AgentObservability>;
+    request = this.withInFlightTimeout(
+      baseRequest,
+      () => {
+        if (this.agentObservabilityInFlight.get(key) !== request) return;
+        this.agentObservabilityInFlight.delete(key);
+        this.agentObservabilityInFlightBytes = Math.max(0, this.agentObservabilityInFlightBytes - reservation.bytes);
+        this.agentObservabilityInFlightTimeouts += 1;
+      },
+      'Agent observability query timed out; retry the latest selection',
+    );
+    this.agentObservabilityInFlight.set(key, request);
+    this.agentObservabilityInFlightBytes += reservation.bytes;
+    try {
+      const value = await request;
+      this.rememberAgentObservabilityRecent(completedKey, value);
+      return value;
+    } finally {
+      if (this.agentObservabilityInFlight.get(key) === request) {
+        this.agentObservabilityInFlight.delete(key);
+        this.agentObservabilityInFlightBytes = Math.max(0, this.agentObservabilityInFlightBytes - reservation.bytes);
+      }
+    }
+  }
+
+  workspaceRiskDistribution(
+    filter: T.SecurityTimeFilter,
+    overlay?: { events: T.JudgedEvent[]; coverage: T.QueryCoverage },
+  ): T.SecurityWorkspaceRiskDistribution {
+    const events = overlay?.events ?? this.win(filter).events;
     const agentScoped = filter.scope !== 'raw';
-    const scopedEvents = agentScoped ? events.filter(isMonitoredAgentEvent) : events;
+    const scopedEvents = overlay ? events : this.scopedEventsForView(events, filter, agentScoped);
     const byWs = new Map<string, T.JudgedEvent[]>();
     for (const e of scopedEvents) {
       const workspacePath = agentScoped ? attributionWorkspacePath(e) : e.workspacePath;
@@ -2064,6 +8457,267 @@ export class AggregationService {
         return { workspacePath, sessionCount: distinct(evs.map((e) => e.sessionId)), totalRiskScore: evs.reduce((a, e) => a + e.riskScore, 0), riskLevel: lvl.level, riskLevelText: lvl.text };
       })
       .sort((a, b) => b.totalRiskScore - a.totalRiskScore);
-    return { list, updateTime: iso() };
+    return { list, ...(overlay ? { coverage: overlay.coverage } : {}), ...this.classificationResponseMeta(filter), updateTime: iso() };
+  }
+
+  async healthCardForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityHealthCard> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.healthCard(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.healthCard(filter, this.boundedHotDashboardOverlay(filter));
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0) || 1;
+    const blocked = rows.filter((row) => row.verdict === 'block').reduce((sum, row) => sum + row.eventCount, 0);
+    const escalated = rows.filter((row) => row.verdict === 'escalate').reduce((sum, row) => sum + row.eventCount, 0);
+    const score = Math.max(1, Math.min(100, Math.round(100 - (blocked / total) * 60 - (escalated / total) * 25)));
+    const text = score >= 90 ? '健康' : score >= 75 ? '良好' : score >= 60 ? '注意' : score >= 40 ? '风险偏高' : '高危';
+    const tokens = fmtTokens(rows.reduce((sum, row) => sum + row.tokenCount, 0));
+    return {
+      healthScore: score,
+      healthStatusText: text,
+      tokenConsumptionTotal: tokens.total,
+      tokenConsumptionUnit: tokens.unit,
+      ...this.classificationResponseMeta(filter),
+    };
+  }
+
+  async explainabilityScanForWindow(filter: T.ExplainabilityScanRequest): Promise<T.SecurityExplainabilityScan> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.explainabilityScan(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.explainabilityScan(filter, this.boundedHotDashboardOverlay(filter));
+    const n = Math.max(8, Math.min(72, filter.seriesPoints ?? 24));
+    const window = resolveTimeWindow(filter);
+    const buckets = this.aggregateHistoryBuckets(history, filter, n);
+    const safeSeries: T.WaveSeriesPoint[] = [];
+    const riskSeries: T.WaveSeriesPoint[] = [];
+    buckets.forEach((bucket, index) => {
+      const statTime = iso(window.startMs + index * (window.spanMs / n));
+      const avgRisk = bucket.eventCount ? bucket.riskScoreTotal / bucket.eventCount : 0;
+      riskSeries.push({ statTime, value: Math.round(avgRisk), activationCount: bucket.riskActivationCount });
+      safeSeries.push({ statTime, value: Math.round(100 - avgRisk), activationCount: bucket.eventCount });
+    });
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0);
+    const blocked = rows.filter((row) => row.verdict === 'block').reduce((sum, row) => sum + row.eventCount, 0);
+    const hotEvents = window.custom ? [] : this.judge.queryRange(Math.max(window.startMs, window.endMs - 5 * 60_000), window.endMs);
+    const scopedHotEvents = this.scopedEventsForView(hotEvents, filter);
+    return {
+      waveSeries: [{ safeSeries, riskSeries }],
+      threatInterception: `${round1((blocked / (total || 1)) * 100)}%`,
+      sessionActiveCount: String(distinct(scopedHotEvents.map((event) => event.sessionId))),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async performanceCardForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityPerformanceCard> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.performanceCard(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.performanceCard(filter, this.boundedHotDashboardOverlay(filter));
+    const window = resolveTimeWindow(filter);
+    const buckets = this.aggregateHistoryBuckets(history, filter, 60);
+    const bucketSeconds = window.spanMs / buckets.length / 1000;
+    const counts = buckets.map((bucket) => bucket.eventCount);
+    const perSecond = counts.map((count) => count / (bucketSeconds || 1));
+    const total = buckets.reduce((sum, bucket) => sum + bucket.eventCount, 0);
+    const latencyTotal = buckets.reduce((sum, bucket) => sum + bucket.latencyTotal, 0);
+    return {
+      componentRequestCount: {
+        current: counts[counts.length - 1] ?? 0,
+        peak: Math.max(0, ...counts),
+        avg: Math.round(mean(counts)),
+      },
+      tps: {
+        current: round1(perSecond[perSecond.length - 1] ?? 0),
+        peak: round1(Math.max(0, ...perSecond)),
+        avg: round1(mean(perSecond)),
+      },
+      avgLatency: { value: Math.round(latencyTotal / (total || 1)), unit: 'ms' },
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async riskSummaryForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityRiskSummary> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.riskSummary(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.riskSummary(filter, this.boundedHotDashboardOverlay(filter));
+    const rows = this.currentDimensions(history, filter).filter((row) => row.verdict !== 'allow');
+    const card = (code: T.RiskType, name: string) => ({
+      riskTypeCode: code,
+      riskTypeName: name,
+      eventCount: rows.filter((row) => row.riskType === code).reduce((sum, row) => sum + row.eventCount, 0),
+    });
+    return {
+      summaryCards: [
+        card('system', '系统性风险'),
+        card('communication', '通信风险'),
+        card('atomic', '单体智能体风险'),
+      ],
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async riskBreakdownForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityRiskBreakdown> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      const window = resolveTimeWindow(filter);
+      const previousFilter: T.SecurityTimeFilter = {
+        ...filter,
+        timeType: 'custom',
+        startTime: new Date(Math.max(0, window.startMs - window.spanMs)).toISOString(),
+        endTime: new Date(Math.max(0, window.startMs - 1)).toISOString(),
+        snapshotAsOf: new Date(Math.max(0, window.startMs - 1)).toISOString(),
+      };
+      const [current, previous] = await Promise.all([
+        this.currentEffectiveOverlay(filter),
+        this.currentEffectiveOverlay(previousFilter),
+      ]);
+      return this.riskBreakdown(filter, current, previous);
+    }
+    const history = await this.history(filter);
+    if (!history) return this.riskBreakdown(filter, this.boundedHotDashboardOverlay(filter));
+    const agentScoped = filter.scope === 'agent';
+    const select = (period: DashboardWindowDimensionRow['period']) => history.dimensions.filter((row) =>
+      row.period === period && row.verdict !== 'allow' && (!agentScoped || row.monitored));
+    const current = select('current');
+    const previous = select('previous');
+    const category = (type: T.RiskType): T.RiskCategory => {
+      const rows = current.filter((row) => row.riskType === type);
+      const previousRows = previous.filter((row) => row.riskType === type);
+      const countOf = (items: DashboardWindowDimensionRow[], code: string) =>
+        items.filter((row) => row.riskCategory === code).reduce((sum, row) => sum + row.eventCount, 0);
+      const known = RISK_TAXONOMY[type];
+      const extras = [...new Set(rows.map((row) => row.riskCategory))]
+        .filter((code) => !known.some((item) => item.code === code))
+        .map((code) => ({ code, name: rows.find((row) => row.riskCategory === code)?.riskName || code }));
+      const items = [...known, ...extras].map(({ code, name }) => {
+        const eventCount = countOf(rows, code);
+        const before = countOf(previousRows, code);
+        const changeRate = before === 0 ? (eventCount ? 100 : 0) : round1(((eventCount - before) / before) * 100);
+        return { riskCode: code, riskName: name, eventCount, changeRate };
+      }).sort((a, b) => b.eventCount - a.eventCount);
+      const top = items.find((item) => item.eventCount > 0);
+      return {
+        totalCount: rows.reduce((sum, row) => sum + row.eventCount, 0),
+        displayColor: CATEGORY_COLOR[top?.riskCode ?? ''] ?? '#94a3b8',
+        items,
+      };
+    };
+    return {
+      systemRisks: category('system'),
+      communicationRisks: category('communication'),
+      singleAgentRisks: category('atomic'),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async highestRiskSessionForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityHighestRiskSession> {
+    if (resolvedClassificationView(filter) === 'current_effective') {
+      const scoped = { ...filter, scope: 'agent' as const };
+      return this.highestRiskSession(scoped, await this.currentEffectiveOverlay(scoped, true));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.highestRiskSession(filter, this.boundedHotDashboardOverlay(filter, true));
+    const top = history.topSession;
+    if (!top) {
+      return {
+        sessionId: '-',
+        userId: '-',
+        workspacePath: '-',
+        riskLevel: 'safe',
+        riskLevelText: LEVEL_TEXT.safe,
+        compositeScore: 0,
+        lastEventTime: iso(resolveTimeWindow(filter).endMs),
+        riskDimensions: DIMENSIONS.map((dimension) => ({ dimensionCode: dimension.code, dimensionName: dimension.name, score: 0 })),
+        ...this.classificationResponseMeta(filter),
+        updateTime: iso(),
+      };
+    }
+    const compositeScore = Math.min(100, Math.round((top.riskScoreTotal / (top.eventCount || 1)) + Math.sqrt(top.riskyEventCount) * 6));
+    const level = levelByRank(Math.min(4, Math.floor(compositeScore / 22)));
+    return {
+      sessionId: top.sessionId,
+      userId: top.userId,
+      workspacePath: top.workspacePath,
+      riskLevel: level.level,
+      riskLevelText: level.text,
+      compositeScore,
+      lastEventTime: iso(top.lastEventAt),
+      riskDimensions: DIMENSIONS.map((dimension) => {
+        const count = top.dimensionCounts[dimension.code] ?? 0;
+        return {
+          dimensionCode: dimension.code,
+          dimensionName: dimension.name,
+          score: count === 0 ? 0 : count === 1 ? 1 : count <= 3 ? 2 : 3,
+        };
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async decisionFunnelForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityDecisionFunnel> {
+    if (this.needsCurrentAgentOverlay(filter)) {
+      return this.decisionFunnel(filter, await this.currentEffectiveOverlay(filter));
+    }
+    const history = await this.history(filter);
+    if (!history) return this.decisionFunnel(filter, this.boundedHotDashboardOverlay(filter));
+    const rows = this.currentDimensions(history, filter);
+    const total = rows.reduce((sum, row) => sum + row.eventCount, 0) || 1;
+    const count = (predicate: (row: DashboardWindowDimensionRow) => boolean) =>
+      rows.filter(predicate).reduce((sum, row) => sum + row.eventCount, 0);
+    const l2 = count((row) => row.tier === 'Llm' || row.tier === 'Agent');
+    const l3 = count((row) => row.tier === 'Agent');
+    const blocked = count((row) => row.verdict === 'block');
+    const percentage = (value: number) => round1((value / total) * 100);
+    return {
+      tiers: [
+        { tierCode: 'L1', tierName: '规则引擎', count: total, percentage: 100, slaDesc: '确定性匹配 · <1ms' },
+        { tierCode: 'L2', tierName: 'LLM 研判', count: l2, percentage: percentage(l2), slaDesc: '语义判定 · <100ms' },
+        { tierCode: 'L3', tierName: '智能体深判', count: l3, percentage: percentage(l3), slaDesc: 'a3s-code · 深度调查' },
+      ],
+      finalBlock: { count: blocked, percentage: percentage(blocked) },
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
+  }
+
+  async workspaceRiskDistributionForWindow(filter: T.SecurityTimeFilter): Promise<T.SecurityWorkspaceRiskDistribution> {
+    if (this.needsCurrentAgentOverlay(filter, filter.scope !== 'raw')) {
+      return this.workspaceRiskDistribution(
+        filter,
+        await this.currentEffectiveOverlay(filter, true),
+      );
+    }
+    const history = await this.history(filter);
+    if (!history || filter.scope === 'raw') {
+      return this.workspaceRiskDistribution(
+        filter,
+        this.boundedHotDashboardOverlay(filter, filter.scope !== 'raw'),
+      );
+    }
+    return {
+      list: history.workspaces.map((workspace) => {
+        const level = levelByRank(workspace.worstSeverityRank);
+        return {
+          workspacePath: workspace.workspacePath,
+          sessionCount: workspace.sessionCount,
+          totalRiskScore: workspace.totalRiskScore,
+          riskLevel: level.level,
+          riskLevelText: level.text,
+        };
+      }),
+      ...this.classificationResponseMeta(filter),
+      updateTime: iso(),
+    };
   }
 }

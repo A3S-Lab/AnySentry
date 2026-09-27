@@ -32,6 +32,21 @@ class SupplyChainEnrichmentFunctionTest {
     }
 
     @Test
+    void matchesCanonicalCommandPathWithHighConfidence() {
+        CanonicalEvent event = new CanonicalEvent();
+        event.executable = "webpack";
+        event.command = "/workspace/node_modules/.bin/webpack --version";
+        event.resource = "/workspace/node_modules/.bin/webpack";
+
+        List<CanonicalEvent.RuntimeVulnerabilityMatch> matches =
+                SupplyChainEnrichmentFunction.matches(event, runtime("webpack", "5.98.0"));
+
+        assertEquals(1, matches.size());
+        assertEquals("high", matches.get(0).confidence);
+        assertEquals("node_modules path", matches.get(0).matchBasis);
+    }
+
+    @Test
     void doesNotMatchPackageNameMentionInUnrelatedText() {
         CanonicalEvent event = new CanonicalEvent();
         event.executable = "printf";

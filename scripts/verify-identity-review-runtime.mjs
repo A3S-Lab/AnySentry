@@ -103,7 +103,7 @@ try {
     body: { targetType: 'agent', agentAssetId, timeType: 'last_3h' },
   });
   assert.equal(review.status, 'succeeded', JSON.stringify(review));
-  assert.equal(review.provider, 'a3s-code-sdk');
+  assert.equal(review.provider, 'direct-llm');
   assert.equal(review.model, 'glm-5.2');
   assert.equal(review.verdict, 'agent');
   assert.equal(review.confidence, 0.88);

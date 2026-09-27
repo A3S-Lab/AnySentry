@@ -30,12 +30,28 @@ install -m 0755 "$built" "$STAGE_DIR/observer/bin/a3s-observer-collector"
 for module in \
   observer-forward.js \
   observer-agent-attribution.js \
+  observer-agent-runtime-signatures.js \
   observer-agent-templates.js \
+  observer-attribution-merge.js \
   observer-behavior-discovery.js \
+  observer-capture-profile-control.js \
+  observer-capture-profile-reporter.js \
+  observer-classification-semantics.js \
   observer-docker-discovery.js \
+  observer-durable-spool.js \
   observer-event-dedup.js \
+  observer-file-aggregation.js \
+  observer-filter-rule-publisher.js \
+  observer-filter-rules.js \
+  observer-infrastructure-policy.js \
   observer-infrastructure-roots.js \
+  observer-infrastructure-rules.js \
+  observer-launch-context.js \
+  observer-pipeline-accounting.js \
   observer-priority-queue.js \
+  observer-systemd-enrichment.js \
+  observer-tls-agent-cgroups.js \
+  observer-unified-filter-policy.js \
   observer-workload-filter.js
 do
   [[ -f "$SOURCE_DIR/anysentry/scripts/$module" ]] || die "Observer forwarder module missing: $module"

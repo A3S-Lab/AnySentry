@@ -1,0 +1,1726 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const {
+  resolveAgentConversationsV2,
+  hopScopedSessionConversationId,
+} = require('../apps/api/dist/security-monitoring/agent-conversation-resolution-v2.js');
+const {
+  projectAgentConversations,
+} = require('../apps/api/dist/security-monitoring/agent-conversation.js');
+const {
+  projectContextReplaySummaries,
+  projectSemanticConversationTimeline,
+} = require('../apps/api/dist/security-monitoring/agent-semantic-timeline.js');
+
+const digest = (value) => createHash('sha256').update(value).digest('hex');
+const unixNs = (ms) => String(BigInt(ms) * 1_000_000n);
+const content = (structured, messages = [], text) => {
+  const body = JSON.stringify(structured);
+  return {
+    body,
+    encoding: 'utf8',
+    contentType: 'application/json',
+    capturedBytes: Buffer.byteLength(body),
+    decodedBytes: Buffer.byteLength(body),
+    sha256: digest(body),
+    completeness: 'complete',
+    messages,
+    structured,
+    ...(text === undefined ? {} : { text }),
+  };
+};
+const human = (id, turnId, value) => ({
+  type: 'message',
+  id,
+  role: 'user',
+  content: [{ type: 'input_text', text: value }],
+  internal_chat_message_metadata_passthrough: {
+    turn_id: turnId,
+    content_item_kinds: ['user.text'],
+  },
+});
+const developer = (id, value) => ({
+  type: 'message',
+  id,
+  role: 'developer',
+  content: [{ type: 'input_text', text: value }],
+  internal_chat_message_metadata_passthrough: {
+    content_item_kinds: ['model.base_instructions'],
+  },
+});
+const toolOutput = (id, turnId, callId, value) => ({
+  type: 'custom_tool_call_output',
+  id,
+  call_id: callId,
+  output: value,
+  internal_chat_message_metadata_passthrough: { turn_id: turnId },
+});
+
+function interaction({
+  id,
+  at,
+  instance,
+  request,
+  responseId,
+  previousResponseId,
+  conversationId,
+  providerConversationId,
+  interactionType = 'model',
+  toolCalls = [],
+  toolResults = [],
+  responseText = 'ok',
+  responseStructured,
+  trafficRole,
+  path = '/backend-api/codex/responses',
+  agentProduct = 'Codex',
+  wireTemplateId,
+  workspacePath = '/workspace/resolver-v2',
+  statusCode = 200,
+  completeness = 'complete',
+  partialReasons = [],
+  conversationCompleteness,
+  logicalAgentId,
+  logicalDefinitionId,
+  logicalScopeMode,
+  logicalIdentityAuthority,
+  tenantId,
+  ownerId,
+  profile,
+  profileVersion,
+  deploymentId,
+  deploymentRevision,
+  environmentId,
+  sessionLifecycle,
+  semanticItems,
+  semanticParserVersion = 1,
+}) {
+  const messages = (request.input ?? request.messages ?? []).map((item) => ({
+    role: item.role ?? item.type ?? 'input',
+    content: item.content ?? item.output ?? item,
+    ...(item.id ? { sourceItemId: item.id } : {}),
+    ...(item.call_id ? { toolCallId: item.call_id } : {}),
+  }));
+  return {
+    schemaVersion: 'anysentry.agent_interaction.v1',
+    interactionId: id,
+    interactionType,
+    at,
+    workspacePath,
+    agentAssetId: instance.includes('two') ? 'agent-alias-new' : 'agent-alias-old',
+    agentInstanceId: instance,
+    agentProduct,
+    providerConversationId,
+    ...(logicalAgentId ? { logicalAgentId } : {}),
+    ...(logicalDefinitionId ? { logicalDefinitionId } : {}),
+    ...(logicalScopeMode ? { logicalScopeMode } : {}),
+    ...(logicalIdentityAuthority ? { logicalIdentityAuthority } : {}),
+    ...(tenantId ? { tenantId } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(profile ? { profile } : {}),
+    ...(profileVersion ? { profileVersion } : {}),
+    ...(deploymentId ? { deploymentId } : {}),
+    ...(deploymentRevision ? { deploymentRevision } : {}),
+    ...(environmentId ? { environmentId } : {}),
+    ...(sessionLifecycle ? { sessionLifecycle } : {}),
+    providerResponseId: responseId,
+    providerPreviousResponseId: previousResponseId,
+    trafficRole,
+    conversationId,
+    conversationIdSource: conversationId ? 'provider' : undefined,
+    conversationBindingVersion: conversationId ? 1 : undefined,
+    detectedClassification: 'confirmed_agent',
+    currentEffectiveClassification: 'confirmed_agent',
+    process: {
+      hostId: 'host-v2',
+      bootId: 'boot-v2',
+      pid: at % 100_000,
+      ppid: 1,
+      startTimeTicks: String(at),
+      comm: 'codex',
+      exe: '/usr/bin/codex',
+      cwd: workspacePath,
+    },
+    connectionId: 'tls:' + id,
+    transport: 'tls',
+    protocol: interactionType === 'tool' ? 'http/1.1' : 'websocket-json',
+    wireTemplateId: wireTemplateId
+      ?? (interactionType === 'tool' ? 'mcp-jsonrpc' : 'openai-responses'),
+    parseState: 'parsed',
+    llmLikelihood: 'confirmed',
+    conversationCompleteness,
+    endpoint: 'gateway.invalid',
+    method: 'POST',
+    path,
+    statusCode,
+    model: interactionType === 'model' ? 'fixture-model' : undefined,
+    startedAtUnixNs: String(BigInt(at) * 1_000_000n),
+    requestCompleteAtUnixNs: String(BigInt(at + 1) * 1_000_000n),
+    firstResponseAtUnixNs: String(BigInt(at + 2) * 1_000_000n),
+    endedAtUnixNs: String(BigInt(at + 3) * 1_000_000n),
+    durationNs: '3000000',
+    timeQuality: 'collector_calibrated',
+    request: content(request, messages),
+    response: content(
+      responseStructured ?? (responseId ? { id: responseId, output: [] } : { result: {} }),
+      [],
+      responseText,
+    ),
+    toolCalls,
+    toolResults,
+    semanticParserId: 'observer.agent-interaction',
+    semanticParserVersion,
+    ...(semanticItems ? { semanticItems } : {}),
+    completeness,
+    partialReasons,
+    captureSource: 'tls_uprobe_rustls',
+    receivedAt: at + 4,
+  };
+}
+
+const base = 1_788_500_000_000;
+const continuityKey = 'stable-resume-key';
+const h0 = human('msg-h0', 'turn-h0', 'initial prompt');
+const h1 = human('msg-h1', 'turn-h1', 'what tools are available');
+const h2 = human('msg-h2', 'turn-h2', 'run the connectivity test');
+const h3 = human('msg-h3', 'turn-h3', 'resume the terminal session');
+const context = {
+  type: 'message',
+  id: 'msg-context',
+  role: 'user',
+  content: [{ type: 'input_text', text: 'runtime instructions' }],
+  internal_chat_message_metadata_passthrough: {
+    turn_id: 'turn-h0',
+    content_item_kinds: ['agents_md.instructions'],
+  },
+};
+
+const seed = interaction({
+  id: 'mi_v2_seed',
+  at: base,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_seed_existing',
+  responseId: 'resp-seed',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [developer('msg-dev', 'developer instructions'), context, h0],
+  },
+  responseText: 'initial response',
+});
+const oldTurn = interaction({
+  id: 'mi_v2_old_turn',
+  at: base + 100,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_old_existing',
+  responseId: 'resp-old-turn',
+  previousResponseId: 'resp-seed',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [h1],
+  },
+  responseText: 'tool summary',
+});
+const oldToolCall = interaction({
+  id: 'mi_v2_old_tool_call',
+  at: base + 200,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_old_existing',
+  responseId: 'resp-tool-call',
+  previousResponseId: 'resp-old-turn',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [h2],
+  },
+  toolCalls: [{
+    toolCallId: 'call-1',
+    name: 'exec_command',
+    arguments: { cmd: 'printf resolver-v2' },
+    issuedAtUnixNs: String(BigInt(base + 202) * 1_000_000n),
+  }],
+  completeness: 'partial',
+  partialReasons: [],
+  conversationCompleteness: 'tool_pending',
+  responseText: 'running a tool',
+});
+const oldToolResult = interaction({
+  id: 'mi_v2_old_tool_result',
+  at: base + 300,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_old_existing',
+  responseId: 'resp-tool-result',
+  previousResponseId: 'resp-tool-call',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [toolOutput('tool-result-1', 'turn-h2', 'call-1', 'resolver-v2')],
+  },
+  toolResults: [{
+    toolCallId: 'call-1',
+    name: 'exec_command',
+    content: 'resolver-v2',
+    isError: false,
+    observedAtUnixNs: String(BigInt(base + 300) * 1_000_000n),
+  }],
+  responseText: 'tool completed',
+});
+const resumed = interaction({
+  id: 'mi_v2_resumed',
+  at: base + 1_000,
+  instance: 'host-root:v2:two',
+  conversationId: 'cv_resume_existing',
+  responseId: 'resp-resumed',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [
+      developer('msg-dev', 'developer instructions'),
+      context,
+      h0,
+      { type: 'message', id: 'assistant-h0', role: 'assistant', content: 'initial response' },
+      h1,
+      { type: 'message', id: 'assistant-h1', role: 'assistant', content: 'tool summary' },
+      h2,
+      toolOutput('tool-result-1', 'turn-h2', 'call-1', 'resolver-v2'),
+      h3,
+    ],
+  },
+  toolResults: [{
+    toolCallId: 'call-1',
+    name: 'exec_command',
+    content: 'resolver-v2',
+    isError: false,
+    observedAtUnixNs: String(BigInt(base + 1_000) * 1_000_000n),
+  }],
+  responseText: 'session resumed',
+});
+const initialize = interaction({
+  id: 'mi_v2_initialize',
+  at: base + 10,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_initialize_noise',
+  interactionType: 'tool',
+  path: '/mcp',
+  request: { jsonrpc: '2.0', id: 0, method: 'initialize', params: {} },
+});
+const toolsList = interaction({
+  id: 'mi_v2_tools_list',
+  at: base + 20,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_tools_list_noise',
+  interactionType: 'tool',
+  path: '/mcp',
+  request: { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} },
+});
+const staleCanonicalControl = interaction({
+  id: 'mi_v2_stale_canonical_control',
+  at: base + 25,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_seed_existing',
+  interactionType: 'tool',
+  path: '/mcp',
+  request: { jsonrpc: '2.0', id: 2, method: 'ping', params: {} },
+});
+const bootstrap = interaction({
+  id: 'mi_v2_bootstrap',
+  at: base + 30,
+  instance: 'host-root:v2:one',
+  conversationId: 'cv_bootstrap_noise',
+  request: {
+    model: 'fixture-model',
+    prompt_cache_key: continuityKey,
+    input: [developer('msg-bootstrap', 'tool definitions')],
+  },
+  responseId: 'resp-bootstrap',
+});
+
+const resolution = resolveAgentConversationsV2([
+  initialize,
+  toolsList,
+  staleCanonicalControl,
+  bootstrap,
+  seed,
+  oldTurn,
+  oldToolCall,
+  oldToolResult,
+  resumed,
+], 42);
+
+assert.equal(resolution.conversationRecords.length, 5);
+assert.equal(resolution.technicalRecords.length, 4);
+assert.deepEqual(
+  [...new Set(resolution.technicalRecords.map((item) => item.trafficRole))].sort(),
+  ['bootstrap', 'control'],
+);
+const canonicalIds = [...new Set(resolution.conversationRecords.map((item) => item.conversationId))];
+assert.deepEqual(canonicalIds, ['cv_seed_existing']);
+assert.equal(resolution.aliases.find((item) =>
+  item.aliasConversationId === 'cv_old_existing')?.canonicalConversationId, 'cv_seed_existing');
+assert.equal(resolution.aliases.find((item) =>
+  item.aliasConversationId === 'cv_resume_existing')?.canonicalConversationId, 'cv_seed_existing');
+assert.equal(resolution.aliases.find((item) =>
+  item.aliasConversationId === 'cv_initialize_noise')?.targetType, 'technical_activity');
+assert.equal(resolution.aliases.find((item) =>
+  item.aliasConversationId === 'cv_seed_existing')?.targetType, 'conversation',
+  'a proven Canonical Thread must outrank a stale control-flow alias using the same id');
+
+const projection = projectAgentConversations(
+  resolution.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(projection.summaries.length, 1);
+assert.equal(projection.summaries[0].conversationId, 'cv_seed_existing');
+assert.equal(projection.summaries[0].turnCount, 4);
+assert.equal(projection.summaries[0].toolCallCount, 1);
+assert.equal(projection.summaries[0].toolResultCount, 1);
+assert.equal(projection.summaries[0].errorCount, 0);
+assert.equal(projection.summaries[0].coverage.status, 'complete',
+  'a later matching tool result must complete a tool_pending model Interaction');
+
+// A native provider Conversation ID is only unique inside its logical definition/tenant scope.
+// The projection must split a reused raw ID instead of silently merging the two applications.
+const collisionA = {
+  ...interaction({
+    id: 'mi_v2_collision_a', at: base + 5_000, instance: 'host-root:collision:a',
+    conversationId: 'cv_reused_provider_id', providerConversationId: 'provider-reused',
+    responseId: 'resp-collision-a', workspacePath: '/workspace/collision-a',
+    request: { messages: [human('collision-a', 'turn-a', 'collision A')] },
+  }),
+  logicalAgentId: 'la-collision-a', logicalDefinitionId: 'definition-a',
+  logicalScopeMode: 'registered_definition', tenantId: 'tenant-a',
+};
+const collisionB = {
+  ...interaction({
+    id: 'mi_v2_collision_b', at: base + 5_001, instance: 'host-root:collision:b',
+    conversationId: 'cv_reused_provider_id', providerConversationId: 'provider-reused',
+    responseId: 'resp-collision-b', workspacePath: '/workspace/collision-b',
+    request: { messages: [human('collision-b', 'turn-b', 'collision B')] },
+  }),
+  logicalAgentId: 'la-collision-b', logicalDefinitionId: 'definition-b',
+  logicalScopeMode: 'registered_definition', tenantId: 'tenant-b',
+};
+const collisionProjection = projectAgentConversations(
+  [collisionA, collisionB], [], { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(collisionProjection.summaries.length, 2,
+  'reused provider IDs across definitions must produce separate conversations');
+assert.equal(new Set(collisionProjection.summaries.map((item) => item.conversationId)).size, 2);
+assert.deepEqual(
+  collisionProjection.summaries.map((item) => item.logicalAgentId).sort(),
+  ['la-collision-a', 'la-collision-b'],
+);
+
+const timeline = projectSemanticConversationTimeline(
+  projection.summaries[0],
+  projection.interactionsByConversation.get('cv_seed_existing'),
+  [],
+);
+const events = timeline.flatMap((turn) => turn.events);
+assert.deepEqual(
+  events.filter((event) => event.kind === 'user_message').map((event) => event.contentPreview),
+  ['initial prompt', 'what tools are available', 'run the connectivity test', 'resume the terminal session'],
+);
+assert.equal(events.filter((event) => event.kind === 'tool_call').length, 1);
+assert.equal(events.filter((event) => event.kind === 'tool_result').length, 1);
+assert.equal(timeline.flatMap((turn) => turn.diagnostics).length, 0);
+const replay = projectContextReplaySummaries(
+  projection.sourceInteractionsByConversation.get('cv_seed_existing'),
+  [],
+);
+assert.equal(replay.length, 1);
+assert.equal(replay[0].replayedUserMessages, 3);
+assert.equal(replay[0].replayedToolResults, 1);
+assert.equal(replay[0].newUserMessages, 1);
+
+// Tool lifecycle status is evidence-driven: an explicit error fails the call, an omitted error
+// bit remains unknown, and an out-of-order result cannot close a later call.  The raw result is
+// still retained for audit/replay.
+const failedToolId = 'call-status-failed';
+const failedStatusCall = interaction({
+  id: 'mi_v2_status_failed_call',
+  at: base + 20_000,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user', 'status-turn', 'run failing tool')] },
+  toolCalls: [{ toolCallId: failedToolId, name: 'exec', arguments: { cmd: 'false' }, issuedAtUnixNs: unixNs(base + 20_000) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const failedStatusResult = interaction({
+  id: 'mi_v2_status_failed_result',
+  at: base + 20_010,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result', 'status-turn', failedToolId, 'failed')] },
+  toolResults: [{ toolCallId: failedToolId, name: 'exec', content: 'failed', isError: true, observedAtUnixNs: unixNs(base + 20_010) }],
+});
+const unknownToolId = 'call-status-unknown';
+const unknownStatusCall = interaction({
+  id: 'mi_v2_status_unknown_call',
+  at: base + 20_100,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user-2', 'status-turn-2', 'run unknown tool')] },
+  toolCalls: [{ toolCallId: unknownToolId, name: 'exec', arguments: { cmd: 'maybe' }, issuedAtUnixNs: unixNs(base + 20_100) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const unknownResult = { toolCallId: unknownToolId, name: 'exec', content: 'opaque', observedAtUnixNs: unixNs(base + 20_110) };
+const unknownStatusResult = interaction({
+  id: 'mi_v2_status_unknown_result',
+  at: base + 20_110,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result-2', 'status-turn-2', unknownToolId, 'opaque')] },
+  toolResults: [unknownResult],
+});
+delete unknownStatusResult.toolResults[0].isError;
+const outOfOrderToolId = 'call-status-out-of-order';
+const outOfOrderResult = interaction({
+  id: 'mi_v2_status_early_result',
+  at: base + 20_190,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { input: [toolOutput('status-result-3', 'status-turn-3', outOfOrderToolId, 'early')] },
+  toolResults: [{ toolCallId: outOfOrderToolId, name: 'exec', content: 'early', isError: false, observedAtUnixNs: unixNs(base + 20_190) }],
+});
+const outOfOrderCall = interaction({
+  id: 'mi_v2_status_late_call',
+  at: base + 20_200,
+  instance: 'host-root:v2:status',
+  conversationId: 'cv_status_contract',
+  request: { model: 'fixture-model', input: [human('status-user-3', 'status-turn-3', 'run late tool')] },
+  toolCalls: [{ toolCallId: outOfOrderToolId, name: 'exec', arguments: { cmd: 'late' }, issuedAtUnixNs: unixNs(base + 20_200) }],
+  completeness: 'partial',
+  conversationCompleteness: 'tool_pending',
+});
+const statusProjection = projectAgentConversations(
+  [failedStatusCall, failedStatusResult, unknownStatusCall, unknownStatusResult, outOfOrderResult, outOfOrderCall],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+const statusSummary = statusProjection.summaries.find((item) => item.conversationId === 'cv_status_contract');
+assert.ok(statusSummary);
+const statusEvents = projectSemanticConversationTimeline(
+  statusSummary,
+  statusProjection.interactionsByConversation.get('cv_status_contract'),
+  [],
+).flatMap((turn) => turn.events);
+assert.equal(statusEvents.find((event) => event.toolCallId === failedToolId && event.kind === 'tool_call')?.status, 'failed');
+assert.equal(statusEvents.find((event) => event.toolCallId === unknownToolId && event.kind === 'tool_call')?.status, 'unknown');
+assert.equal(statusEvents.find((event) => event.toolCallId === outOfOrderToolId && event.kind === 'tool_call')?.status, 'pending',
+  'a result observed before its ToolCall must not close the later call');
+
+const referenceOnlyInteraction = interaction({
+  id: 'mi_v2_reference_only_reconcile',
+  at: base + 21_000,
+  instance: 'host-root:v2:reference',
+  conversationId: 'cv_reference_only',
+  request: { model: 'fixture-model', input: [human('reference-user', 'reference-turn', 'reference tool')] },
+  toolCalls: [{ toolCallId: 'call-reference-only', name: 'exec', arguments: { secret: 'must-stay-out-of-reconciled-timeline' } }],
+  semanticItems: [{
+    semanticItemId: 'si_reference_user', actor: 'user', kind: 'user_message', origin: 'request',
+    atUnixNs: unixNs(base + 21_000), content: 'reference tool', completeness: 'partial', partialReasons: [],
+  }],
+  semanticParserVersion: 2,
+  completeness: 'reference_only',
+});
+const referenceProjection = projectAgentConversations(
+  [referenceOnlyInteraction], [], { timeType: 'last_30d', scope: 'agent', limit: 20 },
+);
+const referenceSummary = referenceProjection.summaries[0];
+const referenceEvents = projectSemanticConversationTimeline(
+  referenceSummary,
+  referenceProjection.interactionsByConversation.get(referenceSummary.conversationId),
+  [],
+).flatMap((turn) => turn.events);
+const reconciledReferenceCall = referenceEvents.find((event) => event.toolCallId === 'call-reference-only');
+assert(reconciledReferenceCall, 'partial semanticItems must retain a missing ToolCall reference');
+assert.equal(JSON.stringify(reconciledReferenceCall.content).includes('must-stay-out-of-reconciled-timeline'), false,
+  'reference-only interactions must not reinsert raw tool arguments during reconciliation');
+
+const boundaryProjection = projectAgentConversations(
+  [resumed],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+const boundarySummary = boundaryProjection.summaries.find((item) => item.hasContent);
+assert.ok(boundarySummary);
+const boundaryTimeline = projectSemanticConversationTimeline(
+  boundarySummary,
+  boundaryProjection.interactionsByConversation.get(boundarySummary.conversationId),
+  [],
+);
+assert.deepEqual(
+  boundaryTimeline.flatMap((turn) => turn.events)
+    .filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['resume the terminal session'],
+  'the first cumulative request inside a bounded window must not replay older user Turns',
+);
+assert.equal(boundaryTimeline.flatMap((turn) => turn.events)
+  .filter((event) => event.kind === 'tool_result').length, 0,
+  'tool results attached to boundary replay context must stay folded');
+const boundaryReplay = projectContextReplaySummaries(
+  boundaryProjection.sourceInteractionsByConversation.get(boundarySummary.conversationId),
+  [],
+);
+assert.equal(boundaryReplay.length, 1);
+assert.equal(boundaryReplay[0].replayedUserMessages, 3);
+assert.equal(boundaryReplay[0].replayedToolResults, 1);
+assert.equal(boundaryReplay[0].newUserMessages, 1);
+
+const clientMetadataSessionId = 'session-observed-after-resume';
+const h4 = human('msg-h4', 'turn-h4', 'continue from the first observed turn');
+const clientMetadataResume = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_client_metadata_prewarm',
+    at: base + 1_050,
+    instance: 'host-root:v2:resume-one',
+    request: {
+      type: 'response.create',
+      generate: false,
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: '',
+      },
+      input: [
+        developer('msg-resume-prewarm', 'resumed Thread instructions'),
+        h0,
+        h1,
+        h2,
+      ],
+    },
+    responseId: 'resp-client-metadata-prewarm',
+    responseText: '',
+  }),
+  interaction({
+    id: 'mi_v2_client_metadata_first_observed',
+    at: base + 1_100,
+    instance: 'host-root:v2:resume-one',
+    request: {
+      type: 'response.create',
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: 'turn-h3',
+      },
+      // The earlier portion was never observed by AnySentry. Only h3 is new at this boundary.
+      input: [h0, h1, h2, h3],
+    },
+    responseId: 'resp-client-metadata-one',
+    responseText: 'first observed response',
+  }),
+  interaction({
+    id: 'mi_v2_client_metadata_next_observed',
+    at: base + 1_200,
+    instance: 'host-root:v2:resume-two',
+    request: {
+      type: 'response.create',
+      model: 'fixture-model',
+      client_metadata: {
+        session_id: clientMetadataSessionId,
+        thread_id: clientMetadataSessionId,
+        turn_id: 'turn-h4',
+      },
+      input: [h0, h1, h2, h3, h4],
+    },
+    responseId: 'resp-client-metadata-two',
+    responseText: 'next observed response',
+  }),
+]);
+assert.equal(clientMetadataResume.technicalRecords.length, 1);
+assert.equal(clientMetadataResume.technicalRecords[0].trafficRole, 'bootstrap',
+  'a generate=false resume prewarm must stay outside the user-visible Thread');
+assert.deepEqual(
+  [...new Set(clientMetadataResume.conversationRecords
+    .map((item) => item.providerConversationId))],
+  [clientMetadataSessionId],
+  'Responses client_metadata session/thread identity must become a provider Conversation anchor',
+);
+assert.equal(new Set(clientMetadataResume.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'a resumed session first observed mid-history must remain one Thread across Runtime instances');
+const clientMetadataProjection = projectAgentConversations(
+  clientMetadataResume.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(clientMetadataProjection.summaries.length, 1);
+assert.equal(clientMetadataProjection.summaries[0].idSource, 'provider');
+const clientMetadataTimeline = projectSemanticConversationTimeline(
+  clientMetadataProjection.summaries[0],
+  clientMetadataProjection.interactionsByConversation.get(
+    clientMetadataProjection.summaries[0].conversationId,
+  ),
+  [],
+);
+assert.deepEqual(
+  clientMetadataTimeline.flatMap((turn) => turn.events)
+    .filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['resume the terminal session', 'continue from the first observed turn'],
+  'only content observed after the collection boundary should become visible user Turns',
+);
+
+const claudeResumeSessionId = '7bbe3df2-b63a-46ad-9137-cfaa84f8cb25';
+const claudeResumeMetadata = {
+  user_id: JSON.stringify({
+    device_id: 'fixture-device',
+    account_uuid: '',
+    session_id: claudeResumeSessionId,
+  }),
+};
+const claudeResumeResolution = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_claude_resume_first',
+    at: base + 1_400,
+    instance: 'host-root:v2:claude-resume-one',
+    agentProduct: 'Claude Code',
+    path: '/v1/messages',
+    request: {
+      model: 'claude-opus',
+      metadata: claudeResumeMetadata,
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'first Claude turn' }],
+      }],
+    },
+    responseId: 'msg-claude-resume-first',
+  }),
+  interaction({
+    id: 'mi_v2_claude_resume_next',
+    at: base + 1_500,
+    instance: 'host-root:v2:claude-resume-two',
+    agentProduct: 'Claude Code',
+    path: '/v1/messages',
+    request: {
+      model: 'claude-opus',
+      metadata: claudeResumeMetadata,
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'continued Claude turn' }],
+      }],
+    },
+    responseId: 'msg-claude-resume-next',
+  }),
+]);
+assert.deepEqual(
+  [...new Set(claudeResumeResolution.conversationRecords
+    .map((item) => item.providerConversationId))],
+  [claudeResumeSessionId],
+  'Claude metadata.user_id JSON must become a provider Conversation anchor',
+);
+assert.equal(new Set(claudeResumeResolution.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'Claude resume turns must remain one Conversation across runtime instances');
+
+const backgroundOperationResolution = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_model_search_backend',
+    at: base + 1_300,
+    instance: 'host-root:v2:resume-two',
+    trafficRole: 'conversation',
+    request: {
+      id: 'search-fixture',
+      model: 'fixture-model',
+      commands: [{ name: 'search', arguments: { query: 'fixture' } }],
+      input: [h4],
+      settings: { mode: 'balanced' },
+      max_output_tokens: 128,
+    },
+    responseStructured: {
+      encrypted_output: 'opaque-fixture',
+      output: [],
+      results: [{ title: 'fixture result' }],
+    },
+    responseText: '',
+    path: '/arbitrary/model-assisted-operation',
+  }),
+  interaction({
+    id: 'mi_v2_session_title',
+    at: base + 1_400,
+    instance: 'host-root:v2:resume-two',
+    trafficRole: 'conversation',
+    wireTemplateId: 'anthropic-messages',
+    agentProduct: 'Claude Code',
+    request: {
+      model: 'fixture-model',
+      system: [{
+        type: 'text',
+        text: 'Generate a concise title. The session content is provided inside <session> tags. Return JSON with a single "title" field.',
+      }],
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: '<session>debug the fixture</session>' }],
+      }],
+      output_config: {
+        format: { type: 'json_schema', schema: { properties: { title: { type: 'string' } } } },
+      },
+    },
+    responseStructured: {
+      id: 'message-title-fixture',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: '{"title":"Debug fixture"}' }],
+    },
+    responseText: '{"title":"Debug fixture"}',
+    path: '/arbitrary/messages',
+  }),
+]);
+assert.equal(backgroundOperationResolution.conversationRecords.length, 0,
+  'model-assisted backend and derived metadata calls must not create user Threads');
+assert.deepEqual(
+  backgroundOperationResolution.technicalRecords.map((item) => item.trafficRole).sort(),
+  ['derived_metadata', 'tool_backend'],
+  'stored legacy conversation roles must be reclassified from wire semantics',
+);
+assert.equal(backgroundOperationResolution.technicalActivities.length, 2);
+
+const claudeToolCallId = 'toolu_fixture_1';
+const claudeToolLoop = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_claude_tool_call',
+    at: base + 1_500,
+    instance: 'host-root:v2:claude-one',
+    agentProduct: 'Claude Code',
+    wireTemplateId: 'anthropic-messages',
+    request: {
+      model: 'fixture-model',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '<system-reminder>runtime context</system-reminder>' },
+          { type: 'text', text: 'run the fixture tool' },
+        ],
+      }],
+    },
+    toolCalls: [{
+      toolCallId: claudeToolCallId,
+      name: 'Bash',
+      arguments: { command: 'printf fixture' },
+      issuedAtUnixNs: String(BigInt(base + 1_502) * 1_000_000n),
+    }],
+    responseText: 'I will run the fixture tool.',
+    conversationCompleteness: 'tool_pending',
+    completeness: 'partial',
+  }),
+  interaction({
+    id: 'mi_v2_claude_tool_result_final',
+    at: base + 1_600,
+    instance: 'host-root:v2:claude-one',
+    agentProduct: 'Claude Code',
+    wireTemplateId: 'anthropic-messages',
+    request: {
+      model: 'fixture-model',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '<system-reminder>runtime context</system-reminder>' },
+            { type: 'text', text: 'run the fixture tool' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: claudeToolCallId, name: 'Bash' }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: claudeToolCallId, content: 'fixture ok' }],
+        },
+      ],
+    },
+    toolResults: [{
+      toolCallId: claudeToolCallId,
+      name: 'Bash',
+      content: 'fixture ok',
+      isError: false,
+      observedAtUnixNs: String(BigInt(base + 1_600) * 1_000_000n),
+    }],
+    responseText: 'The fixture tool completed successfully.',
+  }),
+]);
+assert.equal(new Set(claudeToolLoop.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'an Anthropic cumulative Tool loop must remain one Thread');
+const claudeProjection = projectAgentConversations(
+  claudeToolLoop.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(claudeProjection.summaries.length, 1);
+const claudeTimeline = projectSemanticConversationTimeline(
+  claudeProjection.summaries[0],
+  claudeProjection.interactionsByConversation.get(
+    claudeProjection.summaries[0].conversationId,
+  ),
+  [],
+);
+const claudeEvents = claudeTimeline.flatMap((turn) => turn.events);
+assert.deepEqual(
+  claudeEvents.filter((event) => event.kind === 'user_message')
+    .map((event) => event.contentPreview),
+  ['run the fixture tool'],
+  'runtime context and replayed Human history must not become duplicate user events',
+);
+assert.equal(claudeEvents.filter((event) => event.kind === 'tool_call').length, 1);
+assert.equal(claudeEvents.filter((event) => event.kind === 'tool_result').length, 1);
+assert.deepEqual(
+  claudeEvents.filter((event) => event.actor === 'model')
+    .map((event) => [event.kind, event.contentPreview]),
+  [
+    ['model_progress', 'I will run the fixture tool.'],
+    ['model_final', 'The fixture tool completed successfully.'],
+  ],
+  'the final model reply after a Tool Result must remain a separate model event',
+);
+
+const explicitConflict = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_conflict_a',
+    at: base + 2_000,
+    instance: 'host-root:v2:three',
+    providerConversationId: 'provider-a',
+    request: { model: 'fixture', prompt_cache_key: 'shared-cache', input: [human('a', 'a', 'A')] },
+    responseId: 'a',
+  }),
+  interaction({
+    id: 'mi_v2_conflict_b',
+    at: base + 2_100,
+    instance: 'host-root:v2:three',
+    providerConversationId: 'provider-b',
+    request: { model: 'fixture', prompt_cache_key: 'shared-cache', input: [human('b', 'b', 'B')] },
+    responseId: 'b',
+  }),
+]);
+assert.equal(new Set(explicitConflict.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'distinct explicit provider conversations must block a continuity-key merge');
+
+const cumulative = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_cumulative_a',
+    at: base + 3_000,
+    instance: 'host-root:v2:four',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'one' }] },
+    responseId: 'cum-a',
+  }),
+  interaction({
+    id: 'mi_v2_cumulative_b',
+    at: base + 3_100,
+    instance: 'host-root:v2:five',
+    request: {
+      model: 'fixture',
+      messages: [{ role: 'user', content: 'one' }, { role: 'user', content: 'two' }],
+    },
+    responseId: 'cum-b',
+  }),
+]);
+assert.equal(new Set(cumulative.conversationRecords.map((item) => item.conversationId)).size, 1,
+  'product-neutral cumulative human lineage must survive a process restart without product rules');
+
+const retryRequest = {
+  model: 'claude-fixture',
+  messages: [{ role: 'user', content: 'one request that the provider retries' }],
+};
+const retries = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_retry_a', at: base + 3_200, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+  interaction({
+    id: 'mi_v2_retry_b', at: base + 3_300, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+  interaction({
+    id: 'mi_v2_retry_c', at: base + 3_400, instance: 'host-root:retry:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/retry', request: retryRequest,
+    providerConversationId: 'retry-thread',
+    statusCode: 429, responseText: 'rate limited', completeness: 'partial',
+    partialReasons: ['http_error'],
+  }),
+]);
+const retryProjection = projectAgentConversations(
+  retries.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(retryProjection.summaries.length, 1);
+assert.equal(retryProjection.summaries[0].turnCount, 1,
+  'byte-identical failed provider retries must remain one user Turn');
+const retryTimeline = projectSemanticConversationTimeline(
+  retryProjection.summaries[0],
+  retryProjection.interactionsByConversation.get(retryProjection.summaries[0].conversationId),
+  [],
+);
+assert.equal(retryTimeline.length, 1);
+assert.equal(retryTimeline[0].events.filter((event) => event.kind === 'user_message').length, 1);
+assert.deepEqual(
+  retryTimeline[0].diagnostics
+    .filter((diagnostic) => diagnostic.type === 'retry')
+    .map((diagnostic) => diagnostic.message),
+  ['模型请求发生重试 · Attempt 2', '模型请求发生重试 · Attempt 3'],
+);
+
+const legacyDockerProjection = projectAgentConversations([
+  interaction({
+    id: 'mi_v2_legacy_docker', at: base + 3_500, instance: 'host-root:legacy-docker:one',
+    agentProduct: 'Pi', workspacePath: 'agent://0123456789ab',
+    providerConversationId: 'legacy-docker-thread',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'legacy container' }] },
+    responseId: 'legacy-docker-response',
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 100 });
+assert.equal(legacyDockerProjection.summaries[0].environment, 'docker',
+  'legacy agent:// container workspaces must migrate to the Docker environment');
+
+const legacyHostWorkerProjection = projectAgentConversations([
+  interaction({
+    id: 'mi_v2_legacy_host_worker', at: base + 3_550, instance: 'host-root:legacy-host:one',
+    agentProduct: 'Generic CLI', workspacePath: 'agent://runtime-worker',
+    providerConversationId: 'legacy-host-worker-thread',
+    request: { model: 'fixture', messages: [{ role: 'user', content: 'legacy host worker' }] },
+    responseId: 'legacy-host-worker-response',
+  }),
+], [], { timeType: 'last_30d', scope: 'agent', limit: 100 });
+assert.equal(legacyHostWorkerProjection.summaries[0].environment, 'host',
+  'a non-container agent:// workspace with host-root evidence must remain Host');
+
+const hostResumeAcrossMissingWorkspace = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_host_resume_explicit', at: base + 3_600, instance: 'host-root:resume:one',
+    workspacePath: '/tmp/explicit-workspace', conversationId: 'cv_host_resume_explicit',
+    request: {
+      model: 'fixture', prompt_cache_key: 'host-resume-continuity',
+      input: [human('host-resume-h0', 'host-resume-t0', 'first host turn')],
+    },
+    responseId: 'host-resume-response-1',
+  }),
+  interaction({
+    id: 'mi_v2_host_resume_synthetic', at: base + 3_700, instance: 'host-root:resume:two',
+    workspacePath: 'agent://runtime-worker', conversationId: 'cv_host_resume_synthetic',
+    previousResponseId: 'host-resume-response-1', responseId: 'host-resume-response-2',
+    request: {
+      model: 'fixture', prompt_cache_key: 'host-resume-continuity',
+      input: [
+        human('host-resume-h0', 'host-resume-t0', 'first host turn'),
+        human('host-resume-h1', 'host-resume-t1', 'resumed host turn'),
+      ],
+    },
+  }),
+]);
+assert.equal(new Set(hostResumeAcrossMissingWorkspace.conversationRecords
+  .map((item) => item.conversationId)).size, 1,
+  'strong continuity evidence must bridge one missing/synthetic workspace');
+assert.equal(hostResumeAcrossMissingWorkspace.aliases.find((item) =>
+  item.aliasConversationId === 'cv_host_resume_synthetic')?.canonicalConversationId,
+  'cv_host_resume_explicit');
+
+const conflictingExplicitWorkspaces = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_workspace_a', at: base + 3_800, instance: 'host-root:workspace:a',
+    workspacePath: '/workspace/a', request: {
+      model: 'fixture', prompt_cache_key: 'colliding-continuity',
+      messages: [{ role: 'user', content: 'workspace A' }],
+    }, responseId: 'workspace-a',
+  }),
+  interaction({
+    id: 'mi_v2_workspace_b', at: base + 3_900, instance: 'host-root:workspace:b',
+    workspacePath: '/workspace/b', request: {
+      model: 'fixture', prompt_cache_key: 'colliding-continuity',
+      messages: [{ role: 'user', content: 'workspace B' }],
+    }, responseId: 'workspace-b',
+  }),
+]);
+assert.equal(new Set(conflictingExplicitWorkspaces.conversationRecords
+  .map((item) => item.conversationId)).size, 2,
+  'different explicit workspaces must remain a hard Thread boundary');
+
+const conflictingContinuityHistories = resolveAgentConversationsV2([
+  interaction({
+    id: 'mi_v2_continuity_history_a', at: base + 3_920,
+    instance: 'host-root:continuity-history:a', workspacePath: '/workspace/shared',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-but-not-unique-continuity',
+      input: [human('continuity-msg-a', 'continuity-turn-a', 'investigate service A')],
+    }, responseId: 'continuity-history-a',
+  }),
+  interaction({
+    id: 'mi_v2_continuity_history_b', at: base + 3_930,
+    instance: 'host-root:continuity-history:b', workspacePath: '/workspace/shared',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-but-not-unique-continuity',
+      input: [human('continuity-msg-b', 'continuity-turn-b', 'deploy service B')],
+    }, responseId: 'continuity-history-b',
+  }),
+]);
+assert.equal(new Set(conflictingContinuityHistories.conversationRecords
+  .map((item) => item.conversationId)).size, 2,
+  'continuity alone must not merge divergent Human histories');
+assert(conflictingContinuityHistories.memberships.every((membership) =>
+  membership.evidence.includes('continuity_collision_without_shared_history')),
+'both sides of a blocked continuity merge must preserve auditable conflict evidence');
+
+const exactCollisionMember = {
+  ...interaction({
+    id: 'mi_v2_continuity_exact_a', at: base + 3_940,
+    instance: 'host-root:continuity-exact:a', workspacePath: '/workspace/shared-exact',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-continuity-with-independent-proof',
+      input: [human('continuity-exact-msg-a', 'continuity-exact-turn-a', 'inspect service A')],
+    }, responseId: 'continuity-exact-a',
+  }),
+  correlationQuality: 'exact',
+};
+const mixedQualityCollision = resolveAgentConversationsV2([
+  exactCollisionMember,
+  interaction({
+    id: 'mi_v2_continuity_exact_b', at: base + 3_950,
+    instance: 'host-root:continuity-exact:b', workspacePath: '/workspace/shared-exact',
+    request: {
+      model: 'fixture', prompt_cache_key: 'shared-continuity-with-independent-proof',
+      input: [human('continuity-exact-msg-b', 'continuity-exact-turn-b', 'deploy service B')],
+    }, responseId: 'continuity-exact-b',
+  }),
+]);
+assert.equal(new Set(mixedQualityCollision.conversationRecords
+  .map((item) => item.conversationId)).size, 2);
+assert.equal(mixedQualityCollision.memberships.find((membership) =>
+  membership.interactionId === exactCollisionMember.interactionId)?.confidence, 'exact',
+'a rejected continuity edge must not downgrade independent exact membership evidence');
+assert.equal(mixedQualityCollision.memberships.find((membership) =>
+  membership.interactionId === 'mi_v2_continuity_exact_b')?.confidence, 'unlinked',
+'a continuity-only divergent history must remain explicitly unlinked');
+
+const assertOneThread = (records, label) => {
+  const resolved = resolveAgentConversationsV2(records);
+  assert.equal(new Set(resolved.conversationRecords.map((item) => item.conversationId)).size, 1, label);
+  return resolved;
+};
+
+const claude = assertOneThread([
+  interaction({
+    id: 'mi_v2_claude_a', at: base + 4_000, instance: 'host-root:claude:one',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/claude',
+    request: { model: 'claude', messages: [{ role: 'user', content: 'inspect files' }] },
+    responseId: 'claude-a',
+    toolCalls: [{ toolCallId: 'toolu-1', name: 'Read', arguments: { path: 'a.txt' } }],
+  }),
+  interaction({
+    id: 'mi_v2_claude_b', at: base + 4_100, instance: 'host-root:claude:two',
+    agentProduct: 'Claude Code', workspacePath: '/workspace/claude',
+    request: {
+      model: 'claude',
+      messages: [
+        { role: 'user', content: 'inspect files' },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu-1', content: 'ok' }] },
+        { role: 'user', content: 'continue after resume' },
+      ],
+    },
+    responseId: 'claude-b',
+    toolResults: [{ toolCallId: 'toolu-1', name: 'Read', content: 'ok', isError: false }],
+  }),
+], 'Claude cumulative Messages and tool_use lineage must survive a new Runtime instance');
+assert.equal(claude.conversationRecords.length, 2);
+
+assertOneThread([
+  interaction({
+    id: 'mi_v2_pi_a', at: base + 5_000, instance: 'host-root:pi:one',
+    agentProduct: 'Pi', workspacePath: '/workspace/pi', providerConversationId: 'pi-conversation',
+    request: { model: 'pi-model', messages: [{ role: 'user', content: 'pi one' }] }, responseId: 'pi-a',
+  }),
+  interaction({
+    id: 'mi_v2_pi_b', at: base + 5_100, instance: 'host-root:pi:two',
+    agentProduct: 'Pi', workspacePath: '/workspace/pi', providerConversationId: 'pi-conversation',
+    request: { model: 'pi-model', messages: [{ role: 'user', content: 'pi two' }] }, responseId: 'pi-b',
+  }),
+], 'Pi explicit conversation identity must cross Runtime instances');
+
+assertOneThread([
+  interaction({
+    id: 'mi_v2_kimi_a', at: base + 6_000, instance: 'host-root:kimi:one',
+    agentProduct: 'Kimi CLI', workspacePath: '/workspace/kimi',
+    request: { model: 'kimi', messages: [{ role: 'user', content: 'kimi one' }] }, responseId: 'kimi-a',
+  }),
+  interaction({
+    id: 'mi_v2_kimi_b', at: base + 6_100, instance: 'host-root:kimi:two',
+    agentProduct: 'Kimi CLI', workspacePath: '/workspace/kimi',
+    request: { model: 'kimi', messages: [{ role: 'user', content: 'kimi one' }, { role: 'user', content: 'kimi two' }] }, responseId: 'kimi-b',
+  }),
+], 'Kimi-like cumulative lineage must use the generic resolver');
+
+for (const [product, workspace, conversationId] of [
+  ['Dify', '/workspace/dify', 'dify-conversation'],
+  ['LangChain', '/workspace/langchain', 'langchain-thread'],
+]) {
+  assertOneThread([
+    interaction({
+      id: 'mi_v2_' + product.toLowerCase() + '_a', at: base + 7_000,
+      instance: 'host-root:' + product.toLowerCase() + ':one', agentProduct: product,
+      workspacePath: workspace, providerConversationId: conversationId,
+      request: { model: 'workflow-model', messages: [{ role: 'user', content: 'first run' }] }, responseId: product + '-a',
+    }),
+    interaction({
+      id: 'mi_v2_' + product.toLowerCase() + '_b', at: base + 7_100,
+      instance: 'host-root:' + product.toLowerCase() + ':two', agentProduct: product,
+      workspacePath: workspace, providerConversationId: conversationId,
+      request: { model: 'workflow-model', messages: [{ role: 'user', content: 'second run' }] }, responseId: product + '-b',
+    }),
+  ], product + ' conversation/thread identity must remain distinct from execution Run identity');
+}
+
+const serviceResumeRecords = [
+  interaction({
+    id: 'mi_v2_service_resume_old', at: base + 8_000, instance: 'service-generation-one',
+    agentProduct: 'LangGraph', workspacePath: '/workspace/service-resume',
+    providerConversationId: 'service-thread-resume', responseId: 'service-response-one',
+    request: { model: 'service-model', messages: [{ role: 'user', content: 'first service turn' }] },
+    logicalAgentId: 'la-service-resume', logicalDefinitionId: 'graph-definition',
+    logicalScopeMode: 'service_definition', logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-service', ownerId: 'owner-service', profile: 'test', profileVersion: 'v1',
+    deploymentId: 'deployment-one', deploymentRevision: 'r1', environmentId: 'env-test',
+    sessionLifecycle: 'new',
+  }),
+  interaction({
+    id: 'mi_v2_service_resume_new', at: base + 8_100, instance: 'service-generation-two',
+    agentProduct: 'LangGraph', workspacePath: '/workspace/service-resume',
+    providerConversationId: 'service-thread-resume', previousResponseId: 'service-response-one',
+    responseId: 'service-response-two',
+    request: { model: 'service-model', messages: [{ role: 'user', content: 'second service turn' }] },
+    logicalAgentId: 'la-service-resume', logicalDefinitionId: 'graph-definition',
+    logicalScopeMode: 'service_definition', logicalIdentityAuthority: 'management_registration',
+    tenantId: 'tenant-service', ownerId: 'owner-service', profile: 'production', profileVersion: 'v2',
+    deploymentId: 'deployment-two', deploymentRevision: 'r2', environmentId: 'env-prod',
+    sessionLifecycle: 'resume',
+  }),
+];
+const serviceResumeResolution = resolveAgentConversationsV2(serviceResumeRecords);
+assert.equal(new Set(serviceResumeResolution.conversationRecords.map((item) => item.conversationId)).size, 1,
+  'an explicit service resume may bridge deployment generations for one provider Session');
+
+const workflowDeploymentRecords = serviceResumeRecords.map((record, index) => ({
+  ...record,
+  interactionId: `mi_v2_workflow_deployment_${index}`,
+  logicalAgentId: 'la-workflow-fence',
+  logicalDefinitionId: 'workflow-definition',
+  logicalScopeMode: 'workflow_definition',
+  providerConversationId: 'workflow-thread-same-native-id',
+  sessionLifecycle: index === 0 ? 'new' : undefined,
+  deploymentId: index === 0 ? 'workflow-test' : 'workflow-prod',
+  deploymentRevision: index === 0 ? 'r1' : 'r2',
+  profile: index === 0 ? 'test' : 'production',
+}));
+const workflowDeploymentResolution = resolveAgentConversationsV2(workflowDeploymentRecords);
+assert.equal(new Set(workflowDeploymentResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'workflow test/prod deployment fences do not merge by a reused native Session ID');
+
+// A stateless service may repeat a provider/native conversation label (or a stale legacy
+// conversationId) on every POST. Each request remains a separate canonical Session/Conversation
+// unless an explicit producer Run/canonical Session proves that several exchanges belong together.
+const perRequestRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_per_request_a', at: base + 9_000, instance: 'service-request-a',
+      agentProduct: 'LangChain', workspacePath: '/workspace/stateless-service',
+      providerConversationId: 'native-same-provider-label', conversationId: 'legacy-reused-conversation',
+      request: { model: 'service-model', messages: [{ role: 'user', content: 'request a' }] },
+      responseId: 'per-request-a',
+    }),
+    sessionMode: 'per_request',
+    sessionIdentityQuality: 'ephemeral',
+    sessionIdSource: 'per_request',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_per_request_b', at: base + 9_100, instance: 'service-request-b',
+      agentProduct: 'LangChain', workspacePath: '/workspace/stateless-service',
+      providerConversationId: 'native-same-provider-label', conversationId: 'legacy-reused-conversation',
+      request: { model: 'service-model', messages: [{ role: 'user', content: 'request b' }] },
+      responseId: 'per-request-b',
+    }),
+    sessionMode: 'per_request',
+    sessionIdentityQuality: 'ephemeral',
+    sessionIdSource: 'per_request',
+  },
+];
+const perRequestResolution = resolveAgentConversationsV2(perRequestRecords);
+assert.equal(new Set(perRequestResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'stateless POSTs with a reused provider/legacy conversation label must remain separate');
+assert.equal(new Set(perRequestResolution.memberships.map((item) => item.canonicalConversationId)).size, 2);
+assert.equal(
+  perRequestResolution.aliases.filter((item) => item.aliasConversationId === 'legacy-reused-conversation').length,
+  0,
+  'a reused legacy route with competing per-request targets must not redirect to an arbitrary Conversation',
+);
+assert.deepEqual(perRequestResolution.aliasConflicts, ['legacy-reused-conversation']);
+const perRequestLegacyProjection = projectAgentConversations(
+  perRequestResolution.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(perRequestLegacyProjection.summaries.length, 2,
+  'legacy conversation projection must preserve per-request isolation too');
+const unknownProviderRecords = perRequestRecords.map((record, index) => ({
+  ...record,
+  interactionId: `mi_v2_unknown_provider_${index}`,
+  sessionMode: 'conversation',
+  sessionIdentityQuality: 'unknown',
+  sessionIdSource: 'unresolved',
+  canonicalSessionId: undefined,
+}));
+const unknownProviderResolution = resolveAgentConversationsV2(unknownProviderRecords);
+assert.equal(new Set(unknownProviderResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'an unknown provider anchor without a session key must not merge stateless requests');
+
+// Design B: orchestrator and worker intentionally share runId/sessionId/providerConversationId.
+// Resolver must keep independent Conversations; relatedConversations express the hop, not aliases.
+const designBRunId = 'design-b-shared-run';
+const designBHopRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_designb_orch', at: base + 10_000, instance: 'designb-orch',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-b-orch',
+      providerConversationId: designBRunId,
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'plan 1+1' }] },
+      responseId: 'designb-orch-response',
+      interactionType: 'remote_agent',
+      trafficRole: 'delegation',
+      path: '/runs',
+    }),
+    hop: 'orchestrator',
+    runId: designBRunId,
+    sessionId: designBRunId,
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentIdHeader: 'customer-langgraph-sim-orchestrator',
+    agentAssetId: 'agent-designb-orch',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_designb_worker', at: base + 10_100, instance: 'designb-worker',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-b-worker',
+      providerConversationId: designBRunId,
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'execute 1+1' }] },
+      responseId: 'designb-worker-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'worker',
+    runId: designBRunId,
+    sessionId: designBRunId,
+    parentSessionId: designBRunId,
+    delegationId: 'designb-delegation-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentIdHeader: 'customer-langgraph-sim-worker',
+    agentAssetId: 'agent-designb-worker',
+  },
+];
+const designBResolution = resolveAgentConversationsV2(designBHopRecords);
+const designBConversationIds = [...new Set(
+  designBResolution.conversationRecords.map((item) => item.conversationId),
+)];
+assert.equal(designBConversationIds.length, 2,
+  'Design B orchestrator/worker hops must not collapse into one Canonical Thread');
+assert.equal(
+  designBResolution.aliases.filter((item) =>
+    item.aliasConversationId !== item.canonicalConversationId
+    && designBConversationIds.includes(item.aliasConversationId)
+    && designBConversationIds.includes(item.canonicalConversationId)).length,
+  0,
+  'Design B hops must not alias parent Conversation onto worker or vice versa',
+);
+const designBProjection = projectAgentConversations(
+  designBResolution.records,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(designBProjection.summaries.filter((item) => item.hasContent).length, 2,
+  'projection keeps independent parent/worker Conversations for Design B');
+
+const fanoutRunId = 'fanout-shared-run';
+const fanoutHopRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_fanout_supervisor', at: base + 20_000, instance: 'fanout-supervisor',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/fanout-supervisor',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'fanout left' }] },
+      responseId: 'fanout-sup-response',
+      interactionType: 'remote_agent',
+      trafficRole: 'delegation',
+      path: '/invoke',
+    }),
+    hop: 'supervisor',
+    runId: fanoutRunId,
+    sessionId: fanoutRunId,
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    delegationId: 'fanout-delegation-1',
+    agentAssetId: 'agent-fanout-supervisor',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_fanout_specialist', at: base + 20_100, instance: 'fanout-specialist',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/fanout-specialist',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'nested arm' }] },
+      responseId: 'fanout-spec-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: fanoutRunId,
+    sessionId: fanoutRunId,
+    parentSessionId: fanoutRunId,
+    delegationId: 'fanout-delegation-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-fanout-specialist',
+  },
+];
+const fanoutResolution = resolveAgentConversationsV2(fanoutHopRecords);
+const fanoutConversationIds = [...new Set(
+  fanoutResolution.conversationRecords.map((item) => item.conversationId),
+)];
+assert.equal(fanoutConversationIds.length, 2,
+  'unnamed hops must keep parent/child Conversations independent');
+assert.equal(
+  fanoutResolution.aliases.filter((item) =>
+    item.aliasConversationId !== item.canonicalConversationId
+    && fanoutConversationIds.includes(item.aliasConversationId)
+    && fanoutConversationIds.includes(item.canonicalConversationId)).length,
+  0,
+  'unnamed hops must not alias parent Conversation onto child or vice versa',
+);
+assert.deepEqual(
+  [...new Set(designBProjection.summaries.filter((item) => item.hasContent).map((item) => item.conversationId))].sort(),
+  designBConversationIds.slice().sort(),
+  'directory must reuse durable hop-scoped Thread ids instead of reminting bound aliases',
+);
+assert.equal(
+  hopScopedSessionConversationId(designBHopRecords[0]),
+  designBResolution.conversationRecords.find((item) => item.interactionId === 'mi_v2_designb_orch')?.conversationId,
+  'v2 must mint the directory session-key for a hop-fenced durable Session',
+);
+const unboundDesignBProjection = projectAgentConversations(
+  designBHopRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.deepEqual(
+  [...new Set(unboundDesignBProjection.summaries.filter((item) => item.hasContent).map((item) => item.conversationId))].sort(),
+  designBConversationIds.slice().sort(),
+  'unbound directory must mint the same hop-scoped session-key as v2 persist',
+);
+
+const ephRunId = 'design-a-eph-run';
+const ephSplitRecords = [
+  {
+    ...interaction({
+      id: 'mi_eph_model_a', at: base + 10_200, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '1+1' }] },
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+    sessionId: 'eph-thread-a',
+    sessionMode: 'conversation',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_tool_a', at: base + 10_210, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model' },
+      interactionType: 'tool',
+      path: '/execute',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_model_b', at: base + 10_220, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: 'tool result' }] },
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+    sessionId: 'eph-thread-b',
+    sessionMode: 'conversation',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+  },
+  {
+    ...interaction({
+      id: 'mi_eph_tool_b', at: base + 10_230, instance: 'designa-eph',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a-eph',
+      request: { model: 'lg-model' },
+      interactionType: 'tool',
+      path: '/execute',
+    }),
+    hop: 'orchestrator',
+    runId: ephRunId,
+  },
+];
+const ephProjection = projectAgentConversations(
+  ephSplitRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'one POST / one hop / one Run must stay one directory Thread even when some rows lack thread_id',
+);
+assert.equal(
+  ephProjection.summaries.find((item) => item.hasContent)?.conversationId,
+  hopScopedSessionConversationId(ephSplitRecords[0]),
+);
+
+const ephProductDriftRecords = ephSplitRecords.map((record, index) => ({
+  ...record,
+  interactionId: `${record.interactionId}_drift`,
+  agentProduct: index % 2 === 0
+    ? 'customer-langgraph-sim-lab-sim-workflow-1'
+    : 'f12f4e5f817e',
+  agentAssetId: 'agent-designa-eph',
+}));
+const ephDriftProjection = projectAgentConversations(
+  ephProductDriftRecords,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephDriftProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'one POST / one hop / one Run / one asset must stay one Thread when product labels drift',
+);
+
+const ephPersistedSplit = ephProductDriftRecords.map((record, index) => ({
+  ...record,
+  conversationId: index < 2 ? 'cv_8154c2f5291e2bfdf94709cd' : 'cv_c6118efbaaa104e5f88a11a6',
+  conversationIdSource: 'inferred',
+  conversationBindingVersion: 2,
+}));
+const ephPersistedProjection = projectAgentConversations(
+  ephPersistedSplit,
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 100 },
+);
+assert.equal(
+  ephPersistedProjection.summaries.filter((item) => item.hasContent).length,
+  1,
+  'persist-stamped product-drift rows of one POST must still coalesce to one directory Thread',
+);
+
+// Bound durable ids are already hop-scoped. Directory must not remint them or
+// timeline-v3 point-reads of directory keys return 0 turns (no route alias).
+const boundDurableId = 'cv_ddf7cdc36befaa8eaaf3ba2f';
+const boundProjection = projectAgentConversations(
+  [{
+    ...interaction({
+      id: 'mi_bound_dir_alias',
+      at: base + 11_000,
+      instance: 'designa-orch',
+      agentProduct: 'LangGraph',
+      workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '2+3' }] },
+      conversationId: boundDurableId,
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    sessionId: '4721c522-e3e3-4b8d-8629-ecb4f40546ff',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    conversationId: boundDurableId,
+    conversationIdSource: 'inferred',
+    conversationBindingVersion: 2,
+  }],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 10 },
+);
+assert.equal(
+  boundProjection.summaries[0]?.conversationId,
+  boundDurableId,
+  'directory must reuse the durable hop-scoped Thread id',
+);
+const boundHopRecords = [{
+  ...interaction({
+    id: 'mi_bound_hop_alias',
+    at: base + 11_100,
+    instance: 'designa-orch',
+    agentProduct: 'LangGraph',
+    workspacePath: '/workspace/design-a',
+    request: { model: 'lg-model', messages: [{ role: 'user', content: '2+3' }] },
+    conversationId: boundDurableId,
+    path: '/v1/chat/completions',
+  }),
+  hop: 'orchestrator',
+  sessionId: '4721c522-e3e3-4b8d-8629-ecb4f40546ff',
+  sessionMode: 'resumable',
+  sessionIdentityQuality: 'strong',
+  conversationId: boundDurableId,
+  conversationIdSource: 'inferred',
+  conversationBindingVersion: 2,
+}];
+const boundHopResolution = resolveAgentConversationsV2(boundHopRecords);
+assert.equal(
+  boundHopResolution.aliases.some((item) =>
+    item.aliasConversationId === 'cv_2901172e7ca0eaa4307877db'
+    && item.canonicalConversationId === boundDurableId
+    && item.reason === 'hop_fence_bound_thread'),
+  true,
+  'resolver must alias the hop remint key back to the durable Thread',
+);
+
+// Unbound provider ids may still be reused across hops; remint those only.
+const sharedProviderId = 'cv_shared_provider_thread';
+const unboundHopProjection = projectAgentConversations(
+  [
+    {
+      ...interaction({
+        id: 'mi_unbound_orch',
+        at: base + 12_000,
+        instance: 'unbound-orch',
+        agentProduct: 'LangGraph',
+        workspacePath: '/workspace/unbound-orch',
+        request: { model: 'lg-model', messages: [{ role: 'user', content: 'parent' }] },
+        conversationId: sharedProviderId,
+        path: '/v1/chat/completions',
+      }),
+      hop: 'orchestrator',
+      conversationId: sharedProviderId,
+      conversationIdSource: 'provider',
+      conversationBindingVersion: undefined,
+    },
+    {
+      ...interaction({
+        id: 'mi_unbound_worker',
+        at: base + 12_100,
+        instance: 'unbound-worker',
+        agentProduct: 'LangGraph',
+        workspacePath: '/workspace/unbound-worker',
+        request: { model: 'lg-model', messages: [{ role: 'user', content: 'child' }] },
+        conversationId: sharedProviderId,
+        path: '/v1/chat/completions',
+      }),
+      hop: 'worker',
+      conversationId: sharedProviderId,
+      conversationIdSource: 'provider',
+      conversationBindingVersion: undefined,
+    },
+  ],
+  [],
+  { timeType: 'last_30d', scope: 'agent', limit: 10 },
+);
+const unboundIds = unboundHopProjection.summaries
+  .filter((item) => item.hasContent)
+  .map((item) => item.conversationId);
+assert.equal(unboundIds.length, 2, 'unbound shared provider ids stay hop-isolated');
+assert.equal(unboundIds.includes(sharedProviderId), false,
+  'unbound hop remint must not keep the shared provider id');
+
+// Same container + same prompt must not reuse a child Thread across distinct Session/Run anchors.
+const childRerunSharedPrompt = { model: 'lg-model', messages: [{ role: 'user', content: 'print(12+13)' }] };
+const childRerunRecords = [
+  {
+    ...interaction({
+      id: 'mi_v2_child_run1', at: base + 30_000, instance: 'same-specialist-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/specialist',
+      request: childRerunSharedPrompt,
+      responseId: 'child-run1-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: 'fanout-run-1',
+    sessionId: 'fanout-run-1',
+    parentSessionId: 'fanout-run-1',
+    delegationId: 'delegation-run-1',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-specialist',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_child_run2', at: base + 31_000, instance: 'same-specialist-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/specialist',
+      request: childRerunSharedPrompt,
+      responseId: 'child-run2-response',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'specialist',
+    runId: 'fanout-run-2',
+    sessionId: 'fanout-run-2',
+    parentSessionId: 'fanout-run-2',
+    delegationId: 'delegation-run-2',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-specialist',
+  },
+];
+const childRerunResolution = resolveAgentConversationsV2(childRerunRecords);
+assert.equal(new Set(childRerunResolution.conversationRecords.map((item) => item.conversationId)).size, 2,
+  'same-container child reruns with distinct session/run anchors stay independent');
+
+const statefulSameSession = [
+  {
+    ...interaction({
+      id: 'mi_v2_stateful_run1', at: base + 32_000, instance: 'designa-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '4+5' }] },
+      responseId: 'stateful-r1',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: 'stateful-run-1',
+    sessionId: 's113-stateful-shared',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-designa',
+  },
+  {
+    ...interaction({
+      id: 'mi_v2_stateful_run2', at: base + 33_000, instance: 'designa-container',
+      agentProduct: 'LangGraph', workspacePath: '/workspace/design-a',
+      request: { model: 'lg-model', messages: [{ role: 'user', content: '4+5' }, { role: 'user', content: '6+7' }] },
+      responseId: 'stateful-r2',
+      path: '/v1/chat/completions',
+    }),
+    hop: 'orchestrator',
+    runId: 'stateful-run-2',
+    sessionId: 's113-stateful-shared',
+    sessionMode: 'resumable',
+    sessionIdentityQuality: 'strong',
+    sessionIdSource: 'provider',
+    agentAssetId: 'agent-designa',
+  },
+];
+const statefulResolution = resolveAgentConversationsV2(statefulSameSession);
+assert.equal(new Set(statefulResolution.conversationRecords.map((item) => item.conversationId)).size, 1,
+  'same thread_id across two runs stays one Conversation');
+
+console.log('Agent Conversation Resolver V2 verification passed');

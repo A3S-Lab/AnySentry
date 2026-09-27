@@ -108,6 +108,23 @@ Use the returned `eventId` to open the exact event or build an Evidence Bundle. 
 
 The Agent inventory is discovered from runtime evidence and can be enriched with platform-side owner, team, environment, criticality, tags, and notes. No metadata overlay requires changing the monitored agent.
 
+### Opt-in Agent conversation evidence
+
+On explicitly supported Linux runtimes, the Observer can also reconstruct the final HTTP/1.1
+request an Agent sent to an LLM, the response visible to the Agent, parsed tool instructions and
+later tool results. This plaintext path is off by default and uses three gates: verified Agent
+PID/cgroup, an admitted POST route, and a userspace protocol/semantic check. Raw interaction
+queries require management authentication and are audited.
+
+Compatibility is product-, version-, TLS-implementation-, and protocol-specific. Existing
+historical fixtures include Pi, pinned LangChain and Dify scenarios, Claude Code 2.1.170 over TLS,
+and Codex CLI 0.150.1 over explicit HTTP; the current architecture acceptance focus is Codex,
+Claude Code, Dify, and LangChain/LangGraph. Pi, Kimi, Z.ai, and other future Agents are not
+current release-gate targets. Generic Go/Rustls, Codex HTTPS, HTTP/2, WebSocket and QUIC are not
+claimed. See the
+[product requirements](docs/anysentry-agent-llm-interaction-observability-prd.md) and
+[technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md).
+
 ## How it works
 
 <p align="center">
@@ -128,7 +145,7 @@ Judgment can run in two deployment modes:
 
 L1 rules are enabled by default. L2 and L3 remain inactive until their policy and model backends are explicitly configured; L3 follows an unresolved L2 escalation rather than severity alone.
 
-The policy page provides independent **快速研判模型** and **深度研判模型** connections. A key is
+The policy page provides independent **Fast Review** and **Deep Investigation** model connections. A key is
 accepted only for a bounded A3S Code connection test and, after explicit apply, remains in process
 memory; it is never saved in PolicyConfig, ClickHouse, Redis data structures, logs, responses or
 browser storage. Applied credentials are delivered to workers through non-persistent Redis Pub/Sub
@@ -136,7 +153,10 @@ and take effect without restart. L2 and AI identity review share the fast connec
 only the deep connection. Deployment-injected `A3S_SENTRY_LLM_*` (fast) and `A3S_SENTRY_L3_*`
 (deep) variables remain supported as independent restart-surviving compatibility sources.
 
-Judged events use an in-memory hot ring for current reads and ClickHouse for durable analytics. Without `CLICKHOUSE_URL`, AnySentry continues in memory but does not preserve state across restarts.
+ClickHouse is the source of truth for judged-event history and analytics. A bounded in-memory hot
+ring supplies uncommitted low-latency facts and degraded-mode fallbacks only; it does not decide
+whether historical events, Agents, or relationships exist. Without `CLICKHOUSE_URL`, AnySentry
+continues in partial in-memory mode but does not preserve state across restarts.
 
 ## Progressive API for AI agents
 
@@ -321,7 +341,12 @@ skills/l3/                   L3 investigation prompts
 ## Documentation
 
 - [Deployment runbook](deploy/README.md)
+- [通用智能体全链路可观测架构 v2](docs/anysentry-agent-observability-architecture-v2.md)
+- [Canonical Observability 本地实现与验收](docs/canonical-observability-implementation.md)
+- [多智能体开发工程师执行提示词](docs/anysentry-multiagent-refactor-execution-prompt.md)
 - [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
+- [Agent–LLM and external-tool plaintext observability PRD](docs/anysentry-agent-llm-interaction-observability-prd.md)
+- [Agent–LLM and external-tool plaintext observability technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md)
 - [Performance testing](docs/performance-testing.md)
 - [AnySentry Progressive API Skill](integrations/skills/anysentry-api/SKILL.md)
 

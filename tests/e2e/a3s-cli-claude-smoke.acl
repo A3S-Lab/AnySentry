@@ -1,0 +1,20 @@
+suite "a3s-cli-claude-smoke" {
+    version = 1
+
+    scenario "claude-https-fixture" {
+        surface = "tui"
+        timeout_ms = 180000
+
+        wait "fixture-complete" {
+            text = "A3S_TUI_CLI_PASS claude"
+        }
+
+        expect "tool-result-visible" {
+            text = "A3S_TUI_CLI_PASS claude"
+        }
+
+        terminal_recording "evidence" {
+            path = "terminal/claude-fixture.vt"
+        }
+    }
+}

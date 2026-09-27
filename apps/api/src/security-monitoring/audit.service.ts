@@ -90,11 +90,14 @@ function sanitizeDetails(details?: Record<string, unknown>): Record<string, unkn
 
 @Injectable()
 export class AuditService implements OnModuleInit, OnModuleDestroy {
-  private readonly ch = new ClickHouseStore();
   private readonly records = new Map<string, AuditRecord>();
+  private readonly pendingFacts = new Map<string, AuditRecord>();
   private persistTimer?: NodeJS.Timeout;
   private initialized = false;
+  private closing = false;
   private sequence = 0;
+
+  constructor(private readonly ch: ClickHouseStore) {}
 
   async onModuleInit(): Promise<void> {
     if (await this.ch.init()) {
@@ -104,9 +107,9 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closing = true;
     if (this.persistTimer) clearTimeout(this.persistTimer);
     await this.persist();
-    await this.ch.close();
   }
 
   record(input: AuditRecordInput): AuditListItem {
@@ -126,6 +129,7 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       details: sanitizeDetails(input.details),
     };
     this.records.set(record.auditId, record);
+    this.pendingFacts.set(record.auditId, record);
     this.trim();
     this.persistSoon();
     return this.item(record);
@@ -158,12 +162,16 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
 
     const summary = {
       totalRecords: items.length,
-      policyActions: items.filter((record) => record.resourceType === 'policy').length,
+      policyActions: items.filter((record) =>
+        record.resourceType === 'policy' ||
+        record.resourceType === 'infrastructure-rule' ||
+        record.resourceType === 'unknown-learning').length,
       agentActions: items.filter((record) => record.resourceType === 'agent').length,
       maintenanceActions: items.filter((record) => record.resourceType === 'maintenance').length,
       notificationActions: items.filter((record) => record.resourceType === 'notification').length,
       objectiveActions: items.filter((record) => record.resourceType === 'objective').length,
       sourceActions: items.filter((record) => record.resourceType === 'source').length,
+      userActions: items.filter((record) => record.resourceType === 'user').length,
       incidentActions: items.filter((record) => record.resourceType === 'incident').length,
       alertActions: items.filter((record) => record.resourceType === 'alert').length,
       remediationActions: items.filter((record) => record.resourceType === 'remediation').length,
@@ -215,7 +223,17 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persist(): Promise<void> {
-    const records = [...this.records.values()].sort((a, b) => b.at - a.at).slice(0, RETAIN_LIMIT);
-    await this.ch.saveAuditLog(records);
+    const facts = [...this.pendingFacts.values()];
+    const saved = await this.ch.appendAuditFacts(facts);
+    if (saved) {
+      for (const fact of facts) {
+        if (this.pendingFacts.get(fact.auditId) === fact) this.pendingFacts.delete(fact.auditId);
+      }
+    } else if (facts.length > 0 && !this.closing && !this.persistTimer) {
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = undefined;
+        void this.persist();
+      }, 5_000);
+    }
   }
 }

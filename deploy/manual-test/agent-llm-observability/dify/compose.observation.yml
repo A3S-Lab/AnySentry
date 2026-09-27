@@ -1,0 +1,149 @@
+x-anysentry-dify-observation-env: &anysentry-dify-observation-env
+  # The lab runs on OverlayFS. Avoid first-start __pycache__ writes so Dify's
+  # migration processes do not contend on overlay rename/journal locks.
+  PYTHONDONTWRITEBYTECODE: "1"
+  SSL_CERT_FILE: /run/anysentry-dify-lab/ca-bundle.crt
+  REQUESTS_CA_BUNDLE: /run/anysentry-dify-lab/ca-bundle.crt
+  CURL_CA_BUNDLE: /run/anysentry-dify-lab/ca-bundle.crt
+  NO_PROXY: llm-mock,tool-mock,localhost,127.0.0.1
+  no_proxy: llm-mock,tool-mock,localhost,127.0.0.1
+
+x-anysentry-dify-observation-volumes: &anysentry-dify-observation-volumes
+  - type: bind
+    source: ${DIFY_LAB_RUNTIME:?Set DIFY_LAB_RUNTIME}/tls/ca-bundle.crt
+    target: /run/anysentry-dify-lab/ca-bundle.crt
+    read_only: true
+
+x-anysentry-mock-base: &anysentry-mock-base
+  build:
+    context: ${DIFY_LAB_ROOT:?Set DIFY_LAB_ROOT}/mock-runtime
+  image: anysentry/dify-observation-mock:local
+  user: ${DIFY_LAB_UID:?Set DIFY_LAB_UID}:${DIFY_LAB_GID:?Set DIFY_LAB_GID}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  cap_add:
+    - NET_BIND_SERVICE
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 64
+  mem_limit: 128m
+  cpus: 0.5
+  environment:
+    MOCK_HTTP_PORT: "8000"
+    MOCK_HTTPS_PORT: "443"
+    MOCK_TLS_CERT_FILE: /run/tls/server.crt
+    MOCK_TLS_KEY_FILE: /run/tls/server.key
+    MOCK_API_KEY_FILE: /run/secrets/mock-api-key
+    MOCK_MODEL_NAME: ${DIFY_LAB_MODEL:-anysentry-observation-model}
+  volumes:
+    - type: bind
+      source: ${DIFY_LAB_RUNTIME:?Set DIFY_LAB_RUNTIME}/tls/server.crt
+      target: /run/tls/server.crt
+      read_only: true
+    - type: bind
+      source: ${DIFY_LAB_RUNTIME:?Set DIFY_LAB_RUNTIME}/tls/server.key
+      target: /run/tls/server.key
+      read_only: true
+    - type: bind
+      source: ${DIFY_LAB_RUNTIME:?Set DIFY_LAB_RUNTIME}/secrets/mock-api-key
+      target: /run/secrets/mock-api-key
+      read_only: true
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 5s
+  labels:
+    anysentry.io/workload-kind: test-fixture
+    anysentry.io/observation-role: fixture
+
+services:
+  api:
+    environment:
+      <<: *anysentry-dify-observation-env
+    volumes: *anysentry-dify-observation-volumes
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: dify-observation-lab
+      anysentry.io/agent-runtime: dify
+      anysentry.io/runtime-role: api
+
+  worker:
+    environment:
+      <<: *anysentry-dify-observation-env
+    volumes: *anysentry-dify-observation-volumes
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: dify-observation-lab
+      anysentry.io/agent-runtime: dify
+      anysentry.io/runtime-role: worker
+
+  worker_beat:
+    environment:
+      <<: *anysentry-dify-observation-env
+    volumes: *anysentry-dify-observation-volumes
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: dify-observation-lab
+      anysentry.io/agent-runtime: dify
+      anysentry.io/runtime-role: scheduler
+
+  plugin_daemon:
+    environment:
+      <<: *anysentry-dify-observation-env
+    volumes: *anysentry-dify-observation-volumes
+    labels:
+      anysentry.io/workload-kind: agent
+      anysentry.io/agent-id: dify-observation-lab
+      anysentry.io/agent-runtime: dify
+      anysentry.io/runtime-role: model-provider
+
+  ssrf_proxy:
+    volumes:
+      - type: bind
+        source: ${DIFY_LAB_ROOT:?Set DIFY_LAB_ROOT}/ssrf-proxy/10-anysentry-dify-lab.conf
+        target: /etc/squid/conf.d/10-anysentry-dify-lab.conf
+        read_only: true
+
+  llm-mock:
+    <<: *anysentry-mock-base
+    environment:
+      MOCK_ROLE: llm
+      MOCK_HTTP_PORT: "8000"
+      MOCK_HTTPS_PORT: "443"
+      MOCK_TLS_CERT_FILE: /run/tls/server.crt
+      MOCK_TLS_KEY_FILE: /run/tls/server.key
+      MOCK_API_KEY_FILE: /run/secrets/mock-api-key
+      MOCK_MODEL_NAME: ${DIFY_LAB_MODEL:-anysentry-observation-model}
+    ports:
+      - 127.0.0.1:${DIFY_LAB_LLM_HTTP_PORT:-18000}:8000
+      - 127.0.0.1:${DIFY_LAB_LLM_HTTPS_PORT:-18444}:443
+    labels:
+      anysentry.io/workload-kind: test-fixture
+      anysentry.io/observation-role: llm-provider
+
+  tool-mock:
+    <<: *anysentry-mock-base
+    environment:
+      MOCK_ROLE: tool
+      MOCK_HTTP_PORT: "8000"
+      MOCK_HTTPS_PORT: "443"
+      MOCK_TLS_CERT_FILE: /run/tls/server.crt
+      MOCK_TLS_KEY_FILE: /run/tls/server.key
+      MOCK_API_KEY_FILE: /run/secrets/mock-api-key
+      MOCK_MODEL_NAME: ${DIFY_LAB_MODEL:-anysentry-observation-model}
+    ports:
+      - 127.0.0.1:${DIFY_LAB_TOOL_HTTP_PORT:-18001}:8000
+      - 127.0.0.1:${DIFY_LAB_TOOL_HTTPS_PORT:-18445}:443
+    labels:
+      anysentry.io/workload-kind: test-fixture
+      anysentry.io/observation-role: http-tool

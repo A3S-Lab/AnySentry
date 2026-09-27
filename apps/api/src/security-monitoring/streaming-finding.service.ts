@@ -7,6 +7,7 @@ import {
   RiskProfileFinding,
   StreamFindingList,
 } from './streaming.types';
+import { resolveTimeWindow } from './time-window';
 import { SecurityTimeFilter } from './types';
 
 const PROFILE_TABLE = 'stream_risk_profiles';
@@ -23,6 +24,7 @@ const PROFILE_DDL = `CREATE TABLE IF NOT EXISTS ${PROFILE_TABLE} (
   workspaceId String,
   workspacePath String,
   agentCorrelationId String,
+  agentInstanceId String,
   agentType String,
   windowStart UInt64,
   windowEnd UInt64,
@@ -47,6 +49,7 @@ const COMPOSITE_DDL = `CREATE TABLE IF NOT EXISTS ${COMPOSITE_TABLE} (
   workspaceId String,
   workspacePath String,
   agentCorrelationId String,
+  agentInstanceId String,
   agentType String,
   sessionId String,
   traceId String,
@@ -111,6 +114,14 @@ const compositeJudgmentAlters = (table: string) => [
   `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS synthetic UInt8 AFTER decisionSource`,
 ];
 
+const PROFILE_ALTERS = [
+  `ALTER TABLE ${PROFILE_TABLE} ADD COLUMN IF NOT EXISTS agentInstanceId String AFTER agentCorrelationId`,
+];
+
+const COMPOSITE_ALTERS = [
+  `ALTER TABLE ${COMPOSITE_TABLE} ADD COLUMN IF NOT EXISTS agentInstanceId String AFTER agentCorrelationId`,
+];
+
 const COMPOSITE_JUDGMENT_COLUMNS = [
   'episodeId', 'findingId', 'revision', 'recordVersion', 'evidenceFingerprint',
   'tenantId', 'environmentId', 'workspaceId', 'workspacePath', 'agentCorrelationId',
@@ -138,18 +149,6 @@ function nonNegativeFeatures(value: unknown): Record<string, number> {
   );
 }
 
-
-function sinceMs(filter: SecurityTimeFilter): number {
-  const now = Date.now();
-  if (filter.timeType === 'last_1d') return now - 24 * 60 * 60_000;
-  if (filter.timeType === 'last_7d') return now - 7 * 24 * 60 * 60_000;
-  if (filter.timeType === 'last_30d') return now - 30 * 24 * 60 * 60_000;
-  if (filter.timeType === 'custom') {
-    const parsed = Date.parse(filter.startTime ?? '');
-    return Number.isFinite(parsed) ? parsed : now - 3 * 60 * 60_000;
-  }
-  return now - 3 * 60 * 60_000;
-}
 
 function compositeJudgmentFromRow(row: Record<string, unknown>): CompositeJudgmentFinding {
   return {
@@ -243,7 +242,13 @@ export class StreamFindingStore {
       await boot.close();
       this.client = createClient({ url, database, username, password });
       await this.client.command({ query: PROFILE_DDL });
+      for (const query of PROFILE_ALTERS) {
+        await this.client.command({ query });
+      }
       await this.client.command({ query: COMPOSITE_DDL });
+      for (const query of COMPOSITE_ALTERS) {
+        await this.client.command({ query });
+      }
       await this.client.command({
         query: compositeJudgmentDdl(LEGACY_COMPOSITE_JUDGMENT_TABLE, 'episodeId'),
       });
@@ -278,27 +283,32 @@ export class StreamFindingStore {
   }
 
   async upsert(finding: PersistedStreamFinding): Promise<void> {
+    await this.upsertMany([finding]);
+  }
+
+  async upsertMany(findings: readonly PersistedStreamFinding[]): Promise<void> {
+    if (findings.length === 0) return;
     if (!this.client || !this.ready) throw new Error('stream finding store is unavailable');
-    if (finding.findingType === 'risk_profile') {
-      await this.client.insert({
-        table: PROFILE_TABLE,
-        values: [{
+    const profileRows: Record<string, unknown>[] = [];
+    const compositeRows: Record<string, unknown>[] = [];
+    const judgmentRows: Record<string, unknown>[] = [];
+    for (const finding of findings) {
+      if (finding.findingType === 'risk_profile') {
+        profileRows.push({
           ...finding,
+          agentInstanceId: finding.agentInstanceId ?? '',
           features: JSON.stringify(finding.features),
           hitRules: JSON.stringify(finding.hitRules),
           shadow: 1,
           schemaVersion: undefined,
           findingType: undefined,
-        }],
-        format: 'JSONEachRow',
-      });
-      return;
-    }
-    if (finding.findingType === 'composite_risk') {
-      await this.client.insert({
-        table: COMPOSITE_TABLE,
-        values: [{
+        });
+        continue;
+      }
+      if (finding.findingType === 'composite_risk') {
+        compositeRows.push({
           ...finding,
+          agentInstanceId: finding.agentInstanceId ?? '',
           sessionId: finding.sessionId ?? '',
           traceId: finding.traceId ?? '',
           evidenceEventIds: JSON.stringify(finding.evidenceEventIds),
@@ -306,14 +316,10 @@ export class StreamFindingStore {
           shadow: 1,
           schemaVersion: undefined,
           findingType: undefined,
-        }],
-        format: 'JSONEachRow',
-      });
-      return;
-    }
-    await this.client.insert({
-      table: COMPOSITE_JUDGMENT_TABLE,
-      values: [{
+        });
+        continue;
+      }
+      judgmentRows.push({
         ...finding,
         recordVersion: finding.judgedAt,
         traceIds: JSON.stringify(finding.traceIds),
@@ -332,42 +338,68 @@ export class StreamFindingStore {
         shadow: 1,
         schemaVersion: undefined,
         findingType: undefined,
-      }],
-      format: 'JSONEachRow',
-    });
+      });
+    }
+    if (profileRows.length) {
+      await this.client.insert({
+        table: PROFILE_TABLE,
+        values: profileRows,
+        format: 'JSONEachRow',
+      });
+    }
+    if (compositeRows.length) {
+      await this.client.insert({
+        table: COMPOSITE_TABLE,
+        values: compositeRows,
+        format: 'JSONEachRow',
+      });
+    }
+    if (judgmentRows.length) {
+      await this.client.insert({
+        table: COMPOSITE_JUDGMENT_TABLE,
+        values: judgmentRows,
+        format: 'JSONEachRow',
+      });
+    }
   }
 
   async list(filter: SecurityTimeFilter, limit = 30): Promise<StreamFindingList> {
     if (!this.client || !this.ready) {
       return { enabled: false, riskProfiles: [], compositeRisks: [], compositeJudgments: [], updateTime: new Date().toISOString() };
     }
-    const since = sinceMs(filter);
+    const { startMs: since, endMs: until } = resolveTimeWindow(filter);
     const safeLimit = Math.max(1, Math.min(200, limit));
     const [profileResult, compositeResult, compositeJudgmentResult] = await Promise.all([
       this.client.query({
-        query: `SELECT * FROM ${PROFILE_TABLE} FINAL WHERE calculatedAt >= {since:UInt64} ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
-        query_params: { since, limit: safeLimit },
+        query: `SELECT * FROM ${PROFILE_TABLE} FINAL
+          WHERE calculatedAt >= {since:UInt64} AND calculatedAt <= {until:UInt64}
+          ORDER BY calculatedAt DESC
+          LIMIT 2 BY if(agentInstanceId != '', agentInstanceId, agentCorrelationId)
+          LIMIT {limit:UInt32}`,
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
       this.client.query({
-        query: `SELECT * FROM ${COMPOSITE_TABLE} FINAL WHERE calculatedAt >= {since:UInt64} ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
-        query_params: { since, limit: safeLimit },
+        query: `SELECT * FROM ${COMPOSITE_TABLE} FINAL
+          WHERE calculatedAt >= {since:UInt64} AND calculatedAt <= {until:UInt64}
+          ORDER BY calculatedAt DESC LIMIT {limit:UInt32}`,
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
       this.client.query({
         query: `SELECT * FROM ${COMPOSITE_JUDGMENT_TABLE} FINAL
-          WHERE judgedAt >= {since:UInt64}
-            AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1')
+          WHERE judgedAt >= {since:UInt64} AND judgedAt <= {until:UInt64}
+            AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1', 'supply-chain-temporal-v2', 'temporal-episode-v1', 'temporal-episode-v2')
             AND episodeId IN (
               SELECT episodeId FROM ${COMPOSITE_JUDGMENT_TABLE} FINAL
-              WHERE judgedAt >= {since:UInt64}
-                AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1')
+              WHERE judgedAt >= {since:UInt64} AND judgedAt <= {until:UInt64}
+                AND ruleVersion IN ('composite-risk-v2', 'supply-chain-exploit-v1', 'supply-chain-temporal-v2', 'temporal-episode-v1', 'temporal-episode-v2')
               GROUP BY episodeId
               ORDER BY max(judgedAt) DESC
               LIMIT {limit:UInt32}
             )
           ORDER BY episodeId, revision DESC, judgedAt DESC`,
-        query_params: { since, limit: safeLimit },
+        query_params: { since, until, limit: safeLimit },
         format: 'JSONEachRow',
       }),
     ]);
@@ -385,6 +417,7 @@ export class StreamFindingStore {
       workspaceId: String(row.workspaceId ?? ''),
       workspacePath: String(row.workspacePath ?? ''),
       agentCorrelationId: String(row.agentCorrelationId ?? ''),
+      agentInstanceId: String(row.agentInstanceId ?? ''),
       agentType: String(row.agentType ?? ''),
       windowStart: num(row.windowStart),
       windowEnd: num(row.windowEnd),
@@ -408,6 +441,7 @@ export class StreamFindingStore {
       workspaceId: String(row.workspaceId ?? ''),
       workspacePath: String(row.workspacePath ?? ''),
       agentCorrelationId: String(row.agentCorrelationId ?? ''),
+      agentInstanceId: String(row.agentInstanceId ?? '') || undefined,
       agentType: String(row.agentType ?? ''),
       sessionId: String(row.sessionId ?? '') || undefined,
       traceId: String(row.traceId ?? '') || undefined,

@@ -89,42 +89,39 @@ Confirmed/Candidate-full calls `evaluateThroughL2`. Only an eligible L2 escalati
 the durable L3 worker. Missing model configuration reduces the actual maximum tier without changing
 the requested route snapshot.
 
-## Read-only A3S Code identity reviewer
+## Read-only direct-model identity reviewer
 
 Two UI launch points (selected event and Agent asset) use one asynchronous backend capability. A
-dedicated queue and worker run a small `@a3s-lab/code` SDK Agent. No A3S CLI process or legacy L3
-bridge is allowed.
+bounded in-process scheduler collects one redacted evidence snapshot and performs exactly one
+non-streaming Chat Completions request. It does not create an Agent, Session or Memory Store and
+does not expose tools. No A3S CLI process or legacy L3 bridge is allowed.
 
 The reviewer always uses the **fast-review model profile**, shared with L2 only at the connection
-level. It never falls back to the deep-investigation profile. L2 and identity review still create
-independent A3S Code Agents/Sessions, prompts, permission policies and histories. If the fast-review
-profile is unavailable, or the selected model cannot perform the required read-only tool calls,
-review is unavailable. Credentials are never persisted in a review result.
+level. It never falls back to the deep-investigation profile. L2 and identity review use independent
+prompts, bounded evidence and histories. If the fast-review profile is unavailable, review is
+unavailable. Credentials are never persisted in a review result.
 
-The Agent receives only allowlisted read-only evidence tools:
+The server builds the snapshot from allowlisted read-only evidence sources:
 
 - event, trace, run, behavior, LLM-activity and metadata queries;
 - PID-reuse-safe process/ancestry/cgroup/runtime inspection;
 - Docker/Kubernetes metadata reads;
 - bounded workspace listing, search and text reads rooted at the reviewed workspace.
 
-There is no shell, arbitrary network, write/edit/patch/git, process control, workload mutation,
-delegation or sub-Agent capability. Permission defaults to deny. A node-side evidence probe, not the
-LLM worker, owns any required host `/proc` access and validates collector/host/boot/PID/start-time
-scope. Paths are canonicalized, symlink escape is rejected, file sizes are bounded, and credentials
-are redacted.
+The model cannot request more evidence or invoke shell, network, write/edit/patch/git, process
+control, workload mutation, delegation or sub-Agent capabilities. A node-side evidence probe owns
+any required host `/proc` access and validates collector/host/boot/PID/start-time scope. Paths are
+canonicalized, symlink escape is rejected, evidence size is bounded, and credentials are redacted.
 
 The structured output is advisory:
 
 ```ts
 interface IdentityReviewResult {
-  classification: "agent" | "not_agent";
+  verdict: "agent" | "not_agent";
   confidence: number;
-  description: string;
+  summary: string;
   reason: string;
-  positiveEvidence: EvidenceReference[];
-  negativeEvidence: EvidenceReference[];
-  limitations: string[];
+  evidenceRefs: Array<"target.json" | "events.json" | "processes.json">;
 }
 ```
 
@@ -137,7 +134,7 @@ The UI offers only valid human state transitions after displaying the recommenda
 2. AnySentry policy/routing snapshots and identity-specific L1-L3 dispatch.
 3. Retention/noise separation, Unknown visibility, and ClickHouse cursor search.
 4. Read-only evidence gateway and security boundary tests.
-5. Dedicated A3S Code identity-review worker, queue and audit storage.
+5. Bounded single-request identity reviewer, concurrency control and audit storage.
 6. Event-detail and Agent-asset UI launch points.
 7. Full builds, contracts, Docker/Kafka/Flink chain tests, real identity review and performance
    regression.
@@ -148,7 +145,7 @@ The policy page exposes two operator-facing connections instead of one shared L2
 
 | Connection | Consumers | Isolation |
 | --- | --- | --- |
-| 快速研判模型 | L2 structured judgment and AI identity assistance | shared endpoint/model/key, separate Agents, Sessions, prompts, histories and permissions |
+| 快速研判模型 | L2 structured judgment and AI identity assistance | shared endpoint/model/key, separate prompts, evidence snapshots and histories |
 | 深度研判模型 | L3 deep-investigation Agent only | independent endpoint/model/key, timeout, context and Agent pool |
 
 URL, model, timeout and context limits are non-secret policy fields and may be persisted. API keys
@@ -181,8 +178,8 @@ delivery.
 - Confirmed follows the complete configured escalation chain.
 - Non-Agent new events are discarded independently of noise handling.
 - Sentry staged APIs prove by call-count tests that L1-only never contacts L2/L3.
-- Identity review uses the A3S Code SDK only and fails closed on every non-allowlisted tool.
-- The review Agent cannot write, execute shell, control processes/workloads, escape its evidence
-  scope, or auto-apply an identity decision.
+- Identity review performs exactly one bounded, non-streaming model request and exposes no tools.
+- The model cannot write, execute shell, control processes/workloads, request more evidence, or
+  auto-apply an identity decision.
 - Existing human review, display-name, evidence-chain, Flink/Kafka and dashboard behavior remain
   compatible.
