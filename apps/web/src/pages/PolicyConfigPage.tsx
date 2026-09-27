@@ -603,12 +603,12 @@ function FastReviewSection({ value, onChange, state, ...actions }: { value: L2Co
   const enabled = value !== null;
   const config = value ?? DEFAULT_L2;
   return (
-    <Panel title="快速研判模型" icon={Zap} description="用于快速结构化风险研判，并复用于 AI 身份辅助审核的模型连接。两类任务的会话、提示词和权限相互隔离。" action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}>
+    <Panel title="快速研判模型" icon={Zap} description="用于快速结构化风险研判、AI 身份辅助审核，以及 AI 对话助手（对话页共用此模型的连接与单次超时）。修改测试并应用后实时生效，无需重启。" action={<Switch checked={enabled} onChange={(next) => onChange(next ? { ...DEFAULT_L2 } : null)} />}>
       {enabled ? <div className="space-y-4 p-4">
         <div className="grid gap-4 md:grid-cols-3">
           <Field label="API 基础 URL" hint="填写到 /v1；完整接口地址会自动规范化。"><Input value={config.url} onChange={(event) => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
           <Field label="模型名称"><Input value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
-          <Field label="单次超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="单次超时（秒）" hint="同时是 AI 对话助手的总超时预算，应用后下一轮对话立即生效。"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
         </div>
         <ConnectionControl profile="fast_review" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 仅保留基础规则研判，AI 身份辅助审核不可用。</div>}

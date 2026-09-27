@@ -32,6 +32,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import { Link, useLocation } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import remarkGfm from "remark-gfm";
 import {
   COLLAPSED_SECURITY_SIDEBAR_WIDTH,
@@ -201,6 +202,18 @@ export function SecurityAssistantProvider({ children }: { children: ReactNode })
   const [activeCapability, setActiveCapability] = useState(0);
   const [savedSessions, setSavedSessions] = useState<AssistantSavedSession[]>(initialSavedSessions);
   const sessionId = useRef(id("asa"));
+  const configQuery = useQuery({
+    queryKey: ["security-center-policy-config"],
+    queryFn: () => securityCenterApi.getConfig(),
+    staleTime: 30_000,
+    retry: false,
+  });
+  // The server enforces fast_review.timeoutS as its total budget; the client must
+  // outlive it (plus a network margin) or the page aborts an answerable request.
+  const assistantTimeoutMs = useMemo(() => {
+    const timeoutS = configQuery.data?.connections?.fast_review?.timeoutS;
+    return typeof timeoutS === "number" && timeoutS > 0 ? timeoutS * 1000 + 15_000 : undefined;
+  }, [configQuery.data]);
   const context = useMemo(
     () => pageContext(location.pathname, location.search),
     [location.pathname, location.search],
@@ -264,7 +277,7 @@ export function SecurityAssistantProvider({ children }: { children: ReactNode })
         locale,
         history,
         context,
-      });
+      }, assistantTimeoutMs);
       sessionId.current = response.sessionId;
       setMessages((current) => [
         ...current,
@@ -274,10 +287,17 @@ export function SecurityAssistantProvider({ children }: { children: ReactNode })
       const fallback = locale === "zh-CN"
         ? "助手暂时不可用，请检查模型端点后重试。"
         : "The assistant is temporarily unavailable. Check the model endpoint and try again.";
-      const detail = error instanceof Error && error.message ? `\n${error.message}` : "";
+      const message = error instanceof Error ? error.message : "";
+      const detail = message ? `\n${message}` : "";
+      const budgetS = configQuery.data?.connections?.fast_review?.timeoutS;
+      const timeoutHint = /exceeded \d+ms timeout/.test(message)
+        ? locale === "zh-CN"
+          ? `\n当前对话超时预算为 ${typeof budgetS === "number" ? `${budgetS} 秒` : "快速研判模型的单次超时"}，可在「策略配置 → 快速研判模型 → 单次超时」调大，应用后下一轮对话立即生效。`
+          : `\nThe chat timeout budget is ${typeof budgetS === "number" ? `${budgetS}s` : "the fast review timeout"}. Raise it under Policy → Fast review model → Timeout; it applies to the next conversation immediately.`
+        : "";
       setMessages((current) => [
         ...current,
-        { id: id("msg"), role: "assistant", content: `${fallback}${detail}`, failed: true },
+        { id: id("msg"), role: "assistant", content: `${fallback}${detail}${timeoutHint}`, failed: true },
       ]);
     } finally {
       setLoading(false);
@@ -298,7 +318,7 @@ export function SecurityAssistantProvider({ children }: { children: ReactNode })
     setActiveCapability,
     setQuestion,
     submit,
-  }), [activeCapability, context, loading, messages, question, savedSessions]);
+  }), [activeCapability, assistantTimeoutMs, context, loading, messages, question, savedSessions]);
 
   return (
     <AssistantConversationContext.Provider value={value}>
@@ -469,6 +489,143 @@ function MarkdownAnswer({
       >
         {content}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+function ToolCallsBlock({
+  toolCalls,
+  appearance = "dark",
+  isChinese,
+}: {
+  toolCalls: NonNullable<SecurityAssistantAnswer["toolCalls"]>;
+  appearance?: "dark" | "light";
+  isChinese: boolean;
+}) {
+  const light = appearance === "light";
+  const { submit, loading } = useAssistantConversation();
+  const stateLabel = (call: NonNullable<SecurityAssistantAnswer["toolCalls"]>[number]): string | undefined => {
+    if (call.enforced === true) return isChinese ? "已生效" : "Enforced";
+    if (call.persisted) return isChinese ? "草稿" : "Draft";
+    return undefined;
+  };
+  const ruleWizardHref = (workload: NonNullable<NonNullable<SecurityAssistantAnswer["toolCalls"]>[number]["workloads"]>[number]): string => {
+    const params = new URLSearchParams({ mode: "new" });
+    if (workload.containerName) {
+      // Container workloads are matched at workload scope (agent_template): a process-scope
+      // signature for a generic interpreter (python/node) would misclassify unrelated processes.
+      params.set("draftKind", "agent_template");
+      params.set("matchField", "workload.container");
+      params.set("matchValue", workload.containerName);
+      params.set("placement", "docker");
+    } else {
+      params.set("draftKind", "runtime_signature");
+      if (workload.comm) {
+        params.set("matchField", "process.comm");
+        params.set("matchValue", workload.comm);
+      } else if (workload.exeBasename) {
+        params.set("matchField", "process.exe_basename");
+        params.set("matchValue", workload.exeBasename);
+      }
+    }
+    params.set("ruleName", `candidate ${workload.containerName ?? workload.comm ?? workload.exeBasename ?? workload.podName ?? "workload"}`);
+    return `/filter-rules?${params.toString()}`;
+  };
+  const askWhy = (workload: NonNullable<NonNullable<SecurityAssistantAnswer["toolCalls"]>[number]["workloads"]>[number]) => {
+    const name = workload.containerName ?? workload.podName ?? workload.physicalWorkloadId;
+    void submit(isChinese
+      ? `为什么工作负载 ${name} 当前被分类为 ${workload.classification}？请用 explain_rule_decision 工具说明各阶段的规则判定。`
+      : `Why is workload ${name} classified as ${workload.classification}? Use the explain_rule_decision tool to show the per-stage rule decisions.`);
+  };
+  return (
+    <div className="mt-2 space-y-1.5">
+      <p className={cn("text-[10px] font-medium uppercase tracking-[0.08em]", light ? "text-slate-400" : "text-slate-500")}>
+        {isChinese ? "调用的工具" : "Tools called"}
+      </p>
+      {toolCalls.map((call, index) => {
+        const state = stateLabel(call);
+        const args = Object.entries(call.arguments ?? {})
+          .filter(([, value]) => value !== undefined && value !== "")
+          .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+          .join(" ");
+        return (
+          <div key={`${call.name}-${call.ruleId ?? index}`} className="space-y-1">
+            <div
+              className={cn(
+                "flex items-start gap-1.5 rounded-md border px-2 py-1.5 text-[10px]",
+                light ? "border-slate-200 bg-slate-50 text-slate-500" : "border-[#29313e] bg-[#0d1218] text-slate-400",
+              )}
+            >
+              <Wrench className={cn("mt-px size-3 shrink-0", light ? "text-slate-400" : "text-slate-500")} aria-hidden="true" />
+              <span className={cn("shrink-0 font-mono font-medium", light ? "text-slate-600" : "text-slate-300")}>{call.name}</span>
+              <span className="min-w-0 flex-1 break-words">
+                {args ? <span className={cn("mr-1.5 font-mono", light ? "text-slate-400" : "text-slate-500")}>{args}</span> : null}
+                {call.summary}
+              </span>
+              {state ? (
+                <span className={cn(
+                  "shrink-0 rounded px-1 py-px font-medium",
+                  call.enforced === true
+                    ? light ? "bg-emerald-100 text-emerald-700" : "bg-emerald-500/15 text-emerald-300"
+                    : light ? "bg-amber-100 text-amber-700" : "bg-amber-500/15 text-amber-300",
+                )}>
+                  {state}
+                </span>
+              ) : null}
+            </div>
+            {call.workloads?.length ? (
+              <div className="space-y-1 pl-4">
+                {call.workloads.map((workload) => {
+                  const name = workload.containerName ?? workload.podName ?? workload.physicalWorkloadId;
+                  return (
+                    <div
+                      key={workload.physicalWorkloadId}
+                      className={cn(
+                        "flex flex-wrap items-center gap-x-1.5 gap-y-1 rounded border px-2 py-1 text-[10px]",
+                        light ? "border-slate-200 text-slate-500" : "border-[#232b38] text-slate-400",
+                      )}
+                    >
+                      <span className={cn("min-w-0 break-all font-mono", light ? "text-slate-600" : "text-slate-300")}>{name}</span>
+                      <span className={cn(
+                        "shrink-0 rounded px-1 py-px font-mono",
+                        workload.classification === "unknown"
+                          ? light ? "bg-amber-100 text-amber-700" : "bg-amber-500/15 text-amber-300"
+                          : light ? "bg-slate-100 text-slate-500" : "bg-white/[0.06] text-slate-400",
+                      )}>
+                        {workload.classification}
+                      </span>
+                      {workload.comm ? <span className="shrink-0 font-mono text-[9px] opacity-75">comm={workload.comm}</span> : null}
+                      <span className="flex-1" />
+                      <button
+                        type="button"
+                        disabled={loading}
+                        onClick={() => askWhy(workload)}
+                        className={cn(
+                          "min-h-6 shrink-0 rounded border px-1.5 font-medium disabled:opacity-50",
+                          light ? "border-slate-200 text-slate-500 hover:bg-slate-100" : "border-[#303a49] text-slate-300 hover:bg-white/[0.05]",
+                        )}
+                      >
+                        {isChinese ? "为什么" : "Why"}
+                      </button>
+                      {workload.classification === "unknown" && (workload.comm || workload.exeBasename) ? (
+                        <Link
+                          to={ruleWizardHref(workload)}
+                          className={cn(
+                            "inline-flex min-h-6 shrink-0 items-center rounded px-1.5 font-medium",
+                            light ? "bg-[#f97316]/10 text-[#ea580c] hover:bg-[#f97316]/20" : "bg-[#f97316]/15 text-[#fb923c] hover:bg-[#f97316]/25",
+                          )}
+                        >
+                          {isChinese ? "建规则" : "Create rule"}
+                        </Link>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -810,6 +967,9 @@ function EmbeddedSecurityAssistant({
                           </Link>
                         ))}
                       </div>
+                    ) : null}
+                    {message.response.toolCalls && message.response.toolCalls.length > 0 ? (
+                      <ToolCallsBlock toolCalls={message.response.toolCalls} appearance="light" isChinese={isChinese} />
                     ) : null}
                   </div>
                 ) : null}
@@ -1374,6 +1534,9 @@ export function SecurityAssistant({ mode = "floating" }: { mode?: SecurityAssist
                             <span>{message.response.totalTokens} tokens</span>
                           </div>
                           <p className="text-[11px] text-slate-500">{message.response.evidenceSummary}</p>
+                          {message.response.toolCalls && message.response.toolCalls.length > 0 && (
+                            <ToolCallsBlock toolCalls={message.response.toolCalls} appearance="dark" isChinese={locale === "zh-CN"} />
+                          )}
                           {message.response.references.length > 0 && (
                             <div className="mt-3 space-y-1.5">
                               <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-slate-500">{copy.sources}</p>
