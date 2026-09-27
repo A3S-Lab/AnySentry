@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { buildL3AgentAcl, L3AgentPool, isL3AgentTimeout } from '../apps/api/dist/security-monitoring/l3-agent-pool.js';
+import { buildL3AgentAcl, L3AgentPool, isL3AgentTimeout, isL3CompletionGateError } from '../apps/api/dist/security-monitoring/l3-agent-pool.js';
 import { parseL3Decision } from '../apps/api/dist/security-monitoring/l3-decision-parser.js';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -220,7 +220,15 @@ function verifyModelAclDoesNotCapOutput() {
   assert.match(acl, /context = 32768/, 'L3 model context must have a finite default');
 }
 
+function verifyGateRejectionClassification() {
+  assert.equal(isL3CompletionGateError(new Error('completion gate: workspace observation is incomplete, so this digest is not the effect')), true);
+  assert.equal(isL3CompletionGateError('completion gate: background workspace work is still unobserved'), true);
+  assert.equal(isL3CompletionGateError(new Error('HTTP 401 unauthorized')), false);
+  assert.equal(isL3CompletionGateError(new Error('L3 agent exceeded 90000ms timeout')), false);
+}
+
 verifyModelAclDoesNotCapOutput();
+verifyGateRejectionClassification();
 await verifyConcurrencyAndIsolation();
 verifyDecisionParsing();
 await verifyRotation();

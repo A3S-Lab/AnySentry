@@ -42,6 +42,14 @@ export class L3AgentTimeoutError extends Error {
   }
 }
 
+/** The a3s-code completion gate rejects sessions that conclude without workspace observation.
+ * It is a distinct operational class from transport/model failures: surfacing it as a generic
+ * "unreachable" hid the real cause and cost a full day of misdirected debugging. */
+export function isL3CompletionGateError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /completion gate:/iu.test(message);
+}
+
 type SessionSlot = {
   id: number;
   session: L3Session | null;

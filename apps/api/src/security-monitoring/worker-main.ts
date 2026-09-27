@@ -11,7 +11,7 @@ import {
   L3JudgeJob,
 } from './async-judgment.types';
 import { redisConnection } from './judgment-queue.service';
-import { isL3AgentTimeout, L3AgentPool } from './l3-agent-pool';
+import { isL3AgentTimeout, isL3CompletionGateError, L3AgentPool } from './l3-agent-pool';
 import { isL2CodeJudgeTimeout, L2CodeJudge } from './l2-code-judge';
 import { parseL3Decision } from './l3-decision-parser';
 import { buildFastAcl } from './policy-config';
@@ -317,6 +317,11 @@ function l3Prompt(input: L3JudgeJob): string {
 
 function l3FailureReason(error: unknown): string {
   if (isL3AgentTimeout(error)) return error.message;
+  // Gate rejections are their own failure class: they mean the agent never performed the required
+  // workspace observation, not that the model endpoint was unreachable.
+  if (isL3CompletionGateError(error)) {
+    return `gate_rejected: ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`;
+  }
   return (error instanceof Error ? error.message.split('\n')[0] : String(error)).slice(0, 2_000);
 }
 
