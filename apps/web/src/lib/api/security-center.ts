@@ -209,6 +209,22 @@ export interface SecurityAssistantAnswer {
   systemContext?: SecurityAssistantSystemContextSummary;
   references: SecurityAssistantReference[];
   readOnly: true;
+  toolCalls?: Array<{
+    name: "inspect_workloads" | "propose_identity_rule" | "apply_identity_rule" | "explain_rule_decision";
+    arguments: Record<string, unknown>;
+    persisted: boolean;
+    enforced?: boolean;
+    ruleId?: string;
+    summary?: string;
+    workloads?: Array<{
+      containerName?: string;
+      podName?: string;
+      classification: string;
+      physicalWorkloadId: string;
+      comm?: string;
+      exeBasename?: string;
+    }>;
+  }>;
 }
 
 export interface ClassifiedResponseMeta {
@@ -4453,8 +4469,8 @@ export const securityCenterApi = {
     apiClient.get<PlatformHealth>("/security-center/healthz", { signal }),
   platformMetrics: (range: SecurityTimeType = "last_1h") =>
     apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
-  assistantQuery: (body: SecurityAssistantQuery) =>
-    apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body),
+  assistantQuery: (body: SecurityAssistantQuery, timeoutMs?: number) =>
+    apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body, timeoutMs),
   healthCard: (filter: SecurityTimeFilter) =>
     dashboardPost<SecurityHealthCard>("/security-center/top/healthCard", filter),
   explainabilityScan: (filter: SecurityExplainabilityScanRequest) =>

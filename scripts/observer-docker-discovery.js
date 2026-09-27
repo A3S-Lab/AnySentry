@@ -119,11 +119,24 @@ function dockerRuntimeIdentity(inspect, options = {}) {
     const close = statLine.lastIndexOf(')');
     const fields = close >= 0 ? statLine.slice(close + 1).trim().split(/\s+/u) : [];
     const rootStartTimeTicks = fields[19] && /^\d+$/u.test(fields[19]) ? fields[19] : undefined;
+    // The container init's real process signature, for identity drafting on the API side.
+    // comm comes from the same stat line; exe basename is one extra readlink. argv and
+    // environment are deliberately never read here.
+    const open = statLine.indexOf('(');
+    const processComm = open >= 0 && close > open ? statLine.slice(open + 1, close).trim().slice(0, 64) : '';
+    let processExeBasename = '';
+    try {
+      processExeBasename = text(fs.readlinkSync(`${procRoot}/${hostPid}/exe`).split('/').pop()).slice(0, 120);
+    } catch {
+      // Short-lived or exiting inits lose their exe link first; comm still identifies them.
+    }
     return {
       hostPid,
       cgroupPath: unifiedPath,
       ...(cgroupId ? { cgroupId } : {}),
       ...(rootStartTimeTicks ? { rootStartTimeTicks } : {}),
+      ...(processComm ? { processComm } : {}),
+      ...(processExeBasename ? { processExeBasename } : {}),
       ...network,
     };
   } catch {
@@ -298,6 +311,7 @@ class DockerDiscovery {
       3_600_000,
     );
     this.reconnectMs = boundedNumber(options.reconnectMs, 2_000, 100, 60_000);
+    this.procRoot = text(options.procRoot) || '/proc';
     this.version = 0;
     this.errors = 0;
     this.reconnects = 0;
@@ -371,6 +385,7 @@ class DockerDiscovery {
         this.refreshRequested = true;
         return false;
       }
+      this.refreshProcessIdentities();
       this.containers = containers;
       this.ready = true;
       this.version++;
@@ -444,7 +459,7 @@ class DockerDiscovery {
       .then((inspect) => {
         if ((this.inspectEpoch.get(id) ?? 0) === epoch) {
           this.inspectById.set(id, dockerHealthchecks(inspect));
-          this.runtimeById.set(id, dockerRuntimeIdentity(inspect));
+          this.runtimeById.set(id, dockerRuntimeIdentity(inspect, { procRoot: this.procRoot }));
         }
       })
       .catch(() => {
@@ -467,6 +482,49 @@ class DockerDiscovery {
     this.runtimeById.delete(id);
     this.inspectEpoch.set(id, (this.inspectEpoch.get(id) ?? 0) + 1);
     if (!this.inspectInFlight.has(id)) this.inspectEpoch.delete(id);
+  }
+
+  // The init process signature is resolved once at container start, which races entrypoints
+  // like `sh -c 'cp … && exec real-binary'`: the cached comm stays "sh" forever. Re-read
+  // /proc/<pid>/stat + exe on every bounded refresh (no Docker API calls, microseconds each)
+  // so the reported signature converges to the real main process.
+  refreshProcessIdentities() {
+    for (const [id, runtime] of this.runtimeById) {
+      const hostPid = Number(runtime?.hostPid);
+      if (!Number.isSafeInteger(hostPid) || hostPid <= 0) continue;
+      let statLine;
+      try {
+        statLine = fs.readFileSync(`${this.procRoot}/${hostPid}/stat`, 'utf8').trim();
+        this.deadInitCycles?.delete(id);
+      } catch {
+        // Exiting or reaped inits keep their last-known signature for a few cycles. A permanently
+        // dead init (missed restart event, PID reused by the host) must eventually drop the cached
+        // identity so the bounded refresh re-inspects the container and re-binds the live cgroup.
+        const dead = (this.deadInitCycles?.get(id) ?? 0) + 1;
+        (this.deadInitCycles ??= new Map()).set(id, dead);
+        if (dead >= 5) {
+          this.deadInitCycles.delete(id);
+          this.invalidateInspect(id);
+        }
+        continue;
+      }
+      const open = statLine.indexOf('(');
+      const close = statLine.lastIndexOf(')');
+      const processComm = open >= 0 && close > open ? statLine.slice(open + 1, close).trim().slice(0, 64) : '';
+      let processExeBasename = '';
+      try {
+        processExeBasename = text(fs.readlinkSync(`${this.procRoot}/${hostPid}/exe`).split('/').pop()).slice(0, 120);
+      } catch {
+        // Short-lived or exiting inits lose their exe link first; comm still identifies them.
+      }
+      if (!processComm && !processExeBasename) continue;
+      if (runtime.processComm === processComm && runtime.processExeBasename === processExeBasename) continue;
+      this.runtimeById.set(id, {
+        ...runtime,
+        ...(processComm ? { processComm } : {}),
+        ...(processExeBasename ? { processExeBasename } : {}),
+      });
+    }
   }
 
   openEventStream() {
@@ -546,6 +604,12 @@ class DockerDiscovery {
         this.version++;
         this.onSnapshot(this.snapshot());
       }
+    } else if (action === 'create' || action === 'start' || action === 'restart' || action === 'die') {
+      // These actions always imply a new init process generation (new host PID, new cgroup inode,
+      // new start ticks). The inspect cache skips containers with a complete runtime identity, so
+      // without invalidation a restart keeps the dead cgroup id and probes a stale scope forever.
+      const id = normalizedContainerId(event?.Actor?.ID || event?.id || event?.ID);
+      if (id && (this.runtimeById.has(id) || this.inspectById.has(id))) this.invalidateInspect(id);
     }
     void this.refresh();
   }

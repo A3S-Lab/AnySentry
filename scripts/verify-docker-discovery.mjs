@@ -309,6 +309,33 @@ assert.equal(inspectAttempts, 2, 'failed inspect remains eligible for the next b
 assert.equal(retryingDiscovery.inspectById.has(clawId), true);
 retryingDiscovery.stop();
 
+const signatureDiscovery = new DockerDiscovery({
+  enabled: 'on',
+  socketExists: () => true,
+  requestJson: async (requestPath) => {
+    if (requestPath === '/containers/json?all=1') return [containers[0]];
+    return { State: { Pid: process.pid }, Config: {} };
+  },
+  streamFactory: () => ({ destroy() {} }),
+  refreshMs: 3_600_000,
+});
+const { readFileSync: readProcFile, readlinkSync: readProcLink } = require('node:fs');
+const selfStat = readProcFile(`/proc/${process.pid}/stat`, 'utf8').trim();
+const selfComm = selfStat.slice(selfStat.indexOf('(') + 1, selfStat.lastIndexOf(')')).trim();
+const selfExeBasename = readProcLink(`/proc/${process.pid}/exe`).split('/').pop();
+await signatureDiscovery.start(() => {});
+// Simulate the start-time race: `sh -c 'cp … && exec real-binary'` leaves the cached init
+// signature as the shell wrapper. The next bounded refresh must converge to the real process.
+const racedRuntime = signatureDiscovery.runtimeById.get(clawId);
+assert.ok(racedRuntime && racedRuntime.hostPid === process.pid);
+assert.equal(racedRuntime.processComm, selfComm, 'initial inspect resolves the real process signature');
+signatureDiscovery.runtimeById.set(clawId, { ...racedRuntime, processComm: 'sh', processExeBasename: 'dash' });
+await signatureDiscovery.refresh();
+const converged = signatureDiscovery.runtimeById.get(clawId);
+assert.equal(converged.processComm, selfComm, 'bounded refresh re-resolves the real init signature');
+assert.equal(converged.processExeBasename, selfExeBasename);
+signatureDiscovery.stop();
+
 const staleList = deferred();
 let listCalls = 0;
 const raceSnapshots = [];

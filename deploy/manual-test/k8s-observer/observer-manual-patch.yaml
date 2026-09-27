@@ -107,6 +107,12 @@ spec:
             - { name: forwarder-scripts, mountPath: /opt/observer-tls-agent-cgroups.js, subPath: observer-tls-agent-cgroups.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-workload-filter.js, subPath: observer-workload-filter.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-docker-discovery.js, subPath: observer-docker-discovery.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-behavior-discovery.js, subPath: observer-behavior-discovery.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-pipeline-accounting.js, subPath: observer-pipeline-accounting.js, readOnly: true }
+            # Template/signature registries are identity-domain code: agent_template rules projected
+            # from the control plane are evaluated here, so they must track the development tree too.
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-templates.js, subPath: observer-agent-templates.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-agent-runtime-signatures.js, subPath: observer-agent-runtime-signatures.js, readOnly: true }
             # Local-only: rebuilt collector with plain-HTTP write/sendto probes (Python urllib/httpx).
             - { name: local-collector, mountPath: /usr/local/bin/a3s-observer-collector, readOnly: true }
       volumes:

@@ -692,4 +692,90 @@ assert.match(forwarderSource, /requestAgent === false[\s\S]*?\? false/u);
 assert.match(forwarderSource, /function getJson\(url, timeoutMs, done, extraHeaders = \{\}, requestAgent, maxResponseBytes = IDENTITY_SNAPSHOT_MAX_BYTES\)/u);
 assert.match(forwarderSource, /infrastructurePolicyTarget,[\s\S]*?X-AnySentry-Management-Token[\s\S]*?false,/u);
 
+// Keep-only nodes must still complete Preview -> ACK -> Central -> Grant: nothing destructive
+// exists to bind, so the report carries zero bindings and Central trivially accepts. The
+// Collector's own safety adjustment is a soft downgrade and must not deadlock the handshake.
+const keepOnlyDecision = centralDecision('77', {
+  action: 'keep',
+  classification: 'unknown',
+  authority: 'candidate',
+  captureProfile: 'probable_investigation',
+  reasonCode: 'cold_start_workload',
+  rootPid: 4242,
+  rootProcessKey: 'cold-start-workload:docker:node-a:service-77',
+  desiredProbeActions: {
+    exec: 'full', exit: 'full', tls: 'full', connect: 'full', dns: 'full',
+    file_access: 'full', file_delete: 'full', llm: 'full', ssl: 'full', security: 'full', file_read: 'not_enabled',
+  },
+});
+delete keepOnlyDecision.ruleId;
+delete keepOnlyDecision.ruleRevision;
+delete keepOnlyDecision.materializationId;
+
+const keepOnly = publisher('keep-only', 'enforce');
+keepOnly.synchronizePolicyDecisions([keepOnlyDecision], 7);
+keepOnly.flush();
+const keepPreview = JSON.parse(fs.readFileSync(paths('keep-only').file, 'utf8'));
+assert.equal(keepPreview.activation.mode, 'preview');
+const keepAck = ackFor(keepPreview);
+keepAck.downgrades = ['effective_actions_changed_by_collector_safety'];
+keepAck.effectiveActionsHash = digest(['collector-safety-adjusted']);
+fs.writeFileSync(paths('keep-only').ackFile, `${JSON.stringify(keepAck)}\n`);
+const keepConsumed = keepOnly.consumeAckFile();
+assert.equal(keepConsumed?.accepted, true, 'soft collector-safety downgrades must not deadlock the Preview ACK');
+assert.deepEqual(keepOnly.metrics().lastAckSoftDowngrades, ['effective_actions_changed_by_collector_safety']);
+const keepRequest = keepOnly.materializationReport();
+assert(keepRequest, 'a keep-only node still reports so the grant handshake can complete');
+assert.equal(keepRequest.bindings.length, 0, 'nothing destructive means no bindings to gate');
+assert.equal(
+  keepOnly.acceptCentralMaterialization(keepAck, { ...keepRequest, accepted: true, reportId: 'report-keep-only', filterRuleEntries: [] }),
+  true,
+  'zero destructive entries is vacuously acceptable for the Central drop gate',
+);
+keepOnly.flush();
+const keepActive = JSON.parse(fs.readFileSync(paths('keep-only').file, 'utf8'));
+assert.equal(keepActive.activation.mode, 'enforce');
+assert.equal(keepActive.entries[0].probeActions.tls, 'full', 'the grant switches wire entries to the desired probe set');
+
+const hard = publisher('hard-downgrade', 'enforce');
+hard.observeDecision(centralDecision('78'));
+hard.flush();
+const hardAck = ackFor(JSON.parse(fs.readFileSync(paths('hard-downgrade').file, 'utf8')));
+hardAck.downgrades = ['effective_actions_changed_by_collector_safety', 'entries_dropped_by_capacity'];
+fs.writeFileSync(paths('hard-downgrade').ackFile, `${JSON.stringify(hardAck)}\n`);
+const hardResult = hard.consumeAckFile();
+assert.equal(hardResult?.accepted, false, 'non-whitelisted downgrade reasons still reject');
+assert.equal(hardResult?.reason, 'ack_has_downgrades');
+
+const malformed = publisher('malformed-effective', 'enforce');
+malformed.observeDecision(centralDecision('79'));
+malformed.flush();
+const malformedAck = ackFor(JSON.parse(fs.readFileSync(paths('malformed-effective').file, 'utf8')));
+malformedAck.downgrades = ['effective_actions_changed_by_collector_safety'];
+malformedAck.effectiveActionsHash = 'not-a-hash';
+fs.writeFileSync(paths('malformed-effective').ackFile, `${JSON.stringify(malformedAck)}\n`);
+assert.equal(malformed.consumeAckFile()?.reason, 'ack_effective_actions_mismatch',
+  'a soft downgrade never waives the well-formed effective-actions hash requirement');
+
+// Cold-start TTL churn cannot bounce a live grant; authority-bearing evictions still can.
+let grantNow = fixedNow;
+const grantee = publisher('grantee', 'enforce', { now: () => grantNow });
+grantee.synchronizePolicyDecisions([keepOnlyDecision], 7);
+grantee.flush();
+grantee.activationMode = 'enforce';
+grantee.activationGrant = {
+  collectorInstanceId: 'collector-instance-a',
+  hostBootId: 'boot-a',
+  expiresAt: new Date(fixedNow + 3_600_000).toISOString(),
+};
+grantNow = fixedNow + 601_000; // past the cold-start lease, inside the grant
+grantee.refreshSafety();
+assert.equal(grantee.metrics().activationMode, 'enforce', 'cold-start expiry churn cannot bounce a live grant');
+assert.equal(grantee.entries.size, 0, 'the expired entry itself is still evicted');
+grantee.synchronizePolicyDecisions([centralDecision('88', { classification: 'confirmed_agent', action: 'keep' })], 7);
+grantNow += 610_000;
+grantee.refreshSafety();
+assert.equal(grantee.metrics().activationMode, 'preview', 'evicting an Agent-classified entry still revokes activation');
+assert.equal(grantee.metrics().activationReason, 'scope_expired');
+
 console.log('S5 capture profile control verification passed');

@@ -77,6 +77,14 @@ function defaultIdentitySnapshotUrl(ingestUrl) {
   return url;
 }
 
+function defaultInventoryPushUrl(ingestUrl) {
+  const url = new URL(ingestUrl.toString());
+  const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/identity/observer-inventory');
+  url.pathname = nextPath === url.pathname ? '/security-center/identity/observer-inventory' : nextPath;
+  url.hash = '';
+  return url;
+}
+
 function defaultInfrastructurePolicyUrl(ingestUrl) {
   const url = new URL(ingestUrl.toString());
   const nextPath = url.pathname.replace(/\/ingest(?:\/.*)?$/, '/infrastructure-rules/policy');
@@ -473,6 +481,11 @@ const identitySnapshotTarget = new URL(
   process.env.ANYSENTRY_IDENTITY_SNAPSHOT_URL || defaultIdentitySnapshotUrl(target),
 );
 if (NODE_NAME) identitySnapshotTarget.searchParams.set('nodeName', NODE_NAME);
+// Trimmed docker inventory push (control plane metadata; never enters the event path).
+const INVENTORY_PUSH_SECS = Math.max(0, Number(process.env.ANYSENTRY_INVENTORY_PUSH_SECS || 60));
+const inventoryPushTarget = new URL(
+  process.env.ANYSENTRY_INVENTORY_PUSH_URL || defaultInventoryPushUrl(target),
+);
 const INFRASTRUCTURE_POLICY_SECS = Math.max(
   0,
   Number(process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_SECS || 5),
@@ -651,6 +664,80 @@ const tlsAgentCgroupPublisher = new TlsAgentCgroupPublisher({ file: TLS_AGENT_CG
 // together with host/SSH runtime snapshots. A host CLI is not present in Docker inventory, but it
 // still has a stable process-root/cgroup identity for the lifetime of the session.
 let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
+
+// --- Trimmed docker inventory push (control plane) -------------------------
+// Reports the already-discovered docker inventory to the API's in-memory identity
+// snapshot so the assistant and reviewers can see unmatched containers and their
+// main-process signatures. This never touches the event ingest path: one bounded
+// POST on change plus a slow keepalive. Labels are limited to the anysentry.io/*
+// namespace and argv/environment are never included.
+let inventoryPushTimer;
+let inventoryPushInFlight = false;
+let lastInventoryHash = '';
+let inventoryPushes = 0;
+let inventoryPushErrors = 0;
+
+function observerInventoryDocument() {
+  const entries = (Array.isArray(latestDockerIdentitySnapshot?.entries) ? latestDockerIdentitySnapshot.entries : [])
+    .filter((entry) => entry && (entry.containerName || (Array.isArray(entry.ids) && entry.ids.length)))
+    .slice(0, 500)
+    .map((entry) => {
+      const labels = {};
+      for (const [key, value] of Object.entries(entry.labels || {})) {
+        if (!key.startsWith('anysentry.io/')) continue;
+        const item = text(value).slice(0, 120);
+        if (item) labels[text(key).slice(0, 120)] = item;
+        if (Object.keys(labels).length >= 8) break;
+      }
+      const processComm = text(entry.processComm).slice(0, 64);
+      const processExeBasename = text(entry.processExeBasename).slice(0, 120);
+      return {
+        ...(text(entry.ids?.[1] || entry.ids?.[0]) ? { id: text(entry.ids[1] || entry.ids[0]).slice(0, 80) } : {}),
+        ...(text(entry.containerName) ? { containerName: text(entry.containerName).slice(0, 160) } : {}),
+        ...(text(entry.containerImage) ? { containerImage: text(entry.containerImage).slice(0, 200) } : {}),
+        ...(text(entry.imageDigest) ? { imageDigest: text(entry.imageDigest).slice(0, 80) } : {}),
+        ...(text(entry.containerState) ? { containerState: text(entry.containerState).slice(0, 40) } : {}),
+        ...(text(entry.classification) ? { classification: text(entry.classification).slice(0, 40) } : {}),
+        ...(Object.keys(labels).length ? { labels } : {}),
+        evidence: (Array.isArray(entry.evidence) ? entry.evidence : []).map((item) => text(item).slice(0, 200)).filter(Boolean).slice(0, 6),
+        ...(processComm || processExeBasename
+          ? { processes: [{ ...(processComm ? { comm: processComm } : {}), ...(processExeBasename ? { exeBasename: processExeBasename } : {}) }] }
+          : {}),
+      };
+    });
+  return {
+    schemaVersion: 'anysentry.observer_inventory.v1',
+    ...(NODE_NAME ? { nodeName: NODE_NAME } : {}),
+    generatedAt: new Date().toISOString(),
+    entries,
+  };
+}
+
+function pushObserverInventory(reason) {
+  if (!INVENTORY_PUSH_SECS || inventoryPushInFlight || closing) return;
+  const document = observerInventoryDocument();
+  const hash = crypto.createHash('sha256').update(JSON.stringify(document.entries)).digest('hex');
+  if (hash === lastInventoryHash && reason !== 'interval') return;
+  inventoryPushInFlight = true;
+  postJson(inventoryPushTarget, document, CONTROL_HTTP_TIMEOUT_MS, (failed, failureReason) => {
+    inventoryPushInFlight = false;
+    if (failed) {
+      inventoryPushErrors++;
+      if (inventoryPushErrors <= 3 || inventoryPushErrors % 100 === 0) {
+        console.error(`[observer-forward] observer inventory push failed: ${failureReason || 'unknown'} (errors=${inventoryPushErrors})`);
+      }
+      return;
+    }
+    inventoryPushes++;
+    lastInventoryHash = hash;
+  });
+}
+
+function startObserverInventoryPush() {
+  if (!INVENTORY_PUSH_SECS || inventoryPushTimer) return;
+  inventoryPushTimer = setInterval(() => pushObserverInventory('interval'), INVENTORY_PUSH_SECS * 1_000);
+  inventoryPushTimer.unref();
+}
 
 function endpointHostToken(endpoint) {
   const raw = text(endpoint).toLowerCase();
@@ -1904,6 +1991,7 @@ function refreshInfrastructurePolicy() {
 }
 
 let lastUnifiedFilterProjectionError = '';
+let lastSignatureLoadError = '';
 let lastUnifiedFilterProjectionVersion = -1;
 let unifiedFilterProjectionRefreshInFlight = false;
 function refreshUnifiedFilterProjection(done = () => {}) {
@@ -1953,11 +2041,15 @@ function refreshUnifiedFilterProjection(done = () => {}) {
           unifiedFilterPolicy.runtimeSignatureDocument(),
           'unified-filter-rule-control-plane',
         );
+        // A rejected signature document keeps the previous registry, but it must not block the
+        // template registry or forwarder settings from the same projection: identity domains are
+        // compiled and validated independently, so one bad runtime signature degrades only itself.
         if (!signatureResult.ok) {
           unifiedFilterPolicy.degrade(signatureResult.error);
+          lastSignatureLoadError = signatureResult.error;
           console.error(`[observer-forward] Unified Agent Runtime signatures ignored: ${signatureResult.error}`);
-          done();
-          return;
+        } else {
+          lastSignatureLoadError = '';
         }
         templateRegistry = new AgentTemplateRegistry({
           ...unifiedFilterPolicy.agentTemplateDocument(),
@@ -2768,6 +2860,12 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         unifiedSemanticRules: unifiedRules.semanticRetentionRules,
         unifiedRuntimeSignatures: unifiedRules.runtimeSignatures,
         unifiedAgentTemplates: unifiedRules.agentTemplates,
+        runtimeSignatureRegistryVersion: signatureRegistry.version,
+        runtimeSignatureRegistryLoaded: signatureRegistry.stats.loaded,
+        runtimeSignatureRegistryInvalid: signatureRegistry.stats.invalid,
+        ...(lastSignatureLoadError ? { runtimeSignatureRegistryLastError: lastSignatureLoadError.slice(0, 240) } : {}),
+        captureProfileAckSoftDowngrades: filterRules.ackSoftDowngrades,
+        ...(filterRules.lastAckSoftDowngrades ? { captureProfileLastAckSoftDowngrades: filterRules.lastAckSoftDowngrades.join(',') } : {}),
         unifiedIdentityIndexBuckets: unifiedRules.identityIndexBuckets,
         unifiedCaptureIndexBuckets: unifiedRules.captureIndexBuckets,
         unifiedSemanticIndexBuckets: unifiedRules.semanticIndexBuckets,
@@ -2887,6 +2985,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         dockerReady: docker.ready,
         dockerEntries: docker.entries,
         dockerReconnects: docker.reconnects,
+        inventoryPushes,
+        inventoryPushErrors,
         dockerErrors: docker.errors,
         behaviorWorkloads: behavior.workloads,
         behaviorCandidates: behavior.candidates,
@@ -3011,6 +3111,8 @@ function closeTransports() {
   signatureReloader?.close();
   if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
   infrastructurePolicyTimer = undefined;
+  if (inventoryPushTimer) clearInterval(inventoryPushTimer);
+  inventoryPushTimer = undefined;
   dockerDiscovery.stop();
   infrastructureResolver.close();
   abortActiveEventRequests('event transport closed');
@@ -4404,7 +4506,20 @@ async function start() {
     infrastructurePolicyTimer.unref();
   }
   const dockerStarted = await dockerDiscovery.start((snapshot) => {
-    latestDockerIdentitySnapshot = snapshot;
+    // Labels stay authoritative; the template registry only upgrades still-unknown workloads so
+    // the control-plane inventory agrees with event-path attribution (image/container templates).
+    const classifiedEntries = (Array.isArray(snapshot?.entries) ? snapshot.entries : []).map((entry) => {
+      if (entry?.classification !== 'unknown') return entry;
+      const templateHit = templateRegistry.classifyEntry(entry);
+      const hitClassification = templateHit?.attribution?.classification;
+      if (hitClassification !== 'confirmed_agent' && hitClassification !== 'probable_agent') return entry;
+      return {
+        ...entry,
+        classification: hitClassification,
+        evidence: [...(entry.evidence ?? []), ...(templateHit.attribution?.evidence ?? []).slice(0, 4)],
+      };
+    });
+    latestDockerIdentitySnapshot = { ...snapshot, entries: classifiedEntries };
     // Keep Docker discovery failures distinguishable from an empty inventory. This is a
     // bounded control-plane diagnostic only: never log labels, argv, credentials, or payloads.
     const discoveredAgents = Array.isArray(snapshot?.entries)
@@ -4430,10 +4545,12 @@ async function start() {
     publishLabeledHttpToolBackendCapture(snapshot);
     publishColdStartWorkloadCapture(snapshot);
     if (workloadCache.replace(snapshot, 'docker')) synchronizeInfrastructurePolicyRules();
+    pushObserverInventory('change');
   });
   if (closing) return;
   const docker = dockerDiscovery.metrics();
   console.error(`[observer-forward] docker discovery: enabled=${docker.enabled}; started=${dockerStarted}; socket=${dockerDiscovery.socketPath}`);
+  if (dockerStarted) startObserverInventoryPush();
 
   if (HEARTBEAT_SECS > 0) {
     sendHeartbeat();

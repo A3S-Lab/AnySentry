@@ -31,6 +31,7 @@ import {
 import { IdentityReviewAgentService } from './identity-review-agent.service';
 import { testDeepInvestigationConnection, testFastReviewConnection } from './judgment-connectivity';
 import { KubeIdentityService } from './kube-identity.service';
+import { ObserverInventoryService, type ObserverInventoryPush } from './observer-inventory.service';
 import { managementAuthConfigured, ManagementAuthGuard, RequireManagementAuth } from './management-auth.guard';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { MaintenanceWindowService } from './maintenance-window.service';
@@ -7338,6 +7339,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     private readonly judge: SentryJudgeService,
     private readonly runtimeModels: RuntimeModelConfigService,
     private readonly kube: KubeIdentityService,
+    private readonly observerInventory: ObserverInventoryService,
     private readonly streaming: StreamingQueueService,
     private readonly streamFindings: StreamingFindingService,
     private readonly supplyChain: SupplyChainService,
@@ -8322,11 +8324,23 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
   @Post('assistant/query')
   @HttpCode(200)
-  assistantQuery(@Body() body: T.SecurityAssistantQuery) {
+  assistantQuery(@Body() body: T.SecurityAssistantQuery, @Headers() headers: HeaderBag) {
     if (!body || typeof body.question !== 'string' || !body.question.trim()) {
       throw new BadRequestException('assistant question is required');
     }
-    return this.assistant.answer(body);
+    // The chat user is the second operator who approves assistant-drafted rules.
+    const actorId = (
+      headerValue(headers, 'x-forwarded-user')
+      ?? headerValue(headers, 'x-user-email')
+      ?? headerValue(headers, 'x-anysentry-actor')
+      ?? 'operator'
+    ).slice(0, 160);
+    const displayName = headerValue(headers, 'x-user-name') ?? headerValue(headers, 'x-anysentry-actor-name');
+    return this.assistant.answer(body, {
+      type: 'operator',
+      id: actorId,
+      ...(displayName ? { displayName } : {}),
+    });
   }
 
   @Post('events/timeline')
@@ -14186,13 +14200,37 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   identitySnapshot(@Query('nodeName') nodeName?: string): T.WorkloadIdentitySnapshot {
     const platform = this.kube.snapshot(nodeName);
     const reviewed = this.agentMetadata.identitySnapshotEntries(nodeName);
+    const reported = this.observerInventory.entries(nodeName);
     return {
       ...platform,
-      version: platform.version + this.agentMetadata.identitySnapshotVersion(),
+      version: platform.version + this.agentMetadata.identitySnapshotVersion() + this.observerInventory.snapshotVersion(),
       // Manual decisions are ordered first. WorkloadIdentityCache deliberately keeps the first
       // identity for a key, so a reviewer decision overrides an automatic platform candidate.
-      entries: [...reviewed, ...platform.entries],
+      entries: [...reviewed, ...platform.entries, ...reported],
     };
+  }
+
+  /**
+   * Trimmed workload inventory pushed by observers (docker containers and their
+   * main-process signatures). Control-plane metadata only: it lands in the in-memory
+   * identity snapshot and never enters the event ingest path, Postgres, or ClickHouse.
+   */
+  @Post('identity/observer-inventory')
+  @HttpCode(200)
+  @SkipWrap()
+  observerInventoryPush(@Body() body: ObserverInventoryPush, @Headers() headers: HeaderBag) {
+    const sourceId = headerValue(headers, 'x-anysentry-source-id');
+    const token = headerValue(headers, 'x-anysentry-ingest-token') ?? bearerToken(headers);
+    const resolution = this.sources.resolve({ sourceId, token, type: 'forwarder' });
+    if (!resolution.accepted) {
+      throw new UnauthorizedException(`observer inventory rejected: ${resolution.reason ?? 'source rejected'}`);
+    }
+    try {
+      const result = this.observerInventory.replace(sourceId ?? 'observer', body ?? {});
+      return { ok: true, ...result };
+    } catch (error) {
+      throw new BadRequestException(error instanceof Error ? error.message : 'invalid observer inventory');
+    }
   }
 
   /** Stable current Service Assets derived from server-owned workload inventory. */

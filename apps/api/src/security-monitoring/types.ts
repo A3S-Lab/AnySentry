@@ -433,6 +433,8 @@ export interface WorkloadIdentitySnapshotEntry {
   systemdUnit?: string;
   /** Exact, platform-declared exec probes for this physical container only. */
   platformHealthchecks?: PlatformHealthcheckSpec[];
+  /** Observer-reported main-process signatures (comm/exe basename only; argv and env never leave the observer). */
+  processes?: Array<{ comm?: string; exeBasename?: string }>;
   evidence: string[];
 }
 
@@ -3742,6 +3744,14 @@ export interface CollectorFilterMetrics {
   unifiedSemanticRules?: number;
   unifiedRuntimeSignatures?: number;
   unifiedAgentTemplates?: number;
+  /** Loaded-state of the observer-side runtime signature registry; diverges from the projection
+   * counts when the collector rejects a document (for example generic-launcher signatures). */
+  runtimeSignatureRegistryVersion?: number;
+  runtimeSignatureRegistryLoaded?: number;
+  runtimeSignatureRegistryInvalid?: number;
+  runtimeSignatureRegistryLastError?: string;
+  captureProfileAckSoftDowngrades?: number;
+  captureProfileLastAckSoftDowngrades?: string;
   unifiedIdentityIndexBuckets?: number;
   unifiedCaptureIndexBuckets?: number;
   unifiedSemanticIndexBuckets?: number;
@@ -5173,6 +5183,25 @@ export interface SecurityAssistantSystemContextSummary {
   reasonCodes: string[];
 }
 
+export interface SecurityAssistantToolCall {
+  name: 'inspect_workloads' | 'propose_identity_rule' | 'apply_identity_rule' | 'explain_rule_decision';
+  arguments: Record<string, unknown>;
+  persisted: boolean;
+  /** true only when the rule was actually enforced (apply_identity_rule approved by the chat user). */
+  enforced?: boolean;
+  ruleId?: string;
+  summary?: string;
+  /** Compact workload rows from inspect_workloads so the chat UI can offer per-entry actions. */
+  workloads?: Array<{
+    containerName?: string;
+    podName?: string;
+    classification: string;
+    physicalWorkloadId: string;
+    comm?: string;
+    exeBasename?: string;
+  }>;
+}
+
 export interface SecurityAssistantAnswer {
   sessionId: string;
   answer: string;
@@ -5183,5 +5212,7 @@ export interface SecurityAssistantAnswer {
   /** Quality summary for the bounded System Context actually supplied to the risk assistant. */
   systemContext?: SecurityAssistantSystemContextSummary;
   references: SecurityAssistantReference[];
+  /** The assistant still cannot open collection or run a host shell. A tool may only save a draft. */
   readOnly: true;
+  toolCalls?: SecurityAssistantToolCall[];
 }
