@@ -188,12 +188,12 @@ fi
   note "HEALTH"
   if command -v curl >/dev/null 2>&1; then
     printf '\n$ healthz\n'
-    curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:29653/security-center/healthz || true
+    curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:29653/security-center/healthz 2>&1 || true
     printf '\n\n$ collectors\n'
     if [[ -n $TOKEN ]]; then
       curl --connect-timeout 2 --max-time 15 -fsS \
         -H "x-anysentry-management-token: $TOKEN" \
-        http://127.0.0.1:29653/security-center/collectors || true
+        http://127.0.0.1:29653/security-center/collectors 2>&1 || true
     else
       echo 'collector query skipped: admin token unavailable'
     fi
