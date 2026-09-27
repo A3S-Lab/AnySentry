@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { buildL3AgentAcl, L3AgentPool, isL3AgentTimeout, isL3CompletionGateError } from '../apps/api/dist/security-monitoring/l3-agent-pool.js';
 import { parseL3Decision } from '../apps/api/dist/security-monitoring/l3-decision-parser.js';
 
@@ -9,13 +12,19 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 class FakeSession {
   activeReject;
 
-  constructor(state, options) {
+  constructor(state, options, workspace) {
     this.state = state;
     this.options = options;
+    this.workspace = workspace;
   }
 
   async send(request) {
     this.state.requests.push(request);
+    this.state.evidenceAtSend.push(
+      this.workspace && fs.existsSync(path.join(this.workspace, 'evidence'))
+        ? fs.readdirSync(path.join(this.workspace, 'evidence')).sort()
+        : [],
+    );
     this.state.active += 1;
     this.state.maxActive = Math.max(this.state.maxActive, this.state.active);
     try {
@@ -54,14 +63,17 @@ function fakeHarness() {
     maxActive: 0,
     requests: [],
     sessionOptions: [],
+    workspaces: [],
+    evidenceAtSend: [],
   };
   const agentFactory = async () => {
     state.agents += 1;
     return {
-      sessionAsync: async (_workspace, options) => {
+      sessionAsync: async (workspace, options) => {
         state.sessions += 1;
         state.sessionOptions.push(options);
-        return new FakeSession(state, options);
+        state.workspaces.push(workspace);
+        return new FakeSession(state, options, workspace);
       },
       close: async () => {
         state.agentCloses += 1;
@@ -114,7 +126,15 @@ async function verifyConcurrencyAndIsolation() {
   assert.ok(state.sessionOptions.every((options) => options.skillDirs?.[0] === '/skills/l3'), 'every Session must load the configured skills directory');
   assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.allow?.includes('search_skills')), 'L3 must auto-approve skill discovery');
   assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.allow?.includes('Skill')), 'L3 must auto-approve skill invocation');
-  assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.defaultDecision === 'ask'), 'unrelated L3 tools must retain the SDK confirmation boundary');
+  for (const tool of ['read', 'ls', 'grep', 'glob']) {
+    assert.ok(
+      state.sessionOptions.every((options) => options.permissionPolicy?.allow?.includes(tool)),
+      `L3 must auto-approve the read-only observation tool ${tool}`,
+    );
+  }
+  assert.ok(state.sessionOptions.every((options) => options.permissionPolicy?.defaultDecision === 'deny'),
+    'headless L3 sessions must fail fast on unlisted tools; an interactive ask can never be answered');
+  assert.ok(state.sessionOptions.every((options) => options.guidelines?.includes('evidence/')), 'L3 must point the agent at the evidence workspace');
   assert.ok(state.sessionOptions.every((options) => options.role?.includes('Sentry L3 Security Investigator')), 'L3 must use the security investigator system role');
   assert.ok(state.sessionOptions.every((options) => options.responseStyle?.includes('Return only one JSON object')), 'L3 must require a single JSON response');
   assert.ok(state.sessionOptions.every((options) => options.continuationEnabled === false && options.maxContinuationTurns === 0), 'continuation must be disabled');
@@ -210,6 +230,39 @@ async function verifyLatePartialResultIsTimeout() {
   await pool.close();
 }
 
+async function verifyEvidenceWorkspace() {
+  const { state, agentFactory } = fakeHarness();
+  const pool = new L3AgentPool({ size: 1, timeoutMs: 1_000, maxJobsPerSession: 3, agentFactory });
+  await pool.prewarm('/skills/l3');
+  const workspace = state.workspaces[0];
+  assert(workspace && workspace.startsWith(os.tmpdir()), 'default sessions must run in a disposable tmp workspace');
+  assert.notEqual(workspace, '.');
+  await pool.run('/skills/l3', 'first', undefined, { evidence: { 'event.json': '{"a":1}', 'brief.txt': 'brief-1' } });
+  assert.deepEqual(state.evidenceAtSend.at(-1), ['brief.txt', 'event.json'], 'evidence must be materialized before the agent runs');
+  await pool.run('/skills/l3', 'second', undefined, { evidence: { 'other.json': '{"b":2}' } });
+  assert.deepEqual(state.evidenceAtSend.at(-1), ['other.json'], 'evidence from a previous job must be wiped before the next job');
+  assert.equal(fs.readFileSync(path.join(workspace, 'evidence', 'other.json'), 'utf8'), '{"b":2}');
+  await pool.close();
+  assert.equal(fs.existsSync(workspace), false, 'disposing the session must remove its disposable workspace');
+}
+
+async function verifyExternalWorkspaceKeepsEvidence() {
+  const { state, agentFactory } = fakeHarness();
+  const external = fs.mkdtempSync(path.join(os.tmpdir(), 'l3-external-ws-'));
+  try {
+    const pool = new L3AgentPool({ size: 1, timeoutMs: 1_000, workspace: external, agentFactory });
+    await pool.prewarm('/skills/l3');
+    assert.equal(state.workspaces[0], external, 'an explicit workspace must be used as-is');
+    await pool.run('/skills/l3', 'first', undefined, { evidence: { 'event.json': '{"a":1}' } });
+    assert.deepEqual(state.evidenceAtSend.at(-1), ['event.json']);
+    await pool.close();
+    assert.equal(fs.existsSync(external), true, 'an external workspace is never removed by the pool');
+    assert.equal(fs.existsSync(path.join(external, 'evidence')), true);
+  } finally {
+    fs.rmSync(external, { recursive: true, force: true });
+  }
+}
+
 function verifyModelAclDoesNotCapOutput() {
   const acl = buildL3AgentAcl({
     A3S_SENTRY_L3_URL: 'https://example.invalid/v1',
@@ -237,4 +290,6 @@ await verifyTimeoutRecovery();
 await verifyPerRunTimeout();
 await verifyValidationFailureRecovery();
 await verifyLatePartialResultIsTimeout();
+await verifyEvidenceWorkspace();
+await verifyExternalWorkspaceKeepsEvidence();
 console.log('L3 agent pool verification passed');
