@@ -280,8 +280,18 @@ function verifyGateRejectionClassification() {
   assert.equal(isL3CompletionGateError(new Error('L3 agent exceeded 90000ms timeout')), false);
 }
 
+function verifyWorkerMainSource() {
+  const source = fs.readFileSync(new URL('../apps/api/src/security-monitoring/worker-main.ts', import.meta.url), 'utf8');
+  assert.match(source, /ANYSENTRY_L3_MODE/, 'L3 must expose the completion-mode escape hatch');
+  assert.match(source, /l3JudgeViaCompletion/, 'the completion fallback path must exist');
+  assert.match(source, /gate_rejected:/, 'gate rejections must surface as their own failure class');
+  assert.match(source, /evidence\/ in your workspace/, 'the L3 prompt must point at the evidence workspace');
+  assert.match(source, /evidence: \{[\s\S]*?'event\.json': input\.observerLine/, 'the worker must materialize the raw event as evidence');
+}
+
 verifyModelAclDoesNotCapOutput();
 verifyGateRejectionClassification();
+verifyWorkerMainSource();
 await verifyConcurrencyAndIsolation();
 verifyDecisionParsing();
 await verifyRotation();

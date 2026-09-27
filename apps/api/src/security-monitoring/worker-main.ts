@@ -328,6 +328,39 @@ function l3FailureReason(error: unknown): string {
   return (error instanceof Error ? error.message.split('\n')[0] : String(error)).slice(0, 2_000);
 }
 
+async function l3JudgeViaCompletion(input: L3JudgeJob, timeoutMs: number) {
+  // B4 escape hatch (ANYSENTRY_L3_MODE=completion): judge through the plain structured-completion
+  // channel — no agent session and no completion gate — when the agent pipeline cannot operate in
+  // a deployment. 'escalate' is not a terminal L3 verdict and follows the normal failure path.
+  const model = runtimeModel.get();
+  if (!model) throw new Error('深度研判模型缺少运行时凭据，请在策略配置中重新测试并应用');
+  const judge = new L2CodeJudge({
+    url: model.url,
+    model: model.model,
+    key: model.apiKey,
+    timeoutMs,
+    contextLimit: model.contextTokens,
+  });
+  try {
+    const verdict = await judge.judge({
+      observerLine: input.observerLine,
+      eventKind: input.event.eventKind,
+      subject: input.event.subject,
+      actor: l3Actor(input),
+      provider: l3Provider(input),
+    });
+    if (verdict.verdict === 'escalate') throw new Error('L3 completion returned non-terminal escalate');
+    return {
+      verdict: verdict.verdict,
+      severity: verdict.severity === 'info' ? 'low' : verdict.severity,
+      reason: verdict.reason,
+      tier: 'Agent' as const,
+    };
+  } finally {
+    await judge.close().catch(() => undefined);
+  }
+}
+
 async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
   const startedAt = Date.now();
   const input = job.data;
@@ -341,28 +374,32 @@ async function l3Judge(job: Job<L3JudgeJob>): Promise<void> {
     }
     const agent = input.policy.agent;
     if (!agent || !input.policy.deepModel) throw new Error('L3 is not configured');
-    poolLease = await acquireL3Pool(agent.skills);
     const attempt = attemptNumber(job.attemptsMade);
     const attemptTimeoutMs = attempt === 1 ? l3TimeoutMs : l3RetryTimeoutMs;
-    const run = await poolLease.pool.run(agent.skills, l3Prompt(input), (text) => {
-      // Validate inside the pool so an invalid response quarantines this Session before BullMQ
-      // starts the retry. Agent response text is intentionally never written to service logs.
-      parseL3Decision(text);
-    }, {
-      timeoutMs: attemptTimeoutMs,
-      evidence: {
-        'event.json': input.observerLine,
-        'brief.txt': `Actor: ${l3Actor(input)}\nProvider: ${l3Provider(input)}\nSignal: ${input.event.eventKind}\nSubject: ${input.event.subject}`,
-      },
-    });
-    const decision = parseL3Decision(run.text);
+    const completionMode = (process.env.ANYSENTRY_L3_MODE ?? 'agent') === 'completion';
+    const decision = completionMode
+      ? await l3JudgeViaCompletion(input, attemptTimeoutMs)
+      : await (async () => {
+          poolLease = await acquireL3Pool(agent.skills);
+          const run = await poolLease.pool.run(agent.skills, l3Prompt(input), (text) => {
+            // Validate inside the pool so an invalid response quarantines this Session before
+            // BullMQ starts the retry. Agent response text is never written to service logs.
+            parseL3Decision(text);
+          }, {
+            timeoutMs: attemptTimeoutMs,
+            evidence: {
+              'event.json': input.observerLine,
+              'brief.txt': `Actor: ${l3Actor(input)}\nProvider: ${l3Provider(input)}\nSignal: ${input.event.eventKind}\nSubject: ${input.event.subject}`,
+            },
+          });
+          return parseL3Decision(run.text);
+        })();
     console.info('[l3-worker] judgment completed', JSON.stringify({
       evaluationId: input.evaluationId,
       actor: l3Actor(input),
       attempt,
       timeoutMs: attemptTimeoutMs,
-      poolWaitMs: run.poolWaitMs,
-      agentRunMs: run.agentRunMs,
+      mode: completionMode ? 'completion' : 'agent',
     }));
     const result: DecisionResultJob = {
       schemaVersion: 'anysentry.decision_result.v1',
