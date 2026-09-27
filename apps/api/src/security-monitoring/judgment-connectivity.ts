@@ -1,6 +1,4 @@
 import { L2CodeJudge, L2CodeJudgeOptions } from './l2-code-judge';
-import { L3AgentPool } from './l3-agent-pool';
-import { parseL3Decision } from './l3-decision-parser';
 import { cleanText } from './redaction';
 import { RuntimeModelConnection, RuntimeModelProfile } from './runtime-model-config';
 
@@ -27,7 +25,6 @@ export interface JudgmentConnectivityResult {
 
 type ConnectivityL2Judge = Pick<L2CodeJudge, 'judge' | 'close'>;
 type ConnectivityL2Factory = (options: L2CodeJudgeOptions) => ConnectivityL2Judge;
-type ConnectivityL3Pool = Pick<L3AgentPool, 'initialize' | 'run' | 'close'>;
 
 function failureStatus(error: unknown): JudgmentConnectivityStatus {
   const message = error instanceof Error ? error.message : String(error);
@@ -94,35 +91,35 @@ export async function testFastReviewConnection(
 
 export async function testDeepInvestigationConnection(
   connection: RuntimeModelConnection,
-  skills: string,
-  poolFactory: (options: ConstructorParameters<typeof L3AgentPool>[0]) => ConnectivityL3Pool = (options) => new L3AgentPool(options),
+  _skills: string,
+  judgeFactory: ConnectivityL2Factory = (options) => new L2CodeJudge(options),
 ): Promise<JudgmentConnectivityResult> {
+  // The L3 agent session cannot be used as a synthetic probe: the a3s-code completion gate
+  // requires workspace observation while the session pool's permission policy grants only skill
+  // tools, so the probe always failed regardless of model and blocked operators from saving the
+  // deep profile at all. The connectivity contract of this page is the model endpoint itself —
+  // verify it with the same minimal structured judgment as fast_review. The L3 agent pipeline's
+  // runtime health is observable through production judgment metrics instead.
   const startedAt = Date.now();
-  const pool = poolFactory({
-    size: 1,
+  const judge = judgeFactory({
+    url: connection.url,
+    model: connection.model,
+    key: connection.apiKey,
     timeoutMs: connection.timeoutS * 1_000,
-    executionTimeoutMs: Math.max(1_000, connection.timeoutS * 1_000 - 2_000),
-    maxJobsPerSession: 1,
-    modelConfig: {
-      url: connection.url,
-      model: connection.model,
-      key: connection.apiKey,
-      contextLimit: connection.contextTokens,
-    },
+    contextLimit: connection.contextTokens,
   });
   try {
-    await pool.initialize();
-    const run = await pool.run(
-      skills,
-      'This is a connectivity test, not an incident. Do not use tools. Return only {"verdict":"allow","severity":"low","reason":"connectivity ok"}.',
-      (text) => { parseL3Decision(text); },
-      { timeoutMs: connection.timeoutS * 1_000 },
-    );
-    parseL3Decision(run.text);
+    await judge.judge({
+      observerLine: '{"identity":{"agent":"anysentry-connectivity-test"},"event":{"ToolExec":{"argv":["echo","connectivity-test"],"cwd":"/tmp"}}}',
+      eventKind: 'ToolExec',
+      subject: 'AnySentry deep-investigation connectivity test',
+      actor: 'anysentry-connectivity-test',
+      provider: 'configuration-page',
+    });
     return result('deep_investigation', connection, startedAt, {
       ok: true,
       status: 'connected',
-      message: '连接成功，已通过 A3S Code 完成一次最小深度研判',
+      message: '连接成功，已通过 A3S Code 完成一次最小结构化研判（深度研判 Agent 链路按生产任务观测）',
     });
   } catch (error) {
     return result('deep_investigation', connection, startedAt, {
@@ -131,6 +128,6 @@ export async function testDeepInvestigationConnection(
       message: cleanText(error instanceof Error ? error.message : error, 500) || '连接测试失败',
     });
   } finally {
-    await pool.close().catch(() => undefined);
+    await judge.close().catch(() => undefined);
   }
 }
