@@ -23,6 +23,20 @@ function canonicalProduct(value?: string): string {
   return value?.trim() || 'Unknown Agent';
 }
 
+const KNOWN_PRODUCTS = new Set(['Codex', 'Claude Code', 'Kimi Code', 'LangGraph', 'LangChain', 'Dify', 'Pi']);
+
+// The identity bound at ingest (displayName comes from the confirmed asset) is authoritative
+// over the capture-time process label: a container whose comm is `python` but whose confirmed
+// identity is LangChain must surface as LangChain.  This is generic — it reads the identity
+// layer rather than any per-product special case, so newly confirmed products behave the same.
+// Custom display names outside the known product families keep the raw capture label.
+function resolvedDisplayProduct(agentProduct?: string, boundDisplayName?: string): string {
+  const raw = canonicalProduct(agentProduct);
+  if (!boundDisplayName) return raw;
+  const bound = canonicalProduct(boundDisplayName);
+  return KNOWN_PRODUCTS.has(bound) ? bound : raw;
+}
+
 function isSyntheticWorkspace(value?: string): boolean {
   const workspace = value?.trim() ?? '';
   return !workspace
@@ -252,7 +266,7 @@ export function projectAgentConversationDirectory(
 ): T.LogicalAgentConversationDirectoryItem[] {
   const groups = new Map<string, T.AgentConversationSummary[]>();
   for (const conversation of conversations) {
-    const product = canonicalProduct(conversation.agentProduct);
+    const product = resolvedDisplayProduct(conversation.agentProduct, conversation.displayName);
     const rawWorkspacePath = conversation.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
     const environment = canonicalEnvironment(
       conversation.environment,
@@ -318,7 +332,7 @@ export function projectAgentConversationDirectory(
       compareUnixNs(left.lastActivityAtUnixNs, right.lastActivityAtUnixNs)
       || left.conversationId.localeCompare(right.conversationId));
     const first = conversations[0];
-    const product = canonicalProduct(first.agentProduct);
+    const product = resolvedDisplayProduct(first.agentProduct, first.displayName);
     const rawWorkspacePath = first.workspacePath?.trim().replace(/\/+$/u, '') ?? '';
     const environment = canonicalEnvironment(
       first.environment,

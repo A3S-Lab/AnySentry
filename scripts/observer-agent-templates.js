@@ -16,6 +16,28 @@ const MATCH_FIELDS = [
   'executable',
   'command',
 ];
+// Tie-break weight for equally-scoring template matches: a container/pod/systemd pin is
+// strictly more specific than an image family glob, which outranks broader facts such as
+// namespace. Without this, an operator-pinned container rule ties with a built-in image
+// template and the ambiguity guard drops the workload back to unknown.
+const FIELD_SPECIFICITY = {
+  container: 100,
+  pod: 90,
+  systemdUnit: 80,
+  owner: 60,
+  image: 50,
+  executable: 40,
+  command: 30,
+  namespace: 20,
+};
+const LABEL_SPECIFICITY = 10;
+
+function matchSpecificity(template) {
+  let weight = 0;
+  for (const field of Object.keys(template.fields)) weight += FIELD_SPECIFICITY[field] ?? 0;
+  weight += Object.keys(template.labels).length * LABEL_SPECIFICITY;
+  return weight;
+}
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
@@ -317,17 +339,26 @@ class AgentTemplateRegistry {
       const fuzzyScore = template.name ? nameScore(template.name, facts.names) : 0;
       if (explicitCount === 0 && fuzzyScore === 0) continue;
       const score = explicitCount > 0 ? 1 : fuzzyScore;
-      matches.push({ template, score, evidence: [...evidence, ...(template.name ? [`match:name=${template.name}`] : [])] });
+      matches.push({
+        template,
+        score,
+        specificity: matchSpecificity(template),
+        evidence: [...evidence, ...(template.name ? [`match:name=${template.name}`] : [])],
+      });
     }
     if (matches.length === 0) {
       this.stats.misses++;
       return undefined;
     }
-    matches.sort((a, b) => b.score - a.score || a.template.id.localeCompare(b.template.id));
+    matches.sort(
+      (a, b) =>
+        b.score - a.score || b.specificity - a.specificity || a.template.id.localeCompare(b.template.id),
+    );
     const best = matches[0];
     const conflicting = matches.find(
       (candidate) =>
         candidate.score === best.score &&
+        candidate.specificity === best.specificity &&
         (candidate.template.classification !== best.template.classification ||
           candidate.template.agentId !== best.template.agentId),
     );
