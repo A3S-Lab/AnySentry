@@ -34,6 +34,14 @@ install -m 0644 "$CHANNEL_DIR/package/现场问题采集.md" "$STAGE_DIR/现场�
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
 for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh collect-support-bundle.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
+install -d -m 0755 "$STAGE_DIR/glm-lab"
+for file in Dockerfile requirements.txt app.py server.py mcp_server.py glm.env.example GLM观测测试.md .dockerignore; do
+  install -m 0644 "$CHANNEL_DIR/package/glm-lab/$file" "$STAGE_DIR/glm-lab/$file"
+done
+install -m 0755 "$CHANNEL_DIR/package/glm-lab/start-glm-lab.sh" "$STAGE_DIR/glm-lab/start-glm-lab.sh"
+if [[ -f $BUILD_DIR/langchain-glm-lab-arm64.tar ]]; then
+  install -m 0644 "$BUILD_DIR/langchain-glm-lab-arm64.tar" "$STAGE_DIR/glm-lab/langchain-glm-lab-arm64.tar"
+fi
 
 source "$BUILD_DIR/source-provenance.env"
 {
