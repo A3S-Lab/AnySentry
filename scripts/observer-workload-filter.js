@@ -538,9 +538,9 @@ class WorkloadIdentityCache {
     const result = [];
     for (const entry of [...this.sources.values()].flat()) {
       // Candidate Agent workloads use the same effective capture/runtime fidelity as confirmed
-      // Agents.  Keep the original classification in evidence (so review can still distinguish
-      // discovery provenance), but do not omit a running candidate from the lifecycle snapshot;
-      // otherwise a perfectly observable service appears only after its first semantic event.
+      // Agents, so a running candidate stays in the lifecycle snapshot — but the snapshot must
+      // carry the OBSERVED classification.  Upgrading it to confirmed_agent here would skip the
+      // candidate review stage everywhere downstream (asset identity, directory badges).
       const candidateEffective = entry.classification === 'probable_agent';
       if (entry.classification !== 'confirmed_agent' && !candidateEffective) continue;
       const environment = text(entry.environment).toLowerCase()
@@ -578,7 +578,7 @@ class WorkloadIdentityCache {
           ? text(entry.agentInstanceId) || physicalWorkloadId
           : physicalWorkloadId,
         physicalWorkloadId,
-        classification: 'confirmed_agent',
+        classification: entry.classification,
         runtimeState: 'running',
         rootPid,
         rootStartTimeTicks,
