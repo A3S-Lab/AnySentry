@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat1
+COMPAT_RELEASE_ID=0.4.0-compat2
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -173,8 +173,16 @@ capture_diagnostics() {
     >"$INSTALL_LOG_ROOT/health-api-$phase.json" 2>&1 || true
   if [[ -x $INSTALL_ROOT/kafka/bin/kafka-topics.sh && -x $INSTALL_ROOT/java/bin/java ]]; then
     JAVA_HOME=$INSTALL_ROOT/java PATH=$INSTALL_ROOT/java/bin:$PATH \
-      "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" --bootstrap-server 127.0.0.1:9092 --list \
+      run_kafka_topics --bootstrap-server 127.0.0.1:9092 --list \
       >"$INSTALL_LOG_ROOT/kafka-topics-$phase.txt" 2>&1 || true
+  fi
+  if [[ -f $LOG_DIR/clickhouse-server.err.log ]]; then
+    tail -n 200 "$LOG_DIR/clickhouse-server.err.log" \
+      >"$INSTALL_LOG_ROOT/clickhouse-server.err.log" 2>/dev/null || true
+  fi
+  if [[ -f $LOG_DIR/clickhouse-server.log ]]; then
+    tail -n 200 "$LOG_DIR/clickhouse-server.log" \
+      >"$INSTALL_LOG_ROOT/clickhouse-server.log" 2>/dev/null || true
   fi
   curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/overview \
     >"$INSTALL_LOG_ROOT/flink-overview-$phase.json" 2>&1 || true
@@ -585,11 +593,25 @@ wait_for_redis() {
   return 1
 }
 
+run_kafka_topics() {
+  local log_dir=${ANYSENTRY_KAFKA_LOG_DIR:-$STATE_DIR/kafka-logs}
+  install -d -m 0750 "$log_dir" 2>/dev/null || true
+  LOG_DIR=$log_dir "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" "$@"
+}
+
+wait_for_clickhouse() {
+  local i
+  for i in $(seq 1 60); do
+    curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:8123/ping >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
 wait_for_kafka() {
   local i
   for i in $(seq 1 90); do
-    "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" \
-      --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1 && return 0
+    run_kafka_topics --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1 && return 0
     sleep 2
   done
   return 1
@@ -629,6 +651,7 @@ activate_release() {
   systemctl daemon-reload
   set_stage start-clickhouse
   systemctl enable --now anysentry-clickhouse.service
+  wait_for_clickhouse || fail "AnySentry ClickHouse readiness timeout"
   set_stage start-redis
   systemctl enable --now anysentry-redis.service
   wait_for_redis || fail "AnySentry Redis readiness timeout"
@@ -687,8 +710,13 @@ main() {
     useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$(command -v nologin)" anysentry
   fi
   install -d -o anysentry -g anysentry -m 0750 \
-    "$STATE_DIR" "$STATE_DIR/clickhouse" "$STATE_DIR/redis" "$STATE_DIR/kafka" \
-    "$STATE_DIR/flink" "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
+    "$STATE_DIR" "$STATE_DIR/clickhouse" \
+    "$STATE_DIR/clickhouse/tmp" "$STATE_DIR/clickhouse/user_files" \
+    "$STATE_DIR/clickhouse/format_schemas" "$STATE_DIR/clickhouse/access" \
+    "$STATE_DIR/clickhouse/user_defined" \
+    "$STATE_DIR/redis" "$STATE_DIR/kafka" "$STATE_DIR/kafka-logs" \
+    "$STATE_DIR/flink" "$STATE_DIR/flink/log" \
+    "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
     "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" "$LOG_DIR"
   set_stage normalize-configuration
   install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"

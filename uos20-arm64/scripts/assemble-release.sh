@@ -7,6 +7,9 @@ for dir in app runtime native clickhouse redis observer l3 java kafka flink diag
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
 for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-config.xml" "$STAGE_DIR/clickhouse/etc/config.d/anysentry.xml"
+install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-users.xml" "$STAGE_DIR/clickhouse/etc/users.d/anysentry.xml"
+install -m 0644 "$CHANNEL_DIR/package/config/redis.conf" "$STAGE_DIR/redis/etc/redis.conf"
 install -m 0644 "$CHANNEL_DIR/package/config/flink-config.yaml" "$STAGE_DIR/flink/conf/config.yaml"
 for file in \
   systemd/anysentry.service \

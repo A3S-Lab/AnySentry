@@ -219,6 +219,13 @@ if [[ -d $LOG_DIR/install ]]; then
   done
 fi
 
+if [[ -f $LOG_DIR/clickhouse-server.err.log ]]; then
+  tail -n 200 "$LOG_DIR/clickhouse-server.err.log" >"$WORKDIR/clickhouse-server.err.log" 2>/dev/null || true
+fi
+if [[ -f $LOG_DIR/clickhouse-server.log ]]; then
+  tail -n 200 "$LOG_DIR/clickhouse-server.log" >"$WORKDIR/clickhouse-server.log" 2>/dev/null || true
+fi
+
 if command -v journalctl >/dev/null 2>&1; then
   for unit in "${UNITS[@]}"; do
     journalctl -u "$unit" --no-pager -n 250 >"$WORKDIR/journal/${unit}.log" 2>&1 || true

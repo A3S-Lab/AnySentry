@@ -9,6 +9,10 @@ User=anysentry
 Group=anysentry
 WorkingDirectory=/var/lib/anysentry
 EnvironmentFile=/etc/anysentry/anysentry.env
+# Type=simple must track the server itself. The built-in watchdog forks, then
+# re-exits with only the low 8 bits of the child status, so systemd reports a
+# misleading code and the exception text never reaches the journal.
+Environment=CLICKHOUSE_WATCHDOG_ENABLE=0
 ExecStart=/opt/anysentry/clickhouse/bin/clickhouse server --config-file=/opt/anysentry/clickhouse/etc/config.xml
 Restart=on-failure
 RestartSec=5s

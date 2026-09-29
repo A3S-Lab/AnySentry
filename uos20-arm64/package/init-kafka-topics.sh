@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT=${ANYSENTRY_INSTALL_ROOT:-/opt/anysentry}
 export JAVA_HOME=$ROOT/java
 export PATH=$JAVA_HOME/bin:$PATH
+# kafka-topics.sh inherits Kafka's default LOG_DIR under /opt/anysentry/kafka/logs.
+# That tree is read-only inside the service mount namespace.
+log_dir=${ANYSENTRY_KAFKA_LOG_DIR:-/var/lib/anysentry/kafka-logs}
+install -d -m 0750 "$log_dir"
+export LOG_DIR=$log_dir
 bootstrap=${ANYSENTRY_STREAM_BOOTSTRAP_SERVERS:-127.0.0.1:9092}
 topics=(
   "${ANYSENTRY_STREAM_CANONICAL_TOPIC:-anysentry.events.canonical.v1}"

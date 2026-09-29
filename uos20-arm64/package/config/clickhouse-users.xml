@@ -5,7 +5,6 @@
       <password from_env="CLICKHOUSE_PASSWORD"/>
       <networks>
         <ip>127.0.0.1</ip>
-        <ip>::1</ip>
       </networks>
       <profile>default</profile>
       <quota>default</quota>

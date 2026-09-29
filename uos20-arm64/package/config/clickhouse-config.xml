@@ -1,6 +1,18 @@
 <clickhouse>
-  <listen_host replace="replace">127.0.0.1</listen_host>
+  <!-- Drop any default listen_host, including ::1, then bind IPv4 loopback only.
+       A failed listen is ClickHouse error 210 and exits the process. -->
+  <listen_host remove="remove"/>
+  <listen_host remove="remove"/>
+  <listen_host>127.0.0.1</listen_host>
+  <listen_backlog>511</listen_backlog>
   <http_port>8123</http_port>
+  <tcp_port>9000</tcp_port>
+  <!-- Compatibility and interserver ports are unused on this single-node install.
+       A bind failure on any of them is fatal and takes down HTTP as well. -->
+  <mysql_port remove="remove"/>
+  <postgresql_port remove="remove"/>
+  <interserver_http_port remove="remove"/>
+  <interserver_http_host replace="replace">127.0.0.1</interserver_http_host>
   <path replace="replace">/var/lib/anysentry/clickhouse/</path>
   <tmp_path replace="replace">/var/lib/anysentry/clickhouse/tmp/</tmp_path>
   <user_files_path replace="replace">/var/lib/anysentry/clickhouse/user_files/</user_files_path>
@@ -29,6 +41,7 @@
   <mark_cache_size>1073741824</mark_cache_size>
   <logger>
     <level>information</level>
+    <console>1</console>
     <log replace="replace">/var/log/anysentry/clickhouse-server.log</log>
     <errorlog replace="replace">/var/log/anysentry/clickhouse-server.err.log</errorlog>
     <size>100M</size>
