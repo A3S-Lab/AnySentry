@@ -6,6 +6,13 @@ export JAVA_HOME=$ROOT/java
 export PATH=$JAVA_HOME/bin:$PATH
 export FLINK_HOME=$ROOT/flink
 export FLINK_CONF_DIR=$ROOT/flink/conf
+# Foreground Flink still opens a rolling log under FLINK_LOG_DIR. The default
+# is /opt/anysentry/flink/log, which ProtectSystem=strict keeps read-only.
+state=${ANYSENTRY_FLINK_DATA_DIR:-/var/lib/anysentry/flink}
+log_dir=$state/log
+install -d -o anysentry -g anysentry -m 0750 \
+  "$log_dir" "$state/checkpoints" "$state/savepoints" "$state/blob" "$state/tmp"
+export FLINK_LOG_DIR=$log_dir
 
 case "${1:-}" in
   jobmanager)
