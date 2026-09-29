@@ -19,5 +19,8 @@ root=$tmp
 rm -rf "$STAGE_DIR/kafka"
 install -d -m 0755 "$STAGE_DIR/kafka"
 cp -a "$root/bin" "$root/libs" "$root/licenses" "$root/site-docs" "$STAGE_DIR/kafka/"
+install -d -m 0755 "$STAGE_DIR/kafka/config"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-log4j2.yaml" "$STAGE_DIR/kafka/config/log4j2.yaml"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-tools-log4j2.yaml" "$STAGE_DIR/kafka/config/tools-log4j2.yaml"
 printf '%s\n' "$KAFKA_VERSION" >"$STAGE_DIR/kafka/VERSION"
 printf '%s\n' "$KAFKA_IMAGE" >"$STAGE_DIR/kafka/IMAGE"

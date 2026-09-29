@@ -10,6 +10,9 @@ for file in config/anysentry.env.example config/clickhouse-config.xml config/cli
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-config.xml" "$STAGE_DIR/clickhouse/etc/config.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-users.xml" "$STAGE_DIR/clickhouse/etc/users.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/redis.conf" "$STAGE_DIR/redis/etc/redis.conf"
+install -d -m 0755 "$STAGE_DIR/kafka/config"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-log4j2.yaml" "$STAGE_DIR/kafka/config/log4j2.yaml"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-tools-log4j2.yaml" "$STAGE_DIR/kafka/config/tools-log4j2.yaml"
 install -m 0644 "$CHANNEL_DIR/package/config/flink-config.yaml" "$STAGE_DIR/flink/conf/config.yaml"
 for file in \
   systemd/anysentry.service \

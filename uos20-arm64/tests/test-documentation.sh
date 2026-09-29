@@ -27,7 +27,7 @@ for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'jo
   grep -Fq "$term" "$DEPLOY" || fail "deployment guide omits $term"
 done
 
-for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.4.0-compat3' '/opt/anysentry/verify.sh' 'RUN_HEALTH_SMOKE.sh --safe'; do
+for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.4.0-compat4' '/opt/anysentry/verify.sh' 'RUN_HEALTH_SMOKE.sh --safe'; do
   grep -Fq "$term" "$INSTALL_GUIDE" || fail "deployment guide omits $term"
 done
 

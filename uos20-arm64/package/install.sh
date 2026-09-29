@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat3
+COMPAT_RELEASE_ID=0.4.0-compat4
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -596,7 +596,9 @@ wait_for_redis() {
 run_kafka_topics() {
   local log_dir=${ANYSENTRY_KAFKA_LOG_DIR:-$STATE_DIR/kafka-logs}
   install -d -m 0750 "$log_dir" 2>/dev/null || true
-  LOG_DIR=$log_dir "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" "$@"
+  # The host has no system Java. kafka-topics.sh runs `java` from PATH.
+  JAVA_HOME=$INSTALL_ROOT/java PATH=$INSTALL_ROOT/java/bin:$PATH LOG_DIR=$log_dir \
+    "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" "$@"
 }
 
 wait_for_clickhouse() {

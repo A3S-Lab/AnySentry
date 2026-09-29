@@ -33,8 +33,8 @@
 | `/var/lib/anysentry` | 正式安装 | ClickHouse、Redis、Kafka、Flink 和 L3 状态 |
 | `/var/log/anysentry` | 正式安装 | 服务日志和安装诊断 |
 | `/etc/sysctl.d/90-anysentry.conf` | 正式安装 | 运行时内存参数 |
-| `/tmp/anysentry-install-0.4.0-compat3` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
-| `/tmp/anysentry-health-smoke-0.4.0-compat3` | 执行健康检查脚本 | 健康检查报告 |
+| `/tmp/anysentry-install-0.4.0-compat4` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
+| `/tmp/anysentry-health-smoke-0.4.0-compat4` | 执行健康检查脚本 | 健康检查报告 |
 | `/opt/.anysentry.rollback.*` | 成功升级且已有旧版本 | 上一版本程序备份 |
 | `/opt/anysentry.failed.*` | 激活失败并回滚 | 失败版本现场 |
 
@@ -45,9 +45,9 @@
 将压缩包及同名 `.sha256` 文件放在同一目录：
 
 ```bash
-sha256sum --check anysentry-security-suite-0.4.0-compat3-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.4.0-compat3-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.4.0-compat3-uos20-arm64
+sha256sum --check anysentry-security-suite-0.4.0-compat4-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.4.0-compat4-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.4.0-compat4-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -97,7 +97,7 @@ systemctl is-active anysentry-observer.service
 该命令仅使用 `/tmp`、回环网络和带唯一标识的模拟事件。报告目录由脚本创建：
 
 ```text
-/tmp/anysentry-health-smoke-0.4.0-compat3
+/tmp/anysentry-health-smoke-0.4.0-compat4
 ```
 
 ## 6. 安装日志
@@ -105,21 +105,21 @@ systemctl is-active anysentry-observer.service
 每次执行安装程序都会覆盖本版本诊断目录：
 
 ```text
-/var/log/anysentry/install/0.4.0-compat3
+/var/log/anysentry/install/0.4.0-compat4
 ```
 
 快速入口：
 
 ```text
-/tmp/anysentry-install-0.4.0-compat3
+/tmp/anysentry-install-0.4.0-compat4
 ```
 
 查看结果：
 
 ```bash
-cat /var/log/anysentry/install/0.4.0-compat3/summary.txt
-less /var/log/anysentry/install/0.4.0-compat3/install.log
-cat /var/log/anysentry/install/0.4.0-compat3/current-stage.txt
+cat /var/log/anysentry/install/0.4.0-compat4/summary.txt
+less /var/log/anysentry/install/0.4.0-compat4/install.log
+cat /var/log/anysentry/install/0.4.0-compat4/current-stage.txt
 ```
 
 安装失败时，诊断目录会在自动回滚前记录服务状态、接口响应、验证输出和 journal。
@@ -153,8 +153,8 @@ location /anysentry/ {
 升级由 `./install.sh` 原地完成。激活验证失败时，安装程序自动停止新版本、恢复上一版程序和配置，并写诊断日志。先看：
 
 ```bash
-cat /var/log/anysentry/install/0.4.0-compat3/summary.txt
-cat /var/log/anysentry/install/0.4.0-compat3/current-stage.txt
+cat /var/log/anysentry/install/0.4.0-compat4/summary.txt
+cat /var/log/anysentry/install/0.4.0-compat4/current-stage.txt
 ls -ld /opt/.anysentry.rollback.* /opt/anysentry.failed.*
 ```
 
