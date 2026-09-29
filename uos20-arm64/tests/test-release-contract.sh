@@ -77,7 +77,7 @@ grep -Fq 'systemctl enable --now anysentry-stream-worker.service' "$CHANNEL/pack
 grep -Fq 'systemctl enable --now anysentry-flink-job.service' "$CHANNEL/package/install.sh" || fail "installer does not enable the Flink job"
 grep -Fq 'export LOG_DIR=$log_dir' "$CHANNEL/package/run-kafka.sh" || fail "Kafka GC logs still default to the read-only install tree"
 grep -Fq 'export FLINK_LOG_DIR=$log_dir' "$CHANNEL/package/run-flink.sh" || fail "Flink logs still default to the read-only install tree"
-grep -Fq 'log_dir=$data/logs' "$CHANNEL/package/run-kafka.sh" || fail "Kafka log directory is not under the writable data directory"
+grep -Fq 'log_dir=/var/lib/anysentry/kafka-logs' "$CHANNEL/package/run-kafka.sh" || fail "Kafka log directory is inside the topic data directory"
 grep -Fq '0x0004135a' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not enforce UOS BPF ABI"
 grep -Fq "'Linux BPF'" "$CHANNEL/scripts/verify-release.sh" || fail "release verifier does not recognize the legacy BPF object"
 grep -Fq 'maxmemory 4gb' "$CHANNEL/package/config/redis.conf" || fail "Redis queue memory is not capped at 4 GiB"

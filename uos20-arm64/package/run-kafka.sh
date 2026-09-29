@@ -9,11 +9,15 @@ config=$ROOT/config/kafka-server.properties
 data=${ANYSENTRY_KAFKA_DATA_DIR:-/var/lib/anysentry/kafka}
 cluster_id=${ANYSENTRY_KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
 # Kafka writes GC and Log4j files under LOG_DIR. The default is
-# /opt/anysentry/kafka/logs, which ProtectSystem=strict keeps read-only, so the
-# JVM exits before the broker can listen. Keep those files beside the data dir.
-log_dir=$data/logs
+# /opt/anysentry/kafka/logs, which ProtectSystem=strict keeps read-only.
+# The directory must also stay outside log.dirs: Kafka treats every child of
+# the data directory as a topic partition, so a child named "logs" is fatal.
+log_dir=/var/lib/anysentry/kafka-logs
 
 install -d -o anysentry -g anysentry -m 0750 "$data" "$log_dir"
+if [[ -d $data/logs ]]; then
+  rm -rf "$data/logs"
+fi
 export LOG_DIR=$log_dir
 if [[ ! -f $data/meta.properties ]]; then
   "$ROOT/kafka/bin/kafka-storage.sh" format \
