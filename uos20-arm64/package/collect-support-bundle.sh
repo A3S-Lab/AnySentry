@@ -201,7 +201,7 @@ fi
   fi
   if [[ -x $INSTALL_ROOT/clickhouse/bin/clickhouse ]]; then
     printf '\n$ clickhouse\n'
-    "$INSTALL_ROOT/clickhouse/bin/clickhouse" client --query 'SELECT 1' 2>&1 || true
+    curl --connect-timeout 2 --max-time 10 -fsS http://127.0.0.1:8123/ping 2>&1 || true
   fi
 } >"$WORKDIR/health.txt"
 

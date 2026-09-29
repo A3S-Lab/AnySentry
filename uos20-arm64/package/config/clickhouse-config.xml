@@ -6,7 +6,9 @@
   <listen_host>127.0.0.1</listen_host>
   <listen_backlog>511</listen_backlog>
   <http_port>8123</http_port>
-  <tcp_port>9000</tcp_port>
+  <!-- Native 9000 is already taken on the customer host (EADDRINUSE). AnySentry
+       uses CLICKHOUSE_URL on HTTP 8123 only, so do not open the native port. -->
+  <tcp_port remove="remove"/>
   <!-- Compatibility and interserver ports are unused on this single-node install.
        A bind failure on any of them is fatal and takes down HTTP as well. -->
   <mysql_port remove="remove"/>
