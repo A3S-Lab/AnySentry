@@ -210,7 +210,7 @@ export interface SecurityAssistantAnswer {
   references: SecurityAssistantReference[];
   readOnly: true;
   toolCalls?: Array<{
-    name: "inspect_workloads" | "propose_identity_rule" | "apply_identity_rule" | "explain_rule_decision";
+    name: "inspect_workloads" | "propose_identity_rule" | "apply_identity_rule" | "explain_rule_decision" | "review_agent_candidate";
     arguments: Record<string, unknown>;
     persisted: boolean;
     enforced?: boolean;

@@ -84,6 +84,21 @@ const tools = [
       },
     },
   },
+  {
+    name: 'review_agent_candidate',
+    description: 'Human-review a discovered agent: decision=confirmed_agent confirms it, non_agent excludes it, unknown returns it to observation, clear removes a prior review. confirm=false previews the transition without persisting. confirm=true applies the review as the current chat user (the assistant drafts, the user approves) and requires an explicit user request. Confirming admits the workload to plaintext LLM capture on both http and https, so never confirm on your own initiative. Target the agent by agentId from a prior tool result, or by container/pod name from inspect_workloads. After applying, the tool waits and reports the observed classification.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        agentId: { type: 'string', description: 'Agent id from the agents inventory, e.g. "candidate my-service".' },
+        container: { type: 'string', description: 'Container or pod name from inspect_workloads; used to locate the inventory entry when agentId is unknown.' },
+        decision: { type: 'string', description: 'confirmed_agent, non_agent, unknown, or clear. Default confirmed_agent.' },
+        note: { type: 'string', description: 'Short review note recorded in the audit trail.' },
+        confirm: { type: 'boolean' },
+      },
+    },
+  },
 ];
 
 function send(message: unknown): void {

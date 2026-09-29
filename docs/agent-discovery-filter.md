@@ -288,9 +288,18 @@ Routing policy:
 | Classification | Lifecycle | Security signal | Normal Agent-relevant event | Routine noise |
 |---|---:|---:|---:|---:|
 | confirmed_agent | keep | keep | keep | aggregate/deduplicate |
-| probable_agent | keep | keep | keep within bounded full matrix（TLS 明文交互 FULL） | aggregate/deduplicate |
+| probable_agent | keep | keep | keep within bounded full matrix（无 TLS/HTTP 明文） | aggregate/deduplicate |
 | unknown | keep | keep | keep within discovery budget | sample |
 | non_agent | cleanup only | keep | filter in `agent` mode | aggregate/filter |
+
+Plaintext LLM capture (both the `tls_uprobe` channel for https and the `tcp_plaintext` channel for
+plain http) shares one Collector admission allowlist (`tls-agent-cgroups.json`). Only
+`confirmed_agent` workloads — label-confirmed, human-reviewed, or signature-verified runtimes — are
+written to it; `probable_agent` is deliberately not admitted, so candidate workloads contribute
+metadata events but never conversation plaintext. A human review (asset review UI or the
+`review_agent_candidate` assistant tool, both backed by the same metadata service) promotes a
+candidate to `confirmed_agent`; the forwarder picks it up on the next identity snapshot poll
+(about 15 seconds) and plaintext opens for new traffic only.
 
 When identity metadata is unavailable, `ToolExec`, `SecurityAction`, `FileDelete`, network, and LLM
 evidence remain fail-open. Only routine unknown `FileAccess` is rate-budgeted per physical

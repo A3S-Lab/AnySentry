@@ -5184,10 +5184,10 @@ export interface SecurityAssistantSystemContextSummary {
 }
 
 export interface SecurityAssistantToolCall {
-  name: 'inspect_workloads' | 'propose_identity_rule' | 'apply_identity_rule' | 'explain_rule_decision';
+  name: 'inspect_workloads' | 'propose_identity_rule' | 'apply_identity_rule' | 'explain_rule_decision' | 'review_agent_candidate';
   arguments: Record<string, unknown>;
   persisted: boolean;
-  /** true only when the rule was actually enforced (apply_identity_rule approved by the chat user). */
+  /** true only when the change actually took effect (rule enforced, or agent review applied by the chat user). */
   enforced?: boolean;
   ruleId?: string;
   summary?: string;
