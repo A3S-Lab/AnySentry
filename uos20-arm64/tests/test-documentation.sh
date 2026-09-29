@@ -27,7 +27,7 @@ for term in './install.sh --check' './install.sh' '/opt/anysentry/verify.sh' 'jo
   grep -Fq "$term" "$DEPLOY" || fail "deployment guide omits $term"
 done
 
-for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.4.0-compat4' '/opt/anysentry/verify.sh' 'RUN_HEALTH_SMOKE.sh --safe'; do
+for term in 'sha256sum --check' './install.sh --check' './install.sh' '/var/log/anysentry/install/0.4.0-compat5' '/opt/anysentry/verify.sh' 'RUN_HEALTH_SMOKE.sh --safe'; do
   grep -Fq "$term" "$INSTALL_GUIDE" || fail "deployment guide omits $term"
 done
 
@@ -35,7 +35,7 @@ for term in 'http://<服务器可达IP>:29653/' '同网段浏览器' 'Observer' 
   grep -Fq "$term" "$USAGE_GUIDE" || fail "usage guide omits $term"
 done
 
-for term in 'install.sh' 'verify.sh' 'RUN_HEALTH_SMOKE.sh' 'inspect-host.sh' 'collect-support-bundle.sh' 'RUN_DIAGNOSTICS.sh' 'RUN_PASSIVE_CHECK.sh' 'uninstall.sh' 'wait-clickhouse.sh' 'run-l3-worker.sh'; do
+for term in 'install.sh' 'verify.sh' 'RUN_HEALTH_SMOKE.sh' 'inspect-host.sh' 'collect-support-bundle.sh' 'RUN_DIAGNOSTICS.sh' 'RUN_PASSIVE_CHECK.sh' 'uninstall.sh' 'wait-clickhouse.sh' 'run-l3-worker.sh' 'anysentry-services.sh'; do
   grep -Fq "$term" "$SCRIPT_GUIDE" || fail "script guide omits $term"
 done
 

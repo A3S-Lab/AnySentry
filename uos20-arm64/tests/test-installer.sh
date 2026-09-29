@@ -25,6 +25,9 @@ grep -Fq 'anysentry-l3-worker.service' "$INSTALLER" || fail "installer does not 
 grep -Fq 'wait_for_redis' "$INSTALLER" || fail "installer does not wait for Redis readiness"
 kafka_probe=$(sed -n '/^run_kafka_topics()/,/^}/p' "$INSTALLER")
 grep -Fq 'JAVA_HOME=$INSTALL_ROOT/java' <<<"$kafka_probe" || fail "Kafka readiness does not use the bundled Java"
+[[ -x $ROOT/uos20-arm64/package/anysentry-services.sh ]] || fail "service control script is not executable"
+grep -Fq 'systemctl start' "$ROOT/uos20-arm64/package/anysentry-services.sh" || fail "service control script does not start units"
+grep -Fq 'systemctl stop' "$ROOT/uos20-arm64/package/anysentry-services.sh" || fail "service control script does not stop units"
 grep -Fq 'validate_redis_runtime' "$INSTALLER" || fail "installer preflight does not exercise the Redis startup checks"
 grep -Fq -- '--port 0' "$INSTALLER" || fail "Redis preflight does not disable network listeners"
 grep -Fq 'observer/observer-agent-attribution.js' "$INSTALLER" || fail "installer does not require agent attribution runtime"
@@ -46,7 +49,7 @@ grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder 
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
 grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
-grep -Fq '0.4.0-compat4' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
+grep -Fq '0.4.0-compat5' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
@@ -100,19 +103,19 @@ mkdir -p "$tmp/runtime-tmp"
 ANYSENTRY_INSTALLER_LIB=1 bash -c '
   source "$1"
   LOG_DIR="$2/runtime-log"
-  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat4"
-  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat4"
+  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat5"
+  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat5"
   initialize_install_logging
   set_stage installer-contract-test
   echo installer-log-marker
   write_install_summary 0
 ' _ "$tmp/package/install.sh" "$tmp"
 
-[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat4 ]] ||
+[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat5 ]] ||
   fail "temporary diagnostic path is not a symlink"
-grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat4/install.log" ||
+grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat5/install.log" ||
   fail "installer output was not captured"
-grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat4/summary.txt" ||
+grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat5/summary.txt" ||
   fail "installation summary was not persisted"
 
 mkdir -p "$tmp/verify-root/runtime/node/bin"

@@ -30,6 +30,17 @@
 `--check` 不修改服务、程序、数据或 sysctl，但会写入版本化诊断日志。正式安装需要 root
 权限。
 
+### `anysentry-services.sh`
+
+用途：按依赖顺序启动、按相反顺序停止全部 AnySentry systemd 单元，或查看状态。
+不停止 Docker 或其他系统服务，不删除 `/var/lib/anysentry`。
+
+```bash
+sudo /opt/anysentry/anysentry-services.sh stop
+sudo /opt/anysentry/anysentry-services.sh start
+/opt/anysentry/anysentry-services.sh status
+```
+
 ### `verify.sh`
 
 用途：验证主机 ABI、文件校验和、全部服务、ClickHouse、Redis、Kafka、Flink、API、
@@ -44,7 +55,7 @@
 ### `RUN_HEALTH_SMOKE.sh`
 
 用途：生成统一健康报告。默认报告目录为
-`/tmp/anysentry-health-smoke-0.4.0-compat4`，该目录在脚本运行时创建并覆盖。
+`/tmp/anysentry-health-smoke-0.4.0-compat5`，该目录在脚本运行时创建并覆盖。
 
 ```bash
 /opt/anysentry/RUN_HEALTH_SMOKE.sh --passive

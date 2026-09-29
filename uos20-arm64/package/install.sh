@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat4
+COMPAT_RELEASE_ID=0.4.0-compat5
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -391,7 +391,7 @@ verify_package() {
     systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
     systemd/anysentry-observer.service
     provision-observer.mjs wait-clickhouse.sh run-kafka.sh init-kafka-topics.sh
-    run-flink.sh verify.sh inspect-host.sh
+    run-flink.sh verify.sh inspect-host.sh anysentry-services.sh
     AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
     VERSION PROVENANCE manifest.sha256
   )
@@ -709,7 +709,9 @@ main() {
   set_stage prepare-service-account
   if ! getent group anysentry >/dev/null 2>&1; then groupadd --system anysentry; fi
   if ! id anysentry >/dev/null 2>&1; then
-    useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$(command -v nologin)" anysentry
+    nologin_shell=$(command -v nologin || true)
+    [[ -n $nologin_shell ]] || nologin_shell=/usr/sbin/nologin
+    useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$nologin_shell" anysentry
   fi
   install -d -o anysentry -g anysentry -m 0750 \
     "$STATE_DIR" "$STATE_DIR/clickhouse" \
