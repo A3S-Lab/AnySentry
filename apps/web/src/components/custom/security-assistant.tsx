@@ -537,6 +537,12 @@ function ToolCallsBlock({
       ? `为什么工作负载 ${name} 当前被分类为 ${workload.classification}？请用 explain_rule_decision 工具说明各阶段的规则判定。`
       : `Why is workload ${name} classified as ${workload.classification}? Use the explain_rule_decision tool to show the per-stage rule decisions.`);
   };
+  const confirmCandidate = (workload: NonNullable<NonNullable<SecurityAssistantAnswer["toolCalls"]>[number]["workloads"]>[number]) => {
+    const name = workload.containerName ?? workload.podName ?? workload.physicalWorkloadId;
+    void submit(isChinese
+      ? `确认候选智能体 ${name}：请用 review_agent_candidate 工具（decision=confirmed_agent, confirm=true）将其人工确认为 confirmed_agent，以开启明文采集。`
+      : `Confirm candidate agent ${name}: use the review_agent_candidate tool (decision=confirmed_agent, confirm=true) to mark it confirmed_agent and open plaintext capture.`);
+  };
   return (
     <div className="mt-2 space-y-1.5">
       <p className={cn("text-[10px] font-medium uppercase tracking-[0.08em]", light ? "text-slate-400" : "text-slate-500")}>
@@ -607,6 +613,19 @@ function ToolCallsBlock({
                       >
                         {isChinese ? "为什么" : "Why"}
                       </button>
+                      {workload.classification === "probable_agent" ? (
+                        <button
+                          type="button"
+                          disabled={loading}
+                          onClick={() => confirmCandidate(workload)}
+                          className={cn(
+                            "min-h-6 shrink-0 rounded px-1.5 font-medium disabled:opacity-50",
+                            light ? "bg-emerald-600/10 text-emerald-700 hover:bg-emerald-600/20" : "bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25",
+                          )}
+                        >
+                          {isChinese ? "确认" : "Confirm"}
+                        </button>
+                      ) : null}
                       {workload.classification === "unknown" && (workload.comm || workload.exeBasename) ? (
                         <Link
                           to={ruleWizardHref(workload)}
