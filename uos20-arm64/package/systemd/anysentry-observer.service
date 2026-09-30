@@ -1,7 +1,6 @@
 [Unit]
 Description=AnySentry Linux 4.19 eBPF Observer
-Requires=anysentry.service
-After=network.target anysentry.service
+After=network.target
 
 [Service]
 Type=simple

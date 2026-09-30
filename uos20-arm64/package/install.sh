@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat8
+COMPAT_RELEASE_ID=0.4.0-compat9
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -27,6 +27,8 @@ CURRENT_STAGE=bootstrap
 INSTALL_START_TIME=
 INSTALL_LOG_READY=0
 ROLLBACK_RESULT=not-required
+A3S_CODE_RUNTIME=unknown
+A3S_CODE_BLOCKED_INSTALL=0
 EXPECTED_BPF_VERSION=4.19.90
 EXPECTED_BPF_CODE=0x0004135a
 SERVICES=(
@@ -225,6 +227,8 @@ write_install_summary() {
     printf 'finished_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     printf 'install_log=%s\n' "$INSTALL_LOG_ROOT/install.log"
     printf 'diagnostic_directory=%s\n' "$INSTALL_LOG_ROOT"
+    printf 'a3s_code_runtime=%s\n' "$A3S_CODE_RUNTIME"
+    printf 'a3s_code_blocked_install=%s\n' "$A3S_CODE_BLOCKED_INSTALL"
   } >"$INSTALL_LOG_ROOT/summary.txt"
   echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
 }
@@ -623,17 +627,77 @@ wait_for_flink() {
   wait_for_url http://127.0.0.1:8081/overview
 }
 
+record_unit_startup_log() {
+  local unit=$1 name=$2 dest errors
+  dest=$INSTALL_LOG_ROOT/startup-$name.log
+  errors=$INSTALL_LOG_ROOT/startup-$name.errors.txt
+  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 200 \
+    >"$dest" 2>&1 || true
+  echo "----- $name ($unit) startup journal: $dest -----"
+  if grep -E -i 'error|fail|exception|cannot find module|libzvec|GLIBC_|@a3s-lab/code' \
+      "$dest" >"$errors" 2>/dev/null; then
+    cat "$errors"
+  else
+    : >"$errors"
+    echo "(no error lines yet)"
+  fi
+  echo "----- $name journal tail -----"
+  tail -n 40 "$dest" || true
+}
+
+record_api_observer_startup() {
+  record_unit_startup_log anysentry.service api
+  record_unit_startup_log anysentry-observer.service observer
+}
+
+api_journal_shows_a3s_code_crash() {
+  grep -E -q '@a3s-lab/code|libzvec_c_api|index\.linux-arm64-gnu\.node|GLIBC_|a3s-code-sdk|Cannot find module' \
+    "$INSTALL_LOG_ROOT/startup-api.log" 2>/dev/null
+}
+
+probe_a3s_code_runtime() {
+  local node=$INSTALL_ROOT/runtime/node/bin/node code_dir report
+  report=$INSTALL_LOG_ROOT/a3s-code-startup.txt
+  code_dir=$(readlink -f "$INSTALL_ROOT/app/node_modules/@a3s-lab/code" 2>/dev/null || true)
+  {
+    echo "probed_at=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "package=${code_dir:-missing}"
+  } >"$report"
+  if [[ ! -x $node || -z $code_dir || ! -f $code_dir/index.js ]]; then
+    A3S_CODE_RUNTIME=unavailable
+    echo "status=missing" >>"$report"
+    echo "WARNING: @a3s-lab/code is not installed. L2, L3, and the assistant cannot open a session."
+    echo "The rest of the deployment continues. Details: $report"
+    return 0
+  fi
+  echo "----- a3s code native load -----"
+  if A3S_CODE_DIR=$code_dir "$node" --input-type=commonjs -e \
+      'require(process.env.A3S_CODE_DIR); console.log("status=loaded")' \
+      >>"$report" 2>&1; then
+    A3S_CODE_RUNTIME=loaded
+    echo "a3s code native runtime loaded. Details: $report"
+    return 0
+  fi
+  A3S_CODE_RUNTIME=unavailable
+  echo "status=failed" >>"$report"
+  echo "WARNING: a3s code native runtime failed to load. Installation continues."
+  echo "L2, L3, and the assistant report this when a session is created. The API and Observer stay up."
+  echo "Error output:"
+  tail -n 40 "$report"
+  echo "Full probe: $report"
+}
+
 provision_observer() {
   local port
   port=$(env_value PORT "$ENV_FILE")
   [[ -n $port ]] || port=29653
-  wait_for_url "http://127.0.0.1:$port/security-center/healthz" || fail "AnySentry API readiness timeout"
+  wait_for_url "http://127.0.0.1:$port/security-center/healthz" || return 1
   "$INSTALL_ROOT/runtime/node/bin/node" "$INSTALL_ROOT/provision-observer.mjs" \
-    "$ENV_FILE" "http://127.0.0.1:$port/security-center"
+    "$ENV_FILE" "http://127.0.0.1:$port/security-center" || return 1
   normalize_environment "$ENV_FILE"
   validate_collector_id "$ENV_FILE"
-  [[ -n $(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE") ]] || fail "Observer Source ID was not provisioned"
-  [[ -n $(env_value ANYSENTRY_INGEST_TOKEN "$ENV_FILE") ]] || fail "Observer ingest token was not provisioned"
+  [[ -n $(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE") ]] || return 1
+  [[ -n $(env_value ANYSENTRY_INGEST_TOKEN "$ENV_FILE") ]] || return 1
   chown root:root "$ENV_FILE"
   chmod 0600 "$ENV_FILE"
 }
@@ -667,10 +731,29 @@ activate_release() {
   systemctl enable --now anysentry-flink-taskmanager.service
   wait_for_flink || fail "AnySentry Flink readiness timeout"
   systemctl enable --now anysentry-flink-job.service
-  set_stage start-api
-  systemctl enable --now anysentry.service
+  set_stage start-api-and-observer
+  systemctl enable anysentry.service anysentry-observer.service
+  systemctl start anysentry.service anysentry-observer.service ||
+    echo "WARNING: API or Observer was not active immediately after the joint start. Startup journals follow."
+  sleep 2
+  record_api_observer_startup
+  probe_a3s_code_runtime
   set_stage provision-observer-source
-  provision_observer
+  if ! provision_observer; then
+    record_api_observer_startup
+    if api_journal_shows_a3s_code_crash; then
+      A3S_CODE_BLOCKED_INSTALL=1
+      echo "WARNING: the API did not become ready because the a3s code runtime failed."
+      echo "Observer was started in the same step. Installation continues so both journals stay available."
+      echo "See $INSTALL_LOG_ROOT/startup-api.log and $INSTALL_LOG_ROOT/a3s-code-startup.txt"
+    else
+      fail "AnySentry API readiness timeout"
+    fi
+  else
+    systemctl restart anysentry-observer.service ||
+      echo "WARNING: Observer did not restart after source provisioning. Journal follows."
+    record_unit_startup_log anysentry-observer.service observer
+  fi
   set_stage start-judgment-workers
   systemctl enable --now anysentry-fast-judge.service
   systemctl enable --now anysentry-l3-worker.service
@@ -678,11 +761,17 @@ activate_release() {
   systemctl enable --now anysentry-stream-worker.service
   systemctl enable --now anysentry-composite-judge.service
   systemctl enable --now anysentry-supply-chain.service
-  set_stage start-observer
-  systemctl enable --now anysentry-observer.service
+  record_api_observer_startup
   capture_diagnostics activation
   set_stage verify-activation
-  "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log"
+  if "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log"; then
+    :
+  elif [[ $A3S_CODE_BLOCKED_INSTALL -eq 1 ]]; then
+    echo "WARNING: activation checks failed after the a3s code runtime kept the API down."
+    echo "The deployment is left in place. Startup errors: $INSTALL_LOG_ROOT/startup-api.log $INSTALL_LOG_ROOT/startup-observer.log"
+  else
+    fail "activation verification failed"
+  fi
   ACTIVATED=0
 }
 
