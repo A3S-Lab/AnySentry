@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-SCRIPT_VERSION=0.4.0-compat7
+SCRIPT_VERSION=0.4.0-compat8
 INSTALL_ROOT=${ANYSENTRY_SMOKE_INSTALL_ROOT:-/opt/anysentry}
 ENV_FILE=${ANYSENTRY_SMOKE_ENV_FILE:-/etc/anysentry/anysentry.env}
 export JAVA_HOME=$INSTALL_ROOT/java
 export PATH=$JAVA_HOME/bin:$PATH
-REPORT_DIR=${ANYSENTRY_SMOKE_REPORT_DIR:-/tmp/anysentry-health-smoke-0.4.0-compat7}
+REPORT_DIR=${ANYSENTRY_SMOKE_REPORT_DIR:-/tmp/anysentry-health-smoke-0.4.0-compat8}
 REPORT=$REPORT_DIR/report.txt
 MODE=safe
 PASS_COUNT=0
@@ -26,7 +26,7 @@ Modes:
 
 The script never restarts services, changes configuration, reads the Observer
 token, contacts an external network, or performs destructive system operations.
-The report is overwritten at /tmp/anysentry-health-smoke-0.4.0-compat7/report.txt.
+The report is overwritten at /tmp/anysentry-health-smoke-0.4.0-compat8/report.txt.
 EOF
 }
 
@@ -190,10 +190,10 @@ fi
 if [[ -r $INSTALL_ROOT/VERSION ]]; then
   cat "$INSTALL_ROOT/VERSION"
   installed_release=$(awk -F= '$1=="RELEASE_VERSION" {print $2; exit}' "$INSTALL_ROOT/VERSION")
-  if [[ $installed_release == 0.4.0-compat7 ]]; then
+  if [[ $installed_release == 0.4.0-compat8 ]]; then
     pass "installed release is $installed_release"
   else
-    warn "script targets 0.4.0-compat7; installed release is ${installed_release:-unknown}"
+    warn "script targets 0.4.0-compat8; installed release is ${installed_release:-unknown}"
   fi
 else
   fail "installed VERSION file is missing"
