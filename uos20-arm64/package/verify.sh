@@ -189,7 +189,12 @@ pass "ClickHouse loopback readiness"
 
 health=$(wait_health) || fail "API health endpoint readiness"
 [[ $(printf '%s' "$health" | json_value data.status) == ok ]] || fail "API health status"
-[[ $(printf '%s' "$health" | json_value data.storage.mode) == clickhouse ]] || fail "API ClickHouse storage mode"
+storage_mode=$(printf '%s' "$health" | json_value data.storage.mode)
+clickhouse_ready=$(printf '%s' "$health" | json_value data.storage.clickhouseReady)
+[[ $storage_mode == clickhouse ]] || {
+  echo "API storage mode=${storage_mode:-missing} clickhouseReady=${clickhouse_ready:-missing}" >&2
+  fail "API ClickHouse storage mode"
+}
 pass "API health and ClickHouse storage mode"
 
 smoke_id="install-$(date +%s)-$$"

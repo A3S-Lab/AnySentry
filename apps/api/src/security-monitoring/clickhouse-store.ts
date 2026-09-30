@@ -1183,6 +1183,12 @@ async function runClickHouseBootstrap(
       ...credentials,
     });
     await schema.command({ query: DDL(TABLE) });
+    // Existing installs keep the original events table. Add columns before any
+    // materialized view that reads them; CREATE TABLE IF NOT EXISTS does not
+    // alter a table left by an older release.
+    await schema.command({
+      query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(", ")}`,
+    });
     await schema.command({ query: EVENT_LOCATOR_DDL });
     await schema.command({ query: EVENT_LOCATOR_MV_DDL });
     await schema.command({ query: KERNEL_FACT_LOCATOR_DDL });
@@ -1209,11 +1215,6 @@ async function runClickHouseBootstrap(
         MODIFY COLUMN runId String DEFAULT JSONExtractString(payload, 'runId'),
         MODIFY COLUMN producerRunId String DEFAULT JSONExtractString(payload, 'producerRunId'),
         MODIFY COLUMN traceId String DEFAULT JSONExtractString(payload, 'traceId')`,
-    });
-    // One metadata transaction is materially cheaper than dozens of sequential ALTERs on a busy
-    // MergeTree. Every operation is idempotent, so rolling versions retain the same compatibility.
-    await schema.command({
-      query: `ALTER TABLE ${TABLE} ${EVENT_ALTERS.join(", ")}`,
     });
     await schema.command({
       query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
@@ -2303,7 +2304,7 @@ export class ClickHouseStore {
   private closing = false;
   private flushTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
-  private connectInFlight?: Promise<boolean>;
+  private connectInFlight?: Promise<{ ok: boolean; error: string }>;
   private flushInFlight?: Promise<void>;
   private immediateWritesInFlight = 0;
   private immediateWriteQueue: ImmediateWrite[] = [];
@@ -2522,16 +2523,11 @@ export class ClickHouseStore {
 
   private connect(): Promise<{ ok: boolean; error: string }> {
     if (this.ready) return Promise.resolve({ ok: true, error: "" });
-    if (this.connectInFlight) {
-      return this.connectInFlight.then((ok) => ({
-        ok,
-        error: ok ? "" : "connection attempt failed",
-      }));
-    }
+    if (this.connectInFlight) return this.connectInFlight;
     const operation = this.connectOnce();
-    this.connectInFlight = operation.then((result) => result.ok);
+    this.connectInFlight = operation;
     return operation.finally(() => {
-      this.connectInFlight = undefined;
+      if (this.connectInFlight === operation) this.connectInFlight = undefined;
     });
   }
 
