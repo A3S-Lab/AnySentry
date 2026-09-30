@@ -55,7 +55,7 @@ sudo /opt/anysentry/anysentry-services.sh start
 ### `RUN_HEALTH_SMOKE.sh`
 
 用途：生成统一健康报告。默认报告目录为
-`/tmp/anysentry-health-smoke-0.4.0-compat9`，该目录在脚本运行时创建并覆盖。
+`/tmp/anysentry-health-smoke-0.4.0-compat10`，该目录在脚本运行时创建并覆盖。
 
 ```bash
 /opt/anysentry/RUN_HEALTH_SMOKE.sh --passive

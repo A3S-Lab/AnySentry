@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat9
+COMPAT_RELEASE_ID=0.4.0-compat10
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -28,7 +28,7 @@ INSTALL_START_TIME=
 INSTALL_LOG_READY=0
 ROLLBACK_RESULT=not-required
 A3S_CODE_RUNTIME=unknown
-A3S_CODE_BLOCKED_INSTALL=0
+START_FAILURES=0
 EXPECTED_BPF_VERSION=4.19.90
 EXPECTED_BPF_CODE=0x0004135a
 SERVICES=(
@@ -228,7 +228,7 @@ write_install_summary() {
     printf 'install_log=%s\n' "$INSTALL_LOG_ROOT/install.log"
     printf 'diagnostic_directory=%s\n' "$INSTALL_LOG_ROOT"
     printf 'a3s_code_runtime=%s\n' "$A3S_CODE_RUNTIME"
-    printf 'a3s_code_blocked_install=%s\n' "$A3S_CODE_BLOCKED_INSTALL"
+    printf 'startup_failures=%s\n' "$START_FAILURES"
   } >"$INSTALL_LOG_ROOT/summary.txt"
   echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
 }
@@ -645,14 +645,29 @@ record_unit_startup_log() {
   tail -n 40 "$dest" || true
 }
 
-record_api_observer_startup() {
-  record_unit_startup_log anysentry.service api
-  record_unit_startup_log anysentry-observer.service observer
+remember_start_failure() {
+  START_FAILURES=$((START_FAILURES + 1))
+  echo "ERROR: $1" | tee -a "$INSTALL_LOG_ROOT/startup-failures.txt"
 }
 
-api_journal_shows_a3s_code_crash() {
-  grep -E -q '@a3s-lab/code|libzvec_c_api|index\.linux-arm64-gnu\.node|GLIBC_|a3s-code-sdk|Cannot find module' \
-    "$INSTALL_LOG_ROOT/startup-api.log" 2>/dev/null
+start_unit() {
+  local unit=$1 name=$2
+  systemctl enable "$unit"
+  if ! systemctl start "$unit"; then
+    # A failed dependency would otherwise skip this unit. Start it anyway so its own journal exists.
+    systemctl start --job-mode=ignore-dependencies "$unit" || true
+  fi
+  record_unit_startup_log "$unit" "$name"
+  systemctl is-active --quiet "$unit" || remember_start_failure "$unit is not active"
+}
+
+finish_if_start_failures() {
+  [[ $START_FAILURES -eq 0 ]] && return 0
+  echo "ERROR: $START_FAILURES service startup check(s) failed."
+  echo "Each service was started and its journal is under $INSTALL_LOG_ROOT."
+  echo "This update will roll back."
+  [[ -f $INSTALL_LOG_ROOT/startup-failures.txt ]] && cat "$INSTALL_LOG_ROOT/startup-failures.txt"
+  fail "one or more services did not start"
 }
 
 probe_a3s_code_runtime() {
@@ -667,7 +682,7 @@ probe_a3s_code_runtime() {
     A3S_CODE_RUNTIME=unavailable
     echo "status=missing" >>"$report"
     echo "WARNING: @a3s-lab/code is not installed. L2, L3, and the assistant cannot open a session."
-    echo "The rest of the deployment continues. Details: $report"
+    echo "The probe result is in $report. A service that does not stay up still rolls the update back."
     return 0
   fi
   echo "----- a3s code native load -----"
@@ -680,8 +695,8 @@ probe_a3s_code_runtime() {
   fi
   A3S_CODE_RUNTIME=unavailable
   echo "status=failed" >>"$report"
-  echo "WARNING: a3s code native runtime failed to load. Installation continues."
-  echo "L2, L3, and the assistant report this when a session is created. The API and Observer stay up."
+  echo "WARNING: a3s code native runtime failed to load. The result is recorded and is not itself a service failure."
+  echo "If the API or another service does not stay up, this update still rolls back after every service has been started."
   echo "Error output:"
   tail -n 40 "$report"
   echo "Full probe: $report"
@@ -715,63 +730,66 @@ activate_release() {
     install -m 0644 "$INSTALL_ROOT/systemd/$unit" "$SYSTEMD_DIR/$unit"
   done
   systemctl daemon-reload
+  : >"$INSTALL_LOG_ROOT/startup-failures.txt"
   set_stage start-clickhouse
-  systemctl enable --now anysentry-clickhouse.service
-  wait_for_clickhouse || fail "AnySentry ClickHouse readiness timeout"
+  start_unit anysentry-clickhouse.service clickhouse
+  if systemctl is-active --quiet anysentry-clickhouse.service; then
+    wait_for_clickhouse || remember_start_failure "ClickHouse readiness timeout"
+  fi
   set_stage start-redis
-  systemctl enable --now anysentry-redis.service
-  wait_for_redis || fail "AnySentry Redis readiness timeout"
+  start_unit anysentry-redis.service redis
+  if systemctl is-active --quiet anysentry-redis.service; then
+    wait_for_redis || remember_start_failure "Redis readiness timeout"
+  fi
   set_stage start-kafka
-  systemctl enable --now anysentry-kafka.service
-  wait_for_kafka || fail "AnySentry Kafka readiness timeout"
+  start_unit anysentry-kafka.service kafka
+  if systemctl is-active --quiet anysentry-kafka.service; then
+    wait_for_kafka || remember_start_failure "Kafka readiness timeout"
+  fi
   set_stage initialize-kafka-topics
-  systemctl enable --now anysentry-kafka-init.service
+  start_unit anysentry-kafka-init.service kafka-init
   set_stage start-flink
-  systemctl enable --now anysentry-flink-jobmanager.service
-  systemctl enable --now anysentry-flink-taskmanager.service
-  wait_for_flink || fail "AnySentry Flink readiness timeout"
-  systemctl enable --now anysentry-flink-job.service
+  start_unit anysentry-flink-jobmanager.service flink-jobmanager
+  start_unit anysentry-flink-taskmanager.service flink-taskmanager
+  if systemctl is-active --quiet anysentry-flink-jobmanager.service; then
+    wait_for_flink || remember_start_failure "Flink readiness timeout"
+  fi
+  start_unit anysentry-flink-job.service flink-job
   set_stage start-api-and-observer
   systemctl enable anysentry.service anysentry-observer.service
-  systemctl start anysentry.service anysentry-observer.service ||
-    echo "WARNING: API or Observer was not active immediately after the joint start. Startup journals follow."
+  if ! systemctl start anysentry.service anysentry-observer.service; then
+    systemctl start --job-mode=ignore-dependencies anysentry.service || true
+    systemctl start --job-mode=ignore-dependencies anysentry-observer.service || true
+  fi
   sleep 2
-  record_api_observer_startup
+  record_unit_startup_log anysentry.service api
+  record_unit_startup_log anysentry-observer.service observer
+  systemctl is-active --quiet anysentry.service || remember_start_failure "anysentry.service is not active"
+  systemctl is-active --quiet anysentry-observer.service || remember_start_failure "anysentry-observer.service is not active"
   probe_a3s_code_runtime
   set_stage provision-observer-source
-  if ! provision_observer; then
-    record_api_observer_startup
-    if api_journal_shows_a3s_code_crash; then
-      A3S_CODE_BLOCKED_INSTALL=1
-      echo "WARNING: the API did not become ready because the a3s code runtime failed."
-      echo "Observer was started in the same step. Installation continues so both journals stay available."
-      echo "See $INSTALL_LOG_ROOT/startup-api.log and $INSTALL_LOG_ROOT/a3s-code-startup.txt"
-    else
-      fail "AnySentry API readiness timeout"
-    fi
+  if provision_observer; then
+    systemctl restart anysentry-observer.service || true
+    record_unit_startup_log anysentry-observer.service observer
+    systemctl is-active --quiet anysentry-observer.service ||
+      remember_start_failure "anysentry-observer.service is not active after source provisioning"
   else
-    systemctl restart anysentry-observer.service ||
-      echo "WARNING: Observer did not restart after source provisioning. Journal follows."
+    remember_start_failure "Observer source was not provisioned"
+    record_unit_startup_log anysentry.service api
     record_unit_startup_log anysentry-observer.service observer
   fi
   set_stage start-judgment-workers
-  systemctl enable --now anysentry-fast-judge.service
-  systemctl enable --now anysentry-l3-worker.service
+  start_unit anysentry-fast-judge.service fast-judge
+  start_unit anysentry-l3-worker.service l3-worker
   set_stage start-streaming-workers
-  systemctl enable --now anysentry-stream-worker.service
-  systemctl enable --now anysentry-composite-judge.service
-  systemctl enable --now anysentry-supply-chain.service
-  record_api_observer_startup
+  start_unit anysentry-stream-worker.service stream-worker
+  start_unit anysentry-composite-judge.service composite-judge
+  start_unit anysentry-supply-chain.service supply-chain
   capture_diagnostics activation
+  finish_if_start_failures
   set_stage verify-activation
-  if "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log"; then
-    :
-  elif [[ $A3S_CODE_BLOCKED_INSTALL -eq 1 ]]; then
-    echo "WARNING: activation checks failed after the a3s code runtime kept the API down."
-    echo "The deployment is left in place. Startup errors: $INSTALL_LOG_ROOT/startup-api.log $INSTALL_LOG_ROOT/startup-observer.log"
-  else
+  "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log" ||
     fail "activation verification failed"
-  fi
   ACTIVATED=0
 }
 

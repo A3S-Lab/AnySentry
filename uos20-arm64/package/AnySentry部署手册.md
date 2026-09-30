@@ -33,8 +33,8 @@
 | `/var/lib/anysentry` | 正式安装 | ClickHouse、Redis、Kafka、Flink 和 L3 状态 |
 | `/var/log/anysentry` | 正式安装 | 服务日志和安装诊断 |
 | `/etc/sysctl.d/90-anysentry.conf` | 正式安装 | 运行时内存参数 |
-| `/tmp/anysentry-install-0.4.0-compat9` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
-| `/tmp/anysentry-health-smoke-0.4.0-compat9` | 执行健康检查脚本 | 健康检查报告 |
+| `/tmp/anysentry-install-0.4.0-compat10` | 每次执行安装程序 | 安装诊断入口；通常指向持久日志目录 |
+| `/tmp/anysentry-health-smoke-0.4.0-compat10` | 执行健康检查脚本 | 健康检查报告 |
 | `/opt/.anysentry.rollback.*` | 成功升级且已有旧版本 | 上一版本程序备份 |
 | `/opt/anysentry.failed.*` | 激活失败并回滚 | 失败版本现场 |
 
@@ -45,9 +45,9 @@
 将压缩包及同名 `.sha256` 文件放在同一目录：
 
 ```bash
-sha256sum --check anysentry-security-suite-0.4.0-compat9-uos20-arm64.tar.gz.sha256
-tar -zxf anysentry-security-suite-0.4.0-compat9-uos20-arm64.tar.gz
-cd anysentry-security-suite-0.4.0-compat9-uos20-arm64
+sha256sum --check anysentry-security-suite-0.4.0-compat10-uos20-arm64.tar.gz.sha256
+tar -zxf anysentry-security-suite-0.4.0-compat10-uos20-arm64.tar.gz
+cd anysentry-security-suite-0.4.0-compat10-uos20-arm64
 sha256sum --check manifest.sha256
 ```
 
@@ -67,11 +67,10 @@ sha256sum --check manifest.sha256
 ./install.sh
 ```
 
-安装程序保留现有配置和持久数据，依次启动 ClickHouse、Redis、Kafka 和 Flink。
-API 与 Observer 在同一步启动，安装日志同时保留两边的启动记录和报错。
-`@a3s-lab/code` 原生库加载失败只写入安装日志，不中断其余服务，也不因此回滚。
-其它激活检查失败时仍自动恢复上一版本。
-日志在 `/var/log/anysentry/install/0.4.0-compat9/`：`startup-api.log`、`startup-observer.log`、`a3s-code-startup.txt`。
+安装程序保留现有配置和持久数据，并启动全部服务。API 与 Observer 在同一步启动。
+某一个服务没有起来时，其余服务仍会启动，各自的启动日志和报错先写入安装日志，然后本次更新失败并整体回滚。
+`@a3s-lab/code` 的加载结果记在 `a3s-code-startup.txt`。它本身不是一项 systemd 服务；对应的 API 或 Worker 没有保持运行时，同样回滚。
+日志在 `/var/log/anysentry/install/0.4.0-compat10/`：`startup-*.log`、`startup-failures.txt`、`a3s-code-startup.txt`。
 
 ## 5. 安装验证
 
@@ -100,7 +99,7 @@ systemctl is-active anysentry-observer.service
 该命令仅使用 `/tmp`、回环网络和带唯一标识的模拟事件。报告目录由脚本创建：
 
 ```text
-/tmp/anysentry-health-smoke-0.4.0-compat9
+/tmp/anysentry-health-smoke-0.4.0-compat10
 ```
 
 ## 6. 安装日志
@@ -108,21 +107,21 @@ systemctl is-active anysentry-observer.service
 每次执行安装程序都会覆盖本版本诊断目录：
 
 ```text
-/var/log/anysentry/install/0.4.0-compat9
+/var/log/anysentry/install/0.4.0-compat10
 ```
 
 快速入口：
 
 ```text
-/tmp/anysentry-install-0.4.0-compat9
+/tmp/anysentry-install-0.4.0-compat10
 ```
 
 查看结果：
 
 ```bash
-cat /var/log/anysentry/install/0.4.0-compat9/summary.txt
-less /var/log/anysentry/install/0.4.0-compat9/install.log
-cat /var/log/anysentry/install/0.4.0-compat9/current-stage.txt
+cat /var/log/anysentry/install/0.4.0-compat10/summary.txt
+less /var/log/anysentry/install/0.4.0-compat10/install.log
+cat /var/log/anysentry/install/0.4.0-compat10/current-stage.txt
 ```
 
 安装失败时，诊断目录会在自动回滚前记录服务状态、接口响应、验证输出和 journal。
@@ -156,8 +155,8 @@ location /anysentry/ {
 升级由 `./install.sh` 原地完成。激活验证失败时，安装程序自动停止新版本、恢复上一版程序和配置，并写诊断日志。先看：
 
 ```bash
-cat /var/log/anysentry/install/0.4.0-compat9/summary.txt
-cat /var/log/anysentry/install/0.4.0-compat9/current-stage.txt
+cat /var/log/anysentry/install/0.4.0-compat10/summary.txt
+cat /var/log/anysentry/install/0.4.0-compat10/current-stage.txt
 ls -ld /opt/.anysentry.rollback.* /opt/anysentry.failed.*
 ```
 

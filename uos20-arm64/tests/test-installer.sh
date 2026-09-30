@@ -49,7 +49,7 @@ grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder 
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
 grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
-grep -Fq '0.4.0-compat9' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
+grep -Fq '0.4.0-compat10' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
@@ -59,9 +59,15 @@ grep -Fq 'systemctl start anysentry.service anysentry-observer.service' "$INSTAL
   fail "installer does not start the API and Observer together"
 grep -Fq 'a3s-code-startup.txt' "$INSTALLER" ||
   fail "installer does not record the a3s code load result"
-grep -Fq 'startup-api.log' "$INSTALLER" || fail "installer does not keep the API startup journal"
-grep -Fq 'A3S_CODE_BLOCKED_INSTALL' "$INSTALLER" ||
-  fail "an a3s code startup failure still aborts installation"
+grep -Fq 'startup-$name.log' "$INSTALLER" || fail "installer does not keep per-service startup journals"
+grep -Fq 'record_unit_startup_log anysentry.service api' "$INSTALLER" ||
+  fail "installer does not keep the API startup journal"
+grep -Fq 'one or more services did not start' "$INSTALLER" ||
+  fail "a service that stays down no longer rolls the update back"
+grep -Fq 'ignore-dependencies' "$INSTALLER" ||
+  fail "a failed dependency skips starting the remaining services"
+grep -Fq 'startup-failures.txt' "$INSTALLER" ||
+  fail "installer does not keep the list of services that failed to start"
 grep -Fq 'Requires=anysentry.service' "$ROOT/uos20-arm64/package/systemd/anysentry-observer.service" &&
   fail "Observer unit stops when the API unit fails"
 true
@@ -113,19 +119,19 @@ mkdir -p "$tmp/runtime-tmp"
 ANYSENTRY_INSTALLER_LIB=1 bash -c '
   source "$1"
   LOG_DIR="$2/runtime-log"
-  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat9"
-  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat9"
+  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat10"
+  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat10"
   initialize_install_logging
   set_stage installer-contract-test
   echo installer-log-marker
   write_install_summary 0
 ' _ "$tmp/package/install.sh" "$tmp"
 
-[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat9 ]] ||
+[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat10 ]] ||
   fail "temporary diagnostic path is not a symlink"
-grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat9/install.log" ||
+grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat10/install.log" ||
   fail "installer output was not captured"
-grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat9/summary.txt" ||
+grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat10/summary.txt" ||
   fail "installation summary was not persisted"
 
 mkdir -p "$tmp/verify-root/runtime/node/bin"
