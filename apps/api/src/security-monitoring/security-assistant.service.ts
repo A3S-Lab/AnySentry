@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy, ServiceUnavailableException } from '@nestjs/common';
-import { Agent, FileMemoryStore, Session } from '@a3s-lab/code';
+import type { Agent, Session } from '@a3s-lab/code';
+import { loadA3sCodeSdk } from './a3s-code-sdk';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -319,7 +320,7 @@ export class SecurityAssistantService implements OnModuleDestroy {
         responseStyle: locale === 'zh-CN'
           ? '最终答案必须以 [FINAL_ANSWER] 开头。使用简洁、专业的简体中文回答，默认不超过 500 个汉字。保留 Agent、Workspace、Flink、OSV、L1/L2/L3、Trace、Span 等专有名词。先给结论，再给关键依据；证据不足时明确说明。'
           : 'The final answer must begin with [FINAL_ANSWER]. Answer in concise professional English, normally within 350 words. Lead with the conclusion, then cite the key evidence. State clearly when evidence is insufficient.',
-        memoryStore: new FileMemoryStore(memoryDir),
+        memoryStore: new (loadA3sCodeSdk().FileMemoryStore)(memoryDir),
         continuationEnabled: false,
         maxContinuationTurns: 0,
         maxToolRounds: 1,
@@ -1383,7 +1384,7 @@ export class SecurityAssistantService implements OnModuleDestroy {
     this.agentKey = undefined;
     if (stale) void stale.close().catch(() => undefined);
     this.initializationKey = config.cacheKey;
-    this.initialization = Agent.create(config.acl)
+    this.initialization = loadA3sCodeSdk().Agent.create(config.acl)
       .then((agent) => {
         this.agent = agent;
         this.agentKey = config.cacheKey;

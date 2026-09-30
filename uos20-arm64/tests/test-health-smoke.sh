@@ -18,7 +18,7 @@ mkdir -p "$fake_bin" "$install_root/runtime/node/bin" "$install_root/redis/bin" 
   "$install_root/java/bin" "$install_root/kafka/bin" "$(dirname "$env_file")"
 ln -s "$(command -v node)" "$install_root/runtime/node/bin/node"
 cat > "$install_root/VERSION" <<'EOF'
-RELEASE_VERSION=0.4.0-compat6
+RELEASE_VERSION=0.4.0-compat7
 BPF_KERNEL_VERSION=4.19.90
 EOF
 cat > "$env_file" <<'EOF'

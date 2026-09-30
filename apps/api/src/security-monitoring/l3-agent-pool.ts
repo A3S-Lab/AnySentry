@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { Agent, FileMemoryStore, Session, SessionOptions } from '@a3s-lab/code';
+import type { Session, SessionOptions } from '@a3s-lab/code';
+import { loadA3sCodeSdk } from './a3s-code-sdk';
 import { A3sCodeModelConfig, buildA3sCodeModelAcl, deepInvestigationModelConfig } from './a3s-code-model-config';
 
 type L3Session = Pick<Session, 'send' | 'cancelAsync' | 'closeAsync'>;
@@ -264,7 +265,7 @@ class SkillSessionPool {
         responseStyle: 'Return only one JSON object with exactly these fields: {"verdict":"allow"|"block","severity":"low"|"medium"|"high"|"critical","reason":"<concise justification>"}. Do not include Markdown, code fences, analysis, or any text before or after the JSON object.',
         // A3S Code's default memory backend is persistent and survives new Agents/processes. Give
         // every one-shot L3 Session its own empty store so one security event cannot bias another.
-        memoryStore: new FileMemoryStore(memoryDir),
+        memoryStore: new (loadA3sCodeSdk().FileMemoryStore)(memoryDir),
         continuationEnabled: false,
         maxContinuationTurns: 0,
         autoParallel: false,
@@ -347,7 +348,7 @@ export class L3AgentPool {
       maxSessionAgeMs: positiveInt(options.maxSessionAgeMs ?? 30 * 60_000, 30 * 60_000),
       workspace: options.workspace ?? '',
     };
-    this.agentFactory = options.agentFactory ?? (async (acl) => Agent.create(acl));
+    this.agentFactory = options.agentFactory ?? (async (acl) => loadA3sCodeSdk().Agent.create(acl));
     this.acl = buildL3AgentAcl(options.env, options.modelConfig);
   }
 

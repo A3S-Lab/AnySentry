@@ -1,4 +1,5 @@
-import { Agent, Session } from '@a3s-lab/code';
+import type { Session } from '@a3s-lab/code';
+import { loadA3sCodeSdk } from './a3s-code-sdk';
 import { A3sCodeModelConfig, buildA3sCodeModelAcl } from './a3s-code-model-config';
 import { AsyncDecision } from './async-judgment.types';
 
@@ -96,7 +97,7 @@ export class L2CodeJudge {
       contextLimit: options.contextLimit,
     };
     this.acl = buildA3sCodeModelAcl(config);
-    this.agentFactory = options.agentFactory ?? (async (acl) => Agent.create(acl));
+    this.agentFactory = options.agentFactory ?? (async (acl) => loadA3sCodeSdk().Agent.create(acl));
   }
 
   async judge(input: L2CodeJudgeInput): Promise<AsyncDecision> {
