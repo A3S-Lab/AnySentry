@@ -1,3 +1,5 @@
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Session } from '@a3s-lab/code';
 import { loadA3sCodeSdk } from './a3s-code-sdk';
 import { A3sCodeModelConfig, buildA3sCodeModelAcl } from './a3s-code-model-config';
@@ -44,6 +46,12 @@ function positiveInt(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function writableRuntimeDir(name: string): string {
+  const dir = join(process.env.ANYSENTRY_STATE_DIR || '/var/lib/anysentry', name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function untrustedText(input: L2CodeJudgeInput): string {
   return [
     `Agent: ${input.actor || 'unknown'}`,
@@ -86,7 +94,7 @@ export class L2CodeJudge {
   constructor(options: L2CodeJudgeOptions) {
     this.options = {
       timeoutMs: positiveInt(options.timeoutMs, 60_000),
-      workspace: options.workspace || '.',
+      workspace: options.workspace || writableRuntimeDir('a3s-l2-workspace'),
     };
     const config: A3sCodeModelConfig = {
       id: 'sentry-l2',
@@ -104,6 +112,7 @@ export class L2CodeJudge {
     if (this.closed) throw new Error('L2 A3S Code judge is closed');
     const agent = await this.getAgent();
     const session = await agent.sessionAsync(this.options.workspace, {
+      memoryStore: new (loadA3sCodeSdk().FileMemoryStore)(writableRuntimeDir('a3s-memory')),
       planningMode: 'disabled',
       permissionPolicy: { enabled: true, allow: [], defaultDecision: 'deny' },
       continuationEnabled: false,

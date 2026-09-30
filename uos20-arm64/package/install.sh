@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat12
+COMPAT_RELEASE_ID=0.4.0-compat13
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -828,7 +828,8 @@ main() {
     "$STATE_DIR/redis" "$STATE_DIR/kafka" "$STATE_DIR/kafka-logs" \
     "$STATE_DIR/flink" "$STATE_DIR/flink/log" \
     "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
-    "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" "$LOG_DIR"
+    "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" \
+    "$STATE_DIR/a3s-memory" "$STATE_DIR/a3s-l2-workspace" "$LOG_DIR"
   set_stage normalize-configuration
   install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"
   set_stage persist-resource-configuration
