@@ -62,6 +62,25 @@ const langchainHit = templateRegistry.classifyFacts({
 });
 assert.equal(langchainHit?.attribution?.classification, 'probable_agent',
   'the builtin docker langchain image template must classify as review-gated candidate');
+const officeHit = templateRegistry.classifyFacts({
+  deployment: 'docker',
+  container: 'ai-agent',
+  image: 'agent:office',
+  command: '/usr/local/bin/python /opt/agent/start.pyc --port 8000',
+  executable: 'python',
+  labels: { 'com.docker.compose.service': 'agent', 'com.docker.compose.project': 'deploy' },
+});
+assert.equal(officeHit?.attribution?.classification, 'probable_agent');
+assert.equal(officeHit?.attribution?.agentScopeId, 'office-agent',
+  'agent:office must match the office image glob and stay distinct from langchain/langgraph');
+assert.equal(templateRegistry.classifyFacts({
+  deployment: 'docker',
+  container: 'other',
+  image: 'registry.example/agent:office-v2',
+})?.attribution?.agentScopeId, 'office-agent');
+assert.equal(templateRegistry.classifyFacts({
+  deployment: 'docker', container: 'ai-agent', image: 'some-agent:latest',
+}), undefined, 'a generic *agent* image must not match the office template');
 assert.equal(templateRegistry.classifyFacts({
   deployment: 'host', container: '', image: '', command: 'python x.py', executable: 'python',
 }), undefined, 'generic host python must never match the docker image templates');

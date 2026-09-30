@@ -308,6 +308,21 @@ export function builtinFilterRules(): FilterRuleRecord[] {
       stages: ['f0', 'f1', 'f2', 'f3'], sourceRef: 'agent-template:docker-langgraph-image',
     }),
     builtin({
+      ruleId: 'fr_builtin_docker_office_agent_image',
+      name: 'Docker Office Agent Image',
+      description: '镜像名匹配 *agent:office* 的 Docker 工作负载建立候选 Agent 身份，需审核确认后进入明文采集。不绑定容器名、容器 ID 或镜像摘要。',
+      category: 'agent_identity', ruleKind: 'agent_template', priority: 700,
+      matcher: {
+        all: [
+          { field: 'workload.placement', operator: 'equals', value: 'docker' },
+          { field: 'workload.image', operator: 'equals', value: '*agent:office*' },
+        ],
+        description: 'Docker 部署且镜像名匹配 *agent:office*',
+      },
+      effect: { type: 'emit_identity', classification: 'probable_agent', confidence: 0.6, captureProfile: 'probable_investigation', agentScopeId: 'office-agent' },
+      stages: ['f0', 'f1', 'f2', 'f3'], sourceRef: 'agent-template:docker-office-agent-image',
+    }),
+    builtin({
       ruleId: 'fr_builtin_non_agent_workload_label',
       name: 'Explicit Non-Agent Workload Label',
       description: '精确 Inventory 标签可以建立 non-Agent 身份事实，但不能绕过安全 Guardrail。',
