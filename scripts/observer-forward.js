@@ -497,7 +497,9 @@ const infrastructureMaterializationTarget = new URL(
   process.env.ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL
     || defaultInfrastructureMaterializationUrl(target),
 );
-const INFRASTRUCTURE_POLICY_TOKEN = text(process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN);
+const INFRASTRUCTURE_POLICY_TOKEN = text(process.env.ANYSENTRY_INFRASTRUCTURE_POLICY_TOKEN)
+  || text(process.env.ANYSENTRY_MANAGEMENT_TOKEN)
+  || text(process.env.ANYSENTRY_ADMIN_TOKEN);
 const UNIFIED_FILTER_PROJECTION_SECS = Math.max(
   0,
   Number(process.env.ANYSENTRY_FILTER_RULE_PROJECTION_SECS || 5),

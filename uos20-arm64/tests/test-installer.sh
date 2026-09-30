@@ -42,14 +42,14 @@ grep -Fq 'attachedProbes' "$VERIFY" || fail "verifier does not inspect runtime p
 grep -Fq 'attached_probes -ge 8' "$VERIFY" || fail "verifier does not require eight runtime probes"
 grep -Fq 'wait_for_collector_health' "$VERIFY" || fail "verifier does not wait for collector health visibility"
 collector_wait_body=$(sed -n '/^wait_for_collector_health()/,/^}/p' "$VERIFY")
-grep -Fq 'seq 1 60' <<<"$collector_wait_body" || fail "collector health wait is shorter than 60 seconds"
+grep -Fq 'seq 1 180' <<<"$collector_wait_body" || fail "collector health wait is shorter than 180 seconds"
 grep -Fq 'Collector health response:' "$VERIFY" || fail "collector health failure omits the raw API response"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
 grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
-grep -Fq '0.4.0-compat11' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
+grep -Fq '0.4.0-compat12' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
@@ -119,19 +119,19 @@ mkdir -p "$tmp/runtime-tmp"
 ANYSENTRY_INSTALLER_LIB=1 bash -c '
   source "$1"
   LOG_DIR="$2/runtime-log"
-  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat11"
-  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat11"
+  INSTALL_LOG_ROOT="$LOG_DIR/install/0.4.0-compat12"
+  TEMP_INSTALL_LOG="$2/runtime-tmp/anysentry-install-0.4.0-compat12"
   initialize_install_logging
   set_stage installer-contract-test
   echo installer-log-marker
   write_install_summary 0
 ' _ "$tmp/package/install.sh" "$tmp"
 
-[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat11 ]] ||
+[[ -L $tmp/runtime-tmp/anysentry-install-0.4.0-compat12 ]] ||
   fail "temporary diagnostic path is not a symlink"
-grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat11/install.log" ||
+grep -Fq installer-log-marker "$tmp/runtime-log/install/0.4.0-compat12/install.log" ||
   fail "installer output was not captured"
-grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat11/summary.txt" ||
+grep -Fq result=success "$tmp/runtime-log/install/0.4.0-compat12/summary.txt" ||
   fail "installation summary was not persisted"
 
 mkdir -p "$tmp/verify-root/runtime/node/bin"

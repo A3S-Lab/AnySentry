@@ -76,7 +76,7 @@ wait_health() {
 wait_for_collector_health() {
   local body response= state attached_probes
   body="{\"timeType\":\"last_3h\",\"collectorId\":\"$COLLECTOR_ID\",\"limit\":5}"
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 180); do
     if response=$(post_json collectors/health "$body"); then
       state=$(printf '%s' "$response" |
         collector_value state)
@@ -236,7 +236,7 @@ if ! collector=$(wait_for_collector_health); then
   attached_probes=$(printf '%s' "$collector" | collector_value attachedProbes)
   [[ -n $attached_probes ]] || attached_probes=-1
   echo "Collector health response: $collector" >&2
-  fail "collector did not become ready within 60 seconds; state=${state:-missing} attachedProbes=${attached_probes:--1}"
+  fail "collector did not become ready within 180 seconds; state=${state:-missing} attachedProbes=${attached_probes:--1}"
 fi
 state=$(printf '%s' "$collector" | collector_value state)
 output_dropped=$(printf '%s' "$collector" | collector_value outputDropped)
