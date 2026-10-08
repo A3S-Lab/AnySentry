@@ -107,7 +107,7 @@ export function sanitizeRuntimeModelConnection(
     url: sanitizeEndpoint(input.url),
     model,
     apiKey,
-    timeoutS: positiveInt(input.timeoutS, profile === 'fast_review' ? 60 : 90, 1, 600),
+    timeoutS: positiveInt(input.timeoutS, profile === 'fast_review' ? 60 : 90, 1, 1_800),
     contextTokens: positiveInt(input.contextTokens, profile === 'fast_review' ? 16_384 : 32_768, 4_096, 262_144),
   };
 }

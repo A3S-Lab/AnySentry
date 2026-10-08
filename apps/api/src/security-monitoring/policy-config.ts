@@ -103,7 +103,7 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
 
   const llmIn = o.llm as Record<string, unknown> | null | undefined;
   const llmUrl = normalizeLlmBaseUrl(str(llmIn?.url, 500));
-  const llm: L2Config | null = llmIn && llmUrl ? { url: llmUrl, model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 600, 60) } : null;
+  const llm: L2Config | null = llmIn && llmUrl ? { url: llmUrl, model: str(llmIn.model, 100) || 'default', timeoutS: num(llmIn.timeoutS, 1, 1_800, 60) } : null;
 
   const deepModelIn = o.deepModel as Record<string, unknown> | null | undefined;
   const deepModelUrl = normalizeLlmBaseUrl(str(deepModelIn?.url, 500));
@@ -111,7 +111,7 @@ export function sanitizePolicy(input: unknown): PolicyConfig {
     ? {
         url: deepModelUrl,
         model: str(deepModelIn.model, 100) || 'default',
-        timeoutS: num(deepModelIn.timeoutS, 1, 600, 90),
+        timeoutS: num(deepModelIn.timeoutS, 1, 1_800, 90),
         contextTokens: num(deepModelIn.contextTokens, 4_096, 262_144, 32_768),
       }
     : null;

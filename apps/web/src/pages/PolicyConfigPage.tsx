@@ -608,7 +608,7 @@ function FastReviewSection({ value, onChange, state, ...actions }: { value: L2Co
         <div className="grid gap-4 md:grid-cols-3">
           <Field label="API 基础 URL" hint="填写到 /v1；完整接口地址会自动规范化。"><Input value={config.url} onChange={(event) => onChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
           <Field label="模型名称"><Input value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
-          <Field label="单次超时（秒）" hint="同时是 AI 对话助手的总超时预算，应用后下一轮对话立即生效。"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="单次超时（秒）" hint="同时是 AI 对话助手的总超时预算，应用后下一轮对话立即生效。上限 1800 秒。"><Input type="number" min={1} max={1800} value={config.timeoutS} onChange={(event) => onChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
         </div>
         <ConnectionControl profile="fast_review" state={state} {...actions} />
       </div> : <div className="px-4 py-5 text-xs text-zinc-500">未启用 — 仅保留基础规则研判，AI 身份辅助审核不可用。</div>}
@@ -627,7 +627,7 @@ function DeepReviewSection({ model, agent, onModelChange, onAgentChange, state, 
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label="API 基础 URL"><Input value={config.url} onChange={(event) => onModelChange({ ...config, url: event.target.value })} placeholder="https://api.example.com/v1" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
           <Field label="模型名称"><Input value={config.model} onChange={(event) => onModelChange({ ...config, model: event.target.value })} placeholder="model-id" className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
-          <Field label="任务超时（秒）"><Input type="number" min={1} max={600} value={config.timeoutS} onChange={(event) => onModelChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
+          <Field label="任务超时（秒）" hint="上限 1800 秒。"><Input type="number" min={1} max={1800} value={config.timeoutS} onChange={(event) => onModelChange({ ...config, timeoutS: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
           <Field label="上下文上限"><Input type="number" min={4096} max={262144} value={config.contextTokens} onChange={(event) => onModelChange({ ...config, contextTokens: Number(event.target.value) })} className="h-8 border-white/10 bg-white/5 text-xs" /></Field>
           <Field label="安全技能目录" hint="深度调查只能使用该目录中的受限技能。"><Input value={agentConfig.skills} onChange={(event) => onAgentChange({ ...agentConfig, skills: event.target.value })} placeholder="/opt/anysentry/skills" className="h-8 border-white/10 bg-white/5 font-mono text-xs" /></Field>
         </div>
