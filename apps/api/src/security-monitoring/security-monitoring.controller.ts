@@ -10972,11 +10972,32 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       !updated.policy.llm || fast.url !== updated.policy.llm.url || fast.model !== updated.policy.llm.model
     )) {
       await this.runtimeModels.clear('fast_review');
+    } else if (fast?.source === 'runtime' && updated.policy.llm && fast.timeoutS !== updated.policy.llm.timeoutS) {
+      // The timeout field promises "应用后下一轮对话立即生效": the assistant and the judges read
+      // the runtime snapshot, not the policy document, so a policy-only timeout edit must be
+      // re-activated into the snapshot (the apiKey never leaves server memory).
+      await this.runtimeModels.activate('fast_review', {
+        url: fast.url,
+        model: fast.model,
+        apiKey: fast.apiKey,
+        timeoutS: updated.policy.llm.timeoutS,
+        contextTokens: fast.contextTokens,
+      });
     }
     if (deep?.source === 'runtime' && (
       !updated.policy.deepModel || deep.url !== updated.policy.deepModel.url || deep.model !== updated.policy.deepModel.model
     )) {
       await this.runtimeModels.clear('deep_investigation');
+    } else if (deep?.source === 'runtime' && updated.policy.deepModel && (
+      deep.timeoutS !== updated.policy.deepModel.timeoutS || deep.contextTokens !== updated.policy.deepModel.contextTokens
+    )) {
+      await this.runtimeModels.activate('deep_investigation', {
+        url: deep.url,
+        model: deep.model,
+        apiKey: deep.apiKey,
+        timeoutS: updated.policy.deepModel.timeoutS,
+        contextTokens: updated.policy.deepModel.contextTokens,
+      });
     }
     this.audit.record({
       actor: auditActor(headers),
