@@ -73,3 +73,5 @@ ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
 - Observer：`perf-kprobe-legacy`，不依赖内核 BTF。
 
 该发布通道用于指定 UOS ABI，不替代上游通用 Linux 发布流程。
+
+现场已经遇到的打包和部署要点写在仓库根目录 [UOS20_ARM64_DEPLOYMENT_REVIEW.md](../UOS20_ARM64_DEPLOYMENT_REVIEW.md)。其中包括服务进程不能写 `/opt`、compat 版本与 glibc、ClickHouse 旧表补列、端口占用，以及 Docker 镜像通配模板。

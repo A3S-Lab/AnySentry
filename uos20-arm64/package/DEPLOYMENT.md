@@ -164,7 +164,7 @@ Observer 正常日志应包含 8 条 `legacy probe attached` 和汇总 `effectiv
 `attachedProbes>=8`、`outputDropped=0`、`errorCount=0`。journal 日志仅用于排错，
 不得作为独立的激活或回滚条件。
 
-Collector 健康记录在 API 启动后可能延迟可见。安装验证最长等待 60 秒；若仍未就绪，
+Collector 健康记录在 API 启动后可能延迟可见。安装验证最长等待 180 秒；若仍未就绪，
 错误输出包含最后一次 `/collectors/health` 原始 JSON、`state` 和 `attachedProbes`。
 
 若日志出现 `Cannot find module './observer-agent-attribution'` 或
