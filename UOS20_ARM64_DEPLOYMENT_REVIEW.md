@@ -108,11 +108,13 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 离线包未包含 Prometheus 和 node-exporter（开发 Compose 里才有）。只影响平台监控页图表，不影响 Agent 识别和明文采集。API 读 `ANYSENTRY_PROMETHEUS_URL`；为空时监控页降级为 API 进程本地指标。目标机已有 Prometheus 时，把地址写入 `/etc/anysentry/anysentry.env` 后 `systemctl restart anysentry.service`；没有可留空。以后若打进离线包：aarch64、glibc 2.28、64 KiB 对齐，只监听 `127.0.0.1:9090` 和 `127.0.0.1:9100`，不得占用 `8000`、`7998`、`9000`。
 
-### ai-agent 明文采集（待现场验证）
+### ai-agent 明文采集
 
 候选身份不打开明文。先在审核页把 `office-agent` 确认为已确认 Agent（或助手 `review_agent_candidate`），约 15 秒后对新流量生效；身份在 F0–F3 共用，与 L1–L3 研判深度是两套编号。HTTP 明文确认后走 `tcp_plaintext`，不依赖 SSL 符号。HTTPS 需要在 Observer 环境追加 `A3S_OBSERVER_SSL=1` 和 `A3S_OBSERVER_TLS_PROCESS_PATTERNS=start.pyc`（不要用宽泛的 `python`），改完 `systemctl restart anysentry-observer.service`。采集器从容器进程 `/proc/<宿主机pid>/maps` 找动态 libssl，成对挂接 `SSL_read`/`SSL_write`（含 `_ex`）；静态链接、去符号、Go、Rustls、GnuTLS、NSS 不在当前挂接矩阵。
 
-联调前只读收集（不要反编译客户容器，不要贴 `Config.Env`）：`openssl s_client` 测 `127.0.0.1:8000` 与 `7998`；`docker top` 加 `/proc/<pid>/maps` 是否出现 `libssl`/`_ssl`；Observer 环境是否已有 `A3S_OBSERVER_SSL`。
+联调前只读收集（不要反编译客户容器，不要贴 `Config.Env`）：`openssl s_client` 测容器映射端口；`docker top` 加 `/proc/<pid>/maps` 是否出现 `libssl`/`_ssl`；Observer 环境是否已有 `A3S_OBSERVER_SSL`。
+
+2026-10-09 现场实测：目标机现有 `ai-agent`（7998/8000）和 `ai-agent-skill`（7999/8001）两个 `agent:office` 容器，均被镜像模板命中为候选。`8000` 和 `8001` 的 `openssl s_client` 报 `wrong version number`，即入向服务是纯 HTTP，确认身份后经 `tcp_plaintext` 即可看到明文，**入向不需要开 `A3S_OBSERVER_SSL`**。两个容器的 python 工作进程都加载了 `/usr/lib/aarch64-linux-gnu/libssl.so.3`，若之后要采出向 HTTPS（例如容器调用外部 LLM API），TLS uprobe 挂接条件具备，按需再开 SSL 开关。
 
 ### 现场插曲
 
