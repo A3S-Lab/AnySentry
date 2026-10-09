@@ -116,6 +116,15 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 2026-10-09 现场实测：目标机现有 `ai-agent`（7998/8000）和 `ai-agent-skill`（7999/8001）两个 `agent:office` 容器，均被镜像模板命中为候选。`8000` 和 `8001` 的 `openssl s_client` 报 `wrong version number`，即入向服务是纯 HTTP，确认身份后经 `tcp_plaintext` 即可看到明文，**入向不需要开 `A3S_OBSERVER_SSL`**。两个容器的 python 工作进程都加载了 `/usr/lib/aarch64-linux-gnu/libssl.so.3`，若之后要采出向 HTTPS（例如容器调用外部 LLM API），TLS uprobe 挂接条件具备，按需再开 SSL 开关。
 
+2026-10-09 深入排查（确认身份后明文仍不通）判定为 **cgroup v1/混合布局的功能缺口**，非部署配置问题。目标机是 hybrid cgroup：v1 各控制器挂在 `/sys/fs/cgroup/<控制器>`，v2 unified 挂在 `/sys/fs/cgroup/unified`，容器 `/proc/<pid>/cgroup` 同时有 v1 行和 `0::` 行。两处代码缺陷叠加：
+
+1. `scripts/observer-docker-discovery.js` 按纯 v2 布局用 `/sys/fs/cgroup` 拼 `0::` 路径后 stat；hybrid 上正确路径是 `/sys/fs/cgroup/unified/...`，stat 失败导致所有容器拿不到 `cgroupId`（日志持续 `cold_start_runtime_ready=0`），明文白名单没有 cgroup 可写。cgroup 解析缺失还使进程归因退化，出现身份键污染（gdss 容器 ID 混入 `office-agent` 审核键、office 身份键挂在无关容器进程事件上）。
+2. `observer-forward.js` 的 `TLS_AGENT_CGROUPS_FILE` 由 `ANYSENTRY_FILTER_RULES_FILE` 推导，打包的 systemd unit 未设置该变量，白名单发布 `publish()` 对空路径直接 return 0，文件通道在打包部署里是空操作；同时 legacy collector 事件 `cgroupId` 全为 0（4.19 legacy 后端不上报 BPF cgroup id），白名单匹配对 legacy 路径还需降级策略佐证。
+
+部署侧全部干净：docker socket 可读、`/proc` 可读、`/sys/fs/bpf` 已挂载、统一过滤投影正常加载（identity=1/templates=3）、确认评审在 API 侧已生效、collector healthy（8 探针、outputDropped=0）。unknown/候选工作负载只留生命周期事件是策略设计（`droppedEvents` 即丢弃量），不是积压。
+
+修复方向（integration 分支，随 compat15）：discovery 先探测 unified 挂载点再回退 v1 `memory`/`name=systemd` 层级 inode；打包侧显式设置 `ANYSENTRY_FILTER_RULES_FILE`（如 `/run/anysentry-filter/filter-rules.json`，配 RuntimeDirectory）让白名单落地；legacy 后端补 cgroup id=0 的明文准入降级（pid/路径匹配）。验收标准：`cold_start_runtime_ready>0`、白名单文件出现且含 cgroup 条目、向 8000/8001 发请求后事件表出现 `tcp_plaintext` 明文事件。
+
 ### 现场插曲
 
 - 手动测试启停脚本时 `anysentry-kafka-init.service` 报 `/opt/anysentry/init-kafka-topics.sh: No such file or directory`：WorkingDirectory 的 `/opt/anysentry/kafka` 缺失导致 CHDIR 失败。从安装器解压目录 `cp -a` 补回 kafka 程序目录和脚本，`systemctl reset-failed` 后按序启动恢复。
