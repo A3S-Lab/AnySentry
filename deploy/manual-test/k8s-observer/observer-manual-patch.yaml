@@ -118,17 +118,18 @@ spec:
             - { name: local-collector, mountPath: /usr/local/bin/a3s-observer-collector, readOnly: true }
       volumes:
         - { name: docker-sock, hostPath: { path: /var/run/docker.sock, type: Socket } }
+        # hostPath 指向本机的 AnySentry 开发检出；使用前将 <anysentry-checkout> 替换为本机实际路径。
         - {
             name: forwarder-scripts,
             hostPath: {
-              path: /home/chensicheng/a3s/security/AnySentry/scripts,
+              path: <anysentry-checkout>/scripts,
               type: Directory
             }
           }
         - {
             name: local-collector,
             hostPath: {
-              path: /home/chensicheng/a3s/security/AnySentry/scripts/.local-bin/a3s-observer-collector,
+              path: <anysentry-checkout>/scripts/.local-bin/a3s-observer-collector,
               type: File
             }
           }

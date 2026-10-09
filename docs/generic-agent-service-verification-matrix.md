@@ -110,7 +110,7 @@ Agent E2E；健康检查通过不等价于容量闸门通过。
 管理授权未提供”，不能记为网络故障或 canonical 验收通过。
 
 当前 Docker 中的 `customer-langgraph-sim-lab` 由
-`/home/chensicheng/a3s/security/customer-langgraph-sim-lab` compose 项目管理，包含
+`<customer-sim-lab-checkout>` compose 项目管理，包含
 orchestrator、worker-agent、python-sandbox 和 tool-mocks；端口 18088、18090、18091、
 18092 均返回健康状态 200。该项目是本目标的受控 LangGraph 跨 Agent 实验链路，已核实为
 在用资源，本轮不停止或删除。
@@ -328,7 +328,7 @@ that ordinary Forwarder batches are accepted or that WAL growth has stopped.
 
 ### 2026-09-15 customer LangGraph restart and clean A/B verification
 
-After the host restart, the customer simulation was rebuilt from `/home/chensicheng/a3s/security/customer-langgraph-sim-lab/README.md`. Design A was verified through the existing Kubernetes service (`design=A`, `node_agent_mode=ephemeral_subgraph`): `POST /runs` completed with sandbox exit code 0, stdout `2`, and a run/session correlation tuple (`trace_id=e8276db6fd6ab597be4a87450923baad`, `run_id=session_id=556de716-ea49-42fa-9f7b-022382a028f3`).
+After the host restart, the customer simulation was rebuilt from `<customer-sim-lab-checkout>/README.md`. Design A was verified through the existing Kubernetes service (`design=A`, `node_agent_mode=ephemeral_subgraph`): `POST /runs` completed with sandbox exit code 0, stdout `2`, and a run/session correlation tuple (`trace_id=e8276db6fd6ab597be4a87450923baad`, `run_id=session_id=556de716-ea49-42fa-9f7b-022382a028f3`).
 
 Design B was rebuilt with `docker compose -f docker-compose.design-b.yml up -d --build` and verified through both orchestrator and worker health endpoints (`node_agent_mode=remote_http`). Its POST run completed with sandbox exit code 0, stdout `2`, four spans in the local correlation payload, and explicit `parent_session_id` plus `delegation_id` (`trace_id=5dbb405197833520d310f11c02a9c9b0`, `run_id=session_id=cf9bddac-2be4-4ab5-9819-260185d296d4`). The response reported `telemetry_export.enabled=false` because the local simulation has no OTLP/source credential wiring; this is a coverage limitation, not a failed workflow run.
 

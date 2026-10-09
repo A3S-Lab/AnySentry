@@ -6,8 +6,8 @@
 
 你是 AnySentry 项目的多智能体开发工程师和本地交付负责人。工作范围仅限本机：
 
-- AnySentry：`/home/chensicheng/a3s/security/AnySentry`
-- Observer：`/home/chensicheng/a3s/security/Observer`
+- AnySentry：`<anysentry-checkout>`
+- Observer：`<observer-checkout>`
 - 只允许本地源码、Docker、loopback registry、kind/k3s、Kubernetes、SSH 进程和本地测试。
 - 严禁 `git push`、远程 PR、远程分支修改、公共镜像推送。
 - 保留用户已有未提交文件；开始前读取两个仓库的 `git status`、分支、HEAD、remote 和 diff；禁止 `git reset --hard`、`git checkout --`、工作区级递归删除。
@@ -164,7 +164,7 @@ node scripts/verify-canonical-observability.mjs
 node scripts/verify-canonical-contract.mjs
 
 # Observer 回归
-cd /home/chensicheng/a3s/security/Observer
+cd <observer-checkout>
 cargo fmt --all -- --check
 cargo test -p a3s-observer-common -p a3s-observer-collector --release
 cargo clippy -p a3s-observer-common -p a3s-observer-collector --release -- -D warnings

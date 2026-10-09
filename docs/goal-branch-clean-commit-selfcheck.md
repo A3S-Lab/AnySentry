@@ -18,9 +18,9 @@
 
 ```bash
 # Observer tip 与 pin
-git -C /home/chensicheng/a3s/security/Observer rev-parse --short HEAD   # 期望 9dd4fbd
+git -C <observer-checkout> rev-parse --short HEAD   # 期望 9dd4fbd
 rg -n 'digest:|local-source-revision|FORWARD_RETAIN_NON_AGENT' \
-  /home/chensicheng/a3s/security/AnySentry/deploy/manual-test/k8s-observer/
+  <anysentry-checkout>/deploy/manual-test/k8s-observer/
 
 # 集群是否跟 tip
 kubectl -n anysentry get ds a3s-observer -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
