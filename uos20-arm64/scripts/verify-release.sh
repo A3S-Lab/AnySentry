@@ -17,7 +17,7 @@ required=(
   observer/observer-agent-templates.js observer/observer-attribution-merge.js
   observer/observer-behavior-discovery.js observer/observer-capture-profile-control.js
   observer/observer-capture-profile-reporter.js observer/observer-classification-semantics.js
-  observer/observer-docker-discovery.js observer/observer-durable-spool.js
+  observer/observer-cgroup-mounts.js observer/observer-docker-discovery.js observer/observer-durable-spool.js
   observer/observer-event-dedup.js observer/observer-file-aggregation.js
   observer/observer-filter-rule-publisher.js observer/observer-filter-rules.js
   observer/observer-infrastructure-policy.js observer/observer-infrastructure-roots.js

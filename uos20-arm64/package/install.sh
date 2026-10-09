@@ -380,7 +380,7 @@ verify_package() {
     flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar flink/VERSION
     observer/bin/a3s-observer-collector observer/observer-forward.js
     observer/observer-agent-attribution.js observer/observer-agent-templates.js
-    observer/observer-behavior-discovery.js observer/observer-docker-discovery.js
+    observer/observer-behavior-discovery.js observer/observer-cgroup-mounts.js observer/observer-docker-discovery.js
     observer/observer-event-dedup.js observer/observer-infrastructure-roots.js
     observer/observer-priority-queue.js observer/observer-workload-filter.js
     observer/KERNEL_VERSION_CODE l3/l3-agent.mjs

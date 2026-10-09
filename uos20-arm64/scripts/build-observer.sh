@@ -37,6 +37,7 @@ for module in \
   observer-capture-profile-control.js \
   observer-capture-profile-reporter.js \
   observer-classification-semantics.js \
+  observer-cgroup-mounts.js \
   observer-docker-discovery.js \
   observer-durable-spool.js \
   observer-event-dedup.js \

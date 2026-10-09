@@ -7,9 +7,11 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/anysentry/observer
+RuntimeDirectory=anysentry-filter
 EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=A3S_OBSERVER_JSON=1
 Environment=A3S_OBSERVER_FILES=1
+Environment=ANYSENTRY_FILTER_RULES_FILE=/run/anysentry-filter/filter-rules.json
 Environment=NODE_OPTIONS=--max-old-space-size=1024
 Environment=FORWARD_HTTP_TIMEOUT_MS=20000
 Environment="FORWARD_DROP_PATHS=/sys/,/proc/,/run/,/dev/,/var/lib/anysentry/clickhouse/,/var/lib/anysentry/redis/,/var/log/anysentry/"
