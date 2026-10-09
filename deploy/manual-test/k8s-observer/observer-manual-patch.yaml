@@ -106,6 +106,7 @@ spec:
             - { name: forwarder-scripts, mountPath: /opt/observer-forward.js, subPath: observer-forward.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-tls-agent-cgroups.js, subPath: observer-tls-agent-cgroups.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-workload-filter.js, subPath: observer-workload-filter.js, readOnly: true }
+            - { name: forwarder-scripts, mountPath: /opt/observer-cgroup-mounts.js, subPath: observer-cgroup-mounts.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-docker-discovery.js, subPath: observer-docker-discovery.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-behavior-discovery.js, subPath: observer-behavior-discovery.js, readOnly: true }
             - { name: forwarder-scripts, mountPath: /opt/observer-pipeline-accounting.js, subPath: observer-pipeline-accounting.js, readOnly: true }
