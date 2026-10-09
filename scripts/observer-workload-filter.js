@@ -362,9 +362,11 @@ class WorkloadIdentityCache {
      * share this cache without overwriting the Kubernetes snapshot.
      */
     this.byId = next;
-    // A snapshot change can reclassify or replace a container. Parsed cgroup candidates remain
-    // valid, but the fast cgroup -> identity binding must be rebuilt against the new snapshot.
+    // A snapshot change can reclassify or replace a container, and container ids recycle. Rebuild
+    // the fast cgroup -> identity binding against the new snapshot, and drop memoized per-event
+    // identity candidates so a stale pid-keyed parse cannot outlive the snapshot it came from.
     this.cgroupBindings.clear();
+    this.candidateCache.clear();
     const metrics = [...this.sourceMetrics.values()];
     this.ready = metrics.some((source) => source.ready);
     this.version = metrics.reduce((total, source) => total + source.version, 0);
@@ -382,10 +384,15 @@ class WorkloadIdentityCache {
     const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
       ? observerEvent.process
       : {};
-    const cgroupKey =
+    const rawCgroupKey =
       text(processInfo.cgroupId) ||
       text(processInfo.cgroup_id) ||
       text(processInfo.cgroup);
+    // Legacy collectors report cgroupId 0 (no BPF cgroup id). '0' does not discriminate
+    // workloads: every legacy event would share one cgroup binding and inherit whichever
+    // container identity resolved first, so treat it as absent (the infrastructure policy facts
+    // index applies the same guard).
+    const cgroupKey = rawCgroupKey && rawCgroupKey !== '0' ? rawCgroupKey : '';
     const identityInfo =
       observerEvent?.identity && typeof observerEvent.identity === 'object'
         ? observerEvent.identity
@@ -414,6 +421,9 @@ class WorkloadIdentityCache {
         ? observerEvent.workload
         : {};
     const candidateParts = [
+      // The pid keeps non-discriminating cgroup keys (legacy cgroupId 0, missing identity
+      // fields) from collapsing every event into one shared cache entry.
+      text(processInfo.pid),
       cgroupKey,
       text(identityInfo.session),
       text(identityInfo.agent),
