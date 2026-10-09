@@ -2,6 +2,8 @@
 
 const fs = require('node:fs');
 
+const { resolveCgroup2Root } = require('./observer-cgroup-mounts');
+
 const {
   InfrastructureRuleSet,
   materializeCgroupFilterDecision,
@@ -368,13 +370,16 @@ class InfrastructurePolicyRegistry {
   hostInventory(options = {}) {
     if (!this.ruleSet || this.expiresAt <= this.now()) return [];
     const cgroupRoot = text(options.cgroupRoot, 1_024) || '/sys/fs/cgroup';
+    // systemd unit slice paths live in the unified (cgroup2) hierarchy; on hybrid hosts that
+    // hierarchy is mounted below /sys/fs/cgroup/unified rather than at /sys/fs/cgroup.
+    const unifiedRoot = resolveCgroup2Root('/proc', cgroupRoot);
     const statSync = typeof options.statSync === 'function' ? options.statSync : fs.statSync;
     const facts = [];
     const seen = new Set();
     for (const rule of this.ruleSet.document.rules) {
       if (rule.selector.type !== 'host' || rule.stage === 'disabled') continue;
       const unit = rule.selector.systemdUnit;
-      for (const candidate of [`${cgroupRoot}/system.slice/${unit}`, `${cgroupRoot}/${unit}`]) {
+      for (const candidate of [`${unifiedRoot}/system.slice/${unit}`, `${unifiedRoot}/${unit}`]) {
         try {
           const stat = statSync(candidate, { bigint: true });
           const inode = typeof stat.ino === 'bigint' ? stat.ino : BigInt(stat.ino);
@@ -390,7 +395,7 @@ class InfrastructurePolicyRegistry {
             executable: '',
             physicalWorkloadId: `host:${this.hostGroup}:systemd:${unit}`,
             cgroupId: inode.toString(),
-            cgroupPath: candidate.slice(cgroupRoot.length) || '/',
+            cgroupPath: candidate.slice(unifiedRoot.length) || '/',
           });
           break;
         } catch {}
@@ -402,6 +407,9 @@ class InfrastructurePolicyRegistry {
   resolveCgroupFacts(factsInput, options = {}) {
     if (!factsInput || factsInput.cgroupId || factsInput.type !== 'kubernetes') return factsInput;
     const cgroupRoot = text(options.cgroupRoot, 1_024) || '/sys/fs/cgroup';
+    // kubepods slice paths live in the unified (cgroup2) hierarchy; resolve its real mount point
+    // so hybrid v1+v2 hosts stat the same kernfs inode the collector reports.
+    const unifiedRoot = resolveCgroup2Root('/proc', cgroupRoot);
     const statSync = typeof options.statSync === 'function' ? options.statSync : fs.statSync;
     const podUid = text(factsInput.podUid, 160);
     const containerId = text(factsInput.physicalWorkloadId).split(':').at(-1)?.toLowerCase() || '';
@@ -423,7 +431,7 @@ class InfrastructurePolicyRegistry {
       for (const scope of scopes) {
         const relative = `kubepods.slice/${podSlice}/${scope}`;
         try {
-          const stat = statSync(`${cgroupRoot}/${relative}`, { bigint: true });
+          const stat = statSync(`${unifiedRoot}/${relative}`, { bigint: true });
           const inode = typeof stat.ino === 'bigint' ? stat.ino : BigInt(stat.ino);
           if (inode > 0n) {
             return {

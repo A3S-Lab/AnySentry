@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+
+const { resolveCgroup2Root } = require('./observer-cgroup-mounts');
 const {
   RuntimeSignatureRegistry,
   defaultSignatureDocument,
@@ -134,7 +136,9 @@ function cgroupIdFromCgroup(value) {
     .replace(/^\/+|\/+$/gu, '');
   if (relative === undefined || relative.includes('..')) return undefined;
   try {
-    const stat = fs.statSync(path.join('/sys/fs/cgroup', relative));
+    // Follow the real cgroup2 mount point so hybrid v1+v2 hosts (unified mounted below
+    // /sys/fs/cgroup/unified) resolve the same kernfs inode the collector reports.
+    const stat = fs.statSync(path.join(resolveCgroup2Root('/proc', '/sys/fs/cgroup'), relative));
     return stat.ino > 0 ? String(stat.ino) : undefined;
   } catch {
     return undefined;
@@ -562,7 +566,9 @@ class AgentAttributor {
     if (supplied) return supplied;
     const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
     const cgroupId = text(processInfo.cgroupId) || text(processInfo.cgroup_id);
-    if (!pid || !cgroupId) return '';
+    // Legacy collectors report cgroupId '0' (no BPF cgroup id); '0' must not act as a
+    // same-process discriminator because every legacy event shares it.
+    if (!pid || !cgroupId || cgroupId === '0') return '';
     const hostId = text(processInfo.hostId) || text(processInfo.host_id) || this.hostId;
     const bootId = text(processInfo.bootId) || text(processInfo.boot_id) || this.bootId;
     const cached = this.procs.get(pid, hostId, bootId);
@@ -1244,7 +1250,9 @@ class AgentAttributor {
         (observed.startTime && cached.startTime === observed.startTime) ||
         (!observed.startTime &&
           observed.cgroupId &&
+          observed.cgroupId !== '0' &&
           cached.cgroupId &&
+          cached.cgroupId !== '0' &&
           observed.cgroupId === cached.cgroupId)
       ),
     );

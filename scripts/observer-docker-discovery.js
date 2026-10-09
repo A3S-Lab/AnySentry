@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 const http = require('node:http');
 
+const { resolveCgroup2Root } = require('./observer-cgroup-mounts');
+
 const WORKLOAD_KIND_LABEL = 'anysentry.io/workload-kind';
 const WORKLOAD_ROLE_LABEL = 'anysentry.io/workload-role';
 const OBSERVATION_ROLE_LABEL = 'anysentry.io/observation-role';
@@ -112,7 +114,10 @@ function dockerRuntimeIdentity(inspect, options = {}) {
       .find(Boolean);
     if (!unifiedPath || unifiedPath.includes('..')) return { hostPid, ...network };
     const relative = unifiedPath.replace(/^\/+/, '');
-    const cgroupPath = relative ? `${cgroupRoot}/${relative}` : cgroupRoot;
+    // Hybrid layouts mount the v2 hierarchy below /sys/fs/cgroup/unified; only that hierarchy's
+    // kernfs inodes match the collector's bpf_get_current_cgroup_id keys.
+    const unifiedRoot = resolveCgroup2Root(procRoot, cgroupRoot);
+    const cgroupPath = relative ? `${unifiedRoot}/${relative}` : unifiedRoot;
     const stat = fs.statSync(cgroupPath, { bigint: true });
     const cgroupId = stat.ino > 0n ? stat.ino.toString() : '';
     const statLine = fs.readFileSync(`${procRoot}/${hostPid}/stat`, 'utf8').trim();
