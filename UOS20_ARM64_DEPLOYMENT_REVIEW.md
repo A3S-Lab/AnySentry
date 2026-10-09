@@ -123,7 +123,14 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 部署侧全部干净：docker socket 可读、`/proc` 可读、`/sys/fs/bpf` 已挂载、统一过滤投影正常加载（identity=1/templates=3）、确认评审在 API 侧已生效、collector healthy（8 探针、outputDropped=0）。unknown/候选工作负载只留生命周期事件是策略设计（`droppedEvents` 即丢弃量），不是积压。
 
-修复方向（integration 分支，随 compat15）：discovery 先探测 unified 挂载点再回退 v1 `memory`/`name=systemd` 层级 inode；打包侧显式设置 `ANYSENTRY_FILTER_RULES_FILE`（如 `/run/anysentry-filter/filter-rules.json`，配 RuntimeDirectory）让白名单落地；legacy 后端补 cgroup id=0 的明文准入降级（pid/路径匹配）。验收标准：`cold_start_runtime_ready>0`、白名单文件出现且含 cgroup 条目、向 8000/8001 发请求后事件表出现 `tcp_plaintext` 明文事件。
+修复已于 2026-10-09 完成并合入 compat15（上游修复，打包侧配合）：
+
+- **① discovery 路径**：上游 `71ee8a3` 新增共享 helper `scripts/observer-cgroup-mounts.js`，从 `/proc/mounts` 解析真实 cgroup2 挂载点（hybrid 上 `/sys/fs/cgroup/unified`），修了全部 4 处硬编码点。**刻意不采纳**"回退 v1 inode"：v1 层级 inode 与内核 `bpf_get_current_cgroup_id`（v2 默认层级）不相等，发布 v1 inode 反而准入失配。新文件必须随包分发（打包侧已把 `observer-cgroup-mounts.js` 补入 `build-observer.sh`、`verify-release.sh`、`install.sh` 三处清单——与上游 DaemonSet 逐文件挂载踩的是同一类坑）。
+- **② 白名单文件通道**：打包侧在 `anysentry-observer.service` 增加 `RuntimeDirectory=anysentry-filter` 和 `Environment=ANYSENTRY_FILTER_RULES_FILE=/run/anysentry-filter/filter-rules.json`，`tls-agent-cgroups.json` 随其同目录落地。
+- **③ legacy 明文准入**：上游 Observer `2d86db9` 修复。实际准入链不是按事件 cgroupId 匹配：collector 把白名单 cgroup 经 /proc 扫描解析成 pid 集合，再按 `(bpf_get_current_cgroup_id, pid)` 组装 eBPF 键，事件里的 cgroupId=0 不参与准入。真正断点是 Rust 侧同一个 hybrid 挂载点 bug（`tls_agent_scopes.rs`、`main.rs` 两处）。`bpf_get_current_cgroup_id` 在 4.19 可用且 hybrid 下返回 unified 层级 id，无需额外 pid 降级。含回归测试 `hybrid_unified_mount_resolves_process_cgroup_ids`。
+- **④ 归因污染**：结论为**独立 bug**（非 cgroup 缺失并发症）：`observer-workload-filter.js` 把 `cgroupId='0'` 当可缓存鉴别键，全机 legacy 事件共享 '0' 键先到先绑。同 `71ee8a3` 修复：'0' 视为缺失、candidateCache 键纳入 pid、快照 replace 清空缓存；回归脚本 `verify-workload-filter-legacy-cgroup.mjs`（修复前可精确复现误绑）。
+
+验收标准：`cold_start_runtime_ready>0`、`/run/anysentry-filter/tls-agent-cgroups.json` 出现且含 cgroup 条目、向 8000/8001 发请求后事件表出现明文事件、`office-agent` 审核键只含 `agent:office` 两容器。
 
 ### 现场插曲
 
@@ -131,9 +138,9 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 - 单元名必须写全，少打字母（如 `anysentry-kafka.servic`）报 Unit not found。
 - 停掉 Observer 后页面事件仍短暂增长是正常的：Kafka、Flink 和研判 Worker 在排空已有队列。
 
-### 待并入的上游修正
+### compat15 并入的上游修正
 
-开发分支在 `f4d0fd6` 之后有两个提交待下一版并入：`95d33a8`（策略页只改超时时同步运行时模型快照）和 `ced2110`（LLM 超时上限 600s 提高到 1800s，sanitize、策略边界和页面输入三处对齐）。后者直接缓解慢内网模型上"样例事件通过、真实大事件超时"的风险。
+`95d33a8`（策略页只改超时时同步运行时模型快照）、`ced2110`（LLM 超时上限 600s 提高到 1800s）、`71ee8a3`+`f329b37`（cgroup hybrid 修复与归因污染防护，含 DaemonSet 挂载同步）、Observer `2d86db9`（legacy 明文准入的 cgroup2 挂载点解析）。详见上一节。
 
 ## 最终部署状态
 
