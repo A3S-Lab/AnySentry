@@ -534,16 +534,66 @@ class WorkloadIdentityCache {
 
   confirmedPhysicalWorkloadIds() {
     const ids = new Set();
-    for (const entry of this.byId.values()) {
-      if (text(entry?.classification).toLowerCase() !== 'confirmed_agent') continue;
-      const physicalWorkloadId = text(entry?.physicalWorkloadId);
-      if (physicalWorkloadId) ids.add(physicalWorkloadId);
+    const confirmed = [];
+    const rejected = [];
+    for (const entry of [...this.byId.values(), ...[...this.sources.values()].flat()]) {
+      const classification = text(entry?.classification).toLowerCase();
+      if (classification === 'confirmed_agent') confirmed.push(entry);
+      else if (classification === 'non_agent' && entry?.attributionSource === 'manual_review') {
+        rejected.push(entry);
+      }
     }
-    for (const entry of [...this.sources.values()].flat()) {
-      if (text(entry?.classification).toLowerCase() !== 'confirmed_agent') continue;
+    // Index live discovery entries by their identity keys so a manual review that names
+    // several container instances admits every one of them: review records carry a single
+    // physicalWorkloadId, but one logical Agent may run as many containers (app + skill
+    // sidecar). Keys are physical workload ids, raw container ids, and their hex tails.
+    const livePwidsByKey = new Map();
+    const indexLiveEntry = (entry) => {
+      if (entry?.attributionSource === 'manual_review') return;
       const physicalWorkloadId = text(entry?.physicalWorkloadId);
-      if (physicalWorkloadId) ids.add(physicalWorkloadId);
+      if (!physicalWorkloadId) return;
+      const keys = new Set([physicalWorkloadId]);
+      for (const id of Array.isArray(entry.ids) ? entry.ids : []) keys.add(text(id));
+      for (const key of [...keys]) {
+        const tail = key.split(':').at(-1);
+        if (/^[a-f0-9]{12,64}$/i.test(tail)) keys.add(tail);
+      }
+      for (const key of keys) {
+        if (!key) continue;
+        if (!livePwidsByKey.has(key)) livePwidsByKey.set(key, new Set());
+        livePwidsByKey.get(key).add(physicalWorkloadId);
+      }
+    };
+    for (const entry of [...this.sources.values()].flat()) indexLiveEntry(entry);
+    const lookupLive = (entry) => {
+      const keys = [text(entry?.physicalWorkloadId)];
+      for (const id of Array.isArray(entry?.ids) ? entry.ids : []) keys.push(text(id));
+      const matched = new Set();
+      for (const key of keys) {
+        if (!key) continue;
+        for (const hit of livePwidsByKey.get(key) ?? []) matched.add(hit);
+        const tail = key.split(':').at(-1);
+        for (const hit of livePwidsByKey.get(tail) ?? []) matched.add(hit);
+      }
+      return matched;
+    };
+    // A human non_agent decision wins over any discovery-side confirmation for the same
+    // workloads: a rejected container must not stay on the plaintext whitelist because a
+    // label or template confirmed it first.
+    const rejectedPwids = new Set();
+    for (const entry of rejected) {
+      const physicalWorkloadId = text(entry.physicalWorkloadId);
+      if (physicalWorkloadId) rejectedPwids.add(physicalWorkloadId);
+      for (const pwid of lookupLive(entry)) rejectedPwids.add(pwid);
     }
+    for (const entry of confirmed) {
+      const physicalWorkloadId = text(entry.physicalWorkloadId);
+      if (physicalWorkloadId) ids.add(physicalWorkloadId);
+      if (entry?.attributionSource === 'manual_review') {
+        for (const pwid of lookupLive(entry)) ids.add(pwid);
+      }
+    }
+    for (const pwid of rejectedPwids) ids.delete(pwid);
     return ids;
   }
 

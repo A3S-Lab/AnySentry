@@ -148,4 +148,67 @@ const projectionSnapshot = (entries) => ({
   );
 }
 
+// --- 5. Multi-instance Agent: one review admits every named container --------------------
+// UOS field shape: office-agent is one logical asset with two containers (ai-agent + skill);
+// the review record holds a single physicalWorkloadId but both container identity keys.
+{
+  const cache = newCache();
+  const CONTAINER_B = '8'.repeat(64);
+  const PWID_B = `docker:${HOST_ID}:${CONTAINER_B}`;
+  const multiReview = {
+    ...reviewEntry,
+    ids: [`container:${CONTAINER_ID}`, `container:${CONTAINER_B}`],
+  };
+  assert.equal(cache.replace(projectionSnapshot([multiReview])), true);
+  const liveA = {
+    ids: [CONTAINER_ID, CONTAINER_ID.slice(0, 12)],
+    classification: 'unknown',
+    physicalWorkloadId: PWID,
+    source: 'docker',
+    environment: 'docker',
+    hostId: HOST_ID,
+    bootId: BOOT_ID,
+    containerState: 'running',
+    hostPid: 12345,
+    rootStartTimeTicks: '67890',
+    containerImage: 'registry.local/agent:office',
+  };
+  const liveB = {
+    ...liveA,
+    ids: [CONTAINER_B, CONTAINER_B.slice(0, 12)],
+    physicalWorkloadId: PWID_B,
+    hostPid: 22345,
+  };
+  assert.equal(cache.replace({ ...projectionSnapshot([liveA, liveB]), version: 2 }, 'docker'), true);
+  const confirmed = cache.confirmedPhysicalWorkloadIds();
+  assert.ok(confirmed.has(PWID), 'reviewed physical workload admitted');
+  assert.ok(
+    confirmed.has(PWID_B),
+    'the second container named in the review identity keys must also join the whitelist',
+  );
+}
+
+// --- 6. A non_agent review wins over a label confirmation on the whitelist --------------
+{
+  const cache = newCache();
+  const rejected = { ...reviewEntry, classification: 'non_agent', agentScopeId: undefined };
+  assert.equal(cache.replace(projectionSnapshot([rejected])), true);
+  const liveEntry = {
+    ids: [CONTAINER_ID],
+    classification: 'confirmed_agent',
+    physicalWorkloadId: PWID,
+    source: 'docker',
+    environment: 'docker',
+    hostId: HOST_ID,
+    bootId: BOOT_ID,
+    containerState: 'running',
+    evidence: ['label:anysentry.io/workload-kind=agent'],
+  };
+  assert.equal(cache.replace({ ...projectionSnapshot([liveEntry]), version: 2 }, 'docker'), true);
+  assert.ok(
+    !cache.confirmedPhysicalWorkloadIds().has(PWID),
+    'a human non_agent decision must remove the workload from the whitelist join set',
+  );
+}
+
 console.log('workload filter review precedence verification passed');
