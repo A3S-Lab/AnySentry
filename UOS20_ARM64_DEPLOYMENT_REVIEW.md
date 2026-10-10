@@ -169,7 +169,7 @@ Observer `4a454fa`（HTTP 明文准入与 HTTPS 采集拆开关）：`A3S_OBSERV
 
 JS 侧修复不受此影响，全部真实生效：`cd94d1e`（hybrid discovery）、`c2f18da`（hostId 同源）、`5e53b7b`（审核优先）、`360afde`（多实例白名单）修的都是 observer-forward.js / API 路径。白名单文件内容自 compat19 起正确覆盖两个容器 cgroup，但当前没有消费者。
 
-**compat19 未出包**：合并内容在客户机上与 compat18 行为等价，出包只会让现场白装一轮。打包侧已就位的适配（`anysentry-observer.service` 的 `A3S_OBSERVER_PLAINTEXT_HTTP=1`、versions.env 锁定 360afde/1e76f9c）保留，待上游在 legacy 后端补齐明文采集（kprobe tcp 载荷 + 准入 map + 复用 `tls_agent_scopes` 扫描与 interaction 解析，4.19 约束见交接文档）后一并出包，验收脚本 `check-compat19-acceptance.sh` 届时直接用。若上游决定 UOS 不支持明文，手册明文验收条目需降级为"不支持清单"。
+**compat19 未出包**：合并内容在客户机上与 compat18 行为等价，出包只会让现场白装一轮。现场已拍板明文是必须功能，上游按 `docs/uos-legacy-backend-plaintext-gap-handover-2026-10-10.md` 第 3 节任务书在 legacy 后端补 HTTP 明文采集（kprobe/tracepoint syscall 载荷 + 准入 map + 复用 `tls_agent_scopes` 扫描与 interaction 重组，4.19 约束与防再发措施见该文档）。打包侧已就位的适配（`anysentry-observer.service` 的 `A3S_OBSERVER_PLAINTEXT_HTTP=1`、versions.env 锁定 360afde/1e76f9c）保留；挂接点选型以客户机预检脚本 `check-kernel-preflight.sh` 的结果为准。功能合入后走既定增量流程出包，验收用 `check-compat19-acceptance.sh`。
 
 ## 最终部署状态
 
