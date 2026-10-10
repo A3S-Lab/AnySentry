@@ -8,10 +8,18 @@ require_command docker
 flink_source=$SOURCE_DIR/anysentry/streaming/flink
 m2=$BUILD_DIR/maven-cache
 mkdir -p "$m2"
+# The builder container has no passwd entry for the host uid, so the JVM resolves
+# user.home to "?" and Maven would silently use /src/?/.m2 — a cache that
+# prepare_sources wipes on every build, forcing a full ~200 MB re-download each time
+# and exposing the build to every network hiccup. Pin the local repository to the
+# persistent mounted cache and let wagon retry truncated transfers.
 docker run --rm --user "$(id -u):$(id -g)" \
   -e HOME=/tmp/maven-home \
   -v "$flink_source:/src" -v "$m2:/tmp/maven-home/.m2" \
-  -w /src "$MAVEN_BUILDER_IMAGE" mvn -B package
+  -w /src "$MAVEN_BUILDER_IMAGE" mvn -B \
+  -Dmaven.repo.local=/tmp/maven-home/.m2/repository \
+  -Dmaven.wagon.http.retryHandler.count=5 \
+  package
 job_jar=$flink_source/target/anysentry-flink-streaming.jar
 [[ -f $job_jar ]] || die "Flink job build output is missing: $job_jar"
 
