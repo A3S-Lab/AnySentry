@@ -20,7 +20,7 @@
 > 档位；Codex/Claude 的 TLS 选择按 implementation family/ABI，而不是产品版本字符串。
 > Canonical GET 的 side-lane 读取采用有界 timeout、hot fallback 和 forward-only KernelFact
 > locator。本文的固定版本矩阵仍只描述测试样本，不能外推为所有版本或当前现场的完整被动
-> eBPF 覆盖；实际 r27 部署与未通过项见 `canonical-observability-implementation.md`。
+> eBPF 覆盖。
 
 ## 0. 评审结论
 
@@ -410,5 +410,4 @@ evidence-only fallback 和 KernelFact locator 会把存储超时显式标为 par
 tender_jang LangChain/Claude 的应用调用均可运行，但正式 Observer 在共享节点压力与 mixed-cgroup
 冲突下被保护性暂停，因此本阶段不能把这些应用结果写成稳定的被动 eBPF 全链路通过。LangGraph
 sandbox 的进程事件可独立采集，跨 Pod Tool→Kernel 关系仍按安全规则保留 `semantic_only`/
-`coverage_gap`。完整状态、命令和回滚点见 `docs/canonical-observability-implementation.md`
-及 `docs/local-goal-evidence.md` 的 r51 增补。
+`coverage_gap`。
