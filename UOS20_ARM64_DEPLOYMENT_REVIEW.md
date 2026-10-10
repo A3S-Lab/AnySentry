@@ -74,7 +74,7 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 | compat16 | compat15 的包内 `install.sh` 把 `COMPAT_RELEASE_ID` 硬编码为 compat14 未随包名 bump，安装日志写进上一版目录并覆盖，summary 错标版本 | `install.sh`、`RUN_HEALTH_SMOKE.sh` 和随包文档统一改用 `@RELEASE_VERSION@` 占位符，`assemble-release.sh` 在生成 manifest 前注入 `build.sh --version` 的值并断言无残留。版本命名从此单一来源，不存在"忘了 bump" |
 | compat17 | compat16 给 install.sh 加的运行时占位符守卫，被 assemble 的全局注入连守卫自身的比较串一起改写，变成"等于本版就拒绝"，安装器自我拒绝（现场报错 `unresolved 0.4.0-compat16 placeholder`）。教训：打包侧不做运行时自校验这类过度防御 | 撤掉守卫，install.sh 只剩 `COMPAT_RELEASE_ID=@RELEASE_VERSION@`；正确性由构建期断言（注入后无残留）和合同测试（注入后的副本必须能跑 `--help`）保证。compat16 交付物作废 |
 | compat18 | compat17 现场：人工审核后投影出现 confirmed，但白名单 `tls-agent-cgroups.json` 仍 `entries=[]`——`*agent:office*` 模板重分类把 `manual_review` 的 confirmed_agent 踩回 probable_agent，审核开通明文的路径从未走通过 | 上游 `5e53b7b`：replace() 对 manual_review 条目跳过模板重分类、runtime 快照把审核决定 join 到活体容器条目、投影新增 `reviewVersion`/`reviewedEntries` 字段 |
-| compat19 | compat18 现场：白名单出现 ai-agent cgroup（24429）但探针仍无明文，且 skill 容器 cgroup（24440）未进白名单。两个独立缺口：① Observer 把白名单加载器、named-agent 扫描和 VERIFIED_AGENT_PROCESSES 同步全部套在 `A3S_OBSERVER_SSL` 开关里，纯 HTTP 主机不设该开关则准入链从不运行；② 白名单 join 只按审核记录的单值 `physicalWorkloadId` 全等匹配，一个逻辑 Agent 多容器实例只覆盖一个 | 上游 Observer `4a454fa` 拆分开关：新增 `A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链，`A3S_OBSERVER_SSL` 只管 libssl uprobe 挂接，SSL 开启时隐含准入（存量行为不变）；上游 AnySentry `360afde` 把审核条目按身份键 join 到活体发现条目，一次审核覆盖全部容器实例，人工 non_agent 反向移出白名单。打包侧在 observer 单元加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1`（不开 SSL） |
+| compat19 | compat18 现场：白名单出现 ai-agent cgroup（24429）但探针仍无明文，且 skill 容器 cgroup（24440）未进白名单。打包核验后定案：**随包 collector 是 legacy-kernel-4-19 构建，`main()` 被 `legacy::run()` 整体替换，明文准入/解析/挂接代码全部不在二进制内**——tcp_plaintext/tls_uprobe 在 UOS 4.19 是功能缺口，与开关、审核、白名单均无关 | 上游 Observer `4a454fa` 拆分开关（新增 `A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链、SSL 只管挂接）与 AnySentry `360afde` 多实例白名单均已合并，JS 侧修复真实生效，但 Rust 侧修正只影响非 legacy 路径。打包侧单元已加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1` 备用。**compat19 未出包**（行为与 compat18 等价），待上游在 legacy 后端补齐明文采集后一并交付；证据链见下文 compat19 专节 |
 
 控制面页面的密钥是 `ANYSENTRY_ADMIN_TOKEN`，从 `/etc/anysentry/anysentry.env` 读取后粘贴到页面钥匙图标。`ANYSENTRY_INGEST_TOKEN` 和模型厂商的 API Key 不是这个字段。
 
@@ -161,15 +161,15 @@ compat16 现场验收在上一节 4 条基础上增加：collector 健康 JSON �
 
 compat18 现场验收：compat17 的 5 条基础上，第 5 条改为直接断言投影 `reviewVersion>=1`（新字段）；另加：白名单 `tls-agent-cgroups.json` 出现 cgroupId 条目（客户现场实测为 24429/24440 两个 inode），探针流量 30s 内 ClickHouse 出现 `tcp_plaintext` 事件。
 
-### compat19 并入的上游修正
+### compat19 并入的上游修正与明文定案（重要）
 
-Observer `4a454fa`（HTTP 明文准入与 HTTPS 采集拆开关）：compat18 及以前，`A3S_OBSERVER_SSL` 同时管两件事——libssl uprobe 挂接（HTTPS）和白名单→`VERIFIED_AGENT_PROCESSES`→`tcp_plaintext` 准入链（HTTP 也依赖它）。纯 HTTP 主机不设 SSL，准入链从不运行，白名单文件发布了也没人读。拆分后：`A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链，`A3S_OBSERVER_SSL` 只管 uprobe 挂接；SSL 开启时隐含准入，存量部署行为不变；四象限行为由 `plaintext_admission_switch_quadrants` 测试钉死。打包侧在 `anysentry-observer.service` 加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1`（不设 SSL，客户机入向是纯 HTTP）。
+Observer `4a454fa`（HTTP 明文准入与 HTTPS 采集拆开关）：`A3S_OBSERVER_SSL` 此前同时管 libssl uprobe 挂接和白名单→`VERIFIED_AGENT_PROCESSES`→`tcp_plaintext` 准入链；拆分后新增 `A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链，SSL 只管挂接，SSL 开启时隐含准入（存量行为不变）。AnySentry `360afde`（多实例白名单）：`confirmedPhysicalWorkloadIds()` 按活体发现条目的身份键建索引，一次人工审核覆盖 office-agent 的全部容器实例（ai-agent/skill），人工 `non_agent` 反向移出。同批并入 `624fcef`（rustfmt，无语义）、`9dcd9c6`（CI 门禁与 sticky-poison fixture，Rust 测试首次全量通过）。
 
-AnySentry `360afde`（多实例白名单）：`confirmedPhysicalWorkloadIds()` 此前只收审核记录上的单值 `physicalWorkloadId`，office-agent 一个逻辑资产两个容器（ai-agent/skill）只进了一个 cgroup。现在按活体发现条目的身份键（physicalWorkloadId、容器 ID 全长与 hex 尾段）建索引，一次人工审核把所有命名容器都纳入白名单；人工 `non_agent` 反向把容器移出白名单集合。回归用例已并入 `verify-workload-filter-review-precedence.mjs`。
+**但打包核验时发现定案级事实：以上 Rust 侧修正对 UOS 包二进制无运行时影响。** 随包 collector 以 `--features legacy-kernel-4-19` 构建，该 feature 整体替换 `main()` 为 `legacy::run()`（`legacy.rs`，465 行）——只有 exec/exit/connect 元数据/文件/安全六类事件；白名单读取器、准入同步、`tcp_plaintext` 解析、TLS 挂接、两个开关的读取点全部在非 legacy `main()` 里被 cfg 编译排除。`probes-legacy.o` 符号表实测：8 个 kprobe + 6 个事件 map，无 `VERIFIED_AGENT_PROCESSES`、无载荷采集程序。二进制字节级搜索 `A3S_OBSERVER_SSL`/`tls-agent-cgroups.json`/`libssl` 均为 0 命中。**因此 tcp_plaintext/tls_uprobe 在 UOS 4.19 legacy 后端是功能缺口，不是开关、审核或白名单配置问题**；compat18 现场"白名单有条目但无明文"的真正原因是读取方不存在。完整证据链见 `docs/uos-legacy-backend-plaintext-gap-handover-2026-10-10.md`（开发检出 docs/ 下）。
 
-同批并入：Observer `624fcef`（rustfmt 格式化，无语义变化）、`9dcd9c6`（CI 门禁修复；`classic_sticky_request_parse_error` 测试 fixture 此前从未跑绿，NUL 从 method token 移到 header 行，Rust 测试首次全量通过）。
+JS 侧修复不受此影响，全部真实生效：`cd94d1e`（hybrid discovery）、`c2f18da`（hostId 同源）、`5e53b7b`（审核优先）、`360afde`（多实例白名单）修的都是 observer-forward.js / API 路径。白名单文件内容自 compat19 起正确覆盖两个容器 cgroup，但当前没有消费者。
 
-compat19 现场验收：沿用 compat18 全部条目，明文条目强化为——不开 `A3S_OBSERVER_SSL`、仅靠单元内置的 `A3S_OBSERVER_PLAINTEXT_HTTP=1`，白名单 `tls-agent-cgroups.json` 同时出现 ai-agent 与 skill 两个 cgroup（24429/24440），向 8000 **和** 8001 发探针后 30s 内 ClickHouse 出现 `tcp_plaintext` 事件；collector 日志出现 `reconciled product-neutral TLS Agent cgroup scopes`（HTTP-only 模式下该日志同样会打）。升级后若在投影里看不到 confirmed（两套审核存储无桥接的遗留问题），用管理令牌重新审核一次即可。
+**compat19 未出包**：合并内容在客户机上与 compat18 行为等价，出包只会让现场白装一轮。打包侧已就位的适配（`anysentry-observer.service` 的 `A3S_OBSERVER_PLAINTEXT_HTTP=1`、versions.env 锁定 360afde/1e76f9c）保留，待上游在 legacy 后端补齐明文采集（kprobe tcp 载荷 + 准入 map + 复用 `tls_agent_scopes` 扫描与 interaction 解析，4.19 约束见交接文档）后一并出包，验收脚本 `check-compat19-acceptance.sh` 届时直接用。若上游决定 UOS 不支持明文，手册明文验收条目需降级为"不支持清单"。
 
 ## 最终部署状态
 
