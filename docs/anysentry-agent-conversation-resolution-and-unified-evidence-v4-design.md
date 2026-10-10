@@ -12,8 +12,7 @@
 
 > **当前现场说明**：本文件第 24–25 节保留 2026-09-01 的历史验收记录；它们不是本次
 > r27 本地部署的替代证据。当前仍有 Observer WAL 保护性暂停、LangGraph/Dify 跨 lane
-> EvidenceLink 和部分 SSH Rustls/WebSocket 正文覆盖缺口，最新事实以
-> `canonical-observability-implementation.md` 的 2026-09-05 附录为准。
+> EvidenceLink 和部分 SSH Rustls/WebSocket 正文覆盖缺口。
 >
 > 前置设计：[Agent 生命周期、会话归因与对话追踪 V3](./anysentry-agent-lifecycle-conversation-attribution-and-tracking-v3-design.md)
 

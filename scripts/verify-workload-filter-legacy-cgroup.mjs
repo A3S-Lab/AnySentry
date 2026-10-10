@@ -22,7 +22,7 @@ function snapshot(version) {
     version,
     entries: [
       { ids: [idA], classification: 'confirmed_agent', physicalWorkloadId: `docker:local:${idA}`, agentScopeId: 'office-agent' },
-      { ids: [idB], classification: 'confirmed_agent', physicalWorkloadId: `docker:local:${idB}`, agentScopeId: 'gdss-main' },
+      { ids: [idB], classification: 'confirmed_agent', physicalWorkloadId: `docker:local:${idB}`, agentScopeId: 'payments-agent' },
     ],
   };
 }
@@ -46,17 +46,17 @@ assert.equal(firstA.attribution.agentScopeId, 'office-agent', 'pid 101 belongs t
 // Pre-fix this returned office-agent: the shared '0' cgroup binding from pid 101 was reused.
 const firstB = cache.classify(eventFor(202));
 assert.equal(firstB.state, 'agent');
-assert.equal(firstB.attribution.agentScopeId, 'gdss-main', 'pid 202 belongs to container B, not the first-bound container');
+assert.equal(firstB.attribution.agentScopeId, 'payments-agent', 'pid 202 belongs to container B, not the first-bound container');
 
 // Cache hits for the same pids stay stable.
 assert.equal(cache.classify(eventFor(101)).attribution.agentScopeId, 'office-agent');
-assert.equal(cache.classify(eventFor(202)).attribution.agentScopeId, 'gdss-main');
+assert.equal(cache.classify(eventFor(202)).attribution.agentScopeId, 'payments-agent');
 
 // A snapshot replace must drop pid-keyed candidates too: container ids recycle.
 pidCgroups.set(101, `0::/docker/${idB}`);
 assert.equal(cache.replace(snapshot(2), 'docker'), true);
 const rebound = cache.classify(eventFor(101));
-assert.equal(rebound.attribution.agentScopeId, 'gdss-main', 'snapshot replace invalidates pid-keyed identity candidates');
+assert.equal(rebound.attribution.agentScopeId, 'payments-agent', 'snapshot replace invalidates pid-keyed identity candidates');
 
 // A real cgroup id without container evidence returns no classification and writes no binding.
 const modern = new WorkloadIdentityCache({ readProcCgroup: () => '' });

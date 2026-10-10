@@ -341,9 +341,6 @@ skills/l3/                   L3 investigation prompts
 ## Documentation
 
 - [Deployment runbook](deploy/README.md)
-- [通用智能体全链路可观测架构 v2](docs/anysentry-agent-observability-architecture-v2.md)
-- [Canonical Observability 本地实现与验收](docs/canonical-observability-implementation.md)
-- [多智能体开发工程师执行提示词](docs/anysentry-multiagent-refactor-execution-prompt.md)
 - [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
 - [Agent–LLM and external-tool plaintext observability PRD](docs/anysentry-agent-llm-interaction-observability-prd.md)
 - [Agent–LLM and external-tool plaintext observability technical design](docs/anysentry-agent-llm-interaction-observability-technical-design.md)

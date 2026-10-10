@@ -8,7 +8,7 @@
 >
 > 代码快照：AnySentry `b08e1e5`（分支 `goal/canonical-observability-20260903`，工作树含他人未提交改动）；Observer `e4128b6`（同名分支，工作树含他人未提交改动）。本文不把工作树当作干净发布版本。
 >
-> 上位合同：[总体架构 v2](./anysentry-agent-observability-architecture-v2.md)、[LLM 观测技术设计](./anysentry-agent-llm-interaction-observability-technical-design.md)、[会话归因与统一证据 V4](./anysentry-agent-conversation-resolution-and-unified-evidence-v4-design.md)、[多智能体执行提示词](./anysentry-multiagent-refactor-execution-prompt.md)。本文只在这些合同之下补 Codex/Claude 的具体落点，不重新定义 LogicalAgent、Session、ToolCall、Coverage 语义。
+> 上位合同：[LLM 观测技术设计](./anysentry-agent-llm-interaction-observability-technical-design.md)、[会话归因与统一证据 V4](./anysentry-agent-conversation-resolution-and-unified-evidence-v4-design.md)。本文只在这些合同之下补 Codex/Claude 的具体落点，不重新定义 LogicalAgent、Session、ToolCall、Coverage 语义。
 
 本文使用四种标记：**已确认事实**（当前源码、命令输出、API 响应、二进制检查）、**目标设计**（合同要求或本文提议）、**推断**（有证据支持但未生产验证）、**未验证**。
 
