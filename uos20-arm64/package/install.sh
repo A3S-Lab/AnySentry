@@ -11,7 +11,7 @@ STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
 LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
 SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
-COMPAT_RELEASE_ID=0.4.0-compat14
+COMPAT_RELEASE_ID=@RELEASE_VERSION@
 INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
 INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
 TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
@@ -802,6 +802,8 @@ main() {
     esac
     shift
   done
+  [[ $COMPAT_RELEASE_ID != '@RELEASE_VERSION@' ]] ||
+    fail 'install.sh carries an unresolved @RELEASE_VERSION@ placeholder; run the copy from an assembled release tarball'
   initialize_install_logging
   trap cleanup EXIT
   set_stage preflight

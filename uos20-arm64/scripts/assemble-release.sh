@@ -64,6 +64,17 @@ source "$BUILD_DIR/source-provenance.env"
   printf 'SOURCE_DATE_EPOCH=%s\nBUILT_AT_UTC=%s\n' "$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$STAGE_DIR/PROVENANCE"
 
+# Inject the release version wherever a staged file carries the @RELEASE_VERSION@
+# placeholder (installer diagnostics id, smoke script, shipped guides). Version naming
+# is single-sourced from build.sh --version: a forgotten hardcoded string can no
+# longer mislabel an assembled release (compat15 shipped a compat14-labelled installer).
+while IFS= read -r -d '' staged_file; do
+  sed -i "s|@RELEASE_VERSION@|$RELEASE_VERSION|g" "$staged_file"
+done < <(grep -rlZ '@RELEASE_VERSION@' "$STAGE_DIR")
+if grep -rq '@RELEASE_VERSION@' "$STAGE_DIR"; then
+  die "unresolved @RELEASE_VERSION@ placeholder remains in $STAGE_DIR"
+fi
+
 (cd "$STAGE_DIR" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > manifest.sha256 && sha256sum --check --quiet manifest.sha256)
 "$CHANNEL_DIR/scripts/verify-release.sh" "$STAGE_DIR"
 

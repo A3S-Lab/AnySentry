@@ -49,7 +49,10 @@ grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder 
 grep -Fq 'errorCount' "$VERIFY" || fail "verifier does not inspect forwarder errors"
 grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normalize duplicate environment keys"
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
-grep -Fq '0.4.0-compat14' "$INSTALLER" || fail "installer does not define the compat1 diagnostic directory"
+grep -Fq 'COMPAT_RELEASE_ID=@RELEASE_VERSION@' "$INSTALLER" ||
+  fail "installer release id must come from the assemble-time @RELEASE_VERSION@ injection"
+grep -Fq '@RELEASE_VERSION@' "$ROOT/uos20-arm64/scripts/assemble-release.sh" ||
+  fail "assemble script does not inject the release version into staged files"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
