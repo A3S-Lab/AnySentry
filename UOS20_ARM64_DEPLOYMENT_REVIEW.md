@@ -151,6 +151,14 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 compat16 现场验收在上一节 4 条基础上增加：collector 健康 JSON 中 `runtimeSnapshotPosts>0` 且 `runtimeSnapshotErrors=0`、`runtimeSnapshotRejected=0`，control 车道无 `control_runtime_snapshot_failed`（即 verify-activation 不再因此回滚）；office-agent 的 confirmed 身份应经审核键自动续绑。
 
+### compat18 并入的上游修正
+
+`5e53b7b`（人工审核身份优先级）：① `WorkloadIdentityCache.replace()` 对 `manual_review` 条目跳过模板重分类——此前 `*agent:office*` 模板把人工确认的 `confirmed_agent` 降级回 `probable_agent`，`confirmedPhysicalWorkloadIds()` 为空，明文白名单永远 `entries=[]`，审核开通明文的路径从 compat14 起就没通过；② runtime 快照把审核决定 join 到活体容器条目（审核条目自身不带 containerState 等活体事实），人工 `non_agent` 会把容器从 runtime 清单排除（设计意图）；③ `/security-center/identity/snapshot` 新增 `reviewVersion`/`reviewedEntries` 显式字段，现场可直接断言 `reviewVersion>=1`，不用再拆 version 求和。回归脚本 `verify-workload-filter-review-precedence.mjs`（修复前必败）。
+
+次生问题自查结论（开发反问"安装器是否重置数据卷"）：**不重置**。`install.sh` 对 `/var/lib/anysentry` 只有 `mkdir -p`；无 DROP/TRUNCATE；回滚只恢复 `/opt` 程序和 env，不动数据目录；ClickHouse `config` 表是 `CREATE TABLE IF NOT EXISTS` + ReplacingMergeTree；`agentMetadata.reviewVersion` 初始化时从持久化记录重算（agent-metadata.service.ts:245），不是易失计数器。所以 10-09 审核记录在 compat15 失败+回滚+compat17 重装期间并未被安装器清除，记录丢失的原因仍在两套审核存储无桥接（AgentMetadataService vs ObservedAssetReviewService），留上游继续查；现场 workaround 是升级后重新审核一次（compat17 现场已重做）。
+
+compat18 现场验收：compat17 的 5 条基础上，第 5 条改为直接断言投影 `reviewVersion>=1`（新字段）；另加：白名单 `tls-agent-cgroups.json` 出现 cgroupId 条目（客户现场实测为 24429/24440 两个 inode），探针流量 30s 内 ClickHouse 出现 `tcp_plaintext` 事件。
+
 ## 最终部署状态
 
 ClickHouse、AnySentry API/页面和 Observer 均为 active。API 使用 ClickHouse 存储，受保护 Observer Source 为 active，事件持续接收，拒绝数为 0；collector 状态 healthy，队列、outputDropped 和 errorCount 均为 0。新版本同时内置 Redis 及 L1/L2、L3 异步判定 Worker。L1 默认启用；L2、L3 需配置兼容 LLM 后显式重启 API 和判定 Worker。
