@@ -50,7 +50,7 @@ Redis 的实际 `MADV_FREE + fork()` 脏页自检证明该 UOS 4.19 ARM64 内核
 
 采集统计中 FileAccess 约占 99.7%，主要来自 Observer 对 ClickHouse 数据和日志目录的自观测。systemd 现默认过滤 `/var/lib/anysentry/clickhouse/` 与 `/var/log/anysentry/`，同时保留 `/home`、`/etc` 和工作区安全事件。
 
-## compat7 至 compat14 现场要点
+## compat7 至 compat16 现场要点
 
 目标机是 systemd 宿主，不是 k3s。机器上已有 Docker，`docker-proxy` 占用了 `9000`、`8000`、`8001`、`7998`、`7999`、`17862`、`8080`。AnySentry 不得再监听 `9000` 和 `8000`。发布包标识是 `0.4.0-compatN`；TypeScript 侧 `@a3s-lab/sentry` 保持 `0.3.0`，`@a3s-lab/code` 保持 `8.6.0`。改 compat 号时不要改这两个 npm 版本。
 
@@ -70,6 +70,8 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 | compat12 | Collector 一直 `degraded`：过滤规则和基础设施策略返回 401；首个心跳把进程生命周期内的 `droppedEvents` 算进窗口。60 秒等不到恢复 | Observer 使用环境文件里已有的 `ANYSENTRY_ADMIN_TOKEN` 作为管理令牌。Collector 健康等待改为 180 秒。安装程序会生成并保留令牌，目标机上不要先手工导出 |
 | compat13 | 见上一节的记忆目录只读 | 记忆目录改到 `/var/lib/anysentry` |
 | compat14 | 业务容器 `ai-agent` 镜像 `agent:office`，没有 `anysentry.io/*` 标签 | 增加与 `*langchain*`、`*langgraph*` 同级的镜像模板 |
+| compat15 | hybrid 修复补全容器运行时身份后，模板命中的容器以 `hostId='local'`（`docker:local:<id>`）进入 runtime 快照，与租约的 machine-id 不一致，API foreignRoot 校验 21 次全拒（`identity_conflict`），verify-activation 超时回滚。compat14 没踩到纯属旧 hybrid bug 让容器条目缺 `rootStartTimeTicks` 被跳过；k3s 注入 NODE_NAME 也不触发 | 上游 `c2f18da`：DockerDiscovery 构造改为 `hostId: attributor.hostId`，Docker 身份与采集器租约同源。预期变化：`physicalWorkloadId` 变为 `docker:<machine-id>:<id>`，产生新资产记录；confirmed 身份经 `container:<容器id>` 审核键自动续绑，不需要现场重新确认。回归脚本 `verify-docker-hostid-consistency.mjs` |
+| compat16 | compat15 的包内 `install.sh` 把 `COMPAT_RELEASE_ID` 硬编码为 compat14 未随包名 bump，安装日志写进上一版目录并覆盖，summary 错标版本 | `install.sh`、`RUN_HEALTH_SMOKE.sh` 和随包文档统一改用 `@RELEASE_VERSION@` 占位符，`assemble-release.sh` 在生成 manifest 前注入 `build.sh --version` 的值并断言无残留；占位符未注入时 `install.sh` 拒绝运行。版本命名从此单一来源，不存在"忘了 bump" |
 
 控制面页面的密钥是 `ANYSENTRY_ADMIN_TOKEN`，从 `/etc/anysentry/anysentry.env` 读取后粘贴到页面钥匙图标。`ANYSENTRY_INGEST_TOKEN` 和模型厂商的 API Key 不是这个字段。
 
@@ -141,6 +143,12 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 ### compat15 并入的上游修正
 
 `95d33a8`（策略页只改超时时同步运行时模型快照）、`ced2110`（LLM 超时上限 600s 提高到 1800s）、`71ee8a3`+`f329b37`（cgroup hybrid 修复与归因污染防护，含 DaemonSet 挂载同步）、Observer `2d86db9`（legacy 明文准入的 cgroup2 挂载点解析）。详见上一节。
+
+### compat16 并入的上游修正
+
+`c2f18da`（Docker 工作负载身份与采集器租约同源，修 compat15 现场安装回滚）、`72409eb`+`ee99ab9`（文档与清单卫生，无功能变化）。注意上游分支在 compat15 锁定后做过变基：`71ee8a3`→`cd94d1e`、`f329b37`→`f890e69`，内容等价，仅回归脚本里的真实容器名改为泛化名；integration 合并时对该回归脚本按上游新版解决 add/add 冲突，其余运行时文件与上游树逐字节一致（`git diff HEAD c2f18da -- scripts/ apps/` 只剩打包侧既有适配）。
+
+compat16 现场验收在上一节 4 条基础上增加：collector 健康 JSON 中 `runtimeSnapshotPosts>0` 且 `runtimeSnapshotErrors=0`、`runtimeSnapshotRejected=0`，control 车道无 `control_runtime_snapshot_failed`（即 verify-activation 不再因此回滚）；office-agent 的 confirmed 身份应经审核键自动续绑。
 
 ## 最终部署状态
 
