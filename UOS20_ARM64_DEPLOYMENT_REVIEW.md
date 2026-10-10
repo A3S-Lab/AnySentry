@@ -73,6 +73,8 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 | compat15 | hybrid 修复补全容器运行时身份后，模板命中的容器以 `hostId='local'`（`docker:local:<id>`）进入 runtime 快照，与租约的 machine-id 不一致，API foreignRoot 校验 21 次全拒（`identity_conflict`），verify-activation 超时回滚。compat14 没踩到纯属旧 hybrid bug 让容器条目缺 `rootStartTimeTicks` 被跳过；k3s 注入 NODE_NAME 也不触发 | 上游 `c2f18da`：DockerDiscovery 构造改为 `hostId: attributor.hostId`，Docker 身份与采集器租约同源。预期变化：`physicalWorkloadId` 变为 `docker:<machine-id>:<id>`，产生新资产记录；confirmed 身份经 `container:<容器id>` 审核键自动续绑，不需要现场重新确认。回归脚本 `verify-docker-hostid-consistency.mjs` |
 | compat16 | compat15 的包内 `install.sh` 把 `COMPAT_RELEASE_ID` 硬编码为 compat14 未随包名 bump，安装日志写进上一版目录并覆盖，summary 错标版本 | `install.sh`、`RUN_HEALTH_SMOKE.sh` 和随包文档统一改用 `@RELEASE_VERSION@` 占位符，`assemble-release.sh` 在生成 manifest 前注入 `build.sh --version` 的值并断言无残留。版本命名从此单一来源，不存在"忘了 bump" |
 | compat17 | compat16 给 install.sh 加的运行时占位符守卫，被 assemble 的全局注入连守卫自身的比较串一起改写，变成"等于本版就拒绝"，安装器自我拒绝（现场报错 `unresolved 0.4.0-compat16 placeholder`）。教训：打包侧不做运行时自校验这类过度防御 | 撤掉守卫，install.sh 只剩 `COMPAT_RELEASE_ID=@RELEASE_VERSION@`；正确性由构建期断言（注入后无残留）和合同测试（注入后的副本必须能跑 `--help`）保证。compat16 交付物作废 |
+| compat18 | compat17 现场：人工审核后投影出现 confirmed，但白名单 `tls-agent-cgroups.json` 仍 `entries=[]`——`*agent:office*` 模板重分类把 `manual_review` 的 confirmed_agent 踩回 probable_agent，审核开通明文的路径从未走通过 | 上游 `5e53b7b`：replace() 对 manual_review 条目跳过模板重分类、runtime 快照把审核决定 join 到活体容器条目、投影新增 `reviewVersion`/`reviewedEntries` 字段 |
+| compat19 | compat18 现场：白名单出现 ai-agent cgroup（24429）但探针仍无明文，且 skill 容器 cgroup（24440）未进白名单。两个独立缺口：① Observer 把白名单加载器、named-agent 扫描和 VERIFIED_AGENT_PROCESSES 同步全部套在 `A3S_OBSERVER_SSL` 开关里，纯 HTTP 主机不设该开关则准入链从不运行；② 白名单 join 只按审核记录的单值 `physicalWorkloadId` 全等匹配，一个逻辑 Agent 多容器实例只覆盖一个 | 上游 Observer `4a454fa` 拆分开关：新增 `A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链，`A3S_OBSERVER_SSL` 只管 libssl uprobe 挂接，SSL 开启时隐含准入（存量行为不变）；上游 AnySentry `360afde` 把审核条目按身份键 join 到活体发现条目，一次审核覆盖全部容器实例，人工 non_agent 反向移出白名单。打包侧在 observer 单元加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1`（不开 SSL） |
 
 控制面页面的密钥是 `ANYSENTRY_ADMIN_TOKEN`，从 `/etc/anysentry/anysentry.env` 读取后粘贴到页面钥匙图标。`ANYSENTRY_INGEST_TOKEN` 和模型厂商的 API Key 不是这个字段。
 
@@ -158,6 +160,16 @@ compat16 现场验收在上一节 4 条基础上增加：collector 健康 JSON �
 次生问题自查结论（开发反问"安装器是否重置数据卷"）：**不重置**。`install.sh` 对 `/var/lib/anysentry` 只有 `mkdir -p`；无 DROP/TRUNCATE；回滚只恢复 `/opt` 程序和 env，不动数据目录；ClickHouse `config` 表是 `CREATE TABLE IF NOT EXISTS` + ReplacingMergeTree；`agentMetadata.reviewVersion` 初始化时从持久化记录重算（agent-metadata.service.ts:245），不是易失计数器。所以 10-09 审核记录在 compat15 失败+回滚+compat17 重装期间并未被安装器清除，记录丢失的原因仍在两套审核存储无桥接（AgentMetadataService vs ObservedAssetReviewService），留上游继续查；现场 workaround 是升级后重新审核一次（compat17 现场已重做）。
 
 compat18 现场验收：compat17 的 5 条基础上，第 5 条改为直接断言投影 `reviewVersion>=1`（新字段）；另加：白名单 `tls-agent-cgroups.json` 出现 cgroupId 条目（客户现场实测为 24429/24440 两个 inode），探针流量 30s 内 ClickHouse 出现 `tcp_plaintext` 事件。
+
+### compat19 并入的上游修正
+
+Observer `4a454fa`（HTTP 明文准入与 HTTPS 采集拆开关）：compat18 及以前，`A3S_OBSERVER_SSL` 同时管两件事——libssl uprobe 挂接（HTTPS）和白名单→`VERIFIED_AGENT_PROCESSES`→`tcp_plaintext` 准入链（HTTP 也依赖它）。纯 HTTP 主机不设 SSL，准入链从不运行，白名单文件发布了也没人读。拆分后：`A3S_OBSERVER_PLAINTEXT_HTTP` 管准入链，`A3S_OBSERVER_SSL` 只管 uprobe 挂接；SSL 开启时隐含准入，存量部署行为不变；四象限行为由 `plaintext_admission_switch_quadrants` 测试钉死。打包侧在 `anysentry-observer.service` 加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1`（不设 SSL，客户机入向是纯 HTTP）。
+
+AnySentry `360afde`（多实例白名单）：`confirmedPhysicalWorkloadIds()` 此前只收审核记录上的单值 `physicalWorkloadId`，office-agent 一个逻辑资产两个容器（ai-agent/skill）只进了一个 cgroup。现在按活体发现条目的身份键（physicalWorkloadId、容器 ID 全长与 hex 尾段）建索引，一次人工审核把所有命名容器都纳入白名单；人工 `non_agent` 反向把容器移出白名单集合。回归用例已并入 `verify-workload-filter-review-precedence.mjs`。
+
+同批并入：Observer `624fcef`（rustfmt 格式化，无语义变化）、`9dcd9c6`（CI 门禁修复；`classic_sticky_request_parse_error` 测试 fixture 此前从未跑绿，NUL 从 method token 移到 header 行，Rust 测试首次全量通过）。
+
+compat19 现场验收：沿用 compat18 全部条目，明文条目强化为——不开 `A3S_OBSERVER_SSL`、仅靠单元内置的 `A3S_OBSERVER_PLAINTEXT_HTTP=1`，白名单 `tls-agent-cgroups.json` 同时出现 ai-agent 与 skill 两个 cgroup（24429/24440），向 8000 **和** 8001 发探针后 30s 内 ClickHouse 出现 `tcp_plaintext` 事件；collector 日志出现 `reconciled product-neutral TLS Agent cgroup scopes`（HTTP-only 模式下该日志同样会打）。升级后若在投影里看不到 confirmed（两套审核存储无桥接的遗留问题），用管理令牌重新审核一次即可。
 
 ## 最终部署状态
 
