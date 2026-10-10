@@ -802,8 +802,6 @@ main() {
     esac
     shift
   done
-  [[ $COMPAT_RELEASE_ID != '@RELEASE_VERSION@' ]] ||
-    fail 'install.sh carries an unresolved @RELEASE_VERSION@ placeholder; run the copy from an assembled release tarball'
   initialize_install_logging
   trap cleanup EXIT
   set_stage preflight

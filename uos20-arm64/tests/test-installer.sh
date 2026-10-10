@@ -84,6 +84,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/package/config" "$tmp/package/payload"
 cp "$INSTALLER" "$tmp/package/install.sh"
+
+# An assembled copy must stay runnable: compat16's blanket injection rewrote the
+# installer's own placeholder guard and the shipped script rejected itself.
+sed 's|@RELEASE_VERSION@|0.4.0-test|g' "$INSTALLER" > "$tmp/package/install-injected.sh"
+bash "$tmp/package/install-injected.sh" --help >/dev/null ||
+  fail "assembled installer copy rejects --help after release-id injection"
 printf '%s\n' 'EXISTING=value' > "$tmp/existing.env"
 printf '%s\n' 'EXISTING=default' 'NEW_KEY=new-default' > "$tmp/template.env"
 

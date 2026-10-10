@@ -71,7 +71,8 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 | compat13 | 见上一节的记忆目录只读 | 记忆目录改到 `/var/lib/anysentry` |
 | compat14 | 业务容器 `ai-agent` 镜像 `agent:office`，没有 `anysentry.io/*` 标签 | 增加与 `*langchain*`、`*langgraph*` 同级的镜像模板 |
 | compat15 | hybrid 修复补全容器运行时身份后，模板命中的容器以 `hostId='local'`（`docker:local:<id>`）进入 runtime 快照，与租约的 machine-id 不一致，API foreignRoot 校验 21 次全拒（`identity_conflict`），verify-activation 超时回滚。compat14 没踩到纯属旧 hybrid bug 让容器条目缺 `rootStartTimeTicks` 被跳过；k3s 注入 NODE_NAME 也不触发 | 上游 `c2f18da`：DockerDiscovery 构造改为 `hostId: attributor.hostId`，Docker 身份与采集器租约同源。预期变化：`physicalWorkloadId` 变为 `docker:<machine-id>:<id>`，产生新资产记录；confirmed 身份经 `container:<容器id>` 审核键自动续绑，不需要现场重新确认。回归脚本 `verify-docker-hostid-consistency.mjs` |
-| compat16 | compat15 的包内 `install.sh` 把 `COMPAT_RELEASE_ID` 硬编码为 compat14 未随包名 bump，安装日志写进上一版目录并覆盖，summary 错标版本 | `install.sh`、`RUN_HEALTH_SMOKE.sh` 和随包文档统一改用 `@RELEASE_VERSION@` 占位符，`assemble-release.sh` 在生成 manifest 前注入 `build.sh --version` 的值并断言无残留；占位符未注入时 `install.sh` 拒绝运行。版本命名从此单一来源，不存在"忘了 bump" |
+| compat16 | compat15 的包内 `install.sh` 把 `COMPAT_RELEASE_ID` 硬编码为 compat14 未随包名 bump，安装日志写进上一版目录并覆盖，summary 错标版本 | `install.sh`、`RUN_HEALTH_SMOKE.sh` 和随包文档统一改用 `@RELEASE_VERSION@` 占位符，`assemble-release.sh` 在生成 manifest 前注入 `build.sh --version` 的值并断言无残留。版本命名从此单一来源，不存在"忘了 bump" |
+| compat17 | compat16 给 install.sh 加的运行时占位符守卫，被 assemble 的全局注入连守卫自身的比较串一起改写，变成"等于本版就拒绝"，安装器自我拒绝（现场报错 `unresolved 0.4.0-compat16 placeholder`）。教训：打包侧不做运行时自校验这类过度防御 | 撤掉守卫，install.sh 只剩 `COMPAT_RELEASE_ID=@RELEASE_VERSION@`；正确性由构建期断言（注入后无残留）和合同测试（注入后的副本必须能跑 `--help`）保证。compat16 交付物作废 |
 
 控制面页面的密钥是 `ANYSENTRY_ADMIN_TOKEN`，从 `/etc/anysentry/anysentry.env` 读取后粘贴到页面钥匙图标。`ANYSENTRY_INGEST_TOKEN` 和模型厂商的 API Key 不是这个字段。
 
