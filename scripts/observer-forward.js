@@ -594,7 +594,12 @@ const workloadCache = new WorkloadIdentityCache({
 });
 const dockerDiscovery = new DockerDiscovery({
   nodeName: NODE_NAME,
-  hostId: process.env.A3S_OBSERVER_HOST_ID || NODE_NAME,
+  // Docker workload identity must share the lease host identity: the runtime-state API rejects
+  // any snapshot entry whose hostId/bootId differs from the registered lease (identity_conflict).
+  // With no env override the attributor falls back to /etc/machine-id, while DockerDiscovery's
+  // own empty fallback is the literal 'local' — under bare systemd deployments that mismatch
+  // made every runtime snapshot unaccepted.
+  hostId: attributor.hostId,
   bootId: attributor.bootId,
 });
 /** TTL for HTTP tool-backend Exec/Exit promotion. Short enough to expire after idle backends, long
