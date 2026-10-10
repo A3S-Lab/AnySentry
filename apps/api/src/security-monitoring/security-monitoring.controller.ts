@@ -14225,6 +14225,8 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return {
       ...platform,
       version: platform.version + this.agentMetadata.identitySnapshotVersion() + this.observerInventory.snapshotVersion(),
+      reviewVersion: this.agentMetadata.identitySnapshotVersion(),
+      reviewedEntries: reviewed.length,
       // Manual decisions are ordered first. WorkloadIdentityCache deliberately keeps the first
       // identity for a key, so a reviewer decision overrides an automatic platform candidate.
       entries: [...reviewed, ...platform.entries, ...reported],

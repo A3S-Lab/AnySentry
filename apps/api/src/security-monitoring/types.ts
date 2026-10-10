@@ -446,6 +446,13 @@ export interface WorkloadIdentitySnapshot {
   nodeName?: string;
   entries: WorkloadIdentitySnapshotEntry[];
   errors: number;
+  /**
+   * Explicit manual-review watermark. `version` is a sum across platform, review, and
+   * observer-pushed sources, which field diagnostics cannot decompose; these counters let an
+   * installer tell "no active human review survived restart" apart from "snapshot not fed".
+   */
+  reviewVersion?: number;
+  reviewedEntries?: number;
 }
 
 export type AgentLaunchOriginType =

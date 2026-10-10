@@ -301,7 +301,13 @@ class WorkloadIdentityCache {
     const sourceEntries = [];
     for (const entry of snapshot.entries) {
       if (!entry || !Array.isArray(entry.ids) || !text(entry.classification)) continue;
-      const template = this.templateRegistry?.classifyEntry(entry);
+      // Manual review is the highest-precedence identity signal: a pattern-matched template
+      // must never reclassify it. The byId sort below only decides ownership ordering — it
+      // runs after this override and cannot restore a stomped classification, so a probable
+      // template would silently strip confirmed_agent from the TLS whitelist join.
+      const template = entry.attributionSource === 'manual_review'
+        ? undefined
+        : this.templateRegistry?.classifyEntry(entry);
       const nextEntry = template
         ? {
             ...entry,
@@ -546,13 +552,53 @@ class WorkloadIdentityCache {
     const observedAt = new Date(now).toISOString();
     const seen = new Set();
     const result = [];
+    // Manual review entries travel in the control-plane projection without live runtime facts
+    // (no containerState/hostPid), so the review entry itself is correctly skipped by the gates
+    // below. Re-apply the human decision onto the live discovery entry for the same workload:
+    // identity authority belongs to the review, runtime facts belong to discovery.
+    const reviewByWorkload = new Map();
+    for (const reviewEntry of [...this.sources.values()].flat()) {
+      if (reviewEntry?.attributionSource !== 'manual_review') continue;
+      const decision = text(reviewEntry.classification).toLowerCase();
+      if (!decision || decision === 'clear') continue;
+      const record = {
+        decision,
+        agentScopeId: text(reviewEntry.agentScopeId) || undefined,
+        agentDisplayName: text(reviewEntry.agentDisplayName) || undefined,
+      };
+      const keys = new Set();
+      const reviewPhysicalId = text(reviewEntry.physicalWorkloadId);
+      if (reviewPhysicalId) keys.add(reviewPhysicalId);
+      for (const id of Array.isArray(reviewEntry.ids) ? reviewEntry.ids : []) keys.add(text(id));
+      // Also index container-id tails (docker:<host>:<id> / container:<id>) so live discovery
+      // entries join even when the review recorded a differently-shaped workload id.
+      for (const key of [...keys]) {
+        const tail = key.split(':').at(-1);
+        if (/^[a-f0-9]{12,64}$/i.test(tail)) keys.add(tail);
+      }
+      for (const key of keys) {
+        if (key && !reviewByWorkload.has(key)) reviewByWorkload.set(key, record);
+      }
+    }
+    const reviewForEntry = (entry) => {
+      const candidates = [text(entry?.physicalWorkloadId)];
+      for (const id of Array.isArray(entry?.ids) ? entry.ids : []) candidates.push(text(id));
+      for (const key of candidates) {
+        if (!key) continue;
+        const hit = reviewByWorkload.get(key) ?? reviewByWorkload.get(key.split(':').at(-1));
+        if (hit) return hit;
+      }
+      return undefined;
+    };
     for (const entry of [...this.sources.values()].flat()) {
       // Candidate Agent workloads use the same effective capture/runtime fidelity as confirmed
       // Agents, so a running candidate stays in the lifecycle snapshot — but the snapshot must
       // carry the OBSERVED classification.  Upgrading it to confirmed_agent here would skip the
       // candidate review stage everywhere downstream (asset identity, directory badges).
-      const candidateEffective = entry.classification === 'probable_agent';
-      if (entry.classification !== 'confirmed_agent' && !candidateEffective) continue;
+      const review = reviewForEntry(entry);
+      const classification = review?.decision ?? entry.classification;
+      const candidateEffective = classification === 'probable_agent';
+      if (classification !== 'confirmed_agent' && !candidateEffective) continue;
       const environment = text(entry.environment).toLowerCase()
         || (entry.source === 'kubernetes' ? 'kubernetes' : entry.source === 'docker' ? 'docker' : '');
       if (!['docker', 'kubernetes'].includes(environment)) continue;
@@ -565,7 +611,7 @@ class WorkloadIdentityCache {
           || !entry.ids.some((id) => /^[a-f0-9]{32,64}$/i.test(normalizedContainerId(id)))) continue;
       }
       const physicalWorkloadId = text(entry.physicalWorkloadId);
-      const agentScopeId = text(entry.agentScopeId);
+      const agentScopeId = text(review?.agentScopeId) || text(entry.agentScopeId);
       const resolvedProcess = environment === 'kubernetes'
         ? this.resolveRuntimeProcess(entry)
         : undefined;
@@ -583,12 +629,12 @@ class WorkloadIdentityCache {
       seen.add(physicalWorkloadId);
       result.push({
         agentScopeId,
-        agentDisplayName: text(entry.agentDisplayName) || agentScopeId,
+        agentDisplayName: text(review?.agentDisplayName) || text(entry.agentDisplayName) || agentScopeId,
         agentInstanceId: environment === 'kubernetes'
           ? text(entry.agentInstanceId) || physicalWorkloadId
           : physicalWorkloadId,
         physicalWorkloadId,
-        classification: entry.classification,
+        classification,
         runtimeState: 'running',
         rootPid,
         rootStartTimeTicks,
