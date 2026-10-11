@@ -5,11 +5,17 @@ import fs from 'node:fs';
 const requiredPrograms = [
   'legacy_exec', 'legacy_exit', 'legacy_connect', 'legacy_setuid',
   'legacy_ptrace', 'legacy_bind', 'legacy_openat', 'legacy_unlinkat',
+  // HTTP plaintext capture (identity-whitelisted socket syscall payloads).
+  'legacy_http_write', 'legacy_http_sendto',
+  'legacy_http_read_enter', 'legacy_http_recvfrom_enter',
+  'legacy_http_read_exit', 'legacy_http_recvfrom_exit',
 ];
 const requiredMaps = [
   'EVENTS', 'EXIT_EVENTS', 'CONNECT_EVENTS', 'FILE_EVENTS', 'SEC_EVENTS',
+  'PLAINTEXT_EVENTS',
   'EXEC_SCRATCH', 'EXIT_SCRATCH', 'CONNECT_SCRATCH', 'FILE_SCRATCH',
-  'SEC_SCRATCH', 'DROPS',
+  'SEC_SCRATCH', 'PLAINTEXT_SCRATCH', 'DROPS',
+  'PLAINTEXT_ALLOWED', 'PLAINTEXT_READ_ARGS',
 ];
 const requiredKernelVersion = 0x0004135a;
 
