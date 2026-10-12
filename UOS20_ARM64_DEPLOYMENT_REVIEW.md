@@ -75,6 +75,7 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 | compat17 | compat16 给 install.sh 加的运行时占位符守卫，被 assemble 的全局注入连守卫自身的比较串一起改写，变成"等于本版就拒绝"，安装器自我拒绝（现场报错 `unresolved 0.4.0-compat16 placeholder`）。教训：打包侧不做运行时自校验这类过度防御 | 撤掉守卫，install.sh 只剩 `COMPAT_RELEASE_ID=@RELEASE_VERSION@`；正确性由构建期断言（注入后无残留）和合同测试（注入后的副本必须能跑 `--help`）保证。compat16 交付物作废 |
 | compat18 | compat17 现场：人工审核后投影出现 confirmed，但白名单 `tls-agent-cgroups.json` 仍 `entries=[]`——`*agent:office*` 模板重分类把 `manual_review` 的 confirmed_agent 踩回 probable_agent，审核开通明文的路径从未走通过 | 上游 `5e53b7b`：replace() 对 manual_review 条目跳过模板重分类、runtime 快照把审核决定 join 到活体容器条目、投影新增 `reviewVersion`/`reviewedEntries` 字段 |
 | compat19 | compat18 现场：白名单出现 ai-agent cgroup（24429）但探针仍无明文，且 skill 容器 cgroup（24440）未进白名单。打包核验后定案：**随包 collector 是 legacy-kernel-4-19 构建，`main()` 被 `legacy::run()` 整体替换，明文准入/解析/挂接代码全部不在二进制内**——tcp_plaintext/tls_uprobe 在 UOS 4.19 是功能缺口，与开关、审核、白名单均无关。核对中另发现 ABI 漂移：exit/connect/file/sec 事件尺寸与 common 结构体不匹配被静默丢弃，现场只有 exec 事件在流 | 上游 Observer `63473b7` 在 legacy 后端实现 HTTP 明文（kprobe/kretprobe syscall 载荷 + pid 准入 map + 复用白名单扫描与 interaction 重组）并逐字节修复 ABI 漂移；`4a454fa` 开关拆分与 AnySentry `360afde` 多实例白名单同批并入。打包侧单元加 `Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1`，门禁脚本同步新清单。升级后五类非 exec 事件开始出现属预期 |
+| compat20 | compat19 现场：6 个明文探针只有 2 个暂存类挂上，4 个带载荷拷贝的全部 `BPF_PROG_LOAD` 失败，明文仍为零。验证器日志给出指令级根因：`call bpf_probe_read#4` 处 `R2 unbounded memory access`——钳制（`if len>512 len=512`）的范围收窄落在 count 寄存器上，而 helper 长度参数用的是 len 拷贝寄存器，4.19 验证器不在寄存器拷贝间传播等值关系，拷贝寄存器保持无界 | 打包侧直接在 integration 分支修复（Observer `b667c6a`）：`emit_plaintext` 改定长读取——固定 512B 主读，EFAULT（页边界）回退 64B，再失败 len=0 丢载荷；`len` 字段仍是用户态权威有效长度，尾部不解析。长度参数从此只有常量，验证器无界问题根除。另：现场 env 文件残留 `A3S_OBSERVER_SSL` 已删（legacy WARN 抓获）；并集重审脚本修行匹配后缀（"ai-agent · agent:/sh"），审核体身份键必须并集覆盖两个容器 |
 
 控制面页面的密钥是 `ANYSENTRY_ADMIN_TOKEN`，从 `/etc/anysentry/anysentry.env` 读取后粘贴到页面钥匙图标。`ANYSENTRY_INGEST_TOKEN` 和模型厂商的 API Key 不是这个字段。
 
@@ -174,6 +175,16 @@ JS 侧修复不受此影响，全部真实生效：`cd94d1e`（hybrid discovery�
 **同批修复的第二个缺陷（ABI 漂移）**：`probes.c` 的 exit/connect/file/sec 事件尺寸停留在旧 ABI（28/44/280/32 字节），与 common 结构体（72/80/312/64）不匹配，用户态长度守卫把它们全部静默丢弃——客户机此前实际只有 exec 事件在流（现场 `lastEventSubject=exec` 即此证）。已按 common 布局逐字节对齐。**升级后 ProcessExit/Egress/FileAccess/FileDelete/SecurityAction 会开始出现，属预期**（设计本就如此），验收时把五类事件的出现列为检查项。
 
 compat19 现场验收（`check-compat19-acceptance.sh`）：沿用 compat18 全部条目并强化——单元含 `A3S_OBSERVER_PLAINTEXT_HTTP=1` 且不设 SSL；白名单同时覆盖 ai-agent/skill 当前 cgroup（脚本动态解析 inode）；collector 日志出现 `legacy plaintext Agent cgroup scopes reconciled`；探针 8000 与 8001 后 30s 内 ClickHouse 出 `tcp_plaintext` 且标记可检索；近 15 分钟分布出现五类非 exec 事件。注意开发侧未做活体验证（其机器为 x86_64/6.17，跑不了 arm64/4.19 专用对象），现场验证是收口门禁。
+
+### compat20：明文探针验证器修复（打包侧直修）
+
+compat19 现场验收结果：安装成功、审核/白名单/collector 准入同步全通（354 次 reconcile 日志）、ABI 修复后五类事件恢复流动——但 6 个明文探针只有 2 个暂存参数的挂上，4 个带载荷拷贝的（write/sendto/read_exit/recvfrom_exit）全部 `BPF_PROG_LOAD` 失败。提取完整验证器日志后定位到指令级根因：
+
+- 拒绝点：`call bpf_probe_read#4` 报 `R2 unbounded memory access, use 'var &= const' or 'if (var < const)'`
+- 机制：C 代码 `len = (u32)count; if (len > 512) len = 512;` 经 clang 分配后，范围比较落在 count 所在寄存器，而 probe_read 的长度参数用 len 拷贝寄存器；4.19 验证器不在寄存器拷贝之间传播等值收窄，拷贝寄存器保持 umax=2^32-1，拒绝加载。两个暂存类小程序不带载荷拷贝所以通过——与现场"挂 2 掉 4"精确吻合
+- 修复（打包侧直接在 Observer integration 分支，`b667c6a`）：`emit_plaintext` 消除变长 probe_read——固定 512B 主读，EFAULT（buf 跨未映射页）回退 64B 定长，再失败 `len=0` 丢弃本次载荷；`len`/`orig_len` 字段语义不变（用户态重组器只认 len，截断标记照常）
+
+compat20 验收仍用 `check-compat19-acceptance.sh`：挂接日志应出现全部 14 个程序（8 基础 + 6 明文），其余条目不变。若仍有个别程序加载失败，验证器日志提取命令见第 4.5 节脚本输出说明。
 
 ## 最终部署状态
 
