@@ -123,6 +123,8 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 2026-10-09 现场实测：目标机现有 `ai-agent`（7998/8000）和 `ai-agent-skill`（7999/8001）两个 `agent:office` 容器，均被镜像模板命中为候选。`8000` 和 `8001` 的 `openssl s_client` 报 `wrong version number`，即入向服务是纯 HTTP，确认身份后经 `tcp_plaintext` 即可看到明文，**入向不需要开 `A3S_OBSERVER_SSL`**。两个容器的 python 工作进程都加载了 `/usr/lib/aarch64-linux-gnu/libssl.so.3`，若之后要采出向 HTTPS（例如容器调用外部 LLM API），TLS uprobe 挂接条件具备，按需再开 SSL 开关。
 
+2026-10-12 更正与方向语义（compat21 现场实证 + 代码确认）：明文管线的方向标签按"Agent 是 HTTP 客户端"设计——`write/sendto` 出请求、`read/recvfrom` 出响应，重组器按标签配对，无内容嗅探纠正。**采的是 Agent 主动调 LLM 的出向腿；向 8000/8001 curl 打入的入向探针方向相反**（服务端 read 到请求被标成响应车道、write 出响应被标成请求车道），永远凑不成一对，不出事件——这是设计行为，不是故障。legacy 后端暂不支持 TLS uprobe（设了 `A3S_OBSERVER_SSL` 只会收 WARN；compat21 起安装器自动清除该残留键），出向若走 HTTPS 当前版本采不到。验收探针因此改为：触发 Agent 真实调 LLM（业务侧正常使用一次），而非 curl 入向。若以后需要入向（用户→Agent）明文，属于上游新功能（按内容嗅探方向或服务端角色标记），提需求给开发。
+
 2026-10-09 深入排查（确认身份后明文仍不通）判定为 **cgroup v1/混合布局的功能缺口**，非部署配置问题。目标机是 hybrid cgroup：v1 各控制器挂在 `/sys/fs/cgroup/<控制器>`，v2 unified 挂在 `/sys/fs/cgroup/unified`，容器 `/proc/<pid>/cgroup` 同时有 v1 行和 `0::` 行。两处代码缺陷叠加：
 
 1. `scripts/observer-docker-discovery.js` 按纯 v2 布局用 `/sys/fs/cgroup` 拼 `0::` 路径后 stat；hybrid 上正确路径是 `/sys/fs/cgroup/unified/...`，stat 失败导致所有容器拿不到 `cgroupId`（日志持续 `cold_start_runtime_ready=0`），明文白名单没有 cgroup 可写。cgroup 解析缺失还使进程归因退化，出现身份键污染（gdss 容器 ID 混入 `office-agent` 审核键、office 身份键挂在无关容器进程事件上）。
