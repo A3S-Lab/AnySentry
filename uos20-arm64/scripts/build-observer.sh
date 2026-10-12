@@ -7,16 +7,23 @@ TOOLS=$BUILD_DIR/tools
 zig=$TOOLS/zig-$ZIG_VERSION/zig
 zigbuild=$TOOLS/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION/bin/cargo-zigbuild
 [[ -x "$zig" && -x "$zigbuild" ]] || die 'ARM64 toolchain cache missing; build sentry first'
-require_command docker
 
 observer=$SOURCE_DIR/observer
 bpf=$BUILD_DIR/observer-bpf/probes-legacy.o
 install -d -m 0755 "$(dirname "$bpf")"
-image=${A3S_BPF_BUILDER_IMAGE:-clickhouse/binary-builder@sha256:050ad5096036206c44ac8b015eee5bbdb3207b4250fec957b0f3abd362dfcf9f}
-docker run --rm --user "$(id -u):$(id -g)" -v "$observer:/src:ro" -v "$(dirname "$bpf"):/out" --entrypoint clang "$image" \
-  -target bpfel -mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables \
-  -mllvm -enable-tail-merge=0 -mllvm -disable-branch-fold -mllvm -disable-block-placement \
-  -c /src/a3s-observer-ebpf-legacy/src/probes.c -o /out/probes-legacy.o
+bpf_cflags=(-mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables
+  -mllvm -enable-tail-merge=0 -mllvm -disable-branch-fold -mllvm -disable-block-placement)
+if [[ ${A3S_BPF_LOCAL_CLANG:-} == zig ]]; then
+  # Fallback for a wedged Docker daemon: zig cc embeds the same LLVM BPF backend.
+  "$zig" cc -target bpfel-freestanding-none "${bpf_cflags[@]}" \
+    -c "$observer/a3s-observer-ebpf-legacy/src/probes.c" -o "$bpf"
+else
+  require_command docker
+  image=${A3S_BPF_BUILDER_IMAGE:-clickhouse/binary-builder@sha256:050ad5096036206c44ac8b015eee5bbdb3207b4250fec957b0f3abd362dfcf9f}
+  docker run --rm --user "$(id -u):$(id -g)" -v "$observer:/src:ro" -v "$(dirname "$bpf"):/out" --entrypoint clang "$image" \
+    -target bpfel "${bpf_cflags[@]}" \
+    -c /src/a3s-observer-ebpf-legacy/src/probes.c -o /out/probes-legacy.o
+fi
 node "$CHANNEL_DIR/scripts/verify-legacy-bpf-object.mjs" "$bpf"
 
 rustup target add "$RUST_TARGET" >/dev/null
