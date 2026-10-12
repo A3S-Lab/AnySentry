@@ -290,6 +290,22 @@ normalize_environment() {
   mv "$tmp" "$file"
 }
 
+drop_inert_observer_keys() {
+  # A3S_OBSERVER_SSL predates the HTTP/HTTPS switch split. The legacy Linux 4.19 backend
+  # has no TLS uprobe capture, so on this package the key only logs a WARN at every
+  # Observer start. Remove it during install/upgrade instead of asking the field to
+  # hand-edit the protected env file.
+  local file=${1:-$ENV_FILE} tmp
+  [[ -f $file ]] || return 0
+  grep -qE '^A3S_OBSERVER_SSL=' "$file" || return 0
+  tmp=$(mktemp "${file}.drop-inert.XXXXXX")
+  grep -vE '^A3S_OBSERVER_SSL=' "$file" >"$tmp"
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+  chown --reference="$file" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file"
+  echo "Removed inert configuration key: A3S_OBSERVER_SSL (legacy backend has no TLS uprobe capture)"
+}
+
 validate_collector_id() {
   local file=${1:-$ENV_FILE} collector_id
   collector_id=$(env_value A3S_OBSERVER_COLLECTOR_ID "$file")
@@ -345,6 +361,7 @@ install_environment() {
     normalize_environment "$ENV_FILE"
     merge_environment "$template"
   fi
+  drop_inert_observer_keys "$ENV_FILE"
   normalize_environment "$ENV_FILE"
   validate_collector_id "$ENV_FILE"
   [[ -n $(env_value CLICKHOUSE_PASSWORD "$ENV_FILE") ]] || fail "CLICKHOUSE_PASSWORD is empty in $ENV_FILE"

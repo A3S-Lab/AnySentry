@@ -68,6 +68,19 @@ sudo /opt/anysentry/anysentry-services.sh start
 - `--safe`：默认模式，增加本地安全操作及带唯一标识的模拟事件；
 - `--extended`：增加多类别 Sentry 摄取模拟。
 
+### `ACCEPTANCE_CHECK.sh`
+
+用途：现场验收。只读检查安装结果、Collector 健康、审核投影、明文白名单、Observer
+开关与探针挂接，并向 `127.0.0.1:8000`/`8001` 各发 3 个带唯一标记的 GET（业务返回
+401/404 属预期），30 秒后核对 ClickHouse 中的明文事件与五类非 exec 事件。
+
+```bash
+/opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-result.txt
+```
+
+全部通过时输出 `验收全部通过`；存在未通过项时把输出文件交给打包工程师。该脚本
+不修改服务、配置或数据。
+
 ### `collect-support-bundle.sh`
 
 用途：在出现安装失败、页面报错、模型未连通、采集中断或服务占用过高之后，把主机、服务、日志和模型配置状态打成一个压缩包。密钥和令牌只记录是否已设置、长度和指纹，不写入原文。

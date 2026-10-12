@@ -27,7 +27,7 @@ required=(
   observer/observer-unified-filter-policy.js observer/observer-workload-filter.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
-  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh collect-support-bundle.sh DEPLOYMENT.md
+  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh collect-support-bundle.sh DEPLOYMENT.md
   AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md 现场问题采集.md
   VERSION PROVENANCE manifest.sha256
 )

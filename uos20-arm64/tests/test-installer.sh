@@ -124,6 +124,20 @@ grep -Fxq 'A3S_OBSERVER_COLLECTOR_ID=observer-customer-host' "$tmp/duplicate.env
   fail "generic duplicate environment keys were not removed"
 grep -Fxq 'PORT=29654' "$tmp/duplicate.env" || fail "the last PORT value was not preserved"
 
+printf '%s\n' 'PORT=29653' 'A3S_OBSERVER_SSL=1' > "$tmp/inert.env"
+chmod 0600 "$tmp/inert.env"
+ANYSENTRY_INSTALLER_LIB=1 bash -c '
+  source "$1"
+  ENV_FILE="$2"
+  drop_inert_observer_keys "$ENV_FILE"
+' _ "$tmp/package/install.sh" "$tmp/inert.env"
+
+if grep -q '^A3S_OBSERVER_SSL=' "$tmp/inert.env"; then
+  fail "inert SSL key was not dropped from the environment file"
+fi
+grep -Fxq 'PORT=29653' "$tmp/inert.env" || fail "unrelated keys were dropped"
+[[ $(stat -c %a "$tmp/inert.env") == 600 ]] || fail "environment file permissions were not preserved"
+
 mkdir -p "$tmp/runtime-tmp"
 ANYSENTRY_INSTALLER_LIB=1 bash -c '
   source "$1"
