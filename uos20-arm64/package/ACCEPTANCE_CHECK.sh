@@ -121,6 +121,9 @@ echo "  探针标记: $mark"
 # 方法：宿主机 tarpit（接连接→睡 12s→回 OpenAI 形状 JSON）+ ai-agent 容器内客户端
 # （睡 8s 过准入→POST 带标记请求→真阻塞 recv）。采的是"Agent 作为 HTTP 客户端的出向腿"；
 # 入向 curl 打 8000/8001 方向相反，按设计不出事件。
+# 探针必须与真实 LLM 流量同形状（/v1/chat/completions + OpenAI JSON 双向体）——
+# 现场实测：GET /acc 类"不像 LLM"的请求在发射侧就不会变成交互记录（真实 ctct-guard
+# 流量 281 条/24h 全入库，而旧探针 0 条），标记同时放进 model 字段和消息体。
 # 明文产物落点：events.eventKind='LlmInteraction' 与 agent_interactions_v1
 # （transport='http'，payload 内含 captureSource=tcp_plaintext）。events.source 列只有
 # observer/api，用它判明文恒为 0（compat24 首跑 FAIL 即此谓词问题，非功能问题）。
@@ -129,7 +132,9 @@ if ss -tln 2>/dev/null | grep -q ':18099 '; then
 else
   nohup python3 -c "
 import socket,time
-body=b'{\"id\":\"chatcmpl-acc\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}'
+body=('{\"id\":\"chatcmpl-$mark\",\"object\":\"chat.completion\",\"model\":\"$mark\",'
+      '\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"pong $mark\"},\"finish_reason\":\"stop\"}],'
+      '\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}').encode()
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('0.0.0.0',18099)); s.listen(4)
 conn,_=s.accept(); conn.recv(65536); time.sleep(12)
@@ -144,9 +149,9 @@ conn.close(); s.close()
     docker exec ai-agent "$PYBIN" -c "
 import time,socket
 time.sleep(8)
-req_body=('{\"model\":\"acc-probe\",\"messages\":[{\"role\":\"user\",\"content\":\"$mark\"}]}').encode()
+req_body=('{\"model\":\"$mark\",\"messages\":[{\"role\":\"user\",\"content\":\"ping $mark\"}]}').encode()
 s=socket.create_connection(('${HOSTIP:-172.22.17.203}',18099))
-s.sendall(b'POST /acc/$mark HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: '+str(len(req_body)).encode()+b'\r\n\r\n'+req_body)
+s.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: '+str(len(req_body)).encode()+b'\r\n\r\n'+req_body)
 s.recv(4096)
 s.close()
 print('  出向合成请求完成', flush=True)
