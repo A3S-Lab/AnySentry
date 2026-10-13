@@ -39,7 +39,7 @@ install -m 0644 "$CHANNEL_DIR/package/AnySentry脚本说明.md" "$STAGE_DIR/AnyS
 install -m 0644 "$CHANNEL_DIR/package/现场问题采集.md" "$STAGE_DIR/现场问题采集.md"
 install -m 0644 "$CHANNEL_DIR/package/UOS现场诊断规则.md" "$STAGE_DIR/UOS现场诊断规则.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
-for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh anysentry-services.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh anysentry-services.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 install -d -m 0755 "$STAGE_DIR/glm-lab"
 for file in Dockerfile requirements.txt app.py server.py mcp_server.py glm.env.example GLM观测测试.md .dockerignore; do

@@ -81,6 +81,36 @@ sudo /opt/anysentry/anysentry-services.sh start
 全部通过时输出 `验收全部通过`；存在未通过项时把输出文件交给打包工程师。该脚本
 不修改服务、配置或数据。
 
+### `FIELD_DIAGNOSTIC.sh`
+
+用途：分阶段现场诊断（S0-S8）。任何会话或任何人接手现场时先跑本脚本，按阶段输出
+PASS/FAIL/WARN 和下一步指引，覆盖机器基线、服务存活、探针挂载、审核投影、白名单、
+准入同步、明文采集和归因。
+
+```bash
+/opt/anysentry/FIELD_DIAGNOSTIC.sh 2>&1 | tee field-diagnostic-result.txt
+/opt/anysentry/FIELD_DIAGNOSTIC.sh --with-http   # 追加一次合成 HTTP 明文实验
+```
+
+默认纯只读；`--with-http` 会从容器内发一个带标记的 HTTP 请求（性质同健康检查）。
+
+### `anysentry-data-cleanup.sh`
+
+用途：查看 AnySentry 各项磁盘占用（文件系统、`/var/lib/anysentry` 各子目录、日志、
+回滚残留、ClickHouse 各表和按月分区大小、events 按天分布），并可按天清理
+ClickHouse 事件数据。
+
+```bash
+/opt/anysentry/anysentry-data-cleanup.sh                          # 只读报告（默认）
+/opt/anysentry/anysentry-data-cleanup.sh --keep-days 30           # 只保留最近 30 天事件
+/opt/anysentry/anysentry-data-cleanup.sh --drop-oldest-days 7     # 删除最早 7 天的事件
+```
+
+不带参数时不修改任何数据。删除只作用于事件族四张表（`events`、`event_locators_v1`、
+`kernel_fact_locators_v1`、`agent_interactions_v1`），审核记录等配置数据不受影响；
+执行前会显示将删除的行数并要求输入 `YES` 确认（可用 `--yes` 跳过）。删除通过
+ClickHouse mutation 完成，磁盘空间在分区分配合并后归还，脚本会等待 mutation 结束。
+
 ### `collect-support-bundle.sh`
 
 用途：在出现安装失败、页面报错、模型未连通、采集中断或服务占用过高之后，把主机、服务、日志和模型配置状态打成一个压缩包。密钥和令牌只记录是否已设置、长度和指纹，不写入原文。
