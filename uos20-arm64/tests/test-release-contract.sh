@@ -95,6 +95,9 @@ grep -Fq 'MemoryMax=40G' "$CHANNEL/package/systemd/anysentry-clickhouse.service"
 grep -Fq '<trace_log remove="remove"/>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse profiler logs are not disabled"
 grep -Fq '<asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse system logs are not TTL-bounded"
 grep -Fq '<old_parts_lifetime>120</old_parts_lifetime>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse dead-part lifetime is not bounded"
+if grep -Fq '<opentelemetry_span_log><ttl>' "$CHANNEL/package/config/clickhouse-config.xml"; then
+  fail "opentelemetry_span_log carries a sibling ttl (base config has a custom engine; ClickHouse rejects it at startup)"
+fi
 grep -Fq '<max_server_memory_usage>34359738368</max_server_memory_usage>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse server memory is not raised to 32 GiB"
 grep -Fq 'NODE_OPTIONS=--max-old-space-size=4096' "$CHANNEL/package/systemd/anysentry.service" || fail "API Node heap is not configured"
 grep -Fq 'NODE_OPTIONS=--max-old-space-size=2048' "$CHANNEL/package/systemd/anysentry-fast-judge.service" || fail "fast judge Node heap is not configured"
