@@ -164,7 +164,7 @@ conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'); conn.close(); s
 import time,socket
 time.sleep(8)  # 活过 2 秒准入扫描周期
 s=socket.create_connection(('${HOSTIP:-172.22.17.203}',$PORT))  # 无超时=真阻塞
-s.sendall(b'GET /diag HTTP/1.1\r\nHost: x\r\nX-Marker: ANYSENTRY_FD\r\n\r\n')
+s.sendall(b'GET /diag-ANYSENTRY_FD HTTP/1.1\r\nHost: x\r\n\r\n')
 s.recv(4096)
 s.close()
 print('  client 完成', flush=True)
@@ -180,11 +180,13 @@ print('  client 完成', flush=True)
     wait $CLIENT_BG
     kill $TARPIT 2>/dev/null
     sleep 25
+    # 明文产物落点：events.eventKind='LlmInteraction' 与 agent_interactions_v1；
+    # events.source 列只有 observer/api，不能用它判明文。
     now=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
-      "SELECT count() FROM anysentry.events WHERE source IN ('tcp_plaintext','tls_uprobe')" 2>/dev/null)
-    echo "  明文事件数: ${now:-?}"
+      "SELECT count() FROM anysentry.events WHERE eventKind='LlmInteraction' AND at > toUInt64(toUnixTimestamp(now() - INTERVAL 30 MINUTE)) * 1000" 2>/dev/null)
+    echo "  近 30 分钟 LlmInteraction 事件数: ${now:-?}"
     "${CH[@]}" http://127.0.0.1:8123/ --data-binary \
-      "SELECT count() FROM anysentry.events WHERE rawPreview LIKE '%ANYSENTRY_FD%'" 2>/dev/null | sed 's/^/  含标记事件数: /'
+      "SELECT count() FROM anysentry.agent_interactions_v1 WHERE positionCaseInsensitive(payload, 'ANYSENTRY_FD') > 0 AND at > toUInt64(toUnixTimestamp(now() - INTERVAL 30 MINUTE)) * 1000" 2>/dev/null | sed 's/^/  含标记交互数: /'
   fi
 fi
 

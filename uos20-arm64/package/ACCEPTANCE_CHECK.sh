@@ -118,18 +118,23 @@ echo "  SSL 不支持 WARN 次数（应为 0）: $ssl_warn"
 step "5. 明文链路端到端（出向合成法；入向 curl 按设计不出事件，不再作为验收项）"
 mark="anysentry-fd-$(date +%s)"
 echo "  探针标记: $mark"
-# 方法：宿主机 tarpit（接连接→睡 12s→回 HTTP 200）+ ai-agent 容器内客户端（睡 8s 过准入→
-# 发带标记请求→真阻塞 recv）。采的是"Agent 作为 HTTP 客户端的出向腿"；入向 curl 打 8000/8001
-# 方向相反，按设计不出事件。
+# 方法：宿主机 tarpit（接连接→睡 12s→回 OpenAI 形状 JSON）+ ai-agent 容器内客户端
+# （睡 8s 过准入→POST 带标记请求→真阻塞 recv）。采的是"Agent 作为 HTTP 客户端的出向腿"；
+# 入向 curl 打 8000/8001 方向相反，按设计不出事件。
+# 明文产物落点：events.eventKind='LlmInteraction' 与 agent_interactions_v1
+# （transport='http'，payload 内含 captureSource=tcp_plaintext）。events.source 列只有
+# observer/api，用它判明文恒为 0（compat24 首跑 FAIL 即此谓词问题，非功能问题）。
 if ss -tln 2>/dev/null | grep -q ':18099 '; then
   echo "  [WARN] 端口 18099 被占，本节跳过"
 else
   nohup python3 -c "
 import socket,time
+body=b'{\"id\":\"chatcmpl-acc\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}'
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('0.0.0.0',18099)); s.listen(4)
-conn,_=s.accept(); conn.recv(4096); time.sleep(12)
-conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'); conn.close(); s.close()
+conn,_=s.accept(); conn.recv(65536); time.sleep(12)
+conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body)
+conn.close(); s.close()
 " >/tmp/.acc-tarpit.log 2>&1 &
   TARPIT=$!
   sleep 1
@@ -139,8 +144,9 @@ conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'); conn.close(); s
     docker exec ai-agent "$PYBIN" -c "
 import time,socket
 time.sleep(8)
+req_body=('{\"model\":\"acc-probe\",\"messages\":[{\"role\":\"user\",\"content\":\"$mark\"}]}').encode()
 s=socket.create_connection(('${HOSTIP:-172.22.17.203}',18099))
-s.sendall(b'GET /acc HTTP/1.1\r\nHost: x\r\nX-Marker: $mark\r\n\r\n')
+s.sendall(b'POST /acc/$mark HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: '+str(len(req_body)).encode()+b'\r\n\r\n'+req_body)
 s.recv(4096)
 s.close()
 print('  出向合成请求完成', flush=True)
@@ -160,12 +166,19 @@ echo "     出现: ${abi_kinds:-无}"
 [[ -n ${abi_kinds// /} ]] && ok "非 exec 事件已恢复流动（ABI 修复生效）" || bad "仍只有 ToolExec——ABI 修复未生效"
 echo "  -- 明文事件与标记检索:"
 hits=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
-  "SELECT count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 AND (positionCaseInsensitive(subject, '$mark') > 0 OR positionCaseInsensitive(rawPreview, '$mark') > 0 OR positionCaseInsensitive(process, '$mark') > 0)")
+  "SELECT count() FROM anysentry.agent_interactions_v1 WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 AND positionCaseInsensitive(payload, '$mark') > 0")
 plain=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
-  "SELECT count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 AND source IN ('tcp_plaintext','tls_uprobe')")
-echo "     标记命中事件数: ${hits:-?}   近 15 分钟明文事件数: ${plain:-?}"
-[[ ${plain:-0} -gt 0 || ${hits:-0} -gt 0 ]] && ok "明文链路全通" \
-  || bad "明文仍零产出——若在诊断流程中属预期（compat22/23 为诊断版），按 UOS现场诊断规则.md S7/S9 继续"
+  "SELECT count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 AND eventKind='LlmInteraction'")
+inter=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
+  "SELECT count() FROM anysentry.agent_interactions_v1 WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000")
+echo "     标记命中交互数: ${hits:-?}   近 15 分钟 LlmInteraction 事件: ${plain:-?}   交互明细行: ${inter:-?}"
+if [[ ${hits:-0} -gt 0 ]]; then
+  ok "明文链路全通（合成交互已入 agent_interactions_v1）"
+elif [[ ${plain:-0} -gt 0 || ${inter:-0} -gt 0 ]]; then
+  ok "明文链路已通（窗口内有明文交互；合成标记未命中多为探针时序，可复查 agent_interactions_v1）"
+else
+  bad "明文仍零产出——按 UOS现场诊断规则.md S7/S9 继续"
+fi
 
 step "验收汇总"
 echo "  PASS=$PASS FAIL=$FAIL"

@@ -61,7 +61,7 @@
 | **S4** | 白名单发布 | `/run/anysentry-filter/tls-agent-cgroups.json` 存在且条目 = 容器当前 cgroup inode | inode 用 `stat -c %i <cgroup2挂载点>/<proc的0::路径>` 现算；**容器重建会换 inode，属正常** |
 | **S5** | 准入同步 | journal 有新鲜 `cgroup scopes reconciled cgroups=N pids=M`（N=白名单条数） | 无日志=明文开关没开（单元要 `A3S_OBSERVER_PLAINTEXT_HTTP=1`，**不要设 A3S_OBSERVER_SSL**） |
 | **S6** | 采集产出 | CH 各类型事件持续入库；明文计数为目标指标 | 常规事件断流→Kafka/Flink 链路；仅明文为零→S7 |
-| **S7** | 明文合成实验 | tarpit 慢动作（见第 5 节方法）后 CH 出现 tcp_plaintext 事件 | 不出→S9 内核取证；出了但业务没有→业务那条腿不是 HTTP 明文 |
+| **S7** | 明文合成实验 | tarpit 慢动作（见第 5 节方法）后 CH 出现 LlmInteraction 事件/交互明细行 | 不出→S9 内核取证；出了但业务没有→业务那条腿不是 HTTP 明文 |
 | **S8** | 归因抽查 | 最近事件 agentId 归属正确 | 归因错乱查 workload-filter（cgroupId='0' 共享键已有防护） |
 | **S9** | 内核取证 | bpf-inspect：程序 map_ids 引用正确、READ_ARGS 暂存随流量涨落、DROPS 不涨 | 引用错=重定位 bug；不触发=符号/内核兼容；详见交接文档 |
 
@@ -93,7 +93,7 @@
 1. 宿主机起 tarpit：`python3` 监听 18099，接连接 → 收请求 → **睡 12-15s** → 回 `HTTP/1.1 200` → 关。
 2. ai-agent 容器内客户端：**睡 8s（过准入扫描）**→ connect 宿主机 IP:18099 → `sendall(带标记 HTTP)` →
    **无超时 recv 阻塞**（ tarpit 应答前全程在内核里睡着，READ_ARGS 暂存条目全程可见）。
-3. 观测三件套（同时进行）：bpf-inspect 看 READ_ARGS 条目出现/消失；CH 查 tcp_plaintext 计数与标记串。
+3. 观测三件套（同时进行）：bpf-inspect 看 READ_ARGS 条目出现/消失；CH 查 LlmInteraction 计数与标记串。
 4. 判定：暂存出现+消失+CH 出事件=全通；出现+消失+CH 无=用户态/入库丢；出现+残留=kretprobe 坏；
    不出现=进入侧没触发（先核对客户端 pid 在 ALLOWED_PID 里）。
 
@@ -109,7 +109,10 @@
   curl -sS --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" http://127.0.0.1:8123/ --data-binary \
     "SELECT eventKind, count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 10 MINUTE)) * 1000 GROUP BY eventKind FORMAT TSV"
   ```
-  明文事件：`WHERE source IN ('tcp_plaintext','tls_uprobe')`；时间列 `at` 是毫秒。
+  明文交互事件：`WHERE eventKind='LlmInteraction'`（events.source 列只有 observer/api，**不能**用
+  `source IN ('tcp_plaintext','tls_uprobe')` 判明文——该谓词恒 0，compat24 首跑 FAIL 即此坑）；
+  明细在 `anysentry.agent_interactions_v1`（transport='http'、payload 内含 captureSource=tcp_plaintext）；
+  时间列 `at` 是毫秒。
 - **审核 PUT**（管理头 x-anysentry-admin-token，令牌在同 env 文件）：
   `PUT /security-center/agents/office-agent/review`，body 带并集 identityKeys、不带 agentAssetId。
 - **现场状态打包**：`/opt/anysentry/collect-support-bundle.sh`（只读，脱敏）。
