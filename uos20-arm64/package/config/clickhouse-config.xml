@@ -49,4 +49,24 @@
     <size>100M</size>
     <count>3</count>
   </logger>
+
+  <!-- The distribution's base config.xml enables every system log, most with no TTL;
+       on the field they grew to 7.9 GiB in two weeks (asynchronous_metric_log alone
+       2.85e9 rows). Cap each with a TTL and drop the two pure-profiler logs entirely. -->
+  <trace_log remove="remove"/>
+  <processors_profile_log remove="remove"/>
+  <query_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+  <query_views_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_views_log>
+  <text_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></text_log>
+  <part_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></part_log>
+  <metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></metric_log>
+  <asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>
+  <query_thread_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></query_thread_log>
+  <opentelemetry_span_log><ttl>finish_date + INTERVAL 3 DAY DELETE</ttl></opentelemetry_span_log>
+
+  <!-- High-churn projection tables (config/commit/revision rewrites every few seconds)
+       held ~3.4 GiB of dead parts at the default 480s lifetime; bound it to 120s. -->
+  <merge_tree>
+    <old_parts_lifetime>120</old_parts_lifetime>
+  </merge_tree>
 </clickhouse>
