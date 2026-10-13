@@ -17,8 +17,8 @@ for script in \
 done
 
 for file in \
-  package/install.sh package/verify.sh package/inspect-host.sh package/RUN_HEALTH_SMOKE.sh package/ACCEPTANCE_CHECK.sh package/collect-support-bundle.sh package/DEPLOYMENT.md \
-  package/AnySentry部署手册.md package/AnySentry使用手册.md package/AnySentry脚本说明.md package/现场问题采集.md \
+  package/install.sh package/verify.sh package/inspect-host.sh package/RUN_HEALTH_SMOKE.sh package/ACCEPTANCE_CHECK.sh package/FIELD_DIAGNOSTIC.sh package/collect-support-bundle.sh package/DEPLOYMENT.md \
+  package/AnySentry部署手册.md package/AnySentry使用手册.md package/AnySentry脚本说明.md package/现场问题采集.md package/UOS现场诊断规则.md \
   package/provision-observer.mjs package/wait-clickhouse.sh package/uninstall.sh \
   package/config/anysentry.env.example package/config/clickhouse-config.xml \
   package/config/clickhouse-users.xml package/config/redis.conf \
@@ -66,6 +66,10 @@ grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "a
 grep -Fq 'RUN_HEALTH_SMOKE.sh' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the health smoke script"
 grep -Fq 'ACCEPTANCE_CHECK.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the acceptance check script"
 grep -Fq 'ACCEPTANCE_CHECK.sh' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the acceptance check script"
+grep -Fq 'FIELD_DIAGNOSTIC.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the field diagnostic script"
+grep -Fq 'FIELD_DIAGNOSTIC.sh' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the field diagnostic script"
+grep -Fq 'UOS现场诊断规则.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the UOS diagnostic rules"
+grep -Fq 'UOS现场诊断规则.md' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the UOS diagnostic rules"
 grep -Fq 'drop_inert_observer_keys' "$CHANNEL/package/install.sh" || fail "installer does not drop inert observer keys"
 grep -Fq 'collect-support-bundle.sh' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the support bundle script"
 grep -Fq '现场问题采集.md' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the field collection guide"
