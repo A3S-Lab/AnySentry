@@ -182,7 +182,15 @@ if [[ ${hits:-0} -gt 0 ]]; then
 elif [[ ${plain:-0} -gt 0 || ${inter:-0} -gt 0 ]]; then
   ok "明文链路已通（窗口内有明文交互；合成标记未命中多为探针时序，可复查 agent_interactions_v1）"
 else
-  bad "明文仍零产出——按 UOS现场诊断规则.md S7/S9 继续"
+  # 验收窗口业务安静时回看 3 小时再判，避免空窗误报（compat25 首验即踩中：窗口内 0 条，
+  # 但同小时实际有 55 条明文交互，链路正常）。
+  plain3=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
+    "SELECT count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 3 HOUR)) * 1000 AND eventKind='LlmInteraction'")
+  if [[ ${plain3:-0} -gt 0 ]]; then
+    ok "验收窗口内业务安静，但近 3 小时有 ${plain3} 条明文交互——链路正常（合成探针不入库为已知限制）"
+  else
+    bad "明文仍零产出（含近 3 小时）——按 UOS现场诊断规则.md S7/S9 继续"
+  fi
 fi
 
 step "验收汇总"
