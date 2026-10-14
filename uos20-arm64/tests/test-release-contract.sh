@@ -104,6 +104,7 @@ grep -Fq 'NODE_OPTIONS=--max-old-space-size=2048' "$CHANNEL/package/systemd/anys
 grep -Fq 'NODE_OPTIONS=--max-old-space-size=4096' "$CHANNEL/package/systemd/anysentry-l3-worker.service" || fail "L3 Node heap is not configured"
 grep -Fq 'NODE_OPTIONS=--max-old-space-size=1024' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer forwarder Node heap is not configured"
 grep -Fq 'FORWARD_HTTP_TIMEOUT_MS=20000' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer HTTP timeout hotfix is not persisted"
+grep -Fq 'A3S_OBSERVER_PERF_RING_PAGES=64' "$CHANNEL/package/systemd/anysentry-observer.service" || fail "Observer perf ring is not enlarged for 64K-page SSE bursts"
 grep -Fq 'FORWARD_HTTP_TIMEOUT_MS' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not read the HTTP timeout"
 grep -Fq '[observer-forward] heartbeat delivery failed' "$ROOT/scripts/observer-forward.js" || fail "Observer forwarder does not log HTTP failure details"
 

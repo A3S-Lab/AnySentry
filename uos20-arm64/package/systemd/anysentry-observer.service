@@ -12,6 +12,9 @@ EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=A3S_OBSERVER_JSON=1
 Environment=A3S_OBSERVER_FILES=1
 Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1
+# 64K-page host: 64 pages = 4 MiB/CPU/map, absorbs SSE bursts (empty-shell blackout at the
+# busiest endpoint was ring overflow). Max footprint 64MiB*16cpu*6 maps ≈ 384 MiB.
+Environment=A3S_OBSERVER_PERF_RING_PAGES=64
 Environment=ANYSENTRY_FILTER_RULES_FILE=/run/anysentry-filter/filter-rules.json
 Environment=NODE_OPTIONS=--max-old-space-size=1024
 Environment=FORWARD_HTTP_TIMEOUT_MS=20000
