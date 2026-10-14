@@ -161,8 +161,7 @@ print('  出向合成请求完成', flush=True)
   fi
   kill $TARPIT 2>/dev/null
 fi
-echo "  等待 30 秒入库 ..."; sleep 30
-echo "  -- 近 15 分钟事件分布:"
+echo "  等待 30 秒入库 ..."; sleep 30echo "  -- 近 15 分钟事件分布:"
 "${CH[@]}" http://127.0.0.1:8123/ --data-binary \
   "SELECT eventKind, source, count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 GROUP BY eventKind, source ORDER BY 3 DESC FORMAT TSV" | tee /tmp/.acc-dist | sed 's/^/     /'
 abi_kinds=$(awk -F'\t' '$1=="ProcessExit"||$1=="Egress"||$1=="FileAccess"||$1=="FileDelete"||$1=="SecurityAction"{print $1}' /tmp/.acc-dist | sort -u | tr '\n' ' ')
@@ -177,6 +176,14 @@ plain=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
 inter=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
   "SELECT count() FROM anysentry.agent_interactions_v1 WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000")
 echo "     标记命中交互数: ${hits:-?}   近 15 分钟 LlmInteraction 事件: ${plain:-?}   交互明细行: ${inter:-?}"
+# 合成探针走 idle 超时完成（现场实测约 60-75s 才入库），30s 查不到时补等 45s 再查一次
+if [[ ${hits:-0} -eq 0 ]]; then
+  echo "     标记未到（探针 idle 超时完成需 ~60-75s），补等 45 秒再查 ..."
+  sleep 45
+  hits=$("${CH[@]}" http://127.0.0.1:8123/ --data-binary \
+    "SELECT count() FROM anysentry.agent_interactions_v1 WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 AND positionCaseInsensitive(payload, '$mark') > 0")
+  echo "     二次标记命中交互数: ${hits:-?}"
+fi
 if [[ ${hits:-0} -gt 0 ]]; then
   ok "明文链路全通（合成交互已入 agent_interactions_v1）"
 elif [[ ${plain:-0} -gt 0 || ${inter:-0} -gt 0 ]]; then
