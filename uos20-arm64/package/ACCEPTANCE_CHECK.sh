@@ -161,7 +161,8 @@ print('  出向合成请求完成', flush=True)
   fi
   kill $TARPIT 2>/dev/null
 fi
-echo "  等待 30 秒入库 ..."; sleep 30echo "  -- 近 15 分钟事件分布:"
+echo "  等待 30 秒入库 ..."; sleep 30
+echo "  -- 近 15 分钟事件分布:"
 "${CH[@]}" http://127.0.0.1:8123/ --data-binary \
   "SELECT eventKind, source, count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 15 MINUTE)) * 1000 GROUP BY eventKind, source ORDER BY 3 DESC FORMAT TSV" | tee /tmp/.acc-dist | sed 's/^/     /'
 abi_kinds=$(awk -F'\t' '$1=="ProcessExit"||$1=="Egress"||$1=="FileAccess"||$1=="FileDelete"||$1=="SecurityAction"{print $1}' /tmp/.acc-dist | sort -u | tr '\n' ' ')
