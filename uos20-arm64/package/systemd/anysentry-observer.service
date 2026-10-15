@@ -12,9 +12,9 @@ EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=A3S_OBSERVER_JSON=1
 Environment=A3S_OBSERVER_FILES=1
 Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1
-# 64K-page host: 64 pages = 4 MiB/CPU/map, absorbs SSE bursts (empty-shell blackout at the
-# busiest endpoint was ring overflow). Max footprint 64MiB*16cpu*6 maps ≈ 384 MiB.
-Environment=A3S_OBSERVER_PERF_RING_PAGES=64
+# 64K-page host: 128 pages = 8 MiB/CPU/map。compat28 现场实测：业务高峰（>1000 记录/h）
+# gap 率 85-96% 为 ring 溢出真实丢块，低峰 2-6%；64 页不够。8MiB*16cpu*6map ≈ 768MiB 上限。
+Environment=A3S_OBSERVER_PERF_RING_PAGES=128
 # 双车道 idle 退休（compat28 起）：无在途请求的连接（Redis/日志管道等噪音）走默认 90s
 # 快车道；持有完整请求、在等响应的连接（LLM 思考期，现场实测静默可达数分钟）走 900s
 # 慢车道。900s 覆盖思考期，请求/响应合为一条记录且噪音不滞留。
