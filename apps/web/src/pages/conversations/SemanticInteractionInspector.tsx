@@ -12,6 +12,7 @@ import type {
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatTokenCount } from "./agentUsage";
+import { decodeContentBody } from "./decodeContentBody";
 
 function safeJson(value: unknown) {
   if (typeof value === "string") return value;
@@ -348,14 +349,30 @@ export function SemanticInteractionInspector({
             <div className="space-y-3">
               {!interaction ? <p className="py-12 text-center text-xs text-zinc-500">该事件没有关联的原始 Interaction。</p> : (
                 <>
+                  {interaction.partialReasons.length ? (
+                    <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500" title={interaction.partialReasons.join(", ")}>
+                      <span>记录截断原因</span>
+                      {interaction.partialReasons.slice(0, 6).map((reason) => (
+                        <span key={reason} className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-0.5 text-amber-100">{reason}</span>
+                      ))}
+                      {interaction.partialReasons.length > 6 ? <span>+{interaction.partialReasons.length - 6}</span> : null}
+                    </div>
+                  ) : null}
                   {[["最终发送给 LLM / 工具的请求", interaction.request, "请求"], ["LLM / 工具返回给 Agent 的响应", interaction.response, "响应"]].map(([title, content, label]) => {
                     const side = content as AgentInteractionRecord["request"];
+                    const decodedBody = decodeContentBody(side);
                     return (
                       <details key={String(title)} open className="rounded border border-white/8 bg-black/15">
                         <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-zinc-200">{String(title)}</summary>
                         <div className="border-t border-white/8 p-3">
-                          <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px] text-zinc-500"><span>{side.contentType}</span><span>{side.decodedBytes.toLocaleString()} bytes</span><span>{side.completeness}</span><CopyAction value={side.body} label={`复制完整${label}正文`} /></div>
-                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-black/25 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(side.body)}</pre>
+                          <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
+                            <span>{side.contentType}</span>
+                            <span className="rounded border border-white/10 bg-white/[0.035] px-1.5 py-0.5 text-zinc-400">{side.encoding}</span>
+                            <span>{side.decodedBytes.toLocaleString()} bytes</span>
+                            <span>{side.completeness}</span>
+                            <CopyAction value={decodedBody} label={`复制完整${label}正文`} />
+                          </div>
+                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-black/25 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(decodedBody)}</pre>
                         </div>
                       </details>
                     );

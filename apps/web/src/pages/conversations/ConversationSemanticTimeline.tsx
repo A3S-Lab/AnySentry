@@ -20,6 +20,7 @@ import type {
   AgentConversationSummary,
   AgentConversationTurnV2,
   AgentContextReplaySummary,
+  AgentInteractionRecord,
   AgentRelatedConversation,
   AgentRunTechnicalActivitySummary,
   AgentSemanticEvent,
@@ -28,6 +29,7 @@ import type {
 } from "@/lib/api/security-center";
 import { cn } from "@/lib/utils";
 import { formatDuration, formatTokenTotal, tokenCoverageText } from "./agentUsage";
+import { decodeContentBody } from "./decodeContentBody";
 
 function nsDate(value?: string, format = "MM-DD HH:mm:ss.SSS") {
   if (!value || !/^\d+$/u.test(value)) return "--";
@@ -49,9 +51,9 @@ function nsDate(value?: string, format = "MM-DD HH:mm:ss.SSS") {
   }
 }
 
-function Badge({ children, className }: { children: ReactNode; className?: string }) {
+function Badge({ children, className, title }: { children: ReactNode; className?: string; title?: string }) {
   return (
-    <span className={cn("inline-flex min-h-5 items-center rounded border px-1.5 py-0.5 text-[10px] font-medium leading-none", className)}>
+    <span className={cn("inline-flex min-h-5 items-center rounded border px-1.5 py-0.5 text-[10px] font-medium leading-none", className)} title={title}>
       {children}
     </span>
   );
@@ -125,7 +127,7 @@ function ActorCard({
         <span className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold">{meta.label}</span>
           <Badge className="border-current/15 bg-black/10 text-current/80">{meta.detail}</Badge>
-          {event.completeness !== "complete" ? <Badge className="border-amber-400/25 bg-amber-500/10 text-amber-100">部分</Badge> : null}
+          {event.completeness !== "complete" ? <Badge className="border-amber-400/25 bg-amber-500/10 text-amber-100" title={event.partialReasons?.join(", ") || undefined}>部分</Badge> : null}
         </span>
         <span className="mt-1.5 line-clamp-5 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-200">
           {event.contentPreview ?? "该事件没有可展示的文字摘要；可在检查器查看结构化证据。"}
@@ -304,6 +306,51 @@ function DelegationStepCard({
   );
 }
 
+function UnparsedEvidenceLane({ items }: { items: AgentInteractionRecord[] }) {
+  if (!items.length) return null;
+  return (
+    <div className="mx-auto mt-5 max-w-4xl">
+      <details className="rounded border border-white/10 bg-white/[0.02] px-3 py-2 text-[11px] text-zinc-400">
+        <summary className="min-h-7 cursor-pointer text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
+          原始证据（未解析） · {items.length} 条
+        </summary>
+        <div className="mt-2 space-y-2 border-t border-white/8 pt-2">
+          {items.map((record) => {
+            const requestBody = decodeContentBody(record.request);
+            const responseBody = decodeContentBody(record.response);
+            return (
+              <div key={record.interactionId} className="rounded border border-white/8 bg-black/15 px-3 py-2">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10px] text-zinc-500">
+                  <time>{nsDate(record.startedAtUnixNs)}</time>
+                  {record.endpoint ? <span className="break-all text-zinc-400">{record.method} {record.endpoint}</span> : null}
+                  <Badge className={record.completeness === "complete"
+                    ? "border-white/10 bg-white/[0.035] text-zinc-400"
+                    : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                    {record.completeness}
+                  </Badge>
+                </div>
+                {record.partialReasons.length ? (
+                  <p className="mt-1 text-[10px] text-zinc-600" title={record.partialReasons.join(", ")}>
+                    {record.partialReasons.slice(0, 6).join(" · ")}{record.partialReasons.length > 6 ? ` · +${record.partialReasons.length - 6}` : ""}
+                  </p>
+                ) : null}
+                {[["请求", requestBody], ["响应", responseBody]].map(([label, body]) => body ? (
+                  <div key={label} className="mt-1.5">
+                    <p className="text-[10px] font-medium text-zinc-600">{label}</p>
+                    <pre className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-black/25 p-2 font-mono text-[10px] leading-4 text-zinc-400">
+                      {body.length > 2_000 ? `${body.slice(0, 2_000)}\n…` : body}
+                    </pre>
+                  </div>
+                ) : null)}
+              </div>
+            );
+          })}
+        </div>
+      </details>
+    </div>
+  );
+}
+
 export function ConversationSemanticTimeline({
   agent,
   conversation,
@@ -311,6 +358,7 @@ export function ConversationSemanticTimeline({
   segments,
   contextReplaySummaries,
   technicalActivities,
+  unparsedInteractions,
   selectedEventId,
   loading,
   error,
@@ -325,6 +373,7 @@ export function ConversationSemanticTimeline({
   segments: ConversationInstanceSegment[];
   contextReplaySummaries: AgentContextReplaySummary[];
   technicalActivities: AgentRunTechnicalActivitySummary[];
+  unparsedInteractions?: AgentInteractionRecord[];
   selectedEventId?: string;
   loading: boolean;
   error?: Error;
@@ -542,6 +591,7 @@ export function ConversationSemanticTimeline({
             ))}
           </div>
         )}
+        <UnparsedEvidenceLane items={unparsedInteractions ?? []} />
       </div>
     </section>
   );
