@@ -22,7 +22,7 @@
 | 13 | `probe_call_limit` 标记高发（1KB/chunk 截断） | ⚪ 已知限制 | — | 4.19 验证器要求定长读取（compat20）；跨块重组已保证内容完整（捕获率 p50=1.0），标记仅为提示 | 不修 |
 | 14 | 合成探针入库时滞 60-90s（idle 边界） | ⚪ 已知限制 | — | 验收脚本已适配（补等 45s）；真实流量不受影响 | 不修 |
 | 15 | 后台 API 调用 parseState=unparsed（占大头） | ⚪ 设计行为 | — | 非 LLM 的 REST 调用不做消息级解析；安全视图靠事件表 | 不修 |
-| 16 | **ClickHouse 超时/写入反压**——对话页空、collector degraded 的共同上游 | 🔴 待诊断（脚本已给） | CH/流量形态 | 现场实证（2026-10-16）：API 日志 `ClickHouseError: Timeout exceeded: elapsed ~5s`（agent bucket aggregation）+ `Insert: HTTP request error` / `write EPIPE` 每 4 分钟循环一次；事件速率 ~515K/min（≈8.6K/s 持续洪峰）；目录/轮次回退 `dataSource=hot_ring`（API 的 5s 有界查询预算在保护机制内故意回退热环视图）。**因果链**：CH 慢 → 交互/目录查询超时→热环视图（页面显空）→ 写入反压→spool 积压+采集丢弃（卡片 degraded） | 先跑 `check-ch-health.sh`（S1 慢查询/S2 合并/S3 query_log Top/S4 内存/S5 parts 爆炸/S6 整机）定位主因：查询侧（dashboard 重聚合轮询）→ 开发限流/降级；写入/合并侧 → 调合并或减少事件量；整机过载 → 与客户谈资源。**注意：这是容量/流量形态问题，不是 compat31 修复 bug——P0 搜索（Qwen 命中 5 条）和 P3 持久化（membership 963 行）都实证可用** |
+| 16 | **agent_interactions_v1 大列全表扫描**——对话页空、collector degraded 的共同上游 | 🔴 待开发（查询形态修复） | AnySentry API 查询 | check-ch-health 定论（2026-10-16）：**CH 完全健康**——内存仅 677MB（预算 32G）、parts 健康、合并空闲、load 7.8/16 中等。凶手是这一个查询：`SELECT interactionId, argMax(payload, revision) ... FROM agent_interactions_v1 WHERE at>=? AND at<=? GROUP BY interactionId`——单次**读 892MiB / 5.1 万行（≈全表）**，典型 700ms、峰值 5.9s（撞穿 5s 预算），30 分钟 6 次。后果链：查询超时→目录/轮次回退热环（页面显空、partial=hot_ring_only）→写入争用→spool 积压+采集丢弃（卡片 degraded 变真实）。`at` 在 ORDER BY 第 4 位（tenant/environment/agent 之后），仅按时间过滤无法裁剪 marks，payload 大列被整表读 | ① 按 AC 的窗口裁剪实验定"调用方传宽窗口"还是"排序键不剪枝"（命令已给用户）；② 修复方向：调用方必带 tenant+agent+时间下推 / 查询改排序键适配 / payload 拆列。热环降级是 API 设计内的预算保护，不是 bug |
 
 ## 归档（已闭环，细节见部署手册）
 
