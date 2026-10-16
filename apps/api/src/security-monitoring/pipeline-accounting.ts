@@ -606,7 +606,7 @@ export function summarizePipelineAccounting(
   };
 }
 
-function cumulativeDelta(current: number, previous: number | undefined): number {
+export function cumulativeDelta(current: number, previous: number | undefined): number {
   if (previous === undefined || current < previous) return current;
   return current - previous;
 }
@@ -618,7 +618,7 @@ function cumulativeDelta(current: number, previous: number | undefined): number 
 export function collectorHeartbeatFailureDelta(
   heartbeat: Pick<CollectorHeartbeatRecord, 'origin' | 'droppedEvents' | 'outputDropped' | 'errorCount' | 'legacyCounterTemporality'>,
   previous?: Pick<CollectorHeartbeatRecord, 'droppedEvents' | 'outputDropped' | 'errorCount'>,
-): { droppedDelta: number; errorDelta: number } {
+): { droppedDelta: number; errorDelta: number; outputDroppedDelta: number } {
   const temporality = heartbeat.legacyCounterTemporality ??
     (heartbeat.origin === 'raw_collector' ? 'cumulative' : 'delta');
   if (temporality === 'cumulative') {
@@ -627,10 +627,28 @@ export function collectorHeartbeatFailureDelta(
         cumulativeDelta(heartbeat.droppedEvents, previous?.droppedEvents) +
         cumulativeDelta(heartbeat.outputDropped, previous?.outputDropped),
       errorDelta: cumulativeDelta(heartbeat.errorCount, previous?.errorCount),
+      outputDroppedDelta: cumulativeDelta(heartbeat.outputDropped, previous?.outputDropped),
     };
   }
   return {
     droppedDelta: heartbeat.droppedEvents + heartbeat.outputDropped,
     errorDelta: heartbeat.errorCount,
+    outputDroppedDelta: heartbeat.outputDropped,
   };
+}
+
+/** Window-scoped ring drop accounting: ring counters are process-lifetime cumulative, so a
+ * historical overflow must not pin the capture channel degraded forever. */
+export function ringDropDelta(
+  rings: readonly CollectorPipelineRingAccounting[],
+  previousRings: readonly CollectorPipelineRingAccounting[] | undefined,
+): number {
+  const prior = new Map((previousRings ?? []).map((ring) => [ring.ring, ring]));
+  return rings.reduce((total, ring) => {
+    const before = prior.get(ring.ring);
+    return total
+      + cumulativeDelta(ring.ringDropped, before?.ringDropped)
+      + cumulativeDelta(ring.collectorDropped ?? 0, before?.collectorDropped)
+      + cumulativeDelta(ring.queueDropped, before?.queueDropped);
+  }, 0);
 }

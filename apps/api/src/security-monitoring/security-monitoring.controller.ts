@@ -8388,7 +8388,13 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (f?.routeShape !== undefined && !routeShape) {
       throw new BadRequestException('routeShape is invalid');
     }
-    const result = await this.agg.agentInteractions({ ...f, agentAssetId, agentInstanceId, interactionId, routeShape });
+    const contentQuery = f?.contentQuery === undefined
+      ? undefined
+      : strictIdentityText(f.contentQuery, 200);
+    if (f?.contentQuery !== undefined && !contentQuery) {
+      throw new BadRequestException('contentQuery is invalid');
+    }
+    const result = await this.agg.agentInteractions({ ...f, agentAssetId, agentInstanceId, interactionId, routeShape, contentQuery });
     this.audit.record({
       actor: auditActor(headers),
       action: 'agent.interaction.content.read',
@@ -8433,11 +8439,18 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (f?.conversationId !== undefined && !conversationId) {
       throw new BadRequestException('conversationId is invalid');
     }
+    const contentQuery = f?.contentQuery === undefined
+      ? undefined
+      : strictIdentityText(f.contentQuery, 200);
+    if (f?.contentQuery !== undefined && !contentQuery) {
+      throw new BadRequestException('contentQuery is invalid');
+    }
     const result = await this.agg.agentConversations({
       ...f,
       agentAssetId,
       agentInstanceId,
       conversationId,
+      contentQuery,
     });
     this.audit.record({
       actor: auditActor(headers),

@@ -116,7 +116,7 @@ assert.match(agents, /liveSecuritySnapshotAsOf/u);
 assert.match(topology, /liveSecuritySnapshotAsOf/u);
 assert.match(events, /liveSecuritySnapshotAsOf/u);
 assert.match(dateTime, /Relative ranges are live views/u);
-assert.match(clickhouse, /\['agentInstanceId', 'agentInstanceKey'\]/u);
+assert.match(clickhouse, /INDEX idx_agent_instance_key agentInstanceKey TYPE bloom_filter/u);
 assert.match(clickhouse, /unavailable: true/u);
 assert.match(monitoring, /agentInstanceId: selectedAgent\?\.agentInstanceId/u);
 assert.match(monitoring, /selectedAgentInstanceId/u);

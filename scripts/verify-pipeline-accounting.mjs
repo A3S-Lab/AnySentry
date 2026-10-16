@@ -245,18 +245,19 @@ const forwarderCurrent = { origin: 'forwarder', droppedEvents: 0, outputDropped:
 assert.deepEqual(collectorHeartbeatFailureDelta(forwarderCurrent, forwarderPrevious), {
   droppedDelta: 1,
   errorDelta: 1,
+  outputDroppedDelta: 1,
 });
 assert.deepEqual(collectorHeartbeatFailureDelta(
   { origin: 'raw_collector', droppedEvents: 7, outputDropped: 4, errorCount: 0 },
   { droppedEvents: 5, outputDropped: 3, errorCount: 0 },
-), { droppedDelta: 3, errorDelta: 0 });
+), { droppedDelta: 3, errorDelta: 0, outputDroppedDelta: 1 });
 assert.deepEqual(collectorHeartbeatFailureDelta(
   { origin: 'raw_collector', droppedEvents: 1, outputDropped: 0, errorCount: 0 },
   { droppedEvents: 7, outputDropped: 4, errorCount: 0 },
-), { droppedDelta: 1, errorDelta: 0 });
+), { droppedDelta: 1, errorDelta: 0, outputDroppedDelta: 0 });
 assert.deepEqual(collectorHeartbeatFailureDelta(
   { origin: 'forwarder', legacyCounterTemporality: 'cumulative', droppedEvents: 0, outputDropped: 11, errorCount: 4 },
   { droppedEvents: 0, outputDropped: 9, errorCount: 3 },
-), { droppedDelta: 2, errorDelta: 1 });
+), { droppedDelta: 2, errorDelta: 1, outputDroppedDelta: 2 });
 
 console.log('Pipeline accounting verification passed');

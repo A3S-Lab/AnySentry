@@ -147,6 +147,20 @@ assert.equal(fake.state.calls.length, 1);
 assert.doesNotMatch(fake.state.calls[0].query, /argMax\(payload/u);
 fake.state.calls.length = 0;
 
+// contentQuery pushes a parameterized case-insensitive payload predicate down to ClickHouse.
+fake.state.responses.push([{ payload: JSON.stringify({
+  schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_content',
+  request: { body: '{"messages":[{"content":"hello-marker"}]}' },
+}) }]);
+const contentRecords = await store.queryAgentInteractions({
+  startMs: 100, endMs: 200, contentQuery: 'Hello-Marker', limit: 50,
+});
+assert.equal(contentRecords.length, 1);
+const contentCall = fake.state.calls.at(-1);
+assert.match(contentCall.query, /positionCaseInsensitive\(payload, \{contentQuery:String\}\) > 0/u);
+assert.equal(contentCall.query_params.contentQuery, 'Hello-Marker');
+fake.state.calls.length = 0;
+
 assert.equal(
   await store.dashboardAggregateBucketFacts(0, 3_610_000, 10_000),
   null,

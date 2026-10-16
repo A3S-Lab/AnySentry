@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const {
+  deliveryEvaluation,
   evaluateCollectorCaptureHeartbeat,
   stabilizeCollectorHealthChannel,
 } = require('../apps/api/dist/security-monitoring/aggregation.service.js');
@@ -85,3 +86,57 @@ assert.equal(typedRingLoss.severity, 2);
 assert.deepEqual(typedRingLoss.reasons, ['capture_pipeline_loss']);
 
 console.log('Collector capture/delivery/control health hysteresis verification passed');
+
+// Window-scoped ring accounting: historical cumulative ring overflow with no new delta must
+// not keep the capture channel degraded (aggregation.service.ts:265 comment now enforced).
+const ringHistoricalOverflow = evaluateCollectorCaptureHeartbeat(
+  rawHeartbeat(10_766, { ringDropped: 42 }),
+  rawHeartbeat(10_766, { ringDropped: 42 }),
+);
+assert.equal(ringHistoricalOverflow.severity, 0);
+assert.deepEqual(ringHistoricalOverflow.reasons, []);
+
+const ringNewOverflow = evaluateCollectorCaptureHeartbeat(
+  rawHeartbeat(10_766, { ringDropped: 43 }),
+  rawHeartbeat(10_766, { ringDropped: 42 }),
+);
+assert.equal(ringNewOverflow.severity, 2);
+assert.deepEqual(ringNewOverflow.reasons, ['capture_pipeline_loss']);
+
+// Delivery channel: collector outputDropped is process-lifetime cumulative (temporality
+// marker), so an unchanged total must not report permanent output loss; a fresh increment must.
+const cumulativeDelivery = (outputDropped) => ({
+  origin: 'raw_collector',
+  status: 'ok',
+  droppedEvents: 0,
+  outputDropped,
+  errorCount: 0,
+  legacyCounterTemporality: 'cumulative',
+});
+const unchangedDeliveryLoss = deliveryEvaluation(
+  cumulativeDelivery(915),
+  cumulativeDelivery(915),
+);
+assert.equal(unchangedDeliveryLoss.severity, 0);
+assert.deepEqual(unchangedDeliveryLoss.reasons, []);
+
+const newDeliveryLoss = deliveryEvaluation(
+  cumulativeDelivery(916),
+  cumulativeDelivery(915),
+);
+assert.equal(newDeliveryLoss.severity, 2);
+assert.deepEqual(newDeliveryLoss.reasons, ['permanent_output_loss']);
+
+// A delta-source forwarder keeps its existing semantics: the value is already per-window.
+const forwarderDelivery = deliveryEvaluation({
+  origin: 'forwarder',
+  status: 'ok',
+  droppedEvents: 0,
+  outputDropped: 3,
+  errorCount: 0,
+  legacyCounterTemporality: 'delta',
+});
+assert.equal(forwarderDelivery.severity, 2);
+assert.deepEqual(forwarderDelivery.reasons, ['permanent_output_loss']);
+
+console.log('Collector ring/delivery window-delta verification passed');

@@ -47,6 +47,7 @@ import { eventActivityContext, eventActivitySubtype } from './activity-context';
 import { resolveTimeWindow } from './time-window';
 import {
   collectorHeartbeatFailureDelta,
+  ringDropDelta,
   summarizePipelineAccounting,
 } from './pipeline-accounting';
 import { correlationCaptureRollout } from './correlation-rollout';
@@ -262,8 +263,9 @@ export function evaluateCollectorCaptureHeartbeat(
 ): CollectorChannelEvaluation {
   const reasons: string[] = [];
   const rings = heartbeat.pipelineAccounting?.rings ?? [];
-  const ringLoss = rings.some((ring) =>
-    ring.ringDropped > 0 || (ring.collectorDropped ?? 0) > 0 || ring.queueDropped > 0);
+  // Ring counters are process-lifetime cumulative: judge the window delta against the previous
+  // heartbeat, or a single historical overflow pins the channel degraded forever.
+  const ringLoss = ringDropDelta(rings, previous?.pipelineAccounting?.rings) > 0;
   // Raw Collector compatibility counters are process-lifetime cumulative, while Forwarder
   // compatibility counters are per-window deltas. Reuse the same source-aware arithmetic as
   // collector quality alerting so an old, unchanged raw drop count does not keep the current
@@ -277,11 +279,18 @@ export function evaluateCollectorCaptureHeartbeat(
   return { severity: reasons.length ? 2 : 0, reasons };
 }
 
-function deliveryEvaluation(heartbeat: T.CollectorHeartbeatRecord): CollectorChannelEvaluation {
+export function deliveryEvaluation(
+  heartbeat: T.CollectorHeartbeatRecord,
+  previous?: T.CollectorHeartbeatRecord,
+): CollectorChannelEvaluation {
   const metrics = heartbeat.filterMetrics ?? {} as T.CollectorFilterMetrics;
   const hard: string[] = [];
   const soft: string[] = [];
-  if (heartbeat.outputDropped > 0) hard.push('permanent_output_loss');
+  // outputDropped is process-lifetime cumulative on collector-originated heartbeats; only a
+  // fresh increment within this window evidences a live delivery loss.
+  if (collectorHeartbeatFailureDelta(heartbeat, previous).outputDroppedDelta > 0) {
+    hard.push('permanent_output_loss');
+  }
   if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
   if (metrics.spoolAtCapacity || metrics.spoolWalAtCapacity) hard.push('spool_at_capacity');
   if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
@@ -3198,6 +3207,7 @@ export class AggregationService implements OnModuleDestroy {
           ...(candidateAutoPromoted ? { candidateAutoPromoted: true } : {}),
         };
       });
+    const contentQueryLower = filter.contentQuery?.trim().toLowerCase() || undefined;
     const items = bindInferredProducerRun(classified)
       .filter((item) =>
         // `interactionId` is the globally unique immutable fact key. Asset and Runtime instance
@@ -3227,6 +3237,13 @@ export class AggregationService implements OnModuleDestroy {
         && (!filter.wireTemplateId || item.wireTemplateId === filter.wireTemplateId)
         && (!filter.parseState || item.parseState === filter.parseState)
         && (!filter.completeness || item.completeness === filter.completeness)
+        // Hot-ring side of contentQuery (ClickHouse applies the same predicate on payload).
+        && (!contentQueryLower || [
+          item.request?.body,
+          item.request?.text,
+          item.response?.body,
+          item.response?.text,
+        ].some((value) => value?.toLowerCase().includes(contentQueryLower)))
         && (filter.scope === 'raw' || ['confirmed_agent', 'probable_agent'].includes(
           currentView ? item.currentEffectiveClassification : item.detectedClassification,
         )))
@@ -3522,6 +3539,9 @@ export class AggregationService implements OnModuleDestroy {
       // wide merge sort and can exceed the node memory budget before pagination happens.
       limit: CONVERSATION_INTERACTIONS_PER_AGENT,
       ...(keyedSessionRead ? { runId: correlationSessionId } : {}),
+      // Content search must reach ClickHouse before the fair-per-agent cap, otherwise matching
+      // interactions outside the first page would be invisible to the conversation filter below.
+      ...(filter.contentQuery ? { contentQuery: filter.contentQuery } : {}),
     };
     const inventoryQuery: T.AgentInventoryQuery = {
       timeType: filter.timeType,
@@ -7364,7 +7384,8 @@ export class AggregationService implements OnModuleDestroy {
           'capture_recovering_after_recent_failure',
         ),
         delivery: stabilizeCollectorHealthChannel(
-          recentForwarder.map(deliveryEvaluation),
+          recentForwarder.map((heartbeat, index) =>
+            deliveryEvaluation(heartbeat, recentForwarder[index + 1])),
           'delivery_recovering_after_recent_failure',
         ),
         control: stabilizeCollectorHealthChannel(
