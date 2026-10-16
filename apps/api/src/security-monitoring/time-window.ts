@@ -20,6 +20,31 @@ export interface ResolvedTimeWindow {
   cacheKey: string;
 }
 
+/**
+ * Hard cap for catalogue-style Agent interaction reads (directory / timeline / fair history).
+ * UOS field 2026-10-16: an unclamped 30-day window scanned 969 MiB / 5.1 万行 and blew the API's
+ * 5s bounded budget (read 892 MiB typically), degrading the directory to the hot ring and
+ * back-pressuring the forwarder spool. One day stays ~17x under a 30-day scan (measured:
+ * 1h window reads 57 MiB in 0.59s; the full table 969 MiB in 12.2s). Exact membership point
+ * reads (interactionIds) are exempt — their ids target specific rows regardless of age.
+ */
+export const INTERACTION_READ_MAX_SPAN_MS = 24 * 3_600_000;
+
+export function clampInteractionReadWindow(
+  window: ResolvedTimeWindow,
+  exactMembershipRead: boolean,
+): ResolvedTimeWindow {
+  if (exactMembershipRead || window.spanMs <= INTERACTION_READ_MAX_SPAN_MS) return window;
+  const startMs = window.endMs - INTERACTION_READ_MAX_SPAN_MS;
+  return {
+    startMs,
+    endMs: window.endMs,
+    spanMs: INTERACTION_READ_MAX_SPAN_MS,
+    custom: window.custom,
+    cacheKey: `${window.cacheKey}|clamped24h@${window.endMs}`,
+  };
+}
+
 function parsedTime(value?: string): number | undefined {
   if (!value) return undefined;
   const parsed = Date.parse(value);

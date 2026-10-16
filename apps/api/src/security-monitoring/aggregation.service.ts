@@ -44,7 +44,7 @@ import {
 import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
 import { foldLatestEventRevisions } from './event-revision';
 import { eventActivityContext, eventActivitySubtype } from './activity-context';
-import { resolveTimeWindow } from './time-window';
+import { clampInteractionReadWindow, resolveTimeWindow } from './time-window';
 import {
   collectorHeartbeatFailureDelta,
   ringDropDelta,
@@ -3153,11 +3153,11 @@ export class AggregationService implements OnModuleDestroy {
     } = {},
   ): Promise<T.AgentInteractionList> {
     this.pruneInteractionHot();
-    const window = resolveTimeWindow(filter);
+    const exactMembershipRead = options.interactionIds !== undefined;
+    const window = clampInteractionReadWindow(resolveTimeWindow(filter), exactMembershipRead);
     const exactInteractionIds = new Set((options.interactionIds ?? [])
       .map((value) => value.trim())
       .filter(Boolean));
-    const exactMembershipRead = options.interactionIds !== undefined;
     const requestedAsset = filter.agentAssetId?.trim();
     const agentAssetId = requestedAsset
       ? this.agentMetadata.canonicalAgentAssetId(requestedAsset)
