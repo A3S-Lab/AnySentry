@@ -1867,6 +1867,8 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   wireTemplateId?: string;
   parseState?: 'parsed' | 'partial' | 'unparsed' | 'ambiguous';
   completeness?: AgentInteractionCompleteness;
+  /** Case-insensitive substring match over the stored request/response plaintext bodies. */
+  contentQuery?: string;
   limit?: number;
 }
 
@@ -2050,6 +2052,8 @@ export interface AgentConversationQuery extends SecurityTimeFilter {
   coverageStatus?: AgentConversationCoverageStatus;
   model?: string;
   q?: string;
+  /** Case-insensitive substring over interaction plaintext bodies; groups without a match drop out. */
+  contentQuery?: string;
   limit?: number;
 }
 

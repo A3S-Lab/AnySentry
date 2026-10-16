@@ -65,6 +65,7 @@ import {
   ProcessContext,
   RemediationRecord,
 } from "./types";
+import type { SessionMembership } from "./canonical-observability";
 
 function boundedPositiveInt(
   raw: string | undefined,
@@ -183,6 +184,22 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (tenantId, environmentId, agentAssetId, at, interactionId)
 TTL ts + INTERVAL 30 DAY DELETE`;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
+// PostgreSQL-free deployments persist the canonical SessionMembership projection here so the
+// conversation catalog/timeline survives an API restart. The payload is the whole validated
+// SessionMembership; like the in-memory store, (membershipId, resolutionRevision) is immutable,
+// so replayed identical rows collapse under ReplacingMergeTree.
+const SESSION_MEMBERSHIP_TABLE = "anysentry_session_memberships_v1";
+const SESSION_MEMBERSHIP_DDL = `CREATE TABLE IF NOT EXISTS ${SESSION_MEMBERSHIP_TABLE} (
+  membershipId String,
+  resolutionRevision UInt32,
+  at UInt64,
+  ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000)),
+  payload String
+)
+ENGINE = ReplacingMergeTree(at)
+PARTITION BY toYYYYMM(ts)
+ORDER BY (membershipId, resolutionRevision)
+TTL ts + INTERVAL 30 DAY DELETE`;
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
   eventId String,
@@ -1220,6 +1237,7 @@ async function runClickHouseBootstrap(
       query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
     });
     await schema.command({ query: CONFIG_DDL });
+    await schema.command({ query: SESSION_MEMBERSHIP_DDL });
     try {
       const migrationResult = await schema.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
@@ -8186,6 +8204,9 @@ export class ClickHouseStore {
         : []),
       ...(input.parseState ? ["parseState = {parseState:String}"] : []),
       ...(input.completeness ? ["completeness = {completeness:String}"] : []),
+      ...(input.contentQuery
+        ? ["positionCaseInsensitive(payload, {contentQuery:String}) > 0"]
+        : []),
     ];
     const queryParams = {
       ...(exactMembershipRead
@@ -8218,6 +8239,7 @@ export class ClickHouseStore {
       ...(input.wireTemplateId ? { wireTemplateId: input.wireTemplateId } : {}),
       ...(input.parseState ? { parseState: input.parseState } : {}),
       ...(input.completeness ? { completeness: input.completeness } : {}),
+      ...(input.contentQuery ? { contentQuery: input.contentQuery } : {}),
     };
     const settings = {
       max_execution_time: 10,
@@ -8298,6 +8320,81 @@ export class ClickHouseStore {
         (error as Error).message,
       );
       return null;
+    }
+  }
+
+  /** Append-only SessionMembership projection rows for PostgreSQL-free deployments. Inserting an
+   *  already-persisted (membershipId, resolutionRevision) is an idempotent replay: the in-memory
+   *  store rejects conflicting payloads for the same key, so duplicate rows carry identical
+   *  payloads and collapse under ReplacingMergeTree. */
+  async saveSessionMemberships(
+    records: readonly SessionMembership[],
+  ): Promise<boolean> {
+    if (!this.client || records.length === 0) return false;
+    try {
+      const ingestedAt = Date.now();
+      await this.client.insert({
+        table: SESSION_MEMBERSHIP_TABLE,
+        values: records.map((record) => ({
+          membershipId: record.membershipId,
+          resolutionRevision: Math.max(
+            0,
+            Math.floor(Number(record.resolutionRevision) || 0),
+          ),
+          at: ingestedAt,
+          payload: JSON.stringify(record),
+        })),
+        format: "JSONEachRow",
+      });
+      return true;
+    } catch (err) {
+      console.error(
+        "[clickhouse] saveSessionMemberships failed:",
+        (err as Error).message,
+      );
+      return false;
+    }
+  }
+
+  async loadSessionMemberships(
+    input: { sinceMs?: number; limit?: number } = {},
+  ): Promise<SessionMembership[]> {
+    if (!this.client) return [];
+    const limit = Math.max(
+      1,
+      Math.min(50_000, Math.trunc(Number(input.limit) || 10_000)),
+    );
+    const sinceMs = Number.isFinite(Number(input.sinceMs))
+      ? Math.max(0, Math.trunc(Number(input.sinceMs)))
+      : 0;
+    try {
+      const rs = await this.client.query({
+        query: `
+          SELECT membershipId, resolutionRevision, argMax(payload, at) AS payload, max(at) AS latestAt
+          FROM ${SESSION_MEMBERSHIP_TABLE}
+          WHERE at >= {sinceMs:UInt64}
+          GROUP BY membershipId, resolutionRevision
+          ORDER BY latestAt DESC, membershipId DESC, resolutionRevision DESC
+          LIMIT {limit:UInt32}`,
+        query_params: { sinceMs, limit },
+        format: "JSONEachRow",
+      });
+      const rows = (await rs.json()) as Array<{ payload?: string }>;
+      return rows.reverse().flatMap(({ payload }) => {
+        if (!payload) return [];
+        try {
+          return [JSON.parse(payload) as SessionMembership];
+        } catch {
+          // A malformed legacy row must not prevent later valid memberships from hydrating.
+          return [];
+        }
+      });
+    } catch (err) {
+      console.error(
+        "[clickhouse] loadSessionMemberships failed:",
+        (err as Error).message,
+      );
+      return [];
     }
   }
 

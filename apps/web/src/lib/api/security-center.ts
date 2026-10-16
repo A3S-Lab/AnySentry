@@ -1232,6 +1232,7 @@ export interface AgentInteractionQuery extends SecurityTimeFilter {
   wireTemplateId?: string;
   parseState?: "parsed" | "partial" | "unparsed" | "ambiguous";
   completeness?: AgentInteractionCompleteness;
+  contentQuery?: string;
   limit?: number;
 }
 export interface AgentInteractionList extends ClassifiedResponseMeta {
@@ -1259,6 +1260,7 @@ export interface AgentConversationQuery extends SecurityTimeFilter {
   coverageStatus?: AgentConversationCoverageStatus;
   model?: string;
   q?: string;
+  contentQuery?: string;
   limit?: number;
 }
 export interface AgentConversationSummary {

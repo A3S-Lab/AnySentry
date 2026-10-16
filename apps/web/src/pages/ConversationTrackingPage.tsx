@@ -136,6 +136,7 @@ export default function ConversationTrackingPage() {
     coverageStatus: coverageStatus === "all" ? undefined : coverageStatus,
     classification: classification === "all" ? undefined : classification,
     q: clean(query),
+    contentQuery: clean(query),
     lifecycleScope: "all" as const,
     limit: 200,
   }), [
@@ -413,6 +414,33 @@ export default function ConversationTrackingPage() {
   const selectedInteraction = interactionEnvelope?.clientKey === interactionClientKey
     ? interactionEnvelope.list.items[0]
     : undefined;
+  const unparsedClientKey = [
+    selectedConversationId,
+    selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId) ?? "",
+    timeType,
+    consoleTimeFilter.startTime ?? "",
+    consoleTimeFilter.endTime ?? "",
+  ].join(" ");
+  const { data: unparsedEnvelope } = useRequest(async () => ({
+    clientKey: unparsedClientKey,
+    list: await securityCenterApi.agentInteractions({
+      timeType,
+      startTime: timeType === "custom" ? consoleTimeFilter.startTime : undefined,
+      endTime: timeType === "custom" ? consoleTimeFilter.endTime : undefined,
+      scope: "agent",
+      classificationView: "current_effective",
+      agentAssetId: selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId),
+      interactionType: "unparsed",
+      limit: 50,
+    }),
+  }), {
+    ready: Boolean(selectedConversationId && (selectedConversation?.agentAssetId ?? clean(scopedAgentAssetId))),
+    refreshDeps: [unparsedClientKey],
+    onError: () => undefined,
+  });
+  const unparsedInteractions = unparsedEnvelope?.clientKey === unparsedClientKey
+    ? unparsedEnvelope.list.items
+    : undefined;
   const evidenceClientKey = [
     timeline?.canonicalConversationId ?? selectedConversationId,
     selectedEvent?.semanticEventId ?? "",
@@ -627,6 +655,7 @@ export default function ConversationTrackingPage() {
                 error={!timeline ? timelineError : undefined}
                 contextReplaySummaries={timeline?.contextReplaySummaries ?? []}
                 technicalActivities={timeline?.technicalActivitySummaries ?? []}
+                unparsedInteractions={unparsedInteractions}
                 onBack={clearSelectionOnMobile}
                 onSelect={selectEvent}
                 onSelectConversation={selectConversation}

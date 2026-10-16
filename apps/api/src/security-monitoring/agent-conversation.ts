@@ -161,6 +161,18 @@ function explicitConversation(
       && !record.sessionKey,
     );
   if (perRequestBoundary) {
+    // Capture-session grouping: with no provider/session anchor at all, interactions from one
+    // process instance against one endpoint still belong to one operational conversation —
+    // keep-alive connections share the connectionId; otherwise a 30-minute endpoint bucket
+    // keeps consecutive Q&A chained instead of one singleton conversation per record.
+    const captureSession = captureSessionConversationId(record, scopeKey);
+    if (captureSession) {
+      return {
+        conversationId: captureSession,
+        source: 'inferred',
+        scopeKey,
+      };
+    }
     // A stateless service may repeat a native provider/session label on every POST. Prefer the
     // server-derived canonical Session; if it is unavailable, retain the interaction as an
     // event-local projection key rather than merging unrelated requests by provider text.
@@ -1275,6 +1287,21 @@ export function projectAgentConversations(
   }
   coalesceScopeRunSessionGroups(grouped);
 
+  // Content search keeps whole conversations when any member matches; non-matching groups drop
+  // out entirely so the directory count stays honest.
+  const contentNeedle = query.contentQuery?.trim().toLowerCase();
+  if (contentNeedle) {
+    const matches = (record: T.AgentInteractionRecord): boolean => [
+      record.request?.body,
+      record.request?.text,
+      record.response?.body,
+      record.response?.text,
+    ].some((value) => value?.toLowerCase().includes(contentNeedle));
+    for (const [key, group] of [...grouped]) {
+      if (!group.records.some(matches)) grouped.delete(key);
+    }
+  }
+
   const interactionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const sourceInteractionsByConversation = new Map<string, T.AgentInteractionRecord[]>();
   const summaries: T.AgentConversationSummary[] = [];
@@ -1320,6 +1347,25 @@ export function projectAgentConversations(
     });
 
   return { summaries: visible, interactionsByConversation, sourceInteractionsByConversation };
+}
+
+function captureSessionConversationId(
+  record: T.AgentInteractionRecord,
+  scopeKey: string,
+): string | undefined {
+  const connectionId = record.connectionId?.trim();
+  const endpoint = record.endpoint?.trim();
+  const instance = record.agentInstanceId?.trim() || record.agentAssetId?.trim();
+  if (!instance || (!connectionId && !endpoint)) return undefined;
+  if (connectionId) {
+    return stableId(
+      'cv',
+      `capture\0${scopeKey}\0${instance}\0${endpoint}\0${connectionId}`,
+    );
+  }
+  const bucketMs = 30 * 60_000;
+  const bucket = Number.isSafeInteger(record.at) ? Math.floor(record.at / bucketMs) : 0;
+  return stableId('cv', `capture\0${scopeKey}\0${instance}\0${endpoint}\0${bucket}`);
 }
 
 function parseEndpointPeer(endpoint: string | undefined): { host?: string; port?: number } | undefined {
