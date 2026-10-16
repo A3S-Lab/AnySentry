@@ -22,7 +22,7 @@
 | 13 | `probe_call_limit` 标记高发（1KB/chunk 截断） | ⚪ 已知限制 | — | 4.19 验证器要求定长读取（compat20）；跨块重组已保证内容完整（捕获率 p50=1.0），标记仅为提示 | 不修 |
 | 14 | 合成探针入库时滞 60-90s（idle 边界） | ⚪ 已知限制 | — | 验收脚本已适配（补等 45s）；真实流量不受影响 | 不修 |
 | 15 | 后台 API 调用 parseState=unparsed（占大头） | ⚪ 设计行为 | — | 非 LLM 的 REST 调用不做消息级解析；安全视图靠事件表 | 不修 |
-| 16 | **agent_interactions_v1 全表扫描**——对话页空、collector degraded 的共同上游 | 🔴 待开发（调用侧窗口下推） | AnySentry API 查询 | **定界实验定论（2026-10-16）**：CH 完全健康（内存 677MB/32G、parts 健康、合并 0）。凶手查询 `SELECT interactionId, argMax(payload, revision) ... WHERE at>=? AND at<=? GROUP BY interactionId`；三变体实测——**V1 时间窗 1h：2,687 行 / 57MB / 0.59s；V2 宽窗 30d：52,446 行 / 969MB / 12.2s；V3 前缀+1h：与 V1 持平（单租户，前缀无增益）**。结论：**时间过滤本身就能剪枝（分支①），真因是调用方传宽窗口**——目录/轮次/目录-v4 的读取路径（尤其本轮新增的会话路径）没把时间窗下推或默认窗过宽（表数据仅约两周，≥2 周窗口≈全表）。超时→热环降级（页面显空）→写入争用→spool 积压（卡片 degraded 变真实） | ① 会话目录/轮次读取强制时间窗下推+上限（如目录类 ≤24h，按页选择器）；② 目录列表走 metadata-only 投影（不读 payload 大列）；③ 修复后 spool/卡片自然恢复。热环降级仍是设计内保护。详见第六轮交接 |
+| 16 | **agent_interactions_v1 全表扫描**——对话页空、collector degraded 的共同上游 | ✅ 已直修（compat32，待现场验证） | AnySentry API 查询 | **定界实验定论（2026-10-16）**：CH 完全健康（内存 677MB/32G、parts 健康、合并 0）。凶手查询 `SELECT interactionId, argMax(payload, revision) ... WHERE at>=? AND at<=? GROUP BY interactionId`；三变体实测——**V1 时间窗 1h：2,687 行 / 57MB / 0.59s；V2 宽窗 30d：52,446 行 / 969MB / 12.2s；V3 前缀+1h：与 V1 持平（单租户，前缀无增益）**。结论：**时间过滤本身就能剪枝（分支①），真因是调用方传宽窗口**——目录/轮次/目录-v4 的读取路径（尤其本轮新增的会话路径）没把时间窗下推或默认窗过宽（表数据仅约两周，≥2 周窗口≈全表）。超时→热环降级（页面显空）→写入争用→spool 积压（卡片 degraded 变真实） | 打包侧直修（`27a8588`，integration 分支）：`readAgentInteractions` 对目录类读取加 24h 窗口硬上限（exactMembershipRead 点读豁免，旧 id 可达）；实测依据：30d 窗 969MB/12.2s vs 1h 窗 57MB/0.59s。验证脚本 verify-interaction-read-window 钉死四态。metadata-only 投影/翻页取历史留作开发后续 |
 
 ## 归档（已闭环，细节见部署手册）
 
