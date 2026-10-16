@@ -7,8 +7,8 @@
 
 | # | 问题 | 状态 | 归属 | 现象与证据 | 下一步 |
 |---|---|---|---|---|---|
-| 1 | 前端"观测与研判"卡片恒显示 Observer **部分异常 0/1** | 🟡 待验证 | API 健康评估 | **真根因（开发更正）**：ring 与 outputDropped 是进程累计值，健康评估却按窗口值判——历史溢出把通道永久钉在 degraded（`acf446b` 已改为对上一心跳的窗口增量，ring/delivery 两通道同步；Observer `a7c67a0` 心跳新增 `legacy_counter_temporality:"cumulative"` 标记配套）。**台账更正**：outputDropped 不是"明文准入策略丢弃"，是导出器真实写入失败计数；策略过滤走 filterMetrics 不进 outputDropped。另注意：控制面超时（04:21-04:25）与打包侧 dump 重查询时间重合，诊断负载自身会造成瞬时抖动（自省：dump 后续加限速/分批） | 升级 compat31 后卡片应恢复"正常"；若仍 degraded，看 channels.reasons 是否为窗口内新增丢弃 |
-| 2 | 对话追踪页内容**几分钟后消失**，且不按页面时间窗保留 | 🟡 待验证 | API 持久化 | `295ba8b`：新增 `anysentry_session_memberships_v1`（ReplacingMergeTree、月分区、30 天 TTL 与交互表同生命周期），**仅当 PG 未配置时**作为唯一写入方（绝不双写），启动时恢复近 7 天（env 可调）membership。验证脚本含 PG 在场不双写/重启恢复/CH 中断容忍，本地全过 | 升级后对话跨重启保留；若 timeline 仍 `dataSource=hot_ring`，是 CH 交互查询失败，取 API 日志 `[clickhouse] agent interaction query failed` 行交开发 |
+| 1 | 前端"观测与研判"卡片恒显示 Observer **部分异常 0/1** | 🟠 已转为真实问题（CH 反压） | API 健康评估 | 窗口增量修复（`acf446b`）已生效：reasons 现在是窗口语义——capture=`capture_pipeline_loss`、delivery=`spool_backlog_over_slo` 均为**当前窗口真实发生**。驱动根因=ClickHouse 超时（见 #16）：CH 慢→写入反压→spool 积压+采集丢弃。**台账更正**：outputDropped 不是"明文准入策略丢弃"，是导出器真实写入失败计数；策略过滤走 filterMetrics 不进 outputDropped | 与 #16 一并处理：CH 提速后卡片应自然恢复；恢复前它是真实信号不是误报 |
+| 2 | 对话追踪页内容**几分钟后消失**，且不按页面时间窗保留 | 🟡 部分验证（机制已通，被 #16 掩盖） | API 持久化 | `295ba8b` 实证生效：`anysentry_session_memberships_v1` 已建表并写入 **963 行**（30 天 TTL，仅无 PG 时写，启动恢复 7 天） | #16 解决后复测跨重启保留；若 timeline 仍 hot_ring，取 `[clickhouse] agent interaction query failed` 日志 |
 | 3 | 高峰期 ring 丢块（fragment_sequence_gap 85-96%） | ✅ 已闭环（2026-10-16 验证） | 打包侧 | compat29/30 的 ring 128 页生效：近 6h gap **0 条**（含高峰 1000+ 记录/h 时段） | — |
 | 4 | gzip 压缩响应乱码 | ✅ 已闭环（2026-10-16 验证） | 开发（0592615） | 近 6h `content_decode_error` **0 条**（原 ~14/h）；`truncated_compressed_stream` 9 条（截断容错标记正常）；'Qwen3.8' 可检索 60 条 | — |
 | 5 | **wire 模板匹配覆盖率低**（对话只有 2 条的直接原因） | 🟡 待验证 | Observer 解析层 | `3ad0e8d`：F7 keepalive 串联切分（`keepalive_request_splice`）、F8a 中流起始头重扫（`midstream_head_resync`，限 4KB/64 行）、F8b orphan 响应配对合成占位请求（`midstream_response_only`）；LLM 形状响应（choices/output/candidates）即使请求侧缺失也升级 generic-llm-json/partial/Model 进投影。3 条回归测试，本地 238/238 | 升级后复测 LLM 转化率，目标 >80%；不达标把 decoded.txt 对应失败行交开发 |
@@ -22,6 +22,7 @@
 | 13 | `probe_call_limit` 标记高发（1KB/chunk 截断） | ⚪ 已知限制 | — | 4.19 验证器要求定长读取（compat20）；跨块重组已保证内容完整（捕获率 p50=1.0），标记仅为提示 | 不修 |
 | 14 | 合成探针入库时滞 60-90s（idle 边界） | ⚪ 已知限制 | — | 验收脚本已适配（补等 45s）；真实流量不受影响 | 不修 |
 | 15 | 后台 API 调用 parseState=unparsed（占大头） | ⚪ 设计行为 | — | 非 LLM 的 REST 调用不做消息级解析；安全视图靠事件表 | 不修 |
+| 16 | **ClickHouse 超时/写入反压**——对话页空、collector degraded 的共同上游 | 🔴 待诊断（脚本已给） | CH/流量形态 | 现场实证（2026-10-16）：API 日志 `ClickHouseError: Timeout exceeded: elapsed ~5s`（agent bucket aggregation）+ `Insert: HTTP request error` / `write EPIPE` 每 4 分钟循环一次；事件速率 ~515K/min（≈8.6K/s 持续洪峰）；目录/轮次回退 `dataSource=hot_ring`（API 的 5s 有界查询预算在保护机制内故意回退热环视图）。**因果链**：CH 慢 → 交互/目录查询超时→热环视图（页面显空）→ 写入反压→spool 积压+采集丢弃（卡片 degraded） | 先跑 `check-ch-health.sh`（S1 慢查询/S2 合并/S3 query_log Top/S4 内存/S5 parts 爆炸/S6 整机）定位主因：查询侧（dashboard 重聚合轮询）→ 开发限流/降级；写入/合并侧 → 调合并或减少事件量；整机过载 → 与客户谈资源。**注意：这是容量/流量形态问题，不是 compat31 修复 bug——P0 搜索（Qwen 命中 5 条）和 P3 持久化（membership 963 行）都实证可用** |
 
 ## 归档（已闭环，细节见部署手册）
 
