@@ -514,6 +514,20 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
     64 * 1024,
     32 * 1024 * 1024,
   );
+  // PostgreSQL-free deployments persist session memberships to ClickHouse; on boot the recent
+  // window is replayed into the hot store so the conversation catalog survives restarts.
+  private readonly sessionMembershipRestoreWindowMs = boundedEnvInt(
+    'ANYSENTRY_SESSION_MEMBERSHIP_RESTORE_WINDOW_MS',
+    7 * 24 * 60 * 60_000,
+    60_000,
+    30 * 24 * 60 * 60_000,
+  );
+  private readonly sessionMembershipRestoreLimit = boundedEnvInt(
+    'ANYSENTRY_SESSION_MEMBERSHIP_RESTORE_LIMIT',
+    50_000,
+    1,
+    100_000,
+  );
   private derivedSemanticQueue: Array<{ record: SemanticRecord; bytes: number; onFailure: () => void }> = [];
   private derivedEvidenceQueue: Array<{ link: EvidenceLink; bytes: number; onFailure: () => void }> = [];
   private derivedSessionQueue: Array<{ membership: SessionMembership; bytes: number; onFailure: () => void }> = [];
@@ -525,7 +539,7 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
   private derivedSessionTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
-    @Optional() relationalStore?: RelationalBusinessStore,
+    @Optional() private readonly relationalStore?: RelationalBusinessStore,
     @Optional() private readonly clickhouseStore?: ClickHouseStore,
   ) {
     for (const descriptor of DEFAULT_TRANSPORT_REGISTRY) this.transports.register(descriptor);
@@ -1076,7 +1090,37 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
         .reduce((sum, item) => sum + gapBytes(item.gap), 0);
       this.enforceGapBudget();
     }
+    if (!this.relationalStore?.configured() && this.clickhouseStore && this.canonicalPersistenceEnabled) {
+      void this.restoreSessionMembershipsFromClickHouse();
+    }
     void this.reconcileAsyncCommitCoverageWhenReady();
+  }
+
+  /** PostgreSQL-free deployments keep the durable SessionMembership projection in ClickHouse.
+   *  Replay the recent window into the bounded hot store so conversation catalogs and timelines
+   *  survive an API restart. Replays of entries already in the hot ring surface as the store's
+   *  ordinary duplicate/conflict results and are tolerated. Never throws. */
+  private async restoreSessionMembershipsFromClickHouse(): Promise<number> {
+    const store = this.clickhouseStore;
+    if (!store || this.relationalStore?.configured() || !this.canonicalPersistenceEnabled) return 0;
+    try {
+      const ready = await store.init().catch(() => false);
+      if (!ready || this.closed) return 0;
+      const loaded = await store.loadSessionMemberships({
+        sinceMs: Date.now() - this.sessionMembershipRestoreWindowMs,
+        limit: this.sessionMembershipRestoreLimit,
+      });
+      const safe = loaded.flatMap((candidate) => {
+        const membership = safeDurableSessionMembership(candidate);
+        return membership ? [membership] : [];
+      });
+      if (safe.length === 0) return 0;
+      const results = this.sessionMemberships.appendMany(safe);
+      return results.filter((result) => result.status === 'inserted').length;
+    } catch (error) {
+      console.error('[canonical] session membership ClickHouse restore failed:', (error as Error).message);
+      return 0;
+    }
   }
 
   /** Startup compare of the last ClickHouse commit batch against Postgres raw_observations.
@@ -1777,6 +1821,17 @@ export class CanonicalObservabilityService implements OnModuleInit, OnModuleDest
           () => this.recordGap('projection', 'storage_unavailable', 'session_membership', { count: acceptedMemberships.length }),
         );
       if (this.asyncPersistence) durable = false;
+    } else if (
+      acceptedMemberships.length > 0
+      && this.canonicalPersistenceEnabled
+      && !this.relationalStore?.configured()
+      && this.clickhouseStore
+    ) {
+      // No PostgreSQL in this deployment: persist the accepted delta to ClickHouse so the
+      // membership projection can be restored after a restart. Fire-and-forget — a side-lane
+      // failure is logged by the store and must not fail the commit. When PostgreSQL is
+      // configured the relational sink above is the only writer (no double-write divergence).
+      void this.clickhouseStore.saveSessionMemberships(acceptedMemberships).catch(() => false);
     }
     return {
       accepted: results.filter((result) => result.status === 'inserted' || result.status === 'duplicate').length,
