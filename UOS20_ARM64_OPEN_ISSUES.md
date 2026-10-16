@@ -16,6 +16,9 @@
 | 4d | **前端把 base64 正文原样展示**（用户看到"类似 base64 内容"） | 🔴 待开发 | 前端展示层 | dump 实证：68 条记录 body 以 encoding=base64 存储（非 UTF-8/控制字符内容的正常编码），解码后全部是可读文本——前端对 unparsed 证据记录未按 encoding 解码就渲染 | 前端按 `encoding=base64` 解码后展示；或 API 返回前预解码 |
 | 4e | 明文里直接可见**凭证级内容**（安全发现，价值证明） | 🔵 待客户 | 客户侧 | dump 实证三例：登录接口明文 `username=[已脱敏账号]&password=[已脱敏]`；sandbox 代码内嵌 base64 的 data_vars 含完整 **JWT access_token**；LLM 网关请求头 **Bearer token** 明文（[已脱敏令牌]） | 作为安全发现正式报告客户：明文 HTTP 传凭证+弱密码是业务自身风险；AnySentry 已能抓出——这恰是产品价值的直接证明 |
 | 5 | Prometheus 未配置 | 🔵 待客户 | 客户运维/打包侧 | API 指标端点 `/security-center/platform/metrics/prometheus` 实测健康（curl 可取）；机器上是否有统一监控平台未知（查 `ps -ef \| grep -iE 'prometheus\|vmagent\|grafana\|node_exporter\|夜莺'`） | 有平台→交单机版 scrape 配置（targets 127.0.0.1:29653）；没有→再议是否打包内置 arm64 Prometheus（9090 不在端口禁区） |
+| 6 | 对话追踪页应**展示 unparsed 记录**（原始证据形态） | 🔴 待开发 | 前端+投影 | 现场测试者反馈：测试产生的对话记录找不到——多数记录被 `interactionType=unparsed` 过滤出投影，页面上等于"不存在"。诉求：解析不了的也按原始证据形态列出来（原文+乱码标记），不能只展示解析成功的 | 开发设计：对话追踪增加"未解析证据"分组/开关，数据源 agent_interactions_v1 全量；compat30 已放行 LLM 形状的 partial，本条要求覆盖剩余全部 |
+| 7 | 块分析应**先解码先展示**（渐进式），不等完整重组 | 🔴 待开发 | API/前端展示 | 现场反馈：现在是"完全获取全部对话后才展示"。诉求：采到多少解多少、先出部分内容（截断标记注明），大块/慢流不卡住展示 | 开发：详情接口对截断内容先返回已解码前缀 + truncated 标记（compat30 的 truncated_compressed_stream 已是此语义，延伸到所有截断形态） |
+| 8 | 对话界面**按内容搜索**（输入关键词返回命中的对话记录） | 🔴 待开发 | API+前端 | 现场反馈：测试产生的对话记录无法找到（无搜索入口）。agents/interactions 现有 path/model 等过滤但无正文搜索 | 开发：interactions 接口加 `contentQuery`（CH payload LIKE/positionCaseInsensitive 即可），前端加搜索框；这是现场自验的刚需，建议优先 |
 | 6 | `probe_call_limit` 标记高发（1KB/chunk 截断） | ⚪ 已知限制 | — | 4.19 验证器要求定长读取（compat20）；跨块重组已保证内容完整（捕获率 p50=1.0），标记仅为提示 | 不修 |
 | 7 | 合成探针入库时滞 60-90s（idle 边界） | ⚪ 已知限制 | — | 验收脚本已适配（补等 45s）；真实流量不受影响 | 不修 |
 | 8 | 后台 API 调用 parseState=unparsed（占大头） | ⚪ 设计行为 | — | 非 LLM 的 REST 调用不做消息级解析；安全视图靠事件表 | 不修 |
