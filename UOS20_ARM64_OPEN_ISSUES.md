@@ -2,6 +2,8 @@
 
 > 维护人：打包工程师。每轮现场反馈后更新；闭环项移入底部归档。
 > 部署手册（各 compat 版本全史）见 `UOS20_ARM64_DEPLOYMENT_REVIEW.md`。
+> 当前最新交付包：compat34（Observer `00ef87c`），已完成构建与发布合同校验，**尚未做现场安装验收**；
+> compat33 仅保留为“现场验证失败并定位根因”的历史版本，不得记为已修复。
 
 状态图例：🔴 待修复 ｜ 🟡 待验证（修复已合入 compat31，等现场窗口）｜ 🔵 待客户/外部输入 ｜ ⚪ 已知限制（不修）
 
@@ -14,7 +16,7 @@
 | 5 | **wire 模板匹配覆盖率低**（对话只有 2 条的直接原因） | 🟡 compat34 待验证 | Observer 解析层 | compat33 现场验证失败并定根：主导形态不是“完整干净 JSON + 空响应”，而是 **legacy 1KiB 截断后拼接下一段 HTTP**——全文 JSON 失败、`messages` 无闭合对象，连 `3dc5765` 的 req_msgs>0 条件都不触发，1393 条仍全 `unparsed/wire_unknown`。compat34（Observer `00ef87c`）补两层：①请求侧保守结构识别（POST + LLM 路由 + JSON Content-Type + messages/role/content 前缀）升级为 `generic-llm-json/partial/Model`，普通 REST 不升级；②legacy 载荷 1KiB→16KiB，perf 记录按 header+实际 len 发送，固定窗口分块读保持 4.19 验证器兼容。回归：现场形态 `partial/model`、普通 REST 保持 `unparsed`、legacy 242/242 | 升级后复测：parseState 应从全 unparsed 变为 partial 为主；timeline 应出现可证实的 user/model 轮次；若仍空，取 `decoded.txt` 与 API `[clickhouse] agent interaction query failed` 日志 |
 | 6 | **会话穿线缺失**：每条记录一个随机 sess_ id | 🟡 待验证 | API 会话分组 | `acf446b`：无锚交互按（进程实例+endpoint+keepalive connectionId 或 30 分钟桶）归并采集会话 | 升级后同用户连续问答应成串，会话目录不再只有资产级伪会话 |
 | 7 | **前端把 base64 正文原样展示**（用户看到"类似 base64 内容"） | 🟡 待验证 | 前端展示层 | `e220bed`：raw tab 按 encoding 解码 base64（共享 helper decodeContentBody.ts） | 升级后 base64 正文应显示为可读文本 |
-| 8 | 明文里直接可见**凭证级内容**（安全发现，价值证明） | 🔵 待客户 | 客户侧 | dump 实证三例：登录接口明文 `username=[已脱敏账号]&password=[已脱敏]`；sandbox 代码内嵌 base64 的 data_vars 含完整 **JWT access_token**；LLM 网关请求头 **Bearer token** 明文（[已脱敏令牌]） | 作为安全发现正式报告客户：明文 HTTP 传凭证+弱密码是业务自身风险；AnySentry 已能抓出——这恰是产品价值的直接证明 |
+| 8 | 明文里直接可见**凭证级内容**（安全发现，价值证明） | 🔵 待客户 | 客户侧 | dump 实证三类风险：登录接口以明文表单传输账号/口令；sandbox 代码内嵌 base64 的 data_vars 含完整 JWT；LLM 网关请求头携带 Bearer 令牌。原始敏感值已按数据卫生要求从台账删除，不进入仓库 | 作为安全发现正式报告客户：明文 HTTP 传凭证是业务自身风险；AnySentry 已能抓出——这恰是产品价值的直接证明。回传材料继续脱敏，只保留类型、位置和指纹 |
 | 9 | Prometheus 未配置 | ⚪ 已有结论（2026-10-16） | 打包侧（按需） | 现场排查：机器上没有监控平台进程。API 指标端点健康（curl 可取，验收/巡检够用） | 默认不打包内置 Prometheus；客户运维若提出要求，再出 arm64 组件包 |
 | 10 | 对话追踪页应**展示 unparsed 记录**（原始证据形态） | 🟡 待验证 | 前端 | `e220bed`：timeline 底部新增可折叠"原始证据（未解析）"车道 | 升级后未解析记录以证据车道可见 |
 | 11 | 块分析应**先解码先展示**（渐进式） | 🟡 待验证 | 前端 | `e220bed`："部分"徽标带 partialReasons tooltip（截断原因可见） | 升级后截断内容带标记展示 |

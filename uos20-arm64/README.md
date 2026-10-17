@@ -18,35 +18,59 @@
 
 ## 标准构建
 
+常规基线包使用全量构建：
+
 ```bash
 cd /home/chensicheng/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.4.0
 ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
-./uos20-arm64/build.sh --version 0.4.0-compat18
+  bash uos20-arm64/build.sh --version 0.4.0-compat34
 ```
 
 输出目录：
 
 ```text
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat18-uos20-arm64/
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat18-uos20-arm64.tar.gz
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat18-uos20-arm64.tar.gz.sha256
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64/
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz
+/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz.sha256
 ```
 
 仅检查并准备锁定源码：
 
 ```bash
-./uos20-arm64/build.sh --prepare-only
+bash uos20-arm64/build.sh --prepare-only
 ```
 
 分组件构建：
 
 ```bash
-./uos20-arm64/build.sh --version 0.4.0-compat18 --component observer
-./uos20-arm64/build.sh --version 0.4.0-compat18 --component app
-./uos20-arm64/build.sh --version 0.4.0-compat18 --component assemble
+bash uos20-arm64/build.sh --version 0.4.0-compat34 --component observer
+bash uos20-arm64/build.sh --version 0.4.0-compat34 --component app
+bash uos20-arm64/build.sh --version 0.4.0-compat34 --component l3
+bash uos20-arm64/build.sh --version 0.4.0-compat34 --component assemble
 ```
 
-`--component` 用于开发定位；正式交付必须执行默认的全量构建。
+`--component` 用于开发定位；常规正式基线必须执行默认全量构建。现场热修允许使用审核过的
+组件增量包，但必须复制上一版 stage、只替换目标组件，并重新执行 assemble 与发布合同校验。
+
+## 分支规则与增量打包流程
+
+1. 只使用三个 integration worktree：
+   AnySentry/Observer `uos20-arm64-0.4.0` 与 Sentry 锁定工作树；不得修改开发检出和稳定包工作树。
+2. 提交前三个输入仓库必须 clean；`uos20-arm64/versions.env` 必须写入完整提交 SHA，
+   不得凭短 SHA 或记忆填值。
+3. 版本钉死：AnySentry 包版本只递增 compat 号；`@a3s-lab/code=8.6.0`、
+   `@a3s-lab/sentry npm=0.3.0`、BPF 内核代号 `0x0004135a` 不得随 compat 号改变。
+4. 每次提交前执行 `bash uos20-arm64/tests/run-all.sh`；Observer 代码变更还要执行默认特性、
+   `legacy-kernel-4-19` 特性测试和双特性 clippy。
+5. 只改 Observer 的现场热修：
+   先 `cp -a` 上一版 stage 到新版号，删除新版 stage 的 `observer/`，再执行
+   `--component observer`，最后 `--component assemble`。
+6. 重编 `app` 后必须跟跑 `--component l3`，否则 a3s-code 的 `.node` 与 zvec 会被
+   fresh pnpm 安装清掉。
+7. 每次交付必须校验 tar `.sha256`、解包 `manifest.sha256`、`@RELEASE_VERSION@` 零残留、
+   `install.sh --help`、a3s-code `.node`/zvec，以及 PROVENANCE 中的三个提交号。
+8. 现场未验收前，问题台账只能写“待现场验证”，不能写“已闭环”。
+9. 现场会话默认不推远程；打包工程师在完成上述检查和门禁后，按任务要求推送 integration 分支。
 
 ## 上游迭代与兼容层维护
 
@@ -55,7 +79,8 @@ ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
 3. direct merge 上游 main，按语义解决冲突并更新 `versions.env` 锁定提交；
 4. 执行 `bash uos20-arm64/tests/run-all.sh`；
 5. 执行全量构建，以新版本号生成发布包；
-6. 在 UOS 同规格验证机执行 `./install.sh --check`、`./install.sh` 和 `/opt/anysentry/verify.sh`；
+6. 在 UOS 同规格验证机执行 `./install.sh --check`、`./install.sh`、
+   `/opt/anysentry/ACCEPTANCE_CHECK.sh` 和 `/opt/anysentry/verify.sh`；
 7. 交付 tar 包、`.sha256` 和 `PROVENANCE`。
 
 更新兼容层时，应在新的 integration 分支提交最小、可审计差异，并确认其中不包含构建产物、

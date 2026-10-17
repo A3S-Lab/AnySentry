@@ -110,6 +110,47 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 发布包输出目录是 `ANYSENTRY_RELEASE_DIR`。未设置时写到工作区的 `release/`。现场交付文件放在 `/home/chensicheng/a3s/security/release/`。
 
+### 现场分析脚本
+
+`ACCEPTANCE_CHECK.sh` 随发布包安装到 `/opt/anysentry`。下列分析脚本通常由打包工程师放在现场
+`/opt/anysentry-installer/` 或同级工作目录，不在发布包内；输出统一 `tee` 成 `.txt` 原样回传。
+
+| 脚本 | 用途 |
+| --- | --- |
+| `ACCEPTANCE_CHECK.sh` | 安装验收：服务、14 探针、审核投影、白名单、准入同步、出向 tarpit 明文链路 |
+| `check-conversation-view.sh [分钟]` | 对话追踪主检查：parseState/partialReasons、会话目录、timeline 轮次、请求/响应正文与乱码 |
+| `check-content-fidelity.sh [分钟]` | 捕获率、SSE `[DONE]` 完整率、语义转化率、parseState 小时趋势 |
+| `check-frontend-consistency.sh` | 目录/轮次/资产页三层对账、collector 卡片、API 日志、CH 直查、contentQuery 实测 |
+| `check-ch-health.sh` | CH 慢查询、合并、query_log、内存、parts、整机负载和磁盘 |
+| `check-interaction-scan.sh` | 交互表三变体裁剪实验；用于区分“调用侧宽窗口”和“排序键/表结构问题” |
+| `check-ring-pressure.sh` | ring 压力与丢块归因 |
+| `check-body-completeness.sh` | 端点级请求/响应体留存率 |
+| `check-plaintext-confirm.sh` | 明文、Egress、argv 恢复证据链 |
+| `check-ch-cleanup.sh` / `check-ch-orphans.sh` | CH 数据治理、孤儿/死 part 检查 |
+| `dump-conversations-full.sh [分钟]` | 对话页全量取证包；含敏感明文，用完按数据卫生要求双方删除 |
+
+compat34 现场验收顺序固定为：
+
+```bash
+bash /opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-compat34.txt
+bash check-conversation-view.sh 60 2>&1 | tee conversation-compat34.txt
+bash check-content-fidelity.sh 120 2>&1 | tee fidelity-compat34.txt
+```
+
+若 timeline 仍为 `dataSource=hot_ring`，再取 API 日志里的
+`[clickhouse] agent interaction query failed` 原文；该分支属于 CH 查询失败，不按解析问题处理。
+
+### 当前遗留问题（推送前口径）
+
+详细状态以 [UOS20_ARM64_OPEN_ISSUES.md](./UOS20_ARM64_OPEN_ISSUES.md) 为准。当前未闭环重点是：
+
+1. compat34 已构建但**尚未现场安装验收**；#5 wire 覆盖与 #13 legacy 16KiB 载荷均为“待现场验证”。
+2. #16 的 24h 钳制是止血方案；metadata-only 目录投影与翻页取历史仍需开发后续实现。
+3. #1 collector 卡片 degraded 的 CH 反压、#2 membership 跨重启保留、#6 会话穿线，要等 #16/compat34 现场复测后关闭。
+4. #7/#10/#11/#12 前端 base64、未解析证据车道、截断徽标、正文搜索已交付，仍需现场页面确认。
+5. #8 明文凭证暴露是客户业务自身风险，应作为安全发现正式报告客户。
+6. #9 Prometheus 仅影响平台监控页，不影响采集；客户明确要求时再出 arm64 组件包。
+
 ### 模型配置页和正式研判
 
 本包 `ANYSENTRY_L3_MODE=completion`。配置页的快速研判测试、深度研判测试，以及正式的快速研判和深度研判，都走同一个 L2 会话。测试通过说明地址、模型名和 API Key 能完成一次结构化调用。测试之后还要点应用，凭据才会推到研判进程。凭据在 API 进程内存中，API 重启后要在页面上重新测试并应用。

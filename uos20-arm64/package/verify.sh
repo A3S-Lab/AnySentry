@@ -257,10 +257,10 @@ attached_probes=$(printf '%s' "$collector" | collector_value attachedProbes)
   echo "Collector health response: $collector" >&2
   fail "collector errorCount=$error_count"
 }
-[[ $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]] ||
+[[ $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 14 ]] ||
   {
     echo "Collector health response: $collector" >&2
-    fail "collector attachedProbes=$attached_probes; expected at least 8"
+    fail "collector attachedProbes=$attached_probes; expected at least 14 (8 basic + 6 plaintext)"
   }
 pass "Observer collector is healthy; outputDropped=0 errorCount=0 attachedProbes=$attached_probes"
 

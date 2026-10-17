@@ -6,6 +6,8 @@
 - [AnySentry 使用手册](./AnySentry使用手册.md)：页面访问、监控对象和状态说明。
 - [AnySentry 脚本说明](./AnySentry脚本说明.md)：发布包内各 Shell 脚本的用途和参数。
 - [现场问题采集](./现场问题采集.md)：现场日志、模型配置状态和资源占用的采集方法。
+- [DEPLOYMENT.md](./DEPLOYMENT.md)：UOS 20 ARM64 部署维护、端口边界和常见故障。
+- [UOS现场诊断规则](./UOS现场诊断规则.md)：现场铁律、S0-S9 判定树、明文实验和数据回传规则。
 
 ## 1. 路径规则
 
@@ -50,7 +52,8 @@ sudo /opt/anysentry/anysentry-services.sh start
 /opt/anysentry/verify.sh
 ```
 
-验证过程中会提交本地测试判定并确认 Observer 事件接收，不用于纯只读检查。
+验证过程中会提交本地测试判定并确认 Observer 事件接收，不用于纯只读检查。Collector
+验收阈值是 `attachedProbes>=14`（8 个基础探针 + 6 个明文探针）、`errorCount=0`。
 
 ### `RUN_HEALTH_SMOKE.sh`
 
@@ -68,18 +71,25 @@ sudo /opt/anysentry/anysentry-services.sh start
 - `--safe`：默认模式，增加本地安全操作及带唯一标识的模拟事件；
 - `--extended`：增加多类别 Sentry 摄取模拟。
 
+健康报告中的 Collector 阈值同为 14 个探针；`state=degraded` 时查看窗口 reasons，
+不再把历史累计计数当作当前故障。
+
 ### `ACCEPTANCE_CHECK.sh`
 
-用途：现场验收。只读检查安装结果、Collector 健康、审核投影、明文白名单、Observer
-开关与探针挂接，并向 `127.0.0.1:8000`/`8001` 各发 3 个带唯一标记的 GET（业务返回
-401/404 属预期），30 秒后核对 ClickHouse 中的明文事件与五类非 exec 事件。
+用途：现场验收。检查安装结果、全部 systemd 单元、Collector 功能健康（14 个探针、
+运行时快照 0 拒绝、0 错误）、审核投影、明文白名单、Observer 开关与准入同步，并用
+**出向 tarpit 合成法**验证明文链路：在宿主机 18099 临时监听 OpenAI 形状响应，
+由 `ai-agent` 容器内进程发送 `/v1/chat/completions` 请求。入向 curl 到 8000/8001
+方向相反，按设计不会出明文事件，不作为验收方法。
 
 ```bash
 /opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-result.txt
 ```
 
-全部通过时输出 `验收全部通过`；存在未通过项时把输出文件交给打包工程师。该脚本
-不修改服务、配置或数据。
+脚本会等待合成记录进入 `agent_interactions_v1`；安静连接按 idle 边界完成，首次
+30 秒未命中会补等 45 秒。全部通过时输出 `验收全部通过`；存在未通过项时把输出文件
+原样交给打包工程师。除临时 tarpit 监听和容器内一次合成请求外，不修改服务、配置
+或持久数据。
 
 ### `FIELD_DIAGNOSTIC.sh`
 
@@ -136,7 +146,8 @@ cd /tmp
 
 ### `diagnostics/RUN_DIAGNOSTICS.sh`
 
-用途：执行被动检查和瞬时 BPF syscall 探测，判断实际 BPF kprobe 版本兼容性。
+用途：执行被动检查和瞬时 BPF syscall 探测，判断实际 BPF/kprobe 版本兼容性；UOS 4.19
+环境应看到 kprobe 候选版本 `4.19.90`、版本码 `0x0004135a`。
 
 ```bash
 cd /tmp
@@ -145,7 +156,8 @@ cd /tmp
   /opt/anysentry/observer/bin/a3s-observer-collector
 ```
 
-报告默认写入当前工作目录。该脚本不附加 KProbe，不 pin BPF 对象。
+报告默认写入当前工作目录。该脚本只创建瞬时 BPF map/program FD 并立即关闭，不附加
+KProbe，不 pin BPF 对象，最长运行约 45 秒。
 
 ### `diagnostics/RUN_PASSIVE_CHECK.sh`
 

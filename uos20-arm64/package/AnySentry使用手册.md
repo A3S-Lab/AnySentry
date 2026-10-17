@@ -43,10 +43,13 @@ Source 应为 `Active`，`acceptedEvents` 应持续增加，`rejectedEvents` 不
 Collector 应为 `健康`，并满足：
 
 ```text
-attachedProbes=8
-outputDropped=0
+attachedProbes=14
 errorCount=0
 ```
+
+`outputDropped` 是导出器真实写入失败计数，不是明文准入计数。若 collector 显示
+`degraded`，查看健康接口中 capture/delivery/control 三车道的窗口 reasons；不再把
+历史累计计数当作当前故障。
 
 Kafka、Flink 和流处理 Worker 应为 `active`。Flink 页面只监听本机 `127.0.0.1:8081`，
 其 `AnySentry Flink Shadow Risk` 作业状态应为 `RUNNING`。

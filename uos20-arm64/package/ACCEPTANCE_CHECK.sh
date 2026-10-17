@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# AnySentry UOS 随包现场验收（只读 + 仅向 127.0.0.1:8000/8001 各发 3 个带唯一标记的 GET）
+# AnySentry UOS 随包现场验收（服务/探针/审核/白名单只读 + 出向 tarpit 明文合成）
 # 安装完成后运行：bash /opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-result.txt
-# 也可在发布包解压目录直接运行。业务 401/404 属预期，无副作用。
+# 也可在发布包解压目录直接运行。明文探针按 Agent 出向腿设计；入向 curl 不作为验收方法。
 set -uo pipefail
 
 ENV_FILE=/etc/anysentry/anysentry.env
@@ -31,16 +31,16 @@ print('  state:',it.get('state'),' attachedProbes:',it.get('attachedProbes'),
 print('  runtimeSnapshot posts/errors/rejected:',
       fm.get('runtimeSnapshotPosts'),'/',fm.get('runtimeSnapshotErrors'),'/',fm.get('runtimeSnapshotRejected'))
 print('  confirmedAgent(窗口):',fm.get('confirmedAgent'),' probableAgent:',fm.get('probableAgent'))
-# state=degraded 只说明历史上丢过事件（环丢失累计计数），采集本身可正常工作；
-# 判 FAIL 只看功能指标：探针数、快照拒绝、错误计数。
+# state=degraded 表示当前评估窗口存在真实丢弃/反压原因；安装验收仍先看功能指标：
+# 探针数、运行时快照拒绝、错误计数。窗口 reasons 交给 FIELD_DIAGNOSTIC/前端卡片继续看。
 ok = (it.get('attachedProbes')==14 and fm.get('runtimeSnapshotRejected')==0
       and not fm.get('lastRuntimeSnapshotError') and (it.get('errorCount') or 0)==0)
 if it.get('state')=='degraded':
-    print('  [注意] state=degraded：历史累计丢过事件（droppedEvents>0），功能指标正常即视为通过')
+    print('  [注意] state=degraded：当前窗口有真实丢弃/反压原因；功能指标正常时安装验收仍通过')
 print('  __VERDICT__', 'PASS' if ok else 'FAIL')
 " | tee /tmp/.acc-s2 | grep -E 'state|runtimeSnapshot|confirmed|注意|!!'
 grep -q '__VERDICT__ PASS' /tmp/.acc-s2 && ok "collector 功能健康（探针 14 + 快照 0 拒绝 + 0 错误）" || bad "collector 未就绪或仍有快照拒绝"
-echo "  说明：outputDropped 是策略丢弃计数（非白名单进程事件按设计丢弃），不是故障。"
+echo "  说明：outputDropped 是导出器真实写入失败计数；策略过滤看 filterMetrics。"
 
 step "3. 审核投影显式字段 + confirmed 条目"
 curl -sS --connect-timeout 2 --max-time 15 "$API/identity/snapshot" | python3 -c "

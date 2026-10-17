@@ -90,7 +90,7 @@ case "$all" in
     ;;
   *security-center/collectors/health*)
     state=${FAKE_COLLECTOR_STATE:-healthy}
-    probes=8
+    probes=14
     [[ $state == healthy ]] || probes=0
     printf '{"code":200,"data":{"items":[{"collectorId":"observer-test","state":"%s","attachedProbes":%s,"outputDropped":0,"errorCount":0,"queueDepth":0}]}}\n' "$state" "$probes"
     ;;

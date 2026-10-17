@@ -77,6 +77,7 @@ sha256sum --check manifest.sha256
 
 ```bash
 /opt/anysentry/verify.sh
+/opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-result.txt
 /opt/anysentry/RUN_HEALTH_SMOKE.sh --passive
 curl -fsS http://127.0.0.1:29653/security-center/healthz
 systemctl is-active anysentry-clickhouse.service

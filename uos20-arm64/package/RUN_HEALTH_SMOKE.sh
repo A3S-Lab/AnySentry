@@ -388,9 +388,9 @@ queue_depth=$(numeric_or "$queue_depth" -1)
 [[ $collector_state == healthy ]] &&
   pass "Observer collector state=healthy" ||
   fail "Observer collector state=${collector_state:-missing}"
-[[ $attached_probes -ge 8 ]] &&
+[[ $attached_probes -ge 14 ]] &&
   pass "Observer collector attachedProbes=$attached_probes" ||
-  fail "Observer collector attachedProbes=$attached_probes; expected at least 8"
+  fail "Observer collector attachedProbes=$attached_probes; expected at least 14 (8 basic + 6 plaintext)"
 [[ $output_dropped == 0 ]] &&
   pass "Observer collector outputDropped=0" ||
   fail "Observer collector outputDropped=$output_dropped"

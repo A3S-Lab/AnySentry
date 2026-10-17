@@ -61,9 +61,12 @@ sha256sum --check manifest.sha256
 
 ```bash
 /opt/anysentry/verify.sh
+/opt/anysentry/ACCEPTANCE_CHECK.sh 2>&1 | tee acceptance-result.txt
 cat /opt/anysentry/VERSION
 cat /opt/anysentry/PROVENANCE
 ```
+
+compat 验收以 `ACCEPTANCE_CHECK.sh` 的 14 探针、审核投影、白名单和出向明文链路结果为准。
 
 ## 4. 页面访问
 
@@ -158,11 +161,17 @@ journalctl -b -u anysentry-observer.service -n 300 --no-pager -o cat
 /opt/anysentry/diagnostics/RUN_DIAGNOSTICS.sh
 ```
 
-Observer 正常日志应包含 8 条 `legacy probe attached` 和汇总 `effective_probes=3`。Source 应为 `active`，`acceptedEvents` 持续增加，`rejectedEvents` 不增加；collector 应为 `healthy`，`outputDropped=0`、`errorCount=0`。
+Observer 正常日志应包含 14 个 `legacy probe attached` 程序（8 个基础事件 + 6 个明文
+载荷探针），健康 JSON 的 `attachedProbes` 应为 14。Source 应为 `active`，
+`acceptedEvents` 持续增加，`rejectedEvents` 不增加；collector 应为 `healthy`，
+`errorCount=0`。`state=degraded` 只表示当前窗口存在真实丢弃或反压，需要结合
+capture/delivery/control 三车道 reasons 判断，不再代表历史累计误报。
 
 安装验证以 Source 事件增长及 collector 运行时健康为准，要求
-`attachedProbes>=8`、`outputDropped=0`、`errorCount=0`。journal 日志仅用于排错，
-不得作为独立的激活或回滚条件。
+`attachedProbes>=14`、运行时快照 0 拒绝、`errorCount=0`。journal 日志仅用于排错，
+不得作为独立的激活或回滚条件。`outputDropped` 是导出器真实写入失败计数，
+不是明文白名单准入计数，也不是策略过滤计数；明文链路是否通以 `LlmInteraction` 和
+`agent_interactions_v1` 为准。
 
 Collector 健康记录在 API 启动后可能延迟可见。安装验证最长等待 180 秒；若仍未就绪，
 错误输出包含最后一次 `/collectors/health` 原始 JSON、`state` 和 `attachedProbes`。

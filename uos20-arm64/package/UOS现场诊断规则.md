@@ -73,10 +73,11 @@
    无超时的真阻塞 socket**（tarpit 慢动作法：服务端睡 12-15s，客户端 recv 阻塞全程可见）。
 3. **宿主机 ss 看不见容器桥内直连**（netns 隔离）。要看容器内连接用 `nsenter -t <pid1> -n ss -tanp`。
    docker-proxy 转发腿会暴露在宿主 netns（这就是为什么发布端口的流量可见）。
-4. **events 表是 Agent 安全视图，不是全机流水**：Egress/明文等只保留归因到 Agent 的；未归因事件被
-   策略丢弃（`outputDropped` 就是这个计数，**它的波动是噪音水位，不是故障**）。
-5. **诊断脚本自己会污染现场**：每秒循环调 docker top/ss/awk 会产生大量 ProcessExit/ToolExec 事件
-   和 outputDropped——分析入库暴涨时先排除自己的脚本。
+4. **events 表是 Agent 安全视图，不是全机流水**：Egress/明文等只保留归因到 Agent 的；未归因事件由
+   过滤器丢弃并体现在 filterMetrics，不进 `outputDropped`。`outputDropped` 是导出器真实写入失败
+   计数，持续上升才按 delivery 故障处理。
+5. **诊断脚本自己会污染现场**：每秒循环调 docker top/ss/awk 会产生大量 ProcessExit/ToolExec 事件，
+   并抬高 droppedEvents/filterMetrics——分析入库暴涨时先排除自己的脚本。
 6. **docker exec 有双 pid 陷阱**：`docker exec` 在宿主机上有一个 CLI 代理进程，容器内才是真目标；
    pgrep -f 会先匹配到代理。核对 pid 用 bpf-inspect 的 ALLOWED_PID 或对进程组关系。
 7. **observer 服务停止 = 白名单文件消失**（systemd 擦 RuntimeDirectory）；reconcile 日志停更 ≠ 服务死
@@ -100,8 +101,18 @@
 ## 6. 工具箱
 
 - **`FIELD_DIAGNOSTIC.sh`**（随包）：S0-S8 一次跑完，默认纯只读，`--with-http` 加跑 S7。
+- **`ACCEPTANCE_CHECK.sh`**（随包）：compat 安装验收，14 探针 + 审核投影 + 白名单 + 出向
+  tarpit 明文链路；输出必须 tee 原样回传。
+- **`check-conversation-view.sh [分钟]`**（现场分析脚本，不在发布包）：parseState、会话目录、
+  timeline 轮次、请求/响应正文与乱码检查。
+- **`check-content-fidelity.sh [分钟]`**（现场分析脚本）：捕获率、SSE 完整率、语义转化率、
+  parseState 小时趋势。
+- **`check-frontend-consistency.sh`**（现场分析脚本）：目录/轮次/资产三层对账、collector 卡片、
+  API 日志、CH 直查和 contentQuery 实测。
+- **`check-ch-health.sh`**（现场分析脚本）：CH 慢查询、合并、内存、parts、整机负载。
+- **`check-interaction-scan.sh`**（现场分析脚本）：交互表裁剪实验，区分调用侧宽窗口与表结构问题。
 - **`bpf-inspect`**（随包 diagnostics 建议位）：自研静态 arm64 工具，直读 bpf() 枚举程序 run_cnt、
-  程序引用的 map id 列表、PLAINTEXT_ALLOW 的 pid 键、READ_ARGS 暂存、DROPS。源码 `bpf-inspect.c`，
+  程序引用的 map id 列表、PLAINTEXT_ALLOWED 的 pid 键、PLAINTEXT_READ_ARGS 暂存、DROPS。源码 `bpf-inspect.c`，
   构建：`zig cc -target aarch64-linux-musl -static -O2 -s -o bpf-inspect bpf-inspect.c`。
 - **nsenter 读容器网络**：`nsenter -t $(docker inspect -f '{{.State.Pid}}' <容器>) -n ss -tanp`。
 - **ClickHouse 直查**（凭据在 /etc/anysentry/anysentry.env 的 CLICKHOUSE_USER/PASSWORD）：
@@ -119,7 +130,9 @@
 
 ## 7. 交接与会话恢复
 
-- 打包工作区：`~/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.4.0`（分支 integration/uos20-arm64-0.4.0），
-  Observer 同名 worktree。**不许动开发检出**、不推远程。
+- 打包工作区：`~/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.4.0`（分支
+  integration/uos20-arm64-0.4.0），Observer 同名 worktree。**不许动开发检出**；现场会话不推远程，
+  打包工程师完成检查、门禁和任务明确要求后再推 integration 分支。
 - 给开发的交接文档走开发检出 `docs/` 目录的 untracked 文件（不混入提交）。
-- 打包手册：工作树根 `UOS20_ARM64_DEPLOYMENT_REVIEW.md`（每个 compat 版本的变更与验收都在表里）。
+- 打包手册：工作树根 `UOS20_ARM64_DEPLOYMENT_REVIEW.md`（每个 compat 版本的变更与验收都在表里）；
+  构建入口和分支规则见 `uos20-arm64/README.md`。

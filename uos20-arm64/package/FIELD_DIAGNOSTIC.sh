@@ -76,7 +76,7 @@ try:
     it=json.load(sys.stdin).get('data',{}).get('items',[{}])[0]
     print('  collector state=%s attachedProbes=%s droppedEvents=%s outputDropped=%s' % (
         it.get('state'),it.get('attachedProbes'),it.get('droppedEvents'),it.get('outputDropped')))
-    print('  （注：outputDropped=非Agent事件按策略丢弃，是设计行为不是故障）')
+    print('  （注：outputDropped=导出器真实写入失败计数；策略过滤看 filterMetrics）')
 except Exception as e: print('  health 查询失败:',e)
 "
 
@@ -135,10 +135,13 @@ step "S6. 采集产出（各类型速率 + 明文计数）"
 echo "-- 近 10 分钟事件类型分布:"
 "${CH[@]}" http://127.0.0.1:8123/ --data-binary \
   "SELECT eventKind, count() FROM anysentry.events WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 10 MINUTE)) * 1000 GROUP BY eventKind ORDER BY count() DESC FORMAT TSV" 2>/dev/null | sed 's/^/   /'
-echo "-- 明文事件（tcp_plaintext/tls_uprobe）总数:"
+echo "-- 明文事件（LlmInteraction）近 10 分钟:"
 "${CH[@]}" http://127.0.0.1:8123/ --data-binary \
-  "SELECT count() FROM anysentry.events WHERE source IN ('tcp_plaintext','tls_uprobe')" 2>/dev/null | sed 's/^/   /'
-note "注意：events 表是 Agent 安全视图，不是全机网络流水；Egress 稀疏属正常（未归因被策略丢弃）"
+  "SELECT count() FROM anysentry.events WHERE eventKind='LlmInteraction' AND at > toUInt64(toUnixTimestamp(now() - INTERVAL 10 MINUTE)) * 1000" 2>/dev/null | sed 's/^/   /'
+echo "-- 明文交互明细（agent_interactions_v1）近 10 分钟:"
+"${CH[@]}" http://127.0.0.1:8123/ --data-binary \
+  "SELECT count() FROM anysentry.agent_interactions_v1 WHERE at > toUInt64(toUnixTimestamp(now() - INTERVAL 10 MINUTE)) * 1000" 2>/dev/null | sed 's/^/   /'
+note "注意：events.source 只有 observer/api，不能用 source IN ('tcp_plaintext','tls_uprobe') 判明文"
 
 # =========================================================================
 step "S7. 明文合成实验（--with-http 才跑；tarpit 慢动作法）"
