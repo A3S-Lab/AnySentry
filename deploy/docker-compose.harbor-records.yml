@@ -1,0 +1,7 @@
+# Opt-in, read-only Harbor archives. No auth.json or live Codex home is mounted.
+services:
+  anysentry:
+    environment:
+      ANYSENTRY_LOCAL_HARBOR_JOBS_DIR: /host-agent-state/harbor-jobs
+    volumes:
+      - ${ANYSENTRY_HARBOR_JOBS_DIR:-../terminal-bench/.harbor-jobs}:/host-agent-state/harbor-jobs:ro

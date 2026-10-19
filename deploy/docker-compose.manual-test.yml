@@ -8,6 +8,7 @@ services:
     image: ${ANYSENTRY_IMAGE:?Set ANYSENTRY_IMAGE to the immutable AnySentry image digest}
     environment:
       ANYSENTRY_STREAMING: "on"
+      ANYSENTRY_INTERACTIONS: "on"
       ANYSENTRY_SUPPLY_CHAIN: "on"
       ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
       # The full manual profile starts several relational projections together. Give their
@@ -66,11 +67,14 @@ services:
     environment:
       A3S_OBSERVER_JSON: "1"
       A3S_OBSERVER_FILES: "1"
-      A3S_OBSERVER_SSL: "1"
+      A3S_OBSERVER_INTERACTION_CAPTURE_MODE: metadata
+      A3S_OBSERVER_SSL: "0"
       A3S_OBSERVER_COLLECTOR_ID: manual-docker-observer
       A3S_NODE_NAME: manual-docker-host
       ANYSENTRY_INGEST_URL: http://anysentry:29653/security-center/ingest
       ANYSENTRY_BATCH_INGEST_URL: http://anysentry:29653/security-center/ingest/batch
+      ANYSENTRY_INTERACTIONS: "on"
+      ANYSENTRY_INTERACTION_INGEST_URL: http://anysentry:29653/security-center/interactions/ingest
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: http://anysentry:29653/security-center/identity/snapshot
       ANYSENTRY_AGENT_RUNTIME_LEASE_URL: http://anysentry:29653/security-center/runtime/lease
       ANYSENTRY_AGENT_RUNTIME_SNAPSHOT_URL: http://anysentry:29653/security-center/runtime/snapshot

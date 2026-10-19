@@ -1,0 +1,20 @@
+# Bounded FileAccess canary for A3S Session→eBPF attribution.
+# Layer after docker-compose.modules.yml + docker-compose.override.yml.
+# Keeps FileDelete off and tightens forwarder noise drops so unknown file flood
+# is less likely to overwhelm ClickHouse/API than the unrestricted keep path.
+services:
+  observer:
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "1"
+      A3S_OBSERVER_FILE_DELETE: "0"
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      A3S_OBSERVER_SSL: "0"
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_UNKNOWN: "true"
+      FORWARD_RETAIN_NON_AGENT: "false"
+      FORWARD_NOISE_POLICY: "balanced"
+      FORWARD_FILE_AGGREGATION: "true"
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"
+      FORWARD_DROP_PATHS: "/sys/,/proc/,/run/,/dev/,/var/lib/docker/,/var/lib/containerd/,/var/log/,/tmp/,/home/zhongyule/.cache/,/home/zhongyule/.cursor/,/home/zhongyule/.npm/,/home/zhongyule/.local/share/,/usr/lib/,/usr/share/,/lib/,/lib64/"

@@ -1,0 +1,2 @@
+FROM anysentry-api:normal-dialogue-v2-20260916
+COPY api/ /app/dist/security-monitoring/

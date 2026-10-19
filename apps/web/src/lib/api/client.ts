@@ -19,6 +19,7 @@ export interface ApiResponse<T> {
 
 const REQUEST_TIMEOUT_MS = 30000;
 const ADMIN_TOKEN_STORAGE_KEY = "anysentry.adminToken";
+const RAW_VIEW_TOKEN_STORAGE_KEY = "anysentry.interactionRawViewToken";
 
 /**
  * URL base path the dashboard is served under (set via `PUBLIC_BASE_PATH` at
@@ -75,6 +76,26 @@ export function setAdminToken(token: string): void {
 
 export function hasAdminToken(): boolean {
   return Boolean(getAdminToken());
+}
+
+export function getInteractionRawViewToken(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(RAW_VIEW_TOKEN_STORAGE_KEY)?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setInteractionRawViewToken(token: string): void {
+  if (typeof window === "undefined") return;
+  const clean = token.trim();
+  try {
+    if (clean) window.localStorage.setItem(RAW_VIEW_TOKEN_STORAGE_KEY, clean);
+    else window.localStorage.removeItem(RAW_VIEW_TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable in strict browser contexts.
+  }
 }
 
 export class ApiError extends Error {
@@ -180,6 +201,9 @@ export const apiClient = {
   get<T>(endpoint: string, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, { ...init, method: "GET" });
   },
+  getLong<T>(endpoint: string, init: RequestInit = {}, timeoutMs = 95_000): Promise<T> {
+    return request<T>(endpoint, { ...init, method: "GET" }, timeoutMs);
+  },
   post<T>(endpoint: string, body?: unknown, init: RequestInit = {}): Promise<T> {
     return request<T>(endpoint, {
       ...init,
@@ -206,5 +230,8 @@ export const apiClient = {
       method: "PUT",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+  },
+  delete<T>(endpoint: string, init: RequestInit = {}): Promise<T> {
+    return request<T>(endpoint, { ...init, method: "DELETE" });
   },
 };

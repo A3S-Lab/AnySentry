@@ -61,7 +61,7 @@ assert.equal(rules.length, first.total, 'cursor pagination must enumerate the co
 assert.equal(first.categories.length, 8);
 assert.equal(new Set(rules.map((rule) => rule.ruleId)).size, rules.length);
 assert(rules.filter((rule) => rule.ruleId.startsWith('ifr_')).length >= 60, 'all migrated Infrastructure rules must remain visible');
-assert.equal(rules.filter((rule) => rule.ruleKind === 'runtime_signature').length, 6);
+assert.equal(rules.filter((rule) => rule.ruleKind === 'runtime_signature').length, 7);
 assert(first.kinds.some((kind) => kind.kind === 'agent_template' && kind.total === 0), 'empty Agent Template category must remain explicit');
 assert(rules.some((rule) => rule.ruleId === 'fr_guardrail_security_full' && rule.editable === false));
 assert(rules.some((rule) => rule.ruleId === 'fr_builtin_f3_non_agent_structural'));
@@ -84,7 +84,7 @@ assert.deepEqual(catalogAfterMaterialization.domainVersions, first.domainVersion
 const projectionA = await request('/filter-rules/projections/forwarder', { admin: true });
 await new Promise((resolve) => setTimeout(resolve, 20));
 const projectionB = await request('/filter-rules/projections/forwarder', { admin: true });
-assert.equal(projectionA.runtimeSignatures.runtimes.length, 6);
+assert.equal(projectionA.runtimeSignatures.runtimes.length, 7);
 assert.equal(projectionA.agentTemplates.templates.length, 0);
 assert(projectionA.identityRules.some((rule) => rule.ruleId.startsWith('ifr_')), 'Forwarder projection must contain enforced adapter rules');
 assert.equal(projectionA.captureProfiles.agent_full.file_access, 'full');

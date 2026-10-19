@@ -1,0 +1,12 @@
+# Container-session evidence linkage (P2a): FileAccess path markers (`/session_<uuid>/`) align
+# the in-container mount view (/logs/agent/.kimi-code/...) with host-side records, the runtime
+# guard only vetoes positively different agent families, and the kimi tool-exec lane compares
+# commands after stripping the `cd <cwd> && …` wrapper.
+# Base is the running image so the wire-list resilience fix stays in place.
+FROM anysentry-api:wire-list-resilience-20261012
+COPY local-record-tracking.service.js /app/dist/security-monitoring/local-record-tracking.service.js
+COPY local-record-tracking.service.js.map /app/dist/security-monitoring/local-record-tracking.service.js.map
+COPY session-event-attribution.service.js /app/dist/security-monitoring/session-event-attribution.service.js
+COPY session-event-attribution.service.js.map /app/dist/security-monitoring/session-event-attribution.service.js.map
+COPY clickhouse-store.js /app/dist/security-monitoring/clickhouse-store.js
+COPY clickhouse-store.js.map /app/dist/security-monitoring/clickhouse-store.js.map

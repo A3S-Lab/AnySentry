@@ -1,0 +1,5 @@
+FROM anysentry-api:session-analysis-20260917 AS api
+COPY api/ /app/dist/security-monitoring/
+
+FROM anysentry-web:session-analysis-20260917 AS web
+COPY web/ /usr/share/nginx/html/

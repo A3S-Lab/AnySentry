@@ -1,0 +1,10 @@
+# Transient-FD binding (P1a): inotify-caught proc_fd evidence for kimi-code's open-append-close
+# wire.jsonl writes + live_agent same-cwd guard rails. Only local-record-tracking.service changes
+# vs the previous canary; the kimi-code wire 1.5 adapter layer is inherited from the base image.
+FROM anysentry-api:kimi-code-wire-20261009
+COPY local-record-kimi-cli.adapter.js /app/dist/security-monitoring/local-record-kimi-cli.adapter.js
+COPY local-record-kimi-cli.adapter.js.map /app/dist/security-monitoring/local-record-kimi-cli.adapter.js.map
+COPY local-record-tracking.service.js /app/dist/security-monitoring/local-record-tracking.service.js
+COPY local-record-tracking.service.js.map /app/dist/security-monitoring/local-record-tracking.service.js.map
+COPY session-event-attribution.service.js /app/dist/security-monitoring/session-event-attribution.service.js
+COPY session-event-attribution.service.js.map /app/dist/security-monitoring/session-event-attribution.service.js.map

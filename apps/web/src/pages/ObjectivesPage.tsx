@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   BellRing,
   Bot,
@@ -348,7 +349,7 @@ function ObjectiveRow({ item, active, onSelect }: { item: ObjectiveItem; active:
 export default function ObjectivesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const routeTargetType = isObjectiveTargetType(searchParams.get("targetType")) ? searchParams.get("targetType") as ObjectiveTargetType : undefined;
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [status, setStatus] = useState<ObjectiveStatus | "all">((searchParams.get("status") as ObjectiveStatus) || "all");
   const [targetType, setTargetType] = useState<ObjectiveTargetType | "all">((searchParams.get("targetType") as ObjectiveTargetType) || "all");
   const [targetId, setTargetId] = useState(targetIdFromParams(searchParams, routeTargetType));

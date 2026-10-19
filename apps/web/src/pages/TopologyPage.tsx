@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf, securityTimestampValue } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   Bot,
   BrainCircuit,
@@ -7,6 +8,7 @@ import {
   FileText,
   FolderTree,
   GitBranch,
+  GripHorizontal,
   LoaderCircle,
   Maximize2,
   Minus,
@@ -19,7 +21,14 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  type KeyboardEvent,
+  type PointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { useSecurityConsole } from "@/components/custom/security-console-header";
@@ -298,8 +307,19 @@ const GRAPH_WIDTH = 1260;
 const GRAPH_NODE_WIDTH = 220;
 const GRAPH_NODE_HEIGHT = 76;
 const GRAPH_EDGE_LIMIT = 18;
+const GRAPH_VIEWPORT_DEFAULT_HEIGHT = 680;
+const GRAPH_VIEWPORT_MIN_HEIGHT = 420;
+const GRAPH_VIEWPORT_MAX_HEIGHT = 1040;
+const GRAPH_VIEWPORT_KEYBOARD_STEP = 32;
 
 type GraphPosition = { x: number; y: number };
+
+function clampGraphViewportHeight(value: number) {
+  return Math.min(
+    GRAPH_VIEWPORT_MAX_HEIGHT,
+    Math.max(GRAPH_VIEWPORT_MIN_HEIGHT, Math.round(value)),
+  );
+}
 
 function graphRiskTone(node: AgentTopologyNode) {
   if (node.riskyEventCount > 0) {
@@ -333,6 +353,64 @@ function SecurityTopologyCanvas({
   onSelect: (edge: AgentTopologyEdge) => void;
 }) {
   const [zoom, setZoom] = useState(0.85);
+  const [viewportHeight, setViewportHeight] = useState(GRAPH_VIEWPORT_DEFAULT_HEIGHT);
+  const resizeOriginRef = useRef<{ pointerY: number; height: number }>();
+  const bodyInteractionRef = useRef<{ cursor: string; userSelect: string }>();
+
+  const beginResize = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    resizeOriginRef.current = {
+      pointerY: event.clientY,
+      height: viewportHeight,
+    };
+    bodyInteractionRef.current = {
+      cursor: document.body.style.cursor,
+      userSelect: document.body.style.userSelect,
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const continueResize = (event: PointerEvent<HTMLDivElement>) => {
+    const origin = resizeOriginRef.current;
+    if (!origin) return;
+    setViewportHeight(clampGraphViewportHeight(origin.height + event.clientY - origin.pointerY));
+  };
+
+  const endResize = (event?: PointerEvent<HTMLDivElement>) => {
+    resizeOriginRef.current = undefined;
+    if (event?.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    const previous = bodyInteractionRef.current;
+    if (previous) {
+      document.body.style.cursor = previous.cursor;
+      document.body.style.userSelect = previous.userSelect;
+      bodyInteractionRef.current = undefined;
+    }
+  };
+
+  const resizeWithKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
+    let nextHeight: number | undefined;
+    if (event.key === "ArrowUp") nextHeight = viewportHeight - GRAPH_VIEWPORT_KEYBOARD_STEP;
+    if (event.key === "ArrowDown") nextHeight = viewportHeight + GRAPH_VIEWPORT_KEYBOARD_STEP;
+    if (event.key === "PageUp") nextHeight = viewportHeight - GRAPH_VIEWPORT_KEYBOARD_STEP * 3;
+    if (event.key === "PageDown") nextHeight = viewportHeight + GRAPH_VIEWPORT_KEYBOARD_STEP * 3;
+    if (event.key === "Home") nextHeight = GRAPH_VIEWPORT_MIN_HEIGHT;
+    if (event.key === "End") nextHeight = GRAPH_VIEWPORT_MAX_HEIGHT;
+    if (nextHeight === undefined) return;
+    event.preventDefault();
+    setViewportHeight(clampGraphViewportHeight(nextHeight));
+  };
+
+  useEffect(() => () => {
+    const previous = bodyInteractionRef.current;
+    if (!previous) return;
+    document.body.style.cursor = previous.cursor;
+    document.body.style.userSelect = previous.userSelect;
+  }, []);
+
   const graph = useMemo(() => {
     const visibleEdges = [...edges]
       .sort((a, b) =>
@@ -436,11 +514,24 @@ function SecurityTopologyCanvas({
       </div>
 
       {!agent ? (
-        <div className="flex min-h-[420px] items-center justify-center text-sm text-zinc-500">选择一个 Agent 查看安全关系图</div>
+        <div
+          className="flex items-center justify-center text-sm text-zinc-500"
+          style={{ height: viewportHeight }}
+        >
+          选择一个 Agent 查看安全关系图
+        </div>
       ) : graph.visibleEdges.length === 0 ? (
-        <div className="flex min-h-[420px] items-center justify-center text-sm text-zinc-500">当前筛选范围内没有可绘制关系</div>
+        <div
+          className="flex items-center justify-center text-sm text-zinc-500"
+          style={{ height: viewportHeight }}
+        >
+          当前筛选范围内没有可绘制关系
+        </div>
       ) : (
-        <div className="max-h-[680px] overflow-auto bg-[radial-gradient(circle_at_center,rgba(148,163,184,0.12)_1px,transparent_1px)] [background-size:24px_24px]">
+        <div
+          className="overflow-auto bg-[radial-gradient(circle_at_center,rgba(148,163,184,0.12)_1px,transparent_1px)] [background-size:24px_24px]"
+          style={{ height: viewportHeight }}
+        >
           <div style={{ width: GRAPH_WIDTH * zoom, height: graph.height * zoom }}>
             <div
               className="relative"
@@ -562,6 +653,30 @@ function SecurityTopologyCanvas({
           当前画布优先展示风险最高的 {GRAPH_EDGE_LIMIT} / {edges.length} 条关系，完整关系保留在下方列表
         </div>
       ) : null}
+
+      <div
+        role="separator"
+        aria-label="调整拓扑画布高度"
+        aria-orientation="horizontal"
+        aria-valuemin={GRAPH_VIEWPORT_MIN_HEIGHT}
+        aria-valuemax={GRAPH_VIEWPORT_MAX_HEIGHT}
+        aria-valuenow={viewportHeight}
+        aria-valuetext={`${viewportHeight} 像素`}
+        tabIndex={0}
+        title="上下拖动调整画布高度；双击恢复默认高度"
+        onPointerDown={beginResize}
+        onPointerMove={continueResize}
+        onPointerUp={endResize}
+        onPointerCancel={endResize}
+        onDoubleClick={() => setViewportHeight(GRAPH_VIEWPORT_DEFAULT_HEIGHT)}
+        onKeyDown={resizeWithKeyboard}
+        className="group relative flex h-3 cursor-row-resize touch-none items-center justify-center border-t border-white/[0.06] bg-[#0a0f0d] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-teal-300/60"
+      >
+        <span className="absolute inset-x-0 top-0 h-px bg-teal-300/0 transition-colors group-hover:bg-teal-300/25 group-focus-visible:bg-teal-300/35" />
+        <span className="inline-flex h-2.5 w-16 items-center justify-center rounded-full border border-white/[0.08] bg-white/[0.035] text-zinc-600 transition-colors group-hover:border-teal-300/25 group-hover:bg-teal-300/[0.06] group-hover:text-teal-200 group-focus-visible:border-teal-300/35 group-focus-visible:text-teal-200">
+          <GripHorizontal className="size-3.5" aria-hidden="true" />
+        </span>
+      </div>
     </section>
   );
 }
@@ -821,7 +936,7 @@ export default function TopologyPage() {
   const [eventScope, setEventScope] = useState<TopologyEventScope>(
     searchParams.get("eventScope") === "raw" ? "raw" : "agent",
   );
-  const timeType = consoleTimeFilter.timeType ?? "last_3h";
+  const timeType = consoleTimeFilter.timeType ?? DEFAULT_SECURITY_TIME_TYPE;
   const [scope, setScope] = useState<"all" | "risk">((searchParams.get("scope") as "all" | "risk") || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedEdgeId, setSelectedEdgeId] = useState(searchParams.get("edgeId") ?? "");

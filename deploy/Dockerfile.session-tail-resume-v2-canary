@@ -1,0 +1,2 @@
+FROM anysentry-api:tail-resume-20260913
+COPY apps/api/dist/security-monitoring/local-record-tracking.service.js /app/dist/security-monitoring/local-record-tracking.service.js

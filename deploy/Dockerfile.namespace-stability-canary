@@ -1,0 +1,4 @@
+FROM anysentry-api:harbor-live-20260913
+COPY apps/api/dist/security-monitoring/session-event-attribution.service.js /app/dist/security-monitoring/session-event-attribution.service.js
+COPY apps/api/dist/security-monitoring/relational-business-store.service.js /app/dist/security-monitoring/relational-business-store.service.js
+COPY apps/api/dist/security-monitoring/interaction.types.js /app/dist/security-monitoring/interaction.types.js

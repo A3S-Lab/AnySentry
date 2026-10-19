@@ -1,0 +1,2 @@
+FROM anysentry-web:tab-order-20260923
+COPY web/ /usr/share/nginx/html/

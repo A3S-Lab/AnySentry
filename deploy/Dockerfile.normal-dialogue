@@ -1,0 +1,5 @@
+FROM anysentry-api:tool-candidates-20260916 AS api
+COPY api/ /app/dist/security-monitoring/
+
+FROM anysentry-web:tool-candidates-20260916 AS web
+COPY web/ /usr/share/nginx/html/

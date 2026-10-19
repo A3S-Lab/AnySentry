@@ -1,0 +1,5 @@
+FROM anysentry-api:tail-resume-v2-20260913 AS api
+COPY apps/api/dist/security-monitoring/interaction.service.js /app/dist/security-monitoring/interaction.service.js
+
+FROM anysentry-web:modules AS web
+COPY apps/web/dist/ /usr/share/nginx/html/

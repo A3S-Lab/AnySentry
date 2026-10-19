@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import { ClickHouseStore } from '../apps/api/dist/security-monitoring/clickhouse-store.js';
+import { canonicalProcessLifecycleIdentity } from '../apps/api/dist/security-monitoring/process-lifecycle.js';
+const store = new ClickHouseStore();
+const rows = [];
+Object.assign(store, { ready: true, client: { insert: async call => { rows.push(...call.values); return {}; } } });
+const process = { pid: 42, ppid: 1, hostId: 'host-a', bootId: 'boot-a', pidNamespace: 'ns-a', namespacePid: 5, startTimeTicks: '1000' };
+const base = { schemaVersion: 'v1', eventId: 'harbor-key-test', at: Date.now(), eventKind: 'ToolExec', eventCategory: 'process', source: 'observer', subject: 'test', workspacePath: '/app', agentId: 'codex', sessionId: '', userId: '', traceId: '', spanId: '', runId: '', taskId: '', attributes: {}, reasons: [], verdict: 'allow', tier: 'L1', severity: 'low', process };
+await store.insertNow(base);
+assert.equal(rows[0].processInstanceKey, canonicalProcessLifecycleIdentity(process).processInstanceKey);
+assert.equal(rows[0].sessionId, '', 'OS identity must not invent Session ownership');
+await store.insertNow({ ...base, eventId: 'harbor-key-reuse', process: { ...process, startTimeTicks: '1001' } });
+assert.notEqual(rows[0].processInstanceKey, rows[1].processInstanceKey, 'PID reuse separates generations');
+await store.insertNow({ ...base, eventId: 'harbor-key-incomplete', process: { pid: 42 } });
+assert.equal(rows[2].processInstanceKey, '', 'PID alone is insufficient');
+console.log('PASS: canonical process keys, PID reuse, incomplete identity, no fabricated Session');

@@ -1,0 +1,2 @@
+FROM anysentry-web:filter-select-contrast-20260923
+COPY web/ /usr/share/nginx/html/

@@ -1,6 +1,7 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import { liveSecuritySnapshotAsOf } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   Activity,
   AlertTriangle,
@@ -1338,7 +1339,7 @@ export default function AgentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { filter: consoleTimeFilter, setTimeFilter } = useSecurityConsole();
   const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
-  const timeType = consoleTimeFilter.timeType ?? "last_3h";
+  const timeType = consoleTimeFilter.timeType ?? DEFAULT_SECURITY_TIME_TYPE;
   const routeStartTime = consoleTimeFilter.startTime ?? "";
   const routeEndTime = consoleTimeFilter.endTime ?? "";
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");

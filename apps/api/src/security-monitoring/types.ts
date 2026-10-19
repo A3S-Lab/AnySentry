@@ -1086,6 +1086,15 @@ export interface PlatformMetricsOverview {
   components: PlatformComponentMetric[];
   anomalies: PlatformMetricAnomaly[];
   message?: string;
+  middleware?: {
+    components: Array<Pick<PlatformComponentMetric, 'id' | 'name' | 'status'> & { message: string }>;
+    series: Array<{
+      key: string;
+      label: string;
+      unit: string;
+      points: PlatformMetricPoint[];
+    }>;
+  };
 }
 
 export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
@@ -3402,8 +3411,10 @@ export type AuditAction =
   | 'unknown_learning.infrastructure_draft_created'
   | 'unknown_learning.infrastructure_draft_reused'
   | 'unknown_learning.infrastructure_draft_rejected'
-  | 'unknown_learning.config_updated';
-export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user';
+  | 'unknown_learning.config_updated'
+  | 'interaction.content.viewed'
+  | 'interaction.content.deleted';
+export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user' | 'interaction';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;

@@ -29,9 +29,9 @@ assert.equal(registry.settings().retainNonAgent, false);
 assert.equal(registry.settings().fileAggregationEnabled, true);
 
 const signatures = registry.runtimeSignatureDocument();
-assert.equal(signatures.runtimes.length, 6);
+assert.equal(signatures.runtimes.length, 7);
 const signatureRegistry = new RuntimeSignatureRegistry(signatures, { source: 'unified-filter-rule' });
-assert.equal(signatureRegistry.metrics().loaded, 6);
+assert.equal(signatureRegistry.metrics().loaded, 7);
 assert.equal(signatureRegistry.match({ comm: 'codex' })?.agentId, 'codex');
 const templates = registry.agentTemplateDocument();
 const templateRegistry = new AgentTemplateRegistry(templates);

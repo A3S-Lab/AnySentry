@@ -1,0 +1,4 @@
+# Preserve the deployed API baseline; only ship the validated Session ownership service.
+ARG API_BASE_IMAGE=anysentry-api:modules
+FROM ${API_BASE_IMAGE}
+COPY apps/api/dist/security-monitoring/local-record-tracking.service.js /app/dist/security-monitoring/local-record-tracking.service.js

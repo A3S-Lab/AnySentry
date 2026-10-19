@@ -9,7 +9,7 @@ const {
   legacyRootNameDocument,
 } = require('./observer-agent-runtime-signatures');
 
-const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code';
+const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code,gemini,gemini-cli,gemini cli';
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
@@ -50,6 +50,7 @@ function canonicalAgentName(value) {
   const normalized = text(value).toLowerCase();
   if (normalized === 'a3s' || normalized === 'a3s-code' || normalized === 'a3s code') return 'a3s code';
   if (normalized === 'claude' || normalized === 'claude-code' || normalized === 'claude code') return 'Claude Code';
+  if (normalized === 'gemini' || normalized === 'gemini-cli' || normalized === 'gemini cli') return 'Gemini CLI';
   return normalized;
 }
 
@@ -985,6 +986,11 @@ class AgentAttributor {
         text(processInfo.start_time_ticks) ||
         text(processInfo.startTimeNs) ||
         text(processInfo.start_time_ns),
+      startTimeTicks: text(processInfo.startTimeTicks) || text(processInfo.start_time_ticks),
+      startTimeNs: text(processInfo.startTimeNs) || text(processInfo.start_time_ns),
+      pidNamespace: text(processInfo.pidNamespace) || text(processInfo.pid_namespace),
+      namespacePid: positiveInt(processInfo.namespacePid) || positiveInt(processInfo.namespace_pid),
+      namespacePpid: positiveInt(processInfo.namespacePpid) || positiveInt(processInfo.namespace_ppid),
       cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
       // `identity.agent` is a claimed/inherited scope label from the Observer envelope. It is not
       // process executable evidence. Falling back to it here promoted short-lived bwrap, shell,
@@ -1014,6 +1020,11 @@ class AgentAttributor {
       ...observed,
       ppid: observed.ppid || (sameCachedProcess ? cached.ppid : undefined),
       startTime: observed.startTime || (sameCachedProcess ? cached.startTime : undefined),
+      startTimeTicks: observed.startTimeTicks || (sameCachedProcess ? cached.startTimeTicks : undefined),
+      startTimeNs: observed.startTimeNs || (sameCachedProcess ? cached.startTimeNs : undefined),
+      pidNamespace: observed.pidNamespace || (sameCachedProcess ? cached.pidNamespace : undefined),
+      namespacePid: observed.namespacePid || (sameCachedProcess ? cached.namespacePid : undefined),
+      namespacePpid: observed.namespacePpid || (sameCachedProcess ? cached.namespacePpid : undefined),
       cgroupId: observed.cgroupId || (sameCachedProcess ? cached.cgroupId : undefined),
       comm: observed.comm || (sameCachedProcess ? cached.comm : ''),
       exe: observed.exe || (sameCachedProcess ? cached.exe : ''),
@@ -1025,9 +1036,15 @@ class AgentAttributor {
     else this.stats.cacheMisses++;
 
     const existing = sameCachedProcess ? cached : undefined;
+    // Python CLIs can setproctitle after exec. A newly observed runtime signature must
+    // establish its own nested Agent boundary instead of inheriting a cached parent forever.
+    const runtimeIdentityChanged = Boolean(existing && (
+      (observed.comm && observed.comm !== existing.comm)
+      || (observed.exe && observed.exe !== existing.exe)
+    ));
     // A stable cached binding is the hot path. ToolExec still evaluates the executable first so a
     // nested Agent (for example Pi launched by Codex) can establish its own root instance.
-    if (!toolExec && existing?.state === 'agent' && this.rootForRecord(existing, false)) {
+    if (!toolExec && !runtimeIdentityChanged && existing?.state === 'agent' && this.rootForRecord(existing, false)) {
       const workspace = canonicalWorkspacePath(observed.cwd)
         ? this.resolveWorkspace(current.cwd, existing.workspacePath)
         : {
@@ -1074,7 +1091,7 @@ class AgentAttributor {
       );
     }
 
-    const directAgent = this.matchAgentExecutable(current);
+    const directAgent = this.matchAgent(current);
     const existingScope = existing?.state === 'agent' ? this.agentScope(existing) : undefined;
     const directMatchesExistingScope = Boolean(
       directAgent &&
@@ -1084,7 +1101,7 @@ class AgentAttributor {
     if (
       existing?.state === 'agent' &&
       this.rootForRecord(existing) &&
-      (!toolExec || !directAgent || directMatchesExistingScope)
+      ((!toolExec && !runtimeIdentityChanged) || !directAgent || directMatchesExistingScope)
     ) {
       // A short process can emit ToolExec and ProcessExit after /proc/<pid>/cwd has already
       // disappeared. Preserve an earlier conflict decision for the same PID instead of silently
@@ -1110,7 +1127,7 @@ class AgentAttributor {
     // Routine file/network/security observations reuse a recent negative result. ToolExec and
     // ProcessExit re-evaluate because they are lifecycle/high-signal boundaries and can repair
     // out-of-order parent information.
-    if (!toolExec && !exiting && existing?.nextResolveAt > now) {
+    if (!toolExec && !exiting && !runtimeIdentityChanged && existing?.nextResolveAt > now) {
       if (existing.state === 'non_agent') return this.nonAgentResult();
       return this.unknown();
     }
@@ -1159,9 +1176,10 @@ class AgentAttributor {
       );
     }
 
-    // Only a registry-verified process signature can create a root after ownership resolution.
-    // `identity.agent` is intentionally absent from `current`, so an envelope claim cannot enter
-    // this branch.
+    // Only a registry signature or a narrowly validated command prefix can create a root after
+    // ownership resolution. The latter is needed for Node-packaged CLIs such as Gemini, whose
+    // executable is the generic `node` binary. `identity.agent` is intentionally absent from
+    // `current`, so an envelope claim cannot enter this branch.
     if (directAgent) {
       return this.finish(
         pid,
@@ -1215,6 +1233,24 @@ class AgentAttributor {
           : undefined
       );
       if (record?.startTime) this.rememberTombstone(record);
+      // An exited process is already absent from /proc. Preserve the namespace and generation
+      // actually observed before exit, before deleting this cache entry. Never manufacture a
+      // clock unit from the generic startTime field or borrow another Agent's root identity.
+      if (record?.pidNamespace && (record.startTimeTicks || record.startTimeNs)
+        && record.startTime === current.startTime
+        && record.cgroupId && record.cgroupId === current.cgroupId) {
+        result.processContext = {
+          hostId: record.hostId,
+          bootId: record.bootId,
+          pid: record.pid,
+          ppid: record.ppid,
+          pidNamespace: record.pidNamespace,
+          namespacePid: record.namespacePid,
+          namespacePpid: record.namespacePpid,
+          ...(record.startTimeTicks ? { startTimeTicks: record.startTimeTicks } : {}),
+          ...(record.startTimeNs ? { startTimeNs: record.startTimeNs } : {}),
+        };
+      }
       const root = record?.rootKey ? this.rootsByKey.get(record.rootKey) : undefined;
       if (root && record.processKey === root.rootKey && root.runtimeState === 'running') {
         this.transition(root, 'exited', {
@@ -1394,7 +1430,7 @@ class AgentAttributor {
     const executableMatch = this.matchAgentExecutable(info);
     if (executableMatch) return executableMatch;
     if (!this.builtinHintsEnabled) return undefined;
-    const argv = text(info.argv).toLowerCase();
+    const argv = argvText(info.argv).toLowerCase();
     if (!argv) return undefined;
     // Only the command prefix is identity evidence. Scanning every argument lets untrusted
     // prompts such as "Actor: a3s code" misclassify an ordinary node process as an Agent.
@@ -1403,12 +1439,33 @@ class AgentAttributor {
     if (command === 'codex') return 'codex';
     if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
     if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) return 'Claude Code';
+    if (command === 'gemini' || command === 'gemini-cli') return 'Gemini CLI';
+    if (
+      (command === 'node' || command.startsWith('node-'))
+      && text(tokens[1]).replaceAll('\\', '/').includes('/@google/gemini-cli/')
+    ) return 'Gemini CLI';
     return undefined;
   }
 
   matchAgentExecutable(info) {
     if (isInternalAgentHelper(info)) return undefined;
-    return this.signatureRegistry.match(info);
+    const direct = this.signatureRegistry.match(info);
+    if (direct) return direct;
+    const args = argvText(info.argv).split(/\s+/u).filter(Boolean);
+    if (['node', 'bun'].includes(basename(args[0]))
+      && /\/opencode-ai\/bin\/opencode$/u.test(text(args[1]))) {
+      return this.signatureRegistry.match({ ...info, comm: '', exe: '', argv: ['opencode'] });
+    }
+    if (/^python(?:3(?:\.\d+)?)?$/u.test(basename(args[0]))) {
+      const entrypoint = basename(args[1]);
+      if (['kimi', 'kimi-cli', 'kimi-code'].includes(entrypoint)
+        || (args[1] === '-m' && ['kimi_cli', 'kimi_cli.cli'].includes(args[2]))) {
+        // Resolve the exact Python entrypoint through the configured signature registry.
+        // Prompt text and later flags are never identity evidence.
+        return this.signatureRegistry.match({ ...info, comm: '', exe: '', argv: ['kimi'] });
+      }
+    }
+    return undefined;
   }
 
   rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {

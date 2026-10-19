@@ -1,0 +1,2 @@
+FROM anysentry-web:timeline-collapse-20260914
+COPY apps/web/dist/ /usr/share/nginx/html/

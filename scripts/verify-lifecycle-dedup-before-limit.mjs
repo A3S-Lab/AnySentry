@@ -1,0 +1,28 @@
+// Run production query against connection-local Memory fixtures; no persistent DB writes.
+import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
+import {ClickHouseStore} from '../apps/api/dist/security-monitoring/clickhouse-store.js';
+const container=process.env.ANYSENTRY_TEST_CLICKHOUSE_CONTAINER;
+if(!container)throw Error('Set ANYSENTRY_TEST_CLICKHOUSE_CONTAINER explicitly');
+const store=new ClickHouseStore();let captured;
+store.ready=true;store.client={query:async q=>{if(q.query.includes('ppid IN'))captured=q;return{json:async()=>[]}}};
+await store.readSessionProcessFamilyFacts({rootProcessInstanceKey:'pri_111111111111111111111111',rootPid:100,rootStartTime:'ticks:1',hostId:'fixture-host',bootId:'fixture-boot',sinceMs:1,untilMs:10000,limit:12,maxDepth:3,skipLegacyFallback:true,prioritizeRecent:true});
+assert.ok(captured);
+const quote=x=>`'${String(x).replaceAll('\\','\\\\').replaceAll("'","\\'")}'`;
+const p=captured.query_params;
+const params=Object.entries(p).map(([k,v])=>`--param_${k}=${Array.isArray(v)?`[${v.map(x=>typeof x==='number'?x:quote(x)).join(',')}]`:v}`);
+const columns='factId,eventId,factKind,at,receivedAt,processInstanceKey,pid,ppid,startTime,hostId,bootId,runtimeInstanceId,identityRevision';
+const newer="('new','evt-new','exec',2000,2001,'pri_222222222222222222222222',102,100,'ticks:2','fixture-host','fixture-boot','agent-original',1)";
+const older="('old','evt-old','exec',1000,1001,'pri_333333333333333333333333',101,100,'ticks:3','fixture-host','fixture-boot','agent-older',1)";
+const revision="('new','evt-new','exec',2000,2002,'pri_222222222222222222222222',102,100,'ticks:2','fixture-host','fixture-boot','agent-updated',2)";
+const query=captured.query.replaceAll('process_lifecycle_facts','fixture_lifecycle');
+const sql=`CREATE TEMPORARY TABLE fixture_lifecycle ENGINE=Memory AS SELECT * FROM anysentry.process_lifecycle_facts LIMIT 0;
+INSERT INTO fixture_lifecycle (${columns}) VALUES ${[...Array(200).fill(newer),older,revision].join(',')};
+${query} FORMAT JSONEachRow;`;
+const out=execFileSync('docker',['exec','-i',container,'clickhouse-client','--multiquery','--max_execution_time=8',...params],{input:sql,encoding:'utf8',maxBuffer:1024*1024});
+const rows=out.trim().split('\n').filter(Boolean).map(JSON.parse);
+assert.equal(rows.length,2,'duplicate newest rows must not starve the older child');
+assert.ok(rows.some(r=>r.eventId==='evt-old'));
+assert.equal(rows.find(r=>r.eventId==='evt-new').runtimeInstanceId,'agent-updated','all fields must use the latest coherent version');
+assert.equal(new Set(rows.map(r=>r.factId)).size,rows.length);
+console.log('PASS: real ClickHouse SQL deduplicates 202 physical rows to 2 facts before LIMIT; older child retained, newest revision preserved; temporary Memory table only');

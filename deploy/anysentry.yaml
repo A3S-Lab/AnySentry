@@ -247,6 +247,11 @@ data:
   # The streaming resources remain available in deploy/streaming.yaml, but production operators
   # opt in explicitly after Kafka/Flink capacity and retention have been reviewed.
   ANYSENTRY_STREAMING: "off"
+  # Conversation-adjacent transport metadata is an independent, fail-closed Kafka lane. Enabling
+  # it does not enable TLS payload capture.
+  ANYSENTRY_INTERACTIONS: "off"
+  ANYSENTRY_INTERACTION_BOOTSTRAP_SERVERS: "kafka:9092"
+  ANYSENTRY_INTERACTION_TOPIC: "anysentry.interactions.v1"
   ANYSENTRY_STREAM_AGENT_ONLY: "on"
   ANYSENTRY_STREAM_BOOTSTRAP_SERVERS: "kafka:9092"
   ANYSENTRY_STREAM_CANONICAL_TOPIC: "anysentry.events.canonical.v1"
@@ -317,7 +322,7 @@ spec:
     metadata:
       labels: { app: anysentry, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 60
       serviceAccountName: anysentry
       containers:
         - name: anysentry

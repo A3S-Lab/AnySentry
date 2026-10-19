@@ -1,0 +1,6 @@
+FROM anysentry-api:before-link-awareness-20260914 AS api
+COPY apps/api/dist/security-monitoring/session-event-attribution.service.js /app/dist/security-monitoring/session-event-attribution.service.js
+COPY apps/api/dist/security-monitoring/system-tool-call-binding.js /app/dist/security-monitoring/system-tool-call-binding.js
+
+FROM anysentry-web:review-collapse-20260914 AS web
+COPY apps/web/dist/ /usr/share/nginx/html/

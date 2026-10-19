@@ -127,6 +127,7 @@ spec:
                   anysentry.risk-analysis-batches.v1 \
                   anysentry.stream.findings.v1 \
                   anysentry.supply-chain.context.v1 \
+                  anysentry.interactions.v1 \
                   anysentry.stream.dlq.v1; do
                   /opt/kafka/bin/kafka-topics.sh \
                     --bootstrap-server kafka:9092 \
@@ -294,22 +295,7 @@ spec:
       containers:
         - name: job-submit
           image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
-          command: ["/bin/bash", "-ec"]
-          args:
-            - |
-              until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-              while true; do
-                if flink list -m flink-jobmanager:8081 2>/dev/null \
-                  | grep -Eq ' : AnySentry Flink Shadow Risk \([[:upper:]_]+\)$'; then
-                  sleep 15
-                  continue
-                fi
-                flink run -d \
-                  -m flink-jobmanager:8081 \
-                  -c org.a3s.anysentry.streaming.AnySentryStreamJob \
-                  /opt/flink/usrlib/anysentry-flink-streaming.jar || true
-                sleep 15
-              done
+          command: ["/usr/local/bin/node", "/opt/anysentry/job-guard.mjs"]
           envFrom:
             - configMapRef:
                 name: anysentry-runtime

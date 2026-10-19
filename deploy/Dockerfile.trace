@@ -1,0 +1,2 @@
+FROM anysentry-web:opencode-20260917
+COPY web/ /usr/share/nginx/html/

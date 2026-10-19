@@ -1,0 +1,20 @@
+# Short-lived Gemini CLI Session→eBPF attribution canary.
+#
+# The collector still observes write-open tracepoints host-wide, but discards every FileAccess
+# record outside Gemini's Session directory before serialization/forwarding. Keep this overlay
+# disabled during ordinary operation; it is a bounded validation aid, not a reason to enable
+# unrestricted host file collection.
+services:
+  observer:
+    environment:
+      A3S_OBSERVER_FILES: "0"
+      A3S_OBSERVER_FILE_ACCESS: "1"
+      A3S_OBSERVER_FILE_DELETE: "0"
+      A3S_OBSERVER_FILE_INCLUDE_PATHS: "/home/zhongyule/.gemini/tmp"
+      A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
+      A3S_OBSERVER_SSL: "0"
+      FORWARD_FILTER_MODE: "enforce"
+      FORWARD_RETAIN_NON_AGENT: "false"
+      FORWARD_FILE_AGGREGATION: "true"
+      FORWARD_BATCH_SIZE: "64"
+      FORWARD_BATCH_FLUSH_MS: "50"

@@ -1,0 +1,2 @@
+FROM anysentry-web:trace-no-source-20260918
+COPY web/ /usr/share/nginx/html/

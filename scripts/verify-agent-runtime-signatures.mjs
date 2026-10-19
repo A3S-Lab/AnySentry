@@ -21,8 +21,10 @@ function signatureDocument(runtimes, version = 1) {
 const registry = new RuntimeSignatureRegistry(defaultSignatureDocument(), { source: 'test' });
 for (const [comm, expected] of [
   ['codex', 'codex'],
+  ['opencode', 'opencode'],
   ['pi', 'pi'],
   ['Kimi Code', 'kimi-cli'],
+  ['kimi-code', 'kimi-cli'],
   ['gemini', 'gemini-cli'],
   ['claude', 'Claude Code'],
 ]) {
@@ -33,6 +35,10 @@ for (const [comm, expected] of [
   assert.match(match?.registryDocumentHash ?? '', /^[a-f0-9]{64}$/);
   assert.match(match?.registryMatcherHash ?? '', /^[a-f0-9]{64}$/);
 }
+assert.equal(registry.match({ exe: '/opt/kimi-code/bin/kimi-code' })?.agentId, 'kimi-cli');
+assert.equal(registry.match({ argv: ['kimi-code', '--prompt', 'fixture'] })?.agentId, 'kimi-cli');
+assert.equal(registry.match({ comm: 'node', exe: '/usr/bin/node', argv: ['node', '-e', '"kimi-code"'] }), undefined,
+  'mentioning Kimi in ordinary Node arguments must not create an Agent root');
 assert.equal(registry.match({ comm: 'node', exe: '/usr/bin/node', argv: 'node server.js' }), undefined);
 assert.equal(
   registry.match({ comm: 'node', exe: '/usr/bin/node', argv: 'node prompt mentioning codex' }),
@@ -43,6 +49,11 @@ assert.equal(
   registry.match({ comm: 'node', argv: '/opt/a3s/bin/a3s code' })?.agentId,
   'a3s code',
   'the builtin registry is the source of truth for an A3S argv0 path',
+);
+assert.equal(
+  registry.match({ comm: 'a3s', argv: '/opt/a3s/bin/a3s info' }),
+  undefined,
+  'an A3S administrative subcommand must not become an Agent runtime',
 );
 assert.equal(
   registry.match({ comm: 'claude' })?.agentId,

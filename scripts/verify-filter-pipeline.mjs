@@ -1774,6 +1774,78 @@ assert.equal(rawHeartbeat.heartbeat.filterMetrics.unknown, 0, 'raw heartbeat is 
 assert.equal(rawHeartbeat.heartbeat.filterMetrics.forwarded, 0, 'raw heartbeat is not an Agent forward count');
 assert.equal(rawHeartbeat.heartbeat.filterMetrics.discoveryBudgetDropped, 0);
 
+const kimiFileScope = await runConfig('kimi-file-scope', {
+  FORWARD_AGENT_ALLOWLIST: 'kimi-cli', FORWARD_FILTER_MODE: 'enforce',
+  FORWARD_FILE_INCLUDE_PATHS: '/work/kimi/sessions', FORWARD_FILE_AGGREGATION: 'false',
+}, [
+  event('kimi-scope', 'ToolExec', {pid:70001,argv:['kimi']}, {comm:'Kimi Code',exe:'/bin/python3'}),
+  ...['/work/kimi/sessions/a/wire.jsonl','/work/kimi/config.toml','/work/kimi/sessions-other/wire.jsonl']
+    .map(file => event('kimi-scope','FileAccess',{pid:70001,path:file,write:true},{comm:'Kimi Code',exe:'/bin/python3'})),
+], {expectedObserved:4});
+assert.equal(kimiFileScope.batches.length,2,'only Kimi exec and scoped session write reach ingestion');
+assert.ok(kimiFileScope.batches.every(item=>!item.line.includes('config.toml')&&!item.line.includes('sessions-other')));
+
+const codexOnlyHeartbeat = collectorHeartbeat('codex-only-control-heartbeat');
+const codexOnly = await runConfig('codex-only', {
+  FORWARD_AGENT_ALLOWLIST: 'codex',
+  FORWARD_FILTER_MODE: 'enforce',
+}, [
+  codexOnlyHeartbeat,
+  event('codex-runtime', 'ToolExec', { pid: 70, argv: ['codex', 'exec'] }, {
+    comm: 'codex',
+    exe: '/opt/codex/bin/codex',
+    ppid: 1,
+    start_time_ticks: '700',
+  }),
+  event('codex-runtime', 'ToolExec', { pid: 71, argv: ['/usr/bin/bash', '-lc', 'true'] }, {
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    ppid: 70,
+    start_time_ticks: '710',
+  }),
+  event('codex-runtime', 'ProcessExit', { pid: 71, exit_code: 0 }, {
+    comm: 'bash',
+    exe: '/usr/bin/bash',
+    ppid: 70,
+    start_time_ticks: '710',
+  }),
+  event('claude-runtime', 'ToolExec', { pid: 80, argv: ['claude', '--print'] }, {
+    comm: 'claude',
+    exe: '/opt/claude/bin/claude',
+    ppid: 1,
+    start_time_ticks: '800',
+  }),
+  event('unknown-runtime', 'ToolExec', { pid: 90, argv: ['/usr/bin/ps', 'aux'] }, {
+    comm: 'ps',
+    exe: '/usr/bin/ps',
+    ppid: 1,
+    start_time_ticks: '900',
+  }),
+  event('unknown-runtime', 'SecurityAction', { pid: 91, kind: 'setuid' }, {
+    comm: 'helper',
+    exe: '/usr/bin/helper',
+    ppid: 1,
+    start_time_ticks: '910',
+  }),
+], { expectedObserved: 6 });
+assert.equal(codexOnly.batches.length, 4, 'Codex-only mode keeps control plus Codex root/child lifecycle');
+assert.ok(codexOnly.batches.some((item) => item.line === codexOnlyHeartbeat));
+const codexOnlyEvents = codexOnly.batches.filter((item) => item.line !== codexOnlyHeartbeat);
+assert.equal(codexOnlyEvents.length, 3);
+assert.ok(codexOnlyEvents.every((item) => item.attribution?.agentScopeId === 'codex'));
+assert.deepEqual(codexOnly.heartbeat.filterMetrics.agentAllowlist, ['codex']);
+assert.equal(codexOnly.heartbeat.filterMetrics.agentAllowlistScopedOut, 3);
+assert.match(codexOnly.heartbeat.message, /agent_allowlist=codex/u);
+
+const invalidAgentAllowlist = spawnSync(process.execPath, [forwarder], {
+  env: { ...process.env, FORWARD_AGENT_ALLOWLIST: 'codex,*' },
+  input: '',
+  encoding: 'utf8',
+  timeout: 2_000,
+});
+assert.notEqual(invalidAgentAllowlist.status, 0, 'invalid Agent allowlist must fail closed');
+assert.match(invalidAgentAllowlist.stderr, /FORWARD_AGENT_ALLOWLIST/u);
+
 const scopedPrefix = 'asel-marker-run-docker-shadow-';
 const scopedMarkerValue = scopedPrefix + 'pi';
 const scopedMarkerLine = event('unknown-container', 'ToolExec', {

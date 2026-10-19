@@ -1,0 +1,2 @@
+FROM anysentry-web:normal-dialogue-20260916
+COPY web/ /usr/share/nginx/html/

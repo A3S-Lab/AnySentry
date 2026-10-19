@@ -1,0 +1,2 @@
+FROM anysentry-web:prompt-color-20260914
+COPY apps/web/dist/ /usr/share/nginx/html/

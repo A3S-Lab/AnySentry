@@ -1,0 +1,2 @@
+FROM anysentry-web:evidence-dedup-20260917
+COPY web/ /usr/share/nginx/html/

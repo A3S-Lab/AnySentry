@@ -133,6 +133,66 @@ docker compose --profile observer \
   up -d --no-deps observer
 ```
 
+Both the ordinary Forwarder WAL and the Interaction WAL live in the
+`observer-forward-spool` named volume under `/var/lib/anysentry-forwarder`. Replacing the
+Observer container therefore preserves events that have not received a matching durable
+acknowledgement. Do not replace that volume as part of a routine image update.
+
+### Local Codex/Rustls request capture
+
+The request-content path is implemented by **AnySentry Observer itself**. AgentSight is only a
+design reference; this deployment neither starts AgentSight nor reads an AgentSight SQLite
+database. The owned data path is:
+
+```text
+AnySentry Observer exact-binary Rustls uprobe
+→ LlmRequestObserved
+→ observer-forward encrypted Interaction WAL
+→ AnySentry ContentStore + Kafka durable receipt
+→ PostgreSQL / ClickHouse projections
+→ Record Tracking / Process Tree & AI Prompt
+```
+
+Build the current local Observer before enabling the controlled workstation path:
+
+```bash
+cd /home/zhongyule/code/Observer
+cargo build --release -p a3s-observer-collector
+mkdir -p dist
+cp target/release/a3s-observer-collector dist/
+docker build -f deploy/Dockerfile -t a3s-observer:local dist
+
+cd /home/zhongyule/code/AnySentry
+export ANYSENTRY_OBSERVER_COLLECTOR_IMAGE=a3s-observer:local
+export ANYSENTRY_OBSERVER_WRAPPER_IMAGE=anysentry-observer-wrapper:runtime-local
+export A3S_OBSERVER_INTERACTION_CAPTURE_MODE=runtime_payload
+export A3S_OBSERVER_ENVIRONMENT=controlled_capture
+export A3S_OBSERVER_ALLOW_RUNTIME_PAYLOAD=I_UNDERSTAND_MODEL_REQUEST_CAPTURE
+export A3S_OBSERVER_RUNTIME_AUTO_DISCOVER=1
+export A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS=chatgpt.com,api.openai.com,api.anthropic.com,open.bigmodel.cn,generativelanguage.googleapis.com,cloudcode-pa.googleapis.com
+export ANYSENTRY_INTERACTIONS=on
+
+docker compose \
+  -f docker-compose.yml \
+  -f deploy/docker-compose.modules.yml \
+  --profile observer build observer
+docker compose \
+  -f docker-compose.yml \
+  -f deploy/docker-compose.modules.yml \
+  --profile observer up -d --no-deps observer
+```
+
+No Codex binary path is required. The Observer uses host PID visibility plus the read-only `/host`
+mount to discover native Codex ELF files, validates supported Rustls signatures, and de-duplicates
+them by device/inode before attaching. `A3S_OBSERVER_RUNTIME_BINARY` remains an optional diagnostic
+override. Auto-discovery and explicit PID mode are mutually exclusive. Start Observer before
+Codex/`codex exec` when possible because attaching after a compressed long-lived WebSocket is
+established cannot reconstruct its earlier compression context.
+
+`SIGUSR2` is the emergency content-capture kill switch. It clears the eBPF content gate without
+turning off ordinary process/file/network observation. A restart does not bypass the explicit
+environment and confirmation gates.
+
 This is deliberately **not** described as a lossless Forwarder-only restart. The current Supervisor
 owns a direct Collector stdout-to-Forwarder stdin pipe; a Forwarder exit also terminates the
 Collector. A true Forwarder-only restart requires a durable relay/spool and ACK protocol first.
@@ -155,6 +215,21 @@ Unknown evidence. FileDelete has its own
 canary and ring test, so the two load sources remain attributable. Do not enable both until two
 separate heartbeat windows show a loaded filter epoch and zero access/delete ring, Forwarder
 output, queue, and retry-exhaustion loss.
+
+For Gemini CLI Session binding, use the narrower overlay after rebuilding the local Observer:
+
+```bash
+docker compose -p anysentry-modules-e2e \
+  -f docker-compose.yml \
+  -f deploy/docker-compose.modules.yml \
+  -f deploy/modules/observer-gemini-file-canary.yml \
+  --profile observer up -d --no-deps observer
+```
+
+It enables only write-open observations and applies
+`A3S_OBSERVER_FILE_INCLUDE_PATHS=/home/zhongyule/.gemini/tmp` in the collector before event
+serialization. The tracepoint itself remains host-wide, so this is a short validation overlay;
+disable it after the Session binding has been verified.
 
 ## Flink job boundary
 

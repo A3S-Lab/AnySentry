@@ -40,6 +40,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
+  DEFAULT_SECURITY_TIME_TYPE,
   securityCenterApi,
   type SecurityAssistantAnswer,
   type SecurityAssistantContext,
@@ -320,7 +321,7 @@ function pageContext(pathname: string, search: string): SecurityAssistantContext
   return {
     path: `${pathname}${search}`,
     view: query.get("view") || undefined,
-    timeType: (query.get("timeType") as SecurityAssistantContext["timeType"]) || "last_3h",
+    timeType: (query.get("timeType") as SecurityAssistantContext["timeType"]) || DEFAULT_SECURITY_TIME_TYPE,
     startTime: query.get("startTime") || undefined,
     endTime: query.get("endTime") || undefined,
     agentId: query.get("agentId") || undefined,
@@ -1153,8 +1154,8 @@ export function SecurityAssistant({ mode = "floating" }: { mode?: SecurityAssist
         className={cn(
           "fixed z-[70] flex h-12 w-12 touch-none select-none items-center justify-center rounded-full",
           !launcherPosition && "bottom-5 right-5",
-          "border border-orange-400/50 bg-[#171c25] text-orange-400 shadow-[0_12px_38px_rgba(0,0,0,0.5)]",
-          "cursor-grab transition-[border-color,background-color,opacity,transform] hover:border-orange-400 hover:bg-[#202632] focus:outline-none focus:ring-2 focus:ring-orange-400/40 active:cursor-grabbing",
+          "border border-cyan-400/50 bg-[#171c25] text-cyan-300 shadow-[0_12px_38px_rgba(0,0,0,0.5)]",
+          "cursor-grab transition-[border-color,background-color,opacity,transform] hover:border-cyan-400 hover:bg-[#202632] focus:outline-none focus:ring-2 focus:ring-cyan-400/40 active:cursor-grabbing",
           !draggingLauncher && "hover:-translate-y-0.5",
           draggingLauncher && "scale-105",
           open && "pointer-events-none translate-x-20 opacity-0",
@@ -1240,7 +1241,7 @@ export function SecurityAssistant({ mode = "floating" }: { mode?: SecurityAssist
             <header className="border-b border-[#252c38] bg-[#10151d] px-4 py-3.5">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-3">
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-orange-400/30 bg-orange-500/10 text-orange-400">
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-cyan-400/30 bg-cyan-500/10 text-cyan-300">
                     <Bot className="h-5 w-5" />
                   </span>
                   <div className="min-w-0">
@@ -1317,13 +1318,19 @@ export function SecurityAssistant({ mode = "floating" }: { mode?: SecurityAssist
                             setQuestion("");
                           }}
                           className={cn(
-                            "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400/60",
+                            "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60",
                             activeCapability === index
-                              ? "border-orange-400/50 bg-orange-500/10 text-orange-200"
+                              ? "border-cyan-400/50 bg-cyan-500/10 text-cyan-200"
                               : "border-[#28303d] bg-[#10151c] text-slate-400 hover:border-slate-500 hover:text-slate-200",
                           )}
                         >
-                          <Icon className="size-3.5" aria-hidden="true" />
+                          <Icon
+                            className={cn(
+                              "size-3.5",
+                              activeCapability === index ? "text-cyan-300" : "text-sky-400/70",
+                            )}
+                            aria-hidden="true"
+                          />
                           {capability.label}
                         </button>
                       );

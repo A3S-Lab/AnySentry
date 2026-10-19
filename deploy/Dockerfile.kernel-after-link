@@ -1,0 +1,2 @@
+FROM anysentry-web:live-agent-status-20260923
+COPY web/ /usr/share/nginx/html/

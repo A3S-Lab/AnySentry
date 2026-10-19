@@ -1,6 +1,7 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import { formatSecurityDateTime, parseSecurityTimestamp, securityTimestampValue } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   Activity,
   AlertTriangle,
@@ -2046,7 +2047,7 @@ function agentActivityLabel(value: string): string {
 
 function agentAssetHref(agent: AgentInventoryItem, filter: SecurityTimeFilter): string {
   const query = new URLSearchParams({
-    timeType: filter.timeType ?? "last_3h",
+    timeType: filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
     selectedAgentAssetId: agent.agentAssetId,
   });
   if (agent.agentInstanceId) query.set("selectedAgentInstanceId", agent.agentInstanceId);
@@ -2056,7 +2057,7 @@ function agentAssetHref(agent: AgentInventoryItem, filter: SecurityTimeFilter): 
 }
 
 function allAgentsHref(filter: SecurityTimeFilter): string {
-  const query = new URLSearchParams({ timeType: filter.timeType ?? "last_3h" });
+  const query = new URLSearchParams({ timeType: filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE });
   if (filter.startTime) query.set("startTime", filter.startTime);
   if (filter.endTime) query.set("endTime", filter.endTime);
   return `/agents?${query.toString()}`;
@@ -2107,7 +2108,7 @@ function AgentOverviewCard({ agent, filter }: { agent: AgentInventoryItem; filte
 
 function agentInstanceEventsHref(agent: AgentInventoryItem, filter: SecurityTimeFilter) {
   const query = new URLSearchParams({
-    timeType: filter.timeType ?? "last_3h",
+    timeType: filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
     agentAssetId: agent.agentAssetId,
   });
   if (agent.agentInstanceId) query.set("agentInstanceId", agent.agentInstanceId);
@@ -3560,7 +3561,7 @@ function shortId(value?: string) {
 function eventDetailHref(event: AgentEventListItem, timeFilter: SecurityTimeFilter) {
   const qs = new URLSearchParams({
     eventId: event.eventId,
-    timeType: timeFilter.timeType ?? "last_3h",
+    timeType: timeFilter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
   });
   if (timeFilter.startTime) qs.set("startTime", timeFilter.startTime);
   if (timeFilter.endTime) qs.set("endTime", timeFilter.endTime);
@@ -3987,7 +3988,7 @@ export default function SecurityMonitorPage() {
 
   const requestFilter = useMemo(() => filter, [filter]);
   const timelineContextKey = [
-    requestFilter.timeType ?? "last_3h",
+    requestFilter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
     requestFilter.startTime ?? "",
     requestFilter.endTime ?? "",
     requestFilter.snapshotAsOf ?? "",
@@ -4111,8 +4112,8 @@ export default function SecurityMonitorPage() {
     data: collectorHealth,
     loading: collectorHealthLoading,
     error: collectorHealthRequestError,
-  } = useRequest(() => securityCenterApi.collectorHealth({ timeType: "last_3h", limit: 100 }), {
-    refreshDeps: [refreshVersion],
+  } = useRequest(() => securityCenterApi.collectorHealth({ ...requestFilter, limit: 100 }), {
+    refreshDeps: [refreshVersion, requestFilter],
     pollingInterval: 10000,
     pollingWhenHidden: false,
     refreshOnWindowFocus: true,

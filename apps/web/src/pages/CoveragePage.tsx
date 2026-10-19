@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   AlertTriangle,
   BellRing,
@@ -323,7 +324,7 @@ function IssueDetail({ issue, timeType }: { issue?: CoverageIssue; timeType: Sec
 
 export default function CoveragePage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");
   const [type, setType] = useState<CoverageIssueType | "all">((searchParams.get("type") as CoverageIssueType) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");

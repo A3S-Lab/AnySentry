@@ -1,0 +1,8 @@
+FROM anysentry-api:normal-dialogue-v3-20260916 AS api
+COPY api/ /app/dist/security-monitoring/
+
+FROM anysentry-web:turn-newest-first-20260916 AS web
+COPY web/ /usr/share/nginx/html/
+
+FROM anysentry-observer-wrapper:ws-connection-v2-20260914 AS observer
+LABEL anysentry.kimi-monitoring="20260916"

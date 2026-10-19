@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   BellRing,
   CalendarClock,
@@ -390,7 +391,7 @@ function CollectorDetail({ collector, timeType }: { collector?: CollectorHealthI
 
 export default function CollectorsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [state, setState] = useState<CollectorHealthState | "all">((searchParams.get("state") as CollectorHealthState) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");
   const [selectedCollectorId, setSelectedCollectorId] = useState(searchParams.get("collectorId") ?? "");

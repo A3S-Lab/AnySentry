@@ -2,13 +2,16 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = fileURLToPath(new URL('../', import.meta.url));
+const require = createRequire(import.meta.url);
+const { DurableSpool } = require('./observer-durable-spool');
 const temporary = mkdtempSync(path.join(os.tmpdir(), 'anysentry-forwarder-durable-'));
 const spoolPath = path.join(temporary, 'observer.wal');
 const requests = [];
@@ -84,7 +87,7 @@ const address = server.address();
 assert(address && typeof address === 'object');
 const batchUrl = `http://127.0.0.1:${address.port}/security-center/ingest/batch`;
 
-function runForwarder({ line, killAfterRequest = false }) {
+function runForwarder({ line, killAfterRequest = false, env = {}, timeoutMs = 12_000 }) {
   return new Promise((resolve, reject) => {
     const requestStart = requests.length;
     const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
@@ -105,6 +108,7 @@ function runForwarder({ line, killAfterRequest = false }) {
         FORWARD_HTTP_TIMEOUT_MS: '1000',
         FORWARD_FILTER_MODE: 'shadow',
         FORWARD_NOISE_POLICY: 'include',
+        ...env,
       },
       stdio: ['pipe', 'ignore', 'pipe'],
     });
@@ -119,7 +123,7 @@ function runForwarder({ line, killAfterRequest = false }) {
     const timeout = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`forwarder durability test timed out: ${stderr}`));
-    }, 12_000);
+    }, timeoutMs);
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
@@ -137,7 +141,153 @@ function runForwarder({ line, killAfterRequest = false }) {
   });
 }
 
+function durablePutCount(filePath, markerPrefix) {
+  try {
+    return new Set(readFileSync(filePath, 'utf8')
+      .split('\n')
+      .flatMap((line) => {
+        if (!line) return [];
+        try {
+          const operation = JSON.parse(line);
+          const body = operation?.op === 'put' ? operation.record?.body : undefined;
+          return typeof body?.line === 'string' && body.line.includes(markerPrefix)
+            ? [operation.record.id]
+            : [];
+        } catch {
+          // The concurrently appended final line may be incomplete at this exact read boundary.
+          return [];
+        }
+      }));
+  } catch {
+    return new Set();
+  }
+}
+
+function verifyWalDrainsAheadOfMemoryWindow() {
+  const filePath = path.join(temporary, 'backpressure.wal');
+  const markerPrefix = 'wal-ahead-of-memory-';
+  const eventCount = 64;
+  const requestStart = requests.length;
+  responseMode = 'unavailable';
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['scripts/observer-forward.js'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        ANYSENTRY_BATCH_INGEST_URL: batchUrl,
+        ANYSENTRY_INGEST_URL: batchUrl.replace('/batch', ''),
+        ANYSENTRY_HEARTBEAT_SECS: '0',
+        ANYSENTRY_IDENTITY_SNAPSHOT_SECS: '0',
+        ANYSENTRY_DOCKER_DISCOVERY: 'off',
+        ANYSENTRY_WRITER_ID: 'durability-backpressure-writer',
+        FORWARD_SPOOL_PATH: filePath,
+        FORWARD_SPOOL_FSYNC: 'always',
+        FORWARD_SPOOL_MAX_RECORDS: '1000',
+        FORWARD_MAX_OUTSTANDING_EVENTS: '4',
+        FORWARD_BATCH_SIZE: '4',
+        FORWARD_MAX_INFLIGHT: '1',
+        FORWARD_BATCH_FLUSH_MS: '1',
+        FORWARD_RETRY_BASE_MS: '50',
+        FORWARD_RETRY_MAX_MS: '100',
+        FORWARD_DURABLE_REPLAY_COOLDOWN_MS: '1000',
+        FORWARD_HTTP_TIMEOUT_MS: '1000',
+        FORWARD_FILTER_MODE: 'shadow',
+        FORWARD_NOISE_POLICY: 'include',
+      },
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    let released = false;
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`WAL-ahead backpressure test timed out: ${stderr}`));
+    }, 20_000);
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      clearInterval(poll);
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(`WAL-ahead forwarder exited with ${signal ?? code}: ${stderr}`));
+        return;
+      }
+      const delivered = new Set(requests
+        .slice(requestStart)
+        .flatMap((request) => request.events)
+        .flatMap((event) => event.line?.includes(markerPrefix) ? [event.sourceEventId] : []));
+      try {
+        assert.equal(delivered.size, eventCount, 'every durably spooled event must eventually deliver');
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+    const lines = Array.from(
+      { length: eventCount },
+      (_, index) => observerLine(`${markerPrefix}${String(index).padStart(3, '0')}`),
+    );
+    child.stdin.write(`${lines.join('\n')}\n`);
+    const poll = setInterval(() => {
+      if (released) return;
+      const persisted = durablePutCount(filePath, markerPrefix);
+      if (persisted.size !== eventCount) return;
+      released = true;
+      // All input crossed the process pipe while only four events could be HTTP-owned. A
+      // Forwarder that pauses stdin at the memory cap leaves this assertion unreachable.
+      responseMode = 'accept';
+      child.stdin.end();
+    }, 25);
+  });
+}
+
 try {
+  const streamingSpoolPath = path.join(temporary, 'streaming-recovery.wal');
+  const streamingSeed = new DurableSpool({
+    writerId: 'streaming-recovery-writer',
+    filePath: streamingSpoolPath,
+    fsyncMode: 'always',
+  });
+  streamingSeed.put({
+    id: 'streaming-live',
+    priority: 4,
+    queuedAt: 1,
+    body: { line: `prefix-${'x'.repeat(211)}-跨块恢复-🙂`, sourceEventId: 'streaming-live' },
+  });
+  streamingSeed.put({
+    id: 'streaming-acked',
+    priority: 3,
+    queuedAt: 2,
+    body: { line: 'already acknowledged', sourceEventId: 'streaming-acked' },
+  });
+  streamingSeed.ack(['streaming-acked']);
+  streamingSeed.close();
+  appendFileSync(streamingSpoolPath, '{"op":"put","record":', { mode: 0o600 });
+
+  const streamingRecovered = new DurableSpool({
+    writerId: 'streaming-recovery-writer',
+    filePath: streamingSpoolPath,
+    fsyncMode: 'always',
+    loadChunkBytes: 64,
+  });
+  assert.equal(streamingRecovered.status().records, 1);
+  assert.equal(streamingRecovered.available(new Set(), 1)[0]?.id, 'streaming-live');
+  assert.match(streamingRecovered.available(new Set(), 1)[0]?.body?.line, /跨块恢复-🙂$/u);
+  streamingRecovered.close();
+
+  const corruptSpoolPath = path.join(temporary, 'corrupt-middle.wal');
+  writeFileSync(
+    corruptSpoolPath,
+    `${JSON.stringify({ op: 'ack', ids: [] })}\nnot-json\n${JSON.stringify({ op: 'ack', ids: [] })}\n`,
+    { mode: 0o600 },
+  );
+  assert.throws(
+    () => new DurableSpool({ filePath: corruptSpoolPath, loadChunkBytes: 64 }),
+    /corrupt at line 2/u,
+  );
+
   const firstStart = requests.length;
   await runForwarder({ line: observerLine('retry-same-process') });
   const retryRequests = requests.slice(firstStart);
@@ -188,10 +338,67 @@ try {
   assert.equal(recovered[0].events[0].sourceEventId, sourceEventId);
   assert.equal(recovered[0].batchId, beforeRestart[0].batchId);
 
+  // Reproduce a full WAL whose durable backlog is larger than the Forwarder's bounded in-memory
+  // ownership window. A one-shot startup replay delivers only the first window and then leaves
+  // stdin permanently paused because the spool remains at capacity.
+  const replayCount = 1_001;
+  const replaySpool = new DurableSpool({
+    writerId: 'durability-gate-writer',
+    filePath: spoolPath,
+    maxRecords: 1_000,
+    fsyncMode: 'always',
+  });
+  const replayIds = [];
+  for (let index = 0; index < replayCount; index += 1) {
+    const id = `durable-window-${String(index).padStart(4, '0')}`;
+    replayIds.push(id);
+    replaySpool.put({
+      id,
+      priority: 3,
+      queuedAt: Date.now() + index,
+      body: {
+        line: observerLine(id),
+        sourceEventId: id,
+        observedAt: Date.now() + index,
+      },
+    });
+  }
+  assert.equal(replaySpool.status().atCapacity, true);
+  replaySpool.close();
+
+  const fullReplayStart = requests.length;
+  await runForwarder({
+    env: {
+      FORWARD_SPOOL_MAX_RECORDS: '1000',
+      FORWARD_MAX_OUTSTANDING_EVENTS: '16',
+      FORWARD_BATCH_SIZE: '16',
+      FORWARD_MAX_INFLIGHT: '8',
+    },
+    timeoutMs: 20_000,
+  });
+  const replayedIds = new Set(
+    requests
+      .slice(fullReplayStart)
+      .flatMap((request) => request.events)
+      .map((event) => event.sourceEventId)
+      .filter((id) => id.startsWith('durable-window-')),
+  );
+  assert.equal(
+    replayedIds.size,
+    replayCount,
+    'every WAL record beyond the first in-memory window must be replayed',
+  );
+
+  await verifyWalDrainsAheadOfMemoryWindow();
+
   console.log('PASS Forwarder retries the same stable batch after a transport failure');
   console.log('PASS Forwarder assigns distinct IDs to equal source text observed twice');
   console.log('PASS Forwarder replays an unacknowledged WAL record after process death');
+  console.log('PASS Forwarder continuously hydrates a capacity-full WAL beyond one memory window');
+  console.log('PASS Forwarder drains Collector stdin into WAL beyond the in-memory HTTP window');
   console.log('PASS Forwarder deletes records only after item-level durable acknowledgement');
+  console.log('PASS Forwarder incrementally recovers chunked UTF-8 WAL data and ignores only a torn tail');
+  console.log('PASS Forwarder rejects corruption before the final WAL line');
 } finally {
   await new Promise((resolve) => server.close(resolve));
   rmSync(temporary, { recursive: true, force: true });

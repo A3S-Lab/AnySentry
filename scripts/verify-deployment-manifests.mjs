@@ -203,14 +203,29 @@ function verifyAnySentryManifest() {
     { runtimeConfig: runtimeConfig?.source, deployment: anySentryDeployment?.source },
   );
   assert(
-    'Production manifests retain streaming and supply-chain configuration without enabling it by default',
+    'Production manifests retain streaming, Interaction, and supply-chain configuration without enabling them by default',
     /ANYSENTRY_STREAMING:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
+      /ANYSENTRY_INTERACTIONS:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
+      /ANYSENTRY_INTERACTION_BOOTSTRAP_SERVERS:\s*"kafka:9092"/u.test(runtimeConfig?.source ?? '') &&
+      /ANYSENTRY_INTERACTION_TOPIC:\s*"anysentry\.interactions\.v1"/u.test(runtimeConfig?.source ?? '') &&
       /ANYSENTRY_SUPPLY_CHAIN:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
       /ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*"off"/u.test(runtimeConfig?.source ?? '') &&
       /^      ANYSENTRY_STREAMING:\s*\$\{ANYSENTRY_STREAMING:-off\}\s*$/mu.test(anySentryComposeService) &&
+      /^      ANYSENTRY_INTERACTIONS:\s*\$\{ANYSENTRY_INTERACTIONS:-off\}\s*$/mu.test(anySentryComposeService) &&
       /^      ANYSENTRY_SUPPLY_CHAIN:\s*\$\{ANYSENTRY_SUPPLY_CHAIN:-off\}\s*$/mu.test(anySentryComposeService) &&
       /^      ANYSENTRY_SUPPLY_CHAIN_RUNTIME:\s*\$\{ANYSENTRY_SUPPLY_CHAIN_RUNTIME:-off\}\s*$/mu.test(anySentryComposeService),
     { runtimeConfig: runtimeConfig?.source, compose: anySentryComposeService },
+  );
+  assert(
+    'Production and manual manifests never enable the unsafe local Interaction direct-view bypass',
+    !/ANYSENTRY_INTERACTION_UNSAFE_LOCAL_DIRECT_VIEW/u.test(anySentryManifest)
+      && !/ANYSENTRY_INTERACTION_UNSAFE_LOCAL_DIRECT_VIEW/u.test(compose)
+      && !/ANYSENTRY_INTERACTION_UNSAFE_LOCAL_DIRECT_VIEW/u.test(manualCompose),
+    {
+      manifest: anySentryManifest,
+      compose: anySentryComposeService,
+      manualCompose,
+    },
   );
   assert(
     'Canonical API declares compatible shadow readers for trusted identity, capture, and S3 semantics',
@@ -257,13 +272,13 @@ function verifyAnySentryManifest() {
     anySentryDeployment?.source,
   );
   assert(
-    'AnySentry gives its graceful event-buffer drain 30 seconds',
-    /^\s{6}terminationGracePeriodSeconds:\s*30\s*$/mu.test(anySentryDeployment?.source ?? ''),
+    'AnySentry gives HTTP and provider drains 60 seconds',
+    /^\s{6}terminationGracePeriodSeconds:\s*60\s*$/mu.test(anySentryDeployment?.source ?? ''),
     anySentryDeployment?.source,
   );
   assert(
-    'Docker Compose gives AnySentry the same 30-second event-buffer drain',
-    /^    stop_grace_period:\s*30s\s*$/mu.test(anySentryComposeService),
+    'Docker Compose gives AnySentry the same 60-second shutdown window',
+    /^    stop_grace_period:\s*60s\s*$/mu.test(anySentryComposeService),
     anySentryComposeService,
   );
   assert(
@@ -486,6 +501,7 @@ function verifyStreamingManifest() {
       'anysentry.risk-analysis-batches.v1',
       'anysentry.stream.findings.v1',
       'anysentry.supply-chain.context.v1',
+      'anysentry.interactions.v1',
       'anysentry.stream.dlq.v1',
     ].every((topic) => topicManager?.source.includes(topic)),
     topicManager?.source,
@@ -518,15 +534,19 @@ function verifyStreamingManifest() {
   );
   assert(
     'Flink submit controller runs the packaged AnySentry streaming job',
-    /org\.a3s\.anysentry\.streaming\.AnySentryStreamJob/u.test(jobSubmit?.source ?? '') &&
-      /anysentry-flink-streaming\.jar/u.test(jobSubmit?.source ?? '') &&
+    /\/opt\/anysentry\/job-guard\.mjs/u.test(jobSubmit?.source ?? '') &&
+      /org\.a3s\.anysentry\.streaming\.AnySentryStreamJob/u.test(readText('streaming/flink/job-guard.mjs')) &&
+      /anysentry-flink-streaming\.jar/u.test(readText('streaming/flink/job-guard.mjs')) &&
+      /COPY job-guard\.mjs \/opt\/anysentry\/job-guard\.mjs/u.test(readText('streaming/flink/Dockerfile')) &&
       /ANYSENTRY_FLINK_LEGACY_COMPOSITE_ENABLED,\s*value:\s*"off"/u.test(jobSubmit?.source ?? ''),
     jobSubmit?.source,
   );
   assert(
     'Flink submit controller treats one exact non-terminal job name as active',
-    jobSubmit?.source.includes("grep -Eq ' : AnySentry Flink Shadow Risk \\([[:upper:]_]+\\)$'") &&
-      !jobSubmit?.source.includes('AnySentry Flink Shadow Risk (RUNNING)'),
+    readText('streaming/flink/job-guard.mjs').includes('job.name === name') &&
+      readText('streaming/flink/job-guard.mjs').includes("'RESTARTING'") &&
+      readText('streaming/flink/job-guard.mjs').includes('unknown target job state; refusing submission') &&
+      !jobSubmit?.source.includes('flink list'),
     jobSubmit?.source,
   );
   assert(
@@ -577,6 +597,14 @@ function verifyObserverManifest() {
   assert(
     'Observer DaemonSet forwards to AnySentry ingest API',
     /\{\s*name:\s*ANYSENTRY_INGEST_URL,\s*value:\s*"http:\/\/anysentry:29653\/security-center\/ingest"\s*\}/u.test(daemonSet?.source ?? ''),
+    daemonSet?.source,
+  );
+  assert(
+    'Observer DaemonSet keeps Interaction collection source-level metadata-only and disabled by default',
+    /\{\s*name:\s*A3S_OBSERVER_INTERACTION_CAPTURE_MODE,\s*value:\s*"metadata"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"0"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /\{\s*name:\s*ANYSENTRY_INTERACTIONS,\s*value:\s*"off"\s*\}/u.test(daemonSet?.source ?? '') &&
+      /ANYSENTRY_INTERACTION_INGEST_URL[\s\S]*?security-center\/interactions\/ingest/u.test(daemonSet?.source ?? ''),
     daemonSet?.source,
   );
   assert(
@@ -711,7 +739,9 @@ function verifyManualKubernetesObserverOverlay() {
       /\{\s*name:\s*A3S_OBSERVER_FILES,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*A3S_OBSERVER_FILE_ACCESS,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*A3S_OBSERVER_FILE_DELETE,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
-      /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"1"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_INTERACTION_CAPTURE_MODE,\s*value:\s*"metadata"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*A3S_OBSERVER_SSL,\s*value:\s*"0"\s*\}/u.test(observerPatch) &&
+      /\{\s*name:\s*ANYSENTRY_INTERACTIONS,\s*value:\s*"on"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_DOCKER_DISCOVERY,\s*value:\s*"on"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*ANYSENTRY_DOCKER_SOCKET,\s*value:\s*"\/var\/run\/docker\.sock"\s*\}/u.test(observerPatch) &&
       /\{\s*name:\s*FORWARD_BATCH_SIZE,\s*value:\s*"32"\s*\}/u.test(observerPatch) &&
@@ -739,7 +769,7 @@ function verifyManualKubernetesObserverOverlay() {
     `${fileCanaryKustomization}\n${fileCanaryPatch}`,
   );
   assert(
-    'Manual full-file Observer profile is a separate final gate with both rings, all rollout planes, and one exact host OpenSSL inode',
+    'Manual full-file Observer profile is a separate final gate with both rings and a metadata-only Interaction boundary',
     /resources:\s*\n\s*-\s*\.\.\/k8s-observer/u.test(fullFileKustomization) &&
       /path:\s*full-file-probe-patch\.yaml/u.test(fullFileKustomization) &&
       /manual-observer-profile:\s*"agent-prefilter-files-full-v1"/u.test(fullFilePatch) &&
@@ -755,10 +785,9 @@ function verifyManualKubernetesObserverOverlay() {
       /FORWARD_FILE_AGGREGATION,\s*value:\s*"true"/u.test(fullFilePatch) &&
       /FORWARD_BATCH_SIZE,\s*value:\s*"64"/u.test(fullFilePatch) &&
       /FORWARD_BATCH_FLUSH_MS,\s*value:\s*"50"/u.test(fullFilePatch) &&
-      /A3S_OBSERVER_HOST_LIBSSL,\s*value:\s*"\/usr\/lib\/x86_64-linux-gnu\/libssl\.so\.3"/u.test(fullFilePatch) &&
-      /A3S_OBSERVER_SSL,\s*value:\s*"\/opt\/host-libs\/libssl\.so\.3"/u.test(fullFilePatch) &&
-      /name:\s*host-libssl[\s\S]*mountPath:\s*\/opt\/host-libs\/libssl\.so\.3[\s\S]*readOnly:\s*true/u.test(fullFilePatch) &&
-      /name:\s*host-libssl[\s\S]*hostPath:\s*\{\s*path:\s*\/usr\/lib\/x86_64-linux-gnu\/libssl\.so\.3,\s*type:\s*File\s*\}/u.test(fullFilePatch),
+      /A3S_OBSERVER_INTERACTION_CAPTURE_MODE,\s*value:\s*"metadata"/u.test(fullFilePatch) &&
+      /A3S_OBSERVER_SSL,\s*value:\s*"0"/u.test(fullFilePatch) &&
+      !/host-libssl|\/opt\/host-libs\/libssl/u.test(fullFilePatch),
     `${fullFileKustomization}\n${fullFilePatch}`,
   );
   assert(
@@ -1110,6 +1139,14 @@ function verifyModuleDevelopmentDeployment() {
     { dockerfile, compose, guide },
   );
   assert(
+    'Module Observer persists both ordinary and Interaction WALs outside the replaceable container layer',
+    /FORWARD_SPOOL_PATH:\s*\/var\/lib\/anysentry-forwarder\/spool\.wal/u.test(compose) &&
+      /ANYSENTRY_INTERACTION_SPOOL_PATH:\s*\/var\/lib\/anysentry-forwarder\/interactions\.wal/u.test(compose) &&
+      /observer-forward-spool:\/var\/lib\/anysentry-forwarder/u.test(compose) &&
+      /^  observer-forward-spool:\s*$/mu.test(compose),
+    compose,
+  );
+  assert(
     'Module Observer shares the Capture Profile snapshot/ACK path and central materialization endpoint',
     /ANYSENTRY_CAPTURE_PROFILE_MODE:\s*\$\{ANYSENTRY_CAPTURE_PROFILE_MODE:-legacy\}/u.test(compose) &&
       /ANYSENTRY_UNKNOWN_RETENTION_MODE:\s*\$\{ANYSENTRY_UNKNOWN_RETENTION_MODE:-legacy\}/u.test(compose) &&
@@ -1187,7 +1224,7 @@ function verifyModuleDevelopmentDeployment() {
     { dockerfile, allFeatures, scannerConfig },
   );
   assert(
-    'Module all-features Observer uses an immutable in-image script set and enables independent Access/Delete plus host OpenSSL probes',
+    'Module all-features Observer uses an immutable script set, independent Access/Delete, and metadata-only Interaction collection',
     /^  observer:\s*$/mu.test(allFeatures) &&
       /observer:[\s\S]*?build:\s*!reset\s+null/u.test(allFeatures) &&
       /entrypoint:\s*\["\/usr\/local\/bin\/node",\s*"\/opt\/observer-supervisor\.js"\]/u.test(allFeatures) &&
@@ -1198,7 +1235,9 @@ function verifyModuleDevelopmentDeployment() {
       /ANYSENTRY_CAPTURE_PROFILE_MODE:\s*"enforce"/u.test(allFeatures) &&
       /ANYSENTRY_UNKNOWN_RETENTION_MODE:\s*"enforce"/u.test(allFeatures) &&
       /ANYSENTRY_FILTER_RULES_ACK_FILE:\s*\/run\/anysentry-filter\/filter-rules\.ack\.json/u.test(allFeatures) &&
-      /A3S_OBSERVER_SSL:\s*\/opt\/host-libs\/libssl\.so\.3/u.test(allFeatures) &&
+      /A3S_OBSERVER_INTERACTION_CAPTURE_MODE:\s*metadata/u.test(allFeatures) &&
+      /A3S_OBSERVER_SSL:\s*"0"/u.test(allFeatures) &&
+      /ANYSENTRY_INTERACTIONS:\s*"on"/u.test(allFeatures) &&
       /FORWARD_FILTER_MODE:\s*"enforce"/u.test(allFeatures) &&
       /FORWARD_RETAIN_UNKNOWN:\s*"true"/u.test(allFeatures) &&
       /FORWARD_RETAIN_NON_AGENT:\s*"false"/u.test(allFeatures) &&
@@ -1206,7 +1245,7 @@ function verifyModuleDevelopmentDeployment() {
       /FORWARD_BATCH_SIZE:\s*"64"/u.test(allFeatures) &&
       /FORWARD_BATCH_FLUSH_MS:\s*"50"/u.test(allFeatures) &&
       /volumes:\s*!override/u.test(allFeatures) &&
-      /\$\{A3S_OBSERVER_HOST_LIBSSL:-\/usr\/lib\/x86_64-linux-gnu\/libssl\.so\.3\}:\/opt\/host-libs\/libssl\.so\.3:ro/u.test(allFeatures) &&
+      !/\/opt\/host-libs\/libssl\.so\.3/u.test(allFeatures) &&
       !/anysentry-forwarder-dev/u.test(allFeatures) &&
       /^COPY scripts\/observer-\*\.js \/opt\/$/mu.test(dockerfile) &&
       fs.existsSync(path.join(repoRoot, 'scripts/observer-infrastructure-policy.js')) &&

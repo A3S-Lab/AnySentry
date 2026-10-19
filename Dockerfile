@@ -9,6 +9,9 @@
 # @a3s-lab/sentry ships no linux-arm64 binary.
 
 FROM node:20-bookworm-slim AS build
+ARG ANYSENTRY_BUILD_VERSION=dev
+ARG ANYSENTRY_BUILD_COMMIT=unknown
+ARG ANYSENTRY_BUILD_TIME=unknown
 RUN corepack enable
 WORKDIR /src
 # Manifests + lockfile first so the dependency layer caches independently of source churn.
@@ -33,9 +36,17 @@ RUN pnpm --filter @anysentry/web build \
 
 FROM ubuntu:24.04 AS runtime
 ARG PUBLIC_BASE_PATH=""
+ARG ANYSENTRY_BUILD_VERSION=dev
+ARG ANYSENTRY_BUILD_COMMIT=unknown
+ARG ANYSENTRY_BUILD_TIME=unknown
 COPY --from=build /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
-ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH}
+ENV NODE_ENV=production PORT=29653 ANYSENTRY_WEB_DIR=/app/web PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH} \
+    ANYSENTRY_BUILD_VERSION=${ANYSENTRY_BUILD_VERSION} ANYSENTRY_BUILD_COMMIT=${ANYSENTRY_BUILD_COMMIT} \
+    ANYSENTRY_BUILD_TIME=${ANYSENTRY_BUILD_TIME} ANYSENTRY_API_VERSION=${ANYSENTRY_BUILD_VERSION}
+LABEL org.opencontainers.image.version="${ANYSENTRY_BUILD_VERSION}" \
+      org.opencontainers.image.revision="${ANYSENTRY_BUILD_COMMIT}" \
+      org.opencontainers.image.created="${ANYSENTRY_BUILD_TIME}"
 COPY --from=build /out/node_modules ./node_modules
 COPY --from=build /out/dist ./dist
 COPY --from=build /out/anysentry-production-components.json ./anysentry-production-components.json

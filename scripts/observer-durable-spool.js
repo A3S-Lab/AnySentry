@@ -29,6 +29,8 @@ class DurableSpool {
     this.fsyncMode = options.fsyncMode === 'always' ? 'always' : 'periodic';
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
+    this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 16 * 1024 * 1024);
+    this.maxWalLineBytes = boundedNumber(options.maxWalLineBytes, 16 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024);
     this.filePath = path.resolve(options.filePath);
     this.dlqPath = path.resolve(options.dlqPath || `${this.filePath}.dlq`);
     this.records = new Map();
@@ -51,44 +53,78 @@ class DurableSpool {
 
   load() {
     if (!fs.existsSync(this.filePath)) return;
-    const contents = fs.readFileSync(this.filePath, 'utf8');
-    const lines = contents.split('\n');
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      if (!line) continue;
-      let operation;
-      try {
-        operation = JSON.parse(line);
-      } catch (error) {
-        // A process or host crash can leave only the final append torn. Earlier corruption is not
-        // safe to ignore because doing so could silently discard durable evidence.
-        if (index === lines.length - 1) break;
-        throw new Error(`Observer spool is corrupt at line ${index + 1}: ${error.message}`);
+    // WALs can legitimately grow beyond V8's maximum string size while an endpoint is down.
+    // Recover them incrementally so startup memory is proportional to live records plus one WAL
+    // line, rather than live records plus a second copy of the entire file as one giant string.
+    const fd = fs.openSync(this.filePath, 'r');
+    const chunk = Buffer.allocUnsafe(this.loadChunkBytes);
+    let pending = Buffer.alloc(0);
+    let lineNumber = 0;
+    try {
+      let bytesRead;
+      do {
+        bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (!bytesRead) break;
+        const data = pending.length
+          ? Buffer.concat([pending, chunk.subarray(0, bytesRead)])
+          : chunk.subarray(0, bytesRead);
+        let start = 0;
+        for (let newline = data.indexOf(0x0a, start); newline !== -1; newline = data.indexOf(0x0a, start)) {
+          lineNumber += 1;
+          this.applyWalLine(data.subarray(start, newline), lineNumber, false);
+          start = newline + 1;
+        }
+        pending = start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
+        if (pending.length > this.maxWalLineBytes) {
+          throw new Error(
+            `Observer spool line ${lineNumber + 1} exceeds ${this.maxWalLineBytes} bytes`,
+          );
+        }
+      } while (bytesRead > 0);
+      if (pending.length) {
+        lineNumber += 1;
+        this.applyWalLine(pending, lineNumber, true);
       }
-      if (operation.op === 'put' && operation.record?.id && operation.record?.body) {
-        const previous = this.records.get(operation.record.id);
-        if (previous) {
-          this.logicalBytes -= previous.bytes;
-          this.prioritySets[previous.priority].delete(previous.id);
-        }
-        const record = {
-          id: String(operation.record.id),
-          body: operation.record.body,
-          priority: boundedNumber(operation.record.priority, 0, 0, 5),
-          queuedAt: boundedNumber(operation.record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
-          bytes: Buffer.byteLength(JSON.stringify(operation.record.body)),
-        };
-        this.records.set(record.id, record);
-        this.prioritySets[record.priority].add(record.id);
-        this.logicalBytes += record.bytes;
-      } else if (operation.op === 'ack' && Array.isArray(operation.ids)) {
-        for (const id of operation.ids) {
-          const previous = this.records.get(id);
-          if (!previous) continue;
-          this.logicalBytes -= previous.bytes;
-          this.records.delete(id);
-          this.prioritySets[previous.priority].delete(id);
-        }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  applyWalLine(bytes, lineNumber, allowTornFinalLine) {
+    if (!bytes.length || (bytes.length === 1 && bytes[0] === 0x0d)) return;
+    const line = bytes[bytes.length - 1] === 0x0d ? bytes.subarray(0, -1) : bytes;
+    let operation;
+    try {
+      operation = JSON.parse(line.toString('utf8'));
+    } catch (error) {
+      // A process or host crash can leave only the final append torn. Earlier corruption is not
+      // safe to ignore because doing so could silently discard durable evidence.
+      if (allowTornFinalLine) return;
+      throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
+    }
+    if (operation.op === 'put' && operation.record?.id && operation.record?.body) {
+      const previous = this.records.get(operation.record.id);
+      if (previous) {
+        this.logicalBytes -= previous.bytes;
+        this.prioritySets[previous.priority].delete(previous.id);
+      }
+      const record = {
+        id: String(operation.record.id),
+        body: operation.record.body,
+        priority: boundedNumber(operation.record.priority, 0, 0, 5),
+        queuedAt: boundedNumber(operation.record.queuedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+        bytes: Buffer.byteLength(JSON.stringify(operation.record.body)),
+      };
+      this.records.set(record.id, record);
+      this.prioritySets[record.priority].add(record.id);
+      this.logicalBytes += record.bytes;
+    } else if (operation.op === 'ack' && Array.isArray(operation.ids)) {
+      for (const id of operation.ids) {
+        const previous = this.records.get(id);
+        if (!previous) continue;
+        this.logicalBytes -= previous.bytes;
+        this.records.delete(id);
+        this.prioritySets[previous.priority].delete(id);
       }
     }
   }

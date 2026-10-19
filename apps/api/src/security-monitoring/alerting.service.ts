@@ -8,6 +8,7 @@ import { NotificationService } from './notification.service';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { cleanText } from './redaction';
 import { collectorHeartbeatFailureDelta } from './pipeline-accounting';
+import { securityTimeSpanMs } from './time-window';
 import type { DecisionResultJob } from './async-judgment.types';
 import {
   AlertConfig,
@@ -30,8 +31,6 @@ import {
   Severity,
 } from './types';
 
-const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const ALERT_HISTORY_LIMIT = 2_000;
 const RELATIONAL_REFRESH_MS = 15_000;
@@ -261,6 +260,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
   private relationalRefreshTimer?: NodeJS.Timeout;
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
+  // PostgreSQL is the authoritative mutable store. Remember the exact immutable record objects
+  // it accepted so periodic persistence writes only changed rows instead of serializing the full
+  // alert history every 500 ms.
+  private readonly relationalPersistedAlerts = new Map<string, AlertRecord>();
   private initialized = false;
   private durableMutationHolds = 0;
   private effectCapture?: {
@@ -319,6 +322,10 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
     if (this.collectorTimer) clearInterval(this.collectorTimer);
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
     await this.persist();
   }
 
@@ -1595,8 +1602,8 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
 
   private since(query: AlertListQuery): number {
     const end = Date.now();
-    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - 3 * HOUR;
-    return end - (WINDOW[query.timeType ?? 'last_3h'] ?? 3 * HOUR);
+    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - securityTimeSpanMs();
+    return end - securityTimeSpanMs(query.timeType);
   }
 
   private silenceMinutes(input: number | undefined): number {
@@ -1690,10 +1697,17 @@ export class AlertingService implements OnModuleInit, OnModuleDestroy {
       const alerts = [...this.alerts.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, ALERT_HISTORY_LIMIT);
-      await Promise.all([
-        this.relational.saveAlerts(alerts),
-        this.ch.saveAlertState(alerts),
-      ]);
+      const changed = alerts.filter((alert) => (
+        this.relationalPersistedAlerts.get(alert.alertId) !== alert
+      ));
+      const saved = changed.length === 0 || await this.relational.saveAlerts(changed);
+      if (saved) {
+        for (const alert of changed) this.relationalPersistedAlerts.set(alert.alertId, alert);
+      } else {
+        // ClickHouse is a migration fallback, not a second hot write path. Preserve the former
+        // failover behavior only when the authoritative PostgreSQL commit is unavailable.
+        await this.ch.saveAlertState(alerts);
+      }
     } while (this.persistRequested);
   }
 

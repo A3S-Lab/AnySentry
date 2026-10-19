@@ -60,6 +60,104 @@ function attributor(procEntries = []) {
 }
 
 {
+  const judge = attributor();
+  const observed = observerEvent({ pid: 88201, ppid: 1, comm: 'kimi-code', exe: '/opt/kimi/bin/kimi',
+    hostId: 'host-exit', bootId: 'boot-exit', argv: ['kimi'] });
+  Object.assign(observed.process, { cgroupId: '100', pidNamespace: 'pidns-exit', namespacePid: 12, startTimeTicks: '1234' });
+  judge.classify(observed);
+  const terminal = processExitEvent({ pid: 88201, comm: 'kimi-code', hostId: 'host-exit', bootId: 'boot-exit' });
+  terminal.process.cgroupId = '100';
+  const result = judge.classify(terminal);
+  assert.equal(result.processContext?.startTimeTicks, '1234', 'exit must retain the observed generation after /proc disappears');
+  assert.equal(result.processContext?.pidNamespace, 'pidns-exit');
+  assert.equal(result.processContext?.namespacePid, 12);
+  judge.classify(observed);
+  const reused = structuredClone(terminal);
+  reused.process.startTimeTicks = '5678';
+  assert.equal(judge.classify(reused).processContext, undefined, 'a changed generation must not inherit cached namespace evidence');
+  judge.classify(observed);
+  const foreign = structuredClone(terminal);
+  foreign.process.cgroupId = '200';
+  assert.equal(judge.classify(foreign).processContext, undefined, 'a different cgroup must not inherit exit context');
+}
+
+{
+  const judge = attributor();
+  judge.classify(observerEvent({ pid: 88101, ppid: 1, comm: 'codex', exe: '/bin/codex', startTimeNs: '100', argv: ['codex'] }));
+  const root = judge.classify(observerEvent({ pid: 88102, ppid: 88101, comm: 'kimi-code', exe: '/opt/kimi-code/bin/kimi-code', startTimeNs: '200', argv: ['kimi-code'] }));
+  assert.equal(root.attribution.agentScopeId, 'kimi-cli');
+  assert.equal(root.attribution.rootPid, 88102, 'native Kimi must establish its own root below Codex');
+  const tool = judge.classify(observerEvent({ pid: 88103, ppid: 88102, comm: 'bash', exe: '/bin/bash', startTimeNs: '300', argv: ['bash', '-c', 'true'] }));
+  assert.equal(tool.attribution.agentScopeId, 'kimi-cli');
+  assert.equal(tool.attribution.rootPid, 88102, 'native Kimi shell descendants must retain the Kimi root');
+}
+
+{
+  const judge = attributor();
+  judge.classify(observerEvent({pid:88001,ppid:1,comm:'codex',exe:'/bin/codex',startTimeNs:'100',argv:['codex']}));
+  const python = observerEvent({pid:88002,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'200',argv:['python3','/opt/launcher.py']});
+  assert.equal(judge.classify(python).attribution.agentScopeId,'codex');
+  const renamed = structuredClone(python);
+  renamed.process.comm='Kimi Code';
+  renamed.event={FileAccess:{pid:88002,path:'/tmp/kimi/sessions/wire.jsonl',write:true}};
+  const identified=judge.classify(renamed);
+  assert.equal(identified.attribution.agentScopeId,'kimi-cli');
+  assert.equal(identified.attribution.rootPid,88002,'setproctitle creates independent Kimi boundary');
+  const shell=judge.classify(observerEvent({pid:88003,ppid:88002,comm:'bash',exe:'/bin/bash',startTimeNs:'300',argv:['bash','-c','true']}));
+  assert.equal(shell.attribution.rootPid,88002);
+  const entry = judge.classify(observerEvent({pid:88004,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'400',argv:['python3','/opt/bin/kimi']}));
+  assert.equal(entry.attribution.agentScopeId,'kimi-cli');
+  assert.equal(entry.attribution.rootPid,88004);
+  const misleading = judge.classify(observerEvent({pid:88005,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'500',argv:['python3','-c','print("kimi")']}));
+  assert.equal(misleading.attribution.agentScopeId,'codex','Python prompt text is not runtime identity');
+}
+
+{
+  const geminiRoot = {
+    pid: 870,
+    tgid: 870,
+    ppid: 1,
+    startTime: '8700',
+    comm: 'node',
+    exe: '/usr/bin/node',
+    argv: [
+      '/usr/bin/node',
+      '/home/user/.local/lib/node_modules/@google/gemini-cli/dist/index.js',
+    ],
+    cwd: '/home/user/workspace',
+  };
+  const judge = attributor([geminiRoot]);
+  const classified = judge.classify(observerEvent({
+    pid: 870,
+    ppid: 1,
+    comm: 'node',
+    exe: '/usr/bin/node',
+    startTimeNs: '8700',
+    cwd: '/home/user/workspace',
+    argv: geminiRoot.argv,
+  }));
+  assert.equal(classified.state, 'agent');
+  assert.equal(classified.attribution.agentDisplayName, 'Gemini CLI');
+
+  const ordinaryNode = attributor([{
+    ...geminiRoot,
+    pid: 871,
+    startTime: '8710',
+    argv: ['/usr/bin/node', '/home/user/app.js', '--model', 'gemini-2.5-pro'],
+  }]).classify(observerEvent({
+    pid: 871,
+    ppid: 1,
+    comm: 'node',
+    exe: '/usr/bin/node',
+    startTimeNs: '8710',
+    cwd: '/home/user/workspace',
+    argv: ['/usr/bin/node', '/home/user/app.js', '--model', 'gemini-2.5-pro'],
+  }));
+  assert.notEqual(ordinaryNode.state, 'agent');
+  console.log('PASS Gemini CLI Node package entrypoint is exact identity evidence without generic Node false positives');
+}
+
+{
   const procs = new Map([
     [850, { pid: 850, tgid: 850, ppid: 1, startTime: '85', comm: 'a3s', exe: '/usr/bin/a3s', argv: 'a3s code', cwd: '/home/user/code' }],
     [851, { pid: 851, tgid: 851, ppid: 850, startTime: '86', comm: 'bash', exe: '/usr/bin/bash', argv: 'bash', cwd: '/tmp' }],

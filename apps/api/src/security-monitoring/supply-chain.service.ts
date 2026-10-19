@@ -114,6 +114,13 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   private installTimer?: NodeJS.Timeout;
   private drainingInstallScans = false;
   private serviceReady = false;
+  /**
+   * Local pending install starts keyed like Redis install-intent keys. ProcessExit must not
+   * issue Redis getdel for every host exit — only for PIDs this API instance recently saw as
+   * package-manager ToolExec starts. Cross-replica misses are acceptable: runtime install
+   * correlation is best-effort and must never slow the security ingest ACK path.
+   */
+  private readonly pendingInstallIntents = new Map<string, number>();
   private control: SupplyChainControlConfig = {
     schemaVersion: 'anysentry.supply_chain_control.v1',
     enabled: process.env.ANYSENTRY_SUPPLY_CHAIN === 'on',
@@ -240,6 +247,13 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
   private selectedWorkspace(workspaceId: string): boolean {
     return this.control.selectedWorkspaceIds.length === 0
       || this.control.selectedWorkspaceIds.includes(workspaceId);
+  }
+
+  private expirePendingInstallIntents(now: number): void {
+    if (this.pendingInstallIntents.size === 0) return;
+    for (const [key, until] of this.pendingInstallIntents) {
+      if (until < now) this.pendingInstallIntents.delete(key);
+    }
   }
 
   private async recordScannerHeartbeat(scannerIdInput: string): Promise<void> {
@@ -507,9 +521,11 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
    */
   async observeRuntimeInstall(event: JudgedEvent, observerLine: string): Promise<void> {
     if (!this.enabled || event.source !== 'observer') return;
+    // Avoid JSON.parse + Redis on the common ProcessExit flood when no install start is pending.
+    if (this.pendingInstallIntents.size === 0 && !observerLine.includes('ToolExec')) return;
+    this.expirePendingInstallIntents(Date.now());
     const observed = parseRuntimeInstallEvent(observerLine);
     if (!observed) return;
-    const redis = this.requireRedis();
     const key = installIntentKey(event, observed);
     if (observed.phase === 'started') {
       if (!event.workspacePath.startsWith('/')) return;
@@ -520,12 +536,22 @@ export class SupplyChainService implements OnModuleInit, OnModuleDestroy {
         startTimeNs: observed.startTimeNs,
         observedAt: event.at,
       };
+      this.pendingInstallIntents.set(key, Date.now() + INSTALL_INTENT_TTL_SECONDS * 1_000);
+      const redis = this.requireRedis();
       await redis.set(key, JSON.stringify(intent), 'EX', INSTALL_INTENT_TTL_SECONDS);
       return;
     }
 
+    const pendingUntil = this.pendingInstallIntents.get(key);
+    if (!pendingUntil || pendingUntil < Date.now()) {
+      this.pendingInstallIntents.delete(key);
+      return;
+    }
+    this.pendingInstallIntents.delete(key);
+    if (!observed.succeeded) return;
+    const redis = this.requireRedis();
     const raw = await redis.getdel(key);
-    if (!raw || !observed.succeeded) return;
+    if (!raw) return;
     const intent = JSON.parse(raw) as RuntimeInstallIntent;
     if (intent.startTimeTicks && observed.startTimeTicks && intent.startTimeTicks !== observed.startTimeTicks) return;
     if (intent.startTimeNs && observed.startTimeNs && intent.startTimeNs !== observed.startTimeNs) return;

@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime, liveSecuritySnapshotAsOf } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -507,7 +508,7 @@ export default function AgentEventsPage() {
   const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const { filter: consoleTimeFilter, setTimeFilter } = useSecurityConsole();
-  const timeType = consoleTimeFilter.timeType ?? "last_3h";
+  const timeType = consoleTimeFilter.timeType ?? DEFAULT_SECURITY_TIME_TYPE;
   const routeStartTime = consoleTimeFilter.startTime ?? "";
   const routeEndTime = consoleTimeFilter.endTime ?? "";
   const [sourceId, setSourceId] = useState(searchParams.get("sourceId") ?? "");

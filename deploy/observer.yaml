@@ -60,11 +60,15 @@ spec:
             privileged: true # eBPF load + tracepoint attach. OBSERVE path only — cannot block.
           env:
             - { name: A3S_OBSERVER_JSON, value: "1" }
-            # Full signal set: file writes/deletes (FileAccess/FileDelete) + OpenSSL plaintext
-            # (SslContent → prompt-injection / secret-exfil rules + LlmApi model/token usage).
-            # Set to "0" to reduce footprint on a busy node.
+            # Production is source-level metadata-only. The Collector must not attach TLS payload
+            # probes or copy a plaintext buffer into a Ring Buffer.
             - { name: A3S_OBSERVER_FILES, value: "1" }
-            - { name: A3S_OBSERVER_SSL, value: "1" }
+            - { name: A3S_OBSERVER_INTERACTION_CAPTURE_MODE, value: "metadata" }
+            - { name: A3S_OBSERVER_SSL, value: "0" }
+            # Interaction forwarding is a separate opt-in from metadata collection. Enable it only
+            # after the Kafka topic and API lane are ready.
+            - { name: ANYSENTRY_INTERACTIONS, value: "off" }
+            - { name: ANYSENTRY_INTERACTION_INGEST_URL, value: "http://anysentry:29653/security-center/interactions/ingest" }
             # Stable node-scoped Collector identity for the AnySentry Collector and Source consoles.
             - name: A3S_OBSERVER_COLLECTOR_ID
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }

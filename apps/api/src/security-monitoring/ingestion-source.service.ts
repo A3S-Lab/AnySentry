@@ -363,6 +363,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private readonly sources = new Map<string, IngestionSourceRecord>();
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
+  private activityFlushTimer?: NodeJS.Timeout;
+  private readonly pendingSourceActivity = new Map<string, IngestionSourceCurrentActivity>();
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
   private initialized = false;
@@ -395,6 +397,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.currentStateTimer) clearInterval(this.currentStateTimer);
+    if (this.activityFlushTimer) clearTimeout(this.activityFlushTimer);
+    await this.flushSourceActivity();
     await this.persist();
   }
 
@@ -606,7 +610,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       record.lastEventAt = at;
       record.acceptedEvents += 1;
     }
-    void this.currentState.recordSourceActivity({
+    this.queueSourceActivityFlush({
       sourceId: record.sourceId,
       lastSeenAt: at,
       lastEventAt: kind === 'event' ? at : undefined,
@@ -845,6 +849,31 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       this.persistTimer = undefined;
       void this.persist();
     }, 500);
+  }
+
+  private queueSourceActivityFlush(activity: IngestionSourceCurrentActivity): void {
+    const prior = this.pendingSourceActivity.get(activity.sourceId);
+    this.pendingSourceActivity.set(activity.sourceId, {
+      sourceId: activity.sourceId,
+      lastSeenAt: Math.max(prior?.lastSeenAt ?? 0, activity.lastSeenAt),
+      lastEventAt: activity.lastEventAt ?? prior?.lastEventAt,
+      lastHeartbeatAt: activity.lastHeartbeatAt ?? prior?.lastHeartbeatAt,
+      collectorId: activity.collectorId ?? prior?.collectorId,
+      workspacePath: activity.workspacePath ?? prior?.workspacePath,
+    });
+    if (this.activityFlushTimer) return;
+    this.activityFlushTimer = setTimeout(() => {
+      this.activityFlushTimer = undefined;
+      void this.flushSourceActivity();
+    }, 250);
+    this.activityFlushTimer.unref();
+  }
+
+  private async flushSourceActivity(): Promise<void> {
+    if (this.pendingSourceActivity.size === 0) return;
+    const batch = [...this.pendingSourceActivity.values()];
+    this.pendingSourceActivity.clear();
+    await Promise.all(batch.map((activity) => this.currentState.recordSourceActivity(activity)));
   }
 
   private persist(): Promise<void> {

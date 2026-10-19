@@ -1,0 +1,5 @@
+# Narrow local rollout: preserve the running API baseline and all unrelated modules.
+ARG API_BASE_IMAGE=anysentry-api:lifecycle-overlap-20260908
+FROM ${API_BASE_IMAGE}
+COPY apps/api/dist/security-monitoring/local-record-tracking.service.js /app/dist/security-monitoring/local-record-tracking.service.js
+COPY apps/api/dist/security-monitoring/clickhouse-store.js /app/dist/security-monitoring/clickhouse-store.js

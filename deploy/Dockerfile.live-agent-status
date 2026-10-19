@@ -1,0 +1,2 @@
+FROM anysentry-api:evidence-dedup-20260917
+COPY security-monitoring/ /app/dist/security-monitoring/

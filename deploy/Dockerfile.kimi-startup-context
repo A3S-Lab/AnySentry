@@ -1,0 +1,5 @@
+FROM anysentry-api:kimi-monitoring-v3-20260916 AS api
+COPY api/ /app/dist/security-monitoring/
+
+FROM anysentry-web:kimi-monitoring-20260916 AS web
+COPY web/ /usr/share/nginx/html/

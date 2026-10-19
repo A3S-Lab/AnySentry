@@ -23,8 +23,11 @@ const STAGE_REASONS = Object.freeze({
     'unknown',
     'discovery_budget',
     'e2e_scope',
+    'agent_allowlist',
+    'file_path_scope',
   ]),
   aggregated: Object.freeze(['file_access_coalesced']),
+  interaction_handoff: Object.freeze(['content_spooled', 'content_unavailable']),
   queue_admitted: Object.freeze(['event', 'collector_heartbeat']),
   queue_dropped: Object.freeze([
     'serialization_error',

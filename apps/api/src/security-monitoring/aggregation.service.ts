@@ -43,7 +43,7 @@ import {
 import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
 import { foldLatestEventRevisions } from './event-revision';
 import { eventActivityContext, eventActivitySubtype } from './activity-context';
-import { resolveTimeWindow } from './time-window';
+import { DEFAULT_SECURITY_TIME_TYPE, resolveTimeWindow } from './time-window';
 import { summarizePipelineAccounting } from './pipeline-accounting';
 import { correlationCaptureRollout } from './correlation-rollout';
 import {
@@ -440,7 +440,7 @@ function eventSourceId(e: T.JudgedEvent): string {
 function durableEventSearchKey(filter: T.AgentEventQuery, reviewRevision = 0): string {
   const text = (value?: string): string => value?.trim() ?? '';
   return JSON.stringify({
-    timeType: filter.timeType ?? 'last_3h',
+    timeType: filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
     // Preserve the raw custom boundaries: a date-only end includes the whole day, while an ISO
     // midnight ends at that instant even though Date.parse yields the same millisecond value.
     startTime: filter.startTime ?? '',
@@ -5469,7 +5469,7 @@ export class AggregationService {
   async sharedAgentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
     const window = resolveTimeWindow(filter);
     const key = JSON.stringify([
-      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_3h'],
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE],
       filter.scope ?? 'all',
     ]);
     const effectiveFilter = window.custom || filter.snapshotAsOf

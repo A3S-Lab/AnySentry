@@ -1,6 +1,7 @@
 node_modules/
 .local/
 dist/
+apps/api/dist-shutdown-test/
 *.log
 .DS_Store
 .env

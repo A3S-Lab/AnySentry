@@ -16,6 +16,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const { fileScope } = require('./observer-file-scope');
+const fileInConfiguredScope = fileScope(process.env.FORWARD_FILE_INCLUDE_PATHS);
 const { AgentAttributor, readProcStartTime } = require('./observer-agent-attribution');
 const { mergeAttributionClassifications } = require('./observer-attribution-merge');
 const { classificationSemanticsEnvelope } = require('./observer-classification-semantics');
@@ -28,6 +30,10 @@ const {
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { DurableSpool, safeId, stableWriterId } = require('./observer-durable-spool');
+const {
+  InteractionForwarder,
+  isAgentInteractionClassification,
+} = require('./observer-interaction-forwarder');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
@@ -180,6 +186,12 @@ const RETRY_MAX_DELAY_MS = boundedNumber(
   2_000,
 );
 const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
+const DURABLE_REPLAY_COOLDOWN_MS = boundedNumber(
+  process.env.FORWARD_DURABLE_REPLAY_COOLDOWN_MS,
+  30_000,
+  1_000,
+  300_000,
+);
 const RETRY_JITTER_RATIO = 0.2;
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
@@ -228,6 +240,46 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
 
+function canonicalAgentSelector(value) {
+  return text(value)
+    .toLowerCase()
+    .replace(/[-_]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function agentAllowlist(value) {
+  const raw = text(value);
+  if (!raw) return new Set();
+  const result = new Set();
+  for (const entry of raw.split(',')) {
+    const selector = canonicalAgentSelector(entry);
+    if (!selector || !/^[a-z0-9][a-z0-9 .]{0,63}$/u.test(selector)) {
+      throw new Error('FORWARD_AGENT_ALLOWLIST must be a comma-separated list of exact Agent IDs');
+    }
+    result.add(selector);
+  }
+  return result;
+}
+
+function agentAllowlistMatch(allowlist, observerEvent, classification) {
+  if (allowlist.size === 0) return true;
+  const attribution = classification?.attribution ?? {};
+  // Process attribution is authoritative for ordinary kernel events. The producer Agent label is
+  // only a fallback for the dedicated plaintext Interaction event, where the exact-PID runtime
+  // capture policy already selected the process before emitting sensitive content.
+  const producerAgent = eventKind(observerEvent) === 'LlmRequestObserved'
+    ? observerEvent?.identity?.agent
+    : undefined;
+  const candidates = [
+    attribution.agentScopeId,
+    attribution.agentId,
+    attribution.agentDisplayName,
+    producerAgent,
+  ];
+  return candidates.some((candidate) => allowlist.has(canonicalAgentSelector(candidate)));
+}
+
 const rawE2eIngestMarkerPrefix = process.env.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
 const e2eIngestMarkerPrefixMatch = rawE2eIngestMarkerPrefix?.match(
   /^asel-marker-([a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?)-(host|docker|k8s)-(shadow|enforce)-$/,
@@ -248,6 +300,13 @@ const E2E_INGEST_MARKERS = new Set((!E2E_INGEST_MARKER_PREFIX
     ? ['non-agent-filter-canary', 'host-codex', 'host-kimi']
     : ['unknown-filter-canary', 'pi']
 ).map((suffix) => E2E_INGEST_MARKER_PREFIX + suffix));
+
+// A temporary, explicit benchmark scope. Attribution still observes every process event so a
+// newly started Codex root and its descendants can be discovered, but only the selected Agent
+// families enter the durable event WAL/API lane. With the variable unset, production retention
+// semantics are unchanged. Collector heartbeat and capture-control summaries use their dedicated
+// paths above this gate.
+const FORWARD_AGENT_ALLOWLIST = agentAllowlist(process.env.FORWARD_AGENT_ALLOWLIST);
 
 const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
@@ -346,6 +405,14 @@ const spool = new DurableSpool({
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
+});
+const interactionForwarder = new InteractionForwarder({
+  writerId: WRITER_ID,
+  collectorId: COLLECTOR_ID || NODE_NAME,
+  sourceId: SOURCE_ID,
+  sourceToken: SOURCE_TOKEN,
+  ingestTarget: target,
+  spoolPath: SPOOL_PATH,
 });
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
@@ -541,6 +608,7 @@ function emptyAttributionCounts() {
     discoveryBudgetDropped: 0,
     wouldDiscoveryBudgetDrop: 0,
     e2eMarkerScopedOut: 0,
+    agentAllowlistScopedOut: 0,
     forwarded: 0,
     queueDropped: 0,
     batches: 0,
@@ -570,6 +638,7 @@ let outstandingBytes = 0;
 let retryOutstandingEvents = 0;
 let retryOutstandingBytes = 0;
 const outstandingItems = new Set();
+const durableReplayNotBefore = new Map();
 const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
 const retryTasks = [];
 const activeEventRequests = new Set();
@@ -577,6 +646,7 @@ const activeControlRequests = new Set();
 let eventRequestsAborted = false;
 let outputDropped = 0;
 let errorCount = 0;
+let spoolHydrationActive = false;
 let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
 const pipelineAccounting = new ForwarderPipelineAccounting({
@@ -597,6 +667,7 @@ let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
 let retryTimer;
+let durableReplayTimer;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -679,6 +750,25 @@ function durableRecordKind(body) {
     return eventKind(JSON.parse(String(body?.line || '')));
   } catch {
     return '';
+  }
+}
+
+function durableRecordMatchesAgentAllowlist(body) {
+  if (FORWARD_AGENT_ALLOWLIST.size === 0) return true;
+  try {
+    const observerEvent = JSON.parse(String(body?.line || ''));
+    const kind = eventKind(observerEvent);
+    // These are bounded collector control-plane records rather than host workload evidence.
+    if (kind === 'CollectorHeartbeat' || kind === 'CaptureAggregate') return true;
+    return agentAllowlistMatch(
+      FORWARD_AGENT_ALLOWLIST,
+      observerEvent,
+      { attribution: body?.attribution },
+    );
+  } catch {
+    // A durable record without a valid Observer envelope cannot prove that it belongs to the
+    // selected Agent. Fail closed while an explicit benchmark allowlist is active.
+    return false;
   }
 }
 
@@ -1952,6 +2042,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
       pipelineAccounting: accountingWindow,
       filterMetrics: {
         scope: LEGACY_FORWARD_SCOPE ?? 'decoupled',
+        agentAllowlist: [...FORWARD_AGENT_ALLOWLIST],
+        agentAllowlistScopedOut: classifications.agentAllowlistScopedOut,
         // A periodic heartbeat can race with shutdown. Mark only the heartbeat emitted after the
         // final runtime snapshot and bounded event drain so lifecycle checks cannot accept an
         // ordinary interval heartbeat as shutdown evidence.
@@ -2167,7 +2259,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}agent_allowlist=${[...FORWARD_AGENT_ALLOWLIST].join(',') || 'disabled'}; agent_allowlist_scoped_out=${classifications.agentAllowlistScopedOut}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
   };
   pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };
@@ -2179,6 +2271,8 @@ function closeTransports() {
   transportsClosed = true;
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = undefined;
+  if (durableReplayTimer) clearTimeout(durableReplayTimer);
+  durableReplayTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   captureProfileReporter.close();
@@ -2194,6 +2288,7 @@ function closeTransports() {
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
   spool.close();
+  interactionForwarder.close();
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }
@@ -2281,13 +2376,23 @@ function markRetryOwned(items) {
   }
 }
 
+function deferDurableReplay(items) {
+  const replayAt = Date.now() + DURABLE_REPLAY_COOLDOWN_MS;
+  for (const item of items) {
+    if (item.spoolId) durableReplayNotBefore.set(item.spoolId, replayAt);
+  }
+  scheduleDurableReplayWakeup();
+}
+
 function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
   const count = settleOutstanding(items);
   if (!count) return;
+  deferDurableReplay(items);
   attributionCounts.retryExhausted += count;
   outputDropped += count;
   pipelineAccounting.record('queue_dropped', reason, count);
   if (operationalError) errorCount++;
+  scheduleDurableReplayWakeup();
 }
 
 function retryDelayMs(item, retryAfterMs) {
@@ -2377,6 +2482,9 @@ function finishBatch(batch, outcome, retryDelivery) {
       outcome.reason || 'permanent ingest rejection',
     );
   }
+  const durablySettled = new Set([...acceptedItems, ...rejectedItems]);
+  const unresolvedTerminalItems = terminalItems.filter((item) => !durablySettled.has(item));
+  if (unresolvedTerminalItems.length) deferDurableReplay(unresolvedTerminalItems);
   if (retryDelivery) {
     const exhausted = Math.min(terminalItems.length, outcome.dropped);
     const recovered = Math.max(0, terminalItems.length - exhausted);
@@ -2429,8 +2537,86 @@ function takePendingBatch() {
   return pending.takeWeighted(adaptiveBatchSize, BATCH_MAX_BYTES, (item) => item.bytes);
 }
 
+function scheduleDurableReplayWakeup() {
+  if (closing || eventRequestsAborted || durableReplayTimer || durableReplayNotBefore.size === 0) {
+    return;
+  }
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const replayAt of durableReplayNotBefore.values()) earliest = Math.min(earliest, replayAt);
+  durableReplayTimer = setTimeout(() => {
+    durableReplayTimer = undefined;
+    pumpEventWork();
+  }, Math.max(1, earliest - Date.now()));
+  durableReplayTimer.unref();
+}
+
+// The durable WAL can be much larger than the bounded in-memory ownership window. Refill that
+// window after every acknowledgement instead of replaying only its first window at startup. The
+// old one-shot replay left the remaining WAL records unreachable; once the WAL reached capacity,
+// readline stayed paused forever and eventually forced the Collector's stdout queues to drop
+// process and Interaction events.
+function hydrateFromSpool() {
+  if (eventRequestsAborted || spoolHydrationActive) return 0;
+  const availableSlots = MAX_OUTSTANDING_EVENTS - outstandingEvents;
+  const availableBytes = MAX_OUTSTANDING_BYTES - outstandingBytes;
+  if (availableSlots <= 0 || availableBytes <= 0) return 0;
+
+  const ownedIds = new Set();
+  for (const item of outstandingItems) {
+    if (item.spoolId) ownedIds.add(item.spoolId);
+  }
+  const now = Date.now();
+  for (const [id, replayAt] of durableReplayNotBefore) {
+    if (replayAt <= now) durableReplayNotBefore.delete(id);
+    else ownedIds.add(id);
+  }
+  // Bound each synchronous WAL walk. Subsequent batch completions continue hydration, while the
+  // priority-aware spool iterator ensures protected records are recovered first.
+  const records = spool.available(ownedIds, Math.min(availableSlots, 2_048));
+  if (records.length === 0) {
+    scheduleDurableReplayWakeup();
+    return 0;
+  }
+
+  let admitted = 0;
+  const scopedOutIds = [];
+  spoolHydrationActive = true;
+  try {
+    for (const record of records) {
+      if (!durableRecordMatchesAgentAllowlist(record.body)) {
+        scopedOutIds.push(record.id);
+        attributionCounts.agentAllowlistScopedOut++;
+        pipelineAccounting.record('filtered', 'agent_allowlist');
+        continue;
+      }
+      if (
+        outstandingEvents >= MAX_OUTSTANDING_EVENTS
+        || outstandingBytes + record.bytes > MAX_OUTSTANDING_BYTES
+      ) break;
+      const accepted = enqueue(
+        record.body,
+        record.priority,
+        false,
+        durableRecordKind(record.body),
+        true,
+      );
+      if (!accepted) break;
+      admitted++;
+    }
+    if (scopedOutIds.length) spool.ack(scopedOutIds);
+  } finally {
+    spoolHydrationActive = false;
+  }
+  // A recovered WAL window may contain only pre-allowlist host noise. Continue draining it on the
+  // next event-loop turn instead of waiting for an HTTP completion that will never occur.
+  if (scopedOutIds.length && admitted === 0) setImmediate(pumpEventWork);
+  scheduleDurableReplayWakeup();
+  return admitted;
+}
+
 function pumpEventWork() {
   if (eventRequestsAborted) return;
+  hydrateFromSpool();
   while (inflight < MAX_INFLIGHT) {
     const retryBatch = takeReadyRetryBatch();
     if (retryBatch?.length) {
@@ -2464,6 +2650,9 @@ function recordQueueDrop(kind, priority, reason) {
 function dropQueuedItem(item, reason = 'priority_evicted') {
   if (!item) return;
   settleOutstanding([item]);
+  // The event is still present in the durable WAL. Delay its re-admission so a protected event
+  // can actually use the ownership slot it just reclaimed instead of racing an immediate replay.
+  deferDurableReplay([item]);
   recordQueueDrop(item.kind, item.priority, reason);
 }
 
@@ -2488,11 +2677,13 @@ function makeQueueRoom(bytes, priority) {
 }
 
 function inputAtCapacity() {
-  return (
-    outstandingEvents >= MAX_OUTSTANDING_EVENTS
-    || outstandingBytes >= MAX_OUTSTANDING_BYTES
-    || spool.atCapacity()
-  );
+  // The bounded in-memory ownership window controls HTTP work, not stdin durability. Once an
+  // event has been appended to the WAL it may wait there without occupying an outstanding slot.
+  // Pausing at the in-memory limit leaves fresh Collector output in the finite OS pipe; the
+  // Collector must then drop kernel events even though the durable spool still has room. Keep
+  // draining stdin until the WAL itself reaches its explicit capacity and let hydration refill
+  // the HTTP window as acknowledgements release slots.
+  return spool.atCapacity();
 }
 
 function updateInputFlow() {
@@ -2509,11 +2700,11 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     bytes = Buffer.byteLength(JSON.stringify(durableBody));
   } catch {
     recordQueueDrop(kind, priority, 'serialization_error');
-    return;
+    return false;
   }
   if (bytes > MAX_EVENT_BYTES) {
     recordQueueDrop(kind, priority, 'event_too_large');
-    return;
+    return false;
   }
   const spoolId = kind === 'CollectorHeartbeat'
     ? undefined
@@ -2531,16 +2722,21 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
       console.error(`[observer-forward] durable spool write failed: ${error.message}`);
       if (rl) rl.pause();
       process.exitCode = 1;
-      return;
+      return false;
     }
   }
   if (!makeQueueRoom(bytes, priority)) {
-    recordQueueDrop(
-      kind,
-      priority,
-      priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
-    );
-    return;
+    // A replay record remains durable in the WAL and will be retried when ownership is released;
+    // it has not been lost and therefore must not inflate queue-drop accounting.
+    if (!recovered) {
+      recordQueueDrop(
+        kind,
+        priority,
+        priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
+      );
+      if (spoolId) deferDurableReplay([{ spoolId }]);
+    }
+    return false;
   }
   const item = {
     body: durableBody,
@@ -2558,8 +2754,11 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   };
   const result = pending.push(item, priority);
   if (!result.accepted) {
-    recordQueueDrop(kind, priority, 'queue_rejected');
-    return;
+    if (!recovered) {
+      recordQueueDrop(kind, priority, 'queue_rejected');
+      if (spoolId) deferDurableReplay([{ spoolId }]);
+    }
+    return false;
   }
   if (result.dropped && !result.droppedIncoming) {
     dropQueuedItem(result.dropped);
@@ -2573,6 +2772,7 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
   updateInputFlow();
+  return true;
 }
 
 function abandonPendingEvents() {
@@ -2621,6 +2821,7 @@ function forceShutdown() {
 function flushAndClose() {
   if (closing) return;
   closing = true;
+  interactionForwarder.beginDrain();
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
   if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
@@ -2640,7 +2841,17 @@ function flushAndClose() {
   pumpEventWork();
   const waitForInflight = () => {
     pumpEventWork();
-    const hasEventWork = inflight > 0 || pending.length > 0 || retryTasks.length > 0;
+    // Fresh Collector input can already be durable while waiting outside the bounded in-memory
+    // ownership window. Treat those WAL records as shutdown work as well; otherwise EOF may let
+    // the Forwarder exit after delivering only the first window and defer the rest until a future
+    // restart. The shutdown deadline remains the bound for a genuinely unavailable API.
+    const durableBacklog = spool.status().records > 0;
+    const hasEventWork =
+      inflight > 0
+      || pending.length > 0
+      || retryTasks.length > 0
+      || interactionForwarder.hasPendingWork()
+      || durableBacklog;
     if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);
       return;
@@ -2724,7 +2935,7 @@ function enqueueClassifiedRecord(record) {
 }
 
 function handleLine(raw) {
-  const line = raw.trim();
+  let line = raw.trim();
   if (!line) return;
   pipelineAccounting.record('received', 'input');
   let o;
@@ -2827,6 +3038,24 @@ function handleLine(raw) {
     return;
   }
   const processClassification = attributor.classify(o);
+  if (processClassification.processContext) {
+    const recovered = processClassification.processContext;
+    const process = { ...o.process };
+    for (const [key, value] of Object.entries(recovered)) {
+      if (value !== undefined && (!process[key] || process[key] === '0')) process[key] = value;
+    }
+    o.process = process;
+    line = JSON.stringify(o);
+  }
+  if (!fileInConfiguredScope(o)) {
+    pipelineAccounting.record('filtered', 'file_path_scope');
+    return;
+  }
+  if (!agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification)) {
+    attributionCounts.agentAllowlistScopedOut++;
+    pipelineAccounting.record('filtered', 'agent_allowlist');
+    return;
+  }
   const workloadClassification = workloadCache.classify(o);
   const activity = classifyEventActivity(o, processClassification, workloadClassification);
   const templateClassification = templateRegistry.classifyEvent(o);
@@ -2887,6 +3116,44 @@ function handleLine(raw) {
   // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
   // its process-instance ID with a workload-level ID.
   attributor.enrichRuntimeRoot(processClassification, classification);
+  // LlmRequestObserved/LlmResponseObserved contain sensitive content captured by AnySentry's
+  // exact-PID TLS probes. They have one legal destination: the encrypted Interaction content
+  // lane. Never enqueue the raw Observer line in the ordinary event WAL, evidence ingest,
+  // filter pipeline, or DLQ.
+  // Explicit capture policy already selected the PID, so an unavailable catalog classification
+  // must not silently discard the observation; attribution remains optional metadata.
+  if (kind === 'LlmRequestObserved' || kind === 'LlmResponseObserved') {
+    const accepted = interactionForwarder.observe(o, {
+      line,
+      agentInstanceId:
+        classification.state === 'agent'
+          ? classification.attribution?.agentInstanceId
+          : undefined,
+      agentDisplayName:
+        classification.state === 'agent'
+          ? classification.attribution?.agentDisplayName
+          : undefined,
+      workspacePath:
+        classification.state === 'agent'
+          ? classification.workspacePath
+          : undefined,
+    });
+    pipelineAccounting.record(
+      'interaction_handoff',
+      accepted ? 'content_spooled' : 'content_unavailable',
+    );
+    return;
+  }
+  // A provider-looking TLS connection is not itself an Agent conversation. Keep unknown,
+  // non-Agent, and infrastructure observations in the ordinary evidence lane; only a process
+  // already attributed as an Agent may create conversation-adjacent Interaction metadata.
+  if (kind === 'LlmCall' && isAgentInteractionClassification(classification)) {
+    interactionForwarder.observe(o, {
+      line,
+      agentInstanceId: classification.attribution?.agentInstanceId,
+      workspacePath: classification.workspacePath,
+    });
+  }
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;
@@ -3004,22 +3271,19 @@ async function start() {
   rl.pause();
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
-  const recoveredRecords = spool.available(new Set(), MAX_OUTSTANDING_EVENTS);
-  for (const record of recoveredRecords) {
-    enqueue(
-      record.body,
-      record.priority,
-      false,
-      durableRecordKind(record.body),
-      true,
-    );
-  }
+  hydrateFromSpool();
   const spoolStatus = spool.status();
   console.error(
     `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; `
     + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
     + `fsync=${spoolStatus.fsyncMode}`,
   );
+  if (FORWARD_AGENT_ALLOWLIST.size > 0) {
+    console.error(
+      `[observer-forward] Agent event allowlist enabled: ${[...FORWARD_AGENT_ALLOWLIST].join(',')}; `
+      + 'only matching Agent families enter the durable event/API lane',
+    );
+  }
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one
@@ -3117,7 +3381,11 @@ async function start() {
   rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);
   rootLivenessTimer.unref();
 
-  rl.resume();
+  // Startup WAL hydration may already own the full bounded window (or the durable spool may still
+  // be at capacity). Respect that state instead of unconditionally releasing a burst of Collector
+  // lines into an already-full queue.
+  if (closing) rl.resume();
+  else updateInputFlow();
 }
 
 process.once('SIGINT', () => handleShutdownSignal('SIGINT'));

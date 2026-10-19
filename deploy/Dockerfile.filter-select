@@ -1,0 +1,2 @@
+FROM anysentry-web:record-copy-trim-20260923
+COPY web/ /usr/share/nginx/html/
