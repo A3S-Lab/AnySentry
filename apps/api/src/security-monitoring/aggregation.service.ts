@@ -125,7 +125,12 @@ const AGENT_INSTANCE_METRICS_CACHE_TTL_MS = 15_000;
 const MAX_AGENT_INVENTORY_IN_FLIGHT = 128;
 const MAX_AGENT_OBSERVABILITY_IN_FLIGHT = 128;
 const MAX_CONVERSATION_PROJECTION_IN_FLIGHT = 128;
-const IN_FLIGHT_OPERATION_TIMEOUT_MS = 30_000;
+// Cold dashboard pipelines on slow hosts can exceed 30s (flood-bloated events scans);
+// the in-flight budget is env-tunable with the 30s field-verified default unchanged.
+const IN_FLIGHT_OPERATION_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.ANYSENTRY_IN_FLIGHT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 5_000 && raw <= 600_000 ? Math.floor(raw) : 30_000;
+})();
 const MAX_RECENT_OBSERVABILITY_ENTRIES = 64;
 const MAX_RECENT_OBSERVABILITY_BYTES = 8 * 1024 * 1024;
 const RECENT_OBSERVABILITY_TTL_MS = 15_000;
@@ -1027,8 +1032,51 @@ export class AggregationService implements OnModuleDestroy {
   ) {}
 
   private estimateCacheBytes(value: unknown): number {
+    // Bounded structural estimator. The previous implementation ran a full
+    // JSON.stringify on every cache write; on multi-MB aggregation results that
+    // single call accounted for ~1/3 of the API's CPU (dev-host CDP profile,
+    // 2026-10-20) plus the GC churn it allocated. Cache admission/eviction only
+    // needs to distinguish "entry bigger than the cache cap" — sampled
+    // extrapolation keeps that decision intact at O(1) cost.
+    const NODE_BUDGET = 2_000;
     try {
-      return Math.max(1, Buffer.byteLength(JSON.stringify(value), 'utf8'));
+      let used = 0;
+      const visit = (v: unknown, depth: number): number => {
+        if (v === null || v === undefined) return 4;
+        if (used >= NODE_BUDGET || depth > 24) return 64;
+        used += 1;
+        const t = typeof v;
+        if (t === 'string') {
+          const s = v as string;
+          return s.length <= 4096
+            ? Buffer.byteLength(s, 'utf8') + 4
+            : Math.min(s.length * 2, 16 * 1024 * 1024) + 4;
+        }
+        if (t === 'number' || t === 'boolean' || t === 'bigint') return 16;
+        if (Array.isArray(v)) {
+          let n = 16;
+          if (v.length <= 48) {
+            for (const item of v) n += visit(item, depth + 1);
+          } else {
+            const SAMPLES = 16;
+            let sampled = 0;
+            for (let i = 0; i < SAMPLES; i++) {
+              sampled += visit(v[Math.floor((i * v.length) / SAMPLES)], depth + 1);
+            }
+            n += Math.ceil((sampled / SAMPLES) * v.length);
+          }
+          return n;
+        }
+        if (t === 'object') {
+          let n = 16;
+          for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+            n += Math.min(k.length * 2, 256) + visit(val, depth + 1);
+          }
+          return n;
+        }
+        return 8;
+      };
+      return Math.max(1, visit(value, 0));
     } catch {
       return 1_024;
     }

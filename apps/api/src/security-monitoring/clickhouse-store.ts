@@ -858,8 +858,14 @@ const chBucketBudgetBytes = (envKey: string, fallbackMb: number): string => {
   const mb = Number.isFinite(raw) && raw > 0 ? raw : fallbackMb;
   return String(Math.floor(mb) * 1024 * 1024);
 };
+// Hosts with slower CPUs can raise the bucket-build execution budget; the 5s default keeps
+// the field-verified interactive profile unchanged (bounded at 10 minutes to stay a budget).
+const chBucketBudgetSeconds = (envKey: string, fallbackS: number): number => {
+  const raw = Number(process.env[envKey]);
+  return Number.isFinite(raw) && raw > 0 && raw <= 600 ? Math.floor(raw) : fallbackS;
+};
 const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
-  max_threads: 1,
+  max_threads: chBucketBudgetSeconds("ANYSENTRY_CH_BUCKET_THREADS", 1),
   max_memory_usage: chBucketBudgetBytes("ANYSENTRY_CH_BUCKET_MAX_MEMORY_MB", 128),
   max_bytes_before_external_group_by: chBucketBudgetBytes(
     "ANYSENTRY_CH_BUCKET_EXTERNAL_MB",
@@ -875,7 +881,7 @@ const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
   ),
   max_block_size: "1024",
   preferred_block_size_bytes: String(1024 * 1024),
-  max_execution_time: 5,
+  max_execution_time: chBucketBudgetSeconds("ANYSENTRY_CH_BUCKET_TIMEOUT_S", 5),
 };
 
 // Session/workspace queries materialize wider per-event state. Small blocks keep each below its
@@ -1222,7 +1228,11 @@ async function runClickHouseBootstrap(
   let boot: ClickHouseClient | undefined;
   let schema: ClickHouseClient | undefined;
   try {
-    boot = createClient({ url: config.url, ...credentials });
+    boot = createClient({
+      url: config.url,
+      ...credentials,
+      keep_alive: { eagerly_destroy_stale_sockets: true },
+    });
     await boot.command({
       query: `CREATE DATABASE IF NOT EXISTS ${config.database}`,
     });
@@ -1233,6 +1243,7 @@ async function runClickHouseBootstrap(
       url: config.url,
       database: config.database,
       ...credentials,
+      keep_alive: { eagerly_destroy_stale_sockets: true },
     });
     await schema.command({ query: DDL(TABLE) });
     // Existing installs keep the original events table. Add columns before any
@@ -2608,7 +2619,12 @@ export class ClickHouseStore {
 
       // Schema/progress state is shared, while every store keeps its own client, buffers, retry
       // lane, and shutdown lifecycle.
-      nextClient = createClient({ url, database, ...credentials });
+      nextClient = createClient({
+        url,
+        database,
+        ...credentials,
+        keep_alive: { eagerly_destroy_stale_sockets: true },
+      });
       const ping = await nextClient.ping({ select: true });
       if (!ping.success) throw ping.error;
       for (const entry of bootstrap.committedSourceProgress) {
