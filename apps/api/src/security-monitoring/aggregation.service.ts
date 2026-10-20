@@ -109,6 +109,12 @@ import * as T from './types';
 
 const SEV_RANK: Record<T.Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const MAX_HISTORY_CACHE_ENTRIES = 64;
+
+// Raw-scan fuse for the synchronous agent inventory: the JS-side fact build is
+// linear in window events; beyond this bound the newest slice is used instead.
+const AGENT_INVENTORY_MAX_EVENTS = 12_000;
+const AGENT_INVENTORY_RESULT_TTL_MS = 30_000;
+const MAX_AGENT_INVENTORY_CACHE_ENTRIES = 8;
 const MAX_HISTORY_CACHE_BYTES = 8 * 1024 * 1024;
 const WIN_CACHE_TTL_MS = 1_500;
 const MAX_WIN_CACHE_ENTRIES = 64;
@@ -1335,6 +1341,7 @@ export class AggregationService implements OnModuleDestroy {
   private historyCacheRejected = 0;
   private historyCacheTimeouts = 0;
   private readonly historyCacheTimeoutsByKey = new Map<string, NodeJS.Timeout>();
+  private readonly agentInventoryResultCache = new Map<string, { at: number; value: T.AgentInventory }>();
   private readonly agentInstanceMetricsCache = new Map<string, {
     at: number;
     value: T.AgentInstanceMetrics;
@@ -5041,11 +5048,34 @@ export class AggregationService implements OnModuleDestroy {
   }
 
   agentInventory(filter: T.AgentInventoryQuery): T.AgentInventory {
+    // Each call rebuilds facts for every raw event in the window; on dense hosts
+    // that blocks the loop for tens of seconds and starves control requests
+    // (observer heartbeat aborts). Serve repeat polls from a short-TTL result
+    // cache, mirroring the dashboard history cache philosophy: ingestion does
+    // not invalidate it, entries age out on their own.
+    const cacheKey = `ai:${filter.timeType}:${filter.scope}:${filter.includeUnclassified ? 1 : 0}:${filter.limit ?? 0}`;
+    const nowMs = Date.now();
+    const cached = this.agentInventoryResultCache.get(cacheKey);
+    if (cached && nowMs - cached.at < AGENT_INVENTORY_RESULT_TTL_MS) {
+      this.agentInventoryResultCache.delete(cacheKey);
+      this.agentInventoryResultCache.set(cacheKey, cached);
+      return cached.value;
+    }
+    this.agentInventoryResultCache.delete(cacheKey);
+    if (this.agentInventoryResultCache.size >= MAX_AGENT_INVENTORY_CACHE_ENTRIES) {
+      const oldest = this.agentInventoryResultCache.keys().next().value;
+      if (oldest !== undefined) this.agentInventoryResultCache.delete(oldest);
+    }
     const window = this.win(filter);
     const events = filter.scope === 'agent'
       ? window.events.filter((event) => event.attribution?.monitored === true)
       : window.events;
-    return this.agentInventoryFromEvents(filter, events);
+    const bounded = events.length > AGENT_INVENTORY_MAX_EVENTS
+      ? events.slice(-AGENT_INVENTORY_MAX_EVENTS)
+      : events;
+    const value = this.agentInventoryFromEvents(filter, bounded);
+    this.agentInventoryResultCache.set(cacheKey, { at: nowMs, value });
+    return value;
   }
 
   private agentFactForEvent(event: T.JudgedEvent): StoredAgentWindowFact {
