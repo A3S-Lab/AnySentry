@@ -13,7 +13,7 @@
 | BPF kern_version | 4.19.90（0x0004135a） | 5.14.0（0x00050e00，可按目标内核改 versions.env） |
 | kprobe 符号 | `__arm64_sys_*` | `__x64_sys_*`（Observer `uos20-x86_64-dev` 分支） |
 | ClickHouse | 源码构建 armv8.0-compat | 官方镜像 amd64 二进制 |
-| a3s-code .node | glibc 2.28 重编 | glibc 2.34 重编（`scripts/build-code-x64.sh`） |
+| a3s-code .node | glibc 2.28 重编 | hypot 符号版本补丁降到 2.2.5（`scripts/build-code-x64.sh`，发布件仅 hypot@GLIBC_2.35 超过目标 glibc） |
 | Redis 端口 | 127.0.0.1:6379 | **127.0.0.1:6380**（开发机宿主已有 Redis 占 6379） |
 | Observer 锁定 | `00ef87c`（release 分支） | `b57a231`（uos20-x86_64-dev 分支，含 per-arch 符号） |
 
@@ -23,7 +23,8 @@
   docker（amd64 镜像仅 create+cp，不执行）、rustup、node/pnpm、patchelf；
 - 三仓目录：本仓库（本通道所在 checkout）、`OBSERVER_REPO`（uos20-x86_64-dev）、
   `SENTRY_REPO`（锁定 main 提交）；环境变量可覆盖路径；
-- a3s-code 重编缓存：首次执行 `bash uos20-x86_64/scripts/build-code-x64.sh`。
+- a3s-code 兼容缓存：首次执行 `bash uos20-x86_64/scripts/build-code-x64.sh`（对发布件
+  做 hypot 版本补丁，已在 Rocky 9 glibc 2.34 容器内 dlopen 验证）。
 
 ## 标准构建
 

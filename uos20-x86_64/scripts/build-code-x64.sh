@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# Rebuild the a3s-code Node addon for the debug-variant glibc floor (2.34).
-# The published @a3s-lab/code-linux-x64-gnu binary requires glibc 2.35 (hypot),
-# one symbol newer than the Rocky 9 debug machine provides.
+# Prepare a glibc-2.34-compatible a3s-code Node addon for the debug variant.
+#
+# The published @a3s-lab/code-linux-x64-gnu binary references hypot@GLIBC_2.35
+# (the only 2.35 symbol; an artifact of the publisher's newer build glibc).
+# glibc's hypot(double,double) has existed unchanged since GLIBC_2.2.5, so the
+# version reference is retargeted instead of rebuilding from source: the source
+# tree at this version needs private workspace crates that are not published.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
-TOOLS=$BUILD_DIR/tools
 CACHE=$BUILD_DIR/cache
-zig=$TOOLS/zig-$ZIG_VERSION/zig
-zigbuild=$TOOLS/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION/bin/cargo-zigbuild
-[[ -x "$zig" && -x "$zigbuild" ]] || die 'x86_64 toolchain cache missing; build sentry first'
+mkdir -p "$CACHE"
+archive=$CACHE/a3s-lab-code-linux-x64-gnu-$CODE_VERSION.tgz
+[[ -f "$archive" ]] || npm pack --silent --pack-destination "$CACHE" "@a3s-lab/code-linux-x64-gnu@$CODE_VERSION" >/dev/null
+echo "$CODE_X64_SHA256  $archive" | sha256sum --check
 
-source_dir=$BUILD_DIR/code-source
-if [[ ! -d "$source_dir/.git" ]]; then
-  git clone "$CODE_SOURCE_REPO" "$source_dir"
-fi
-git -C "$source_dir" fetch --tags origin
-git -C "$source_dir" checkout --detach --force "$CODE_SOURCE_COMMIT"
+tmp=$(mktemp -d "$BUILD_DIR/code-patch.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$archive" -C "$tmp"
 
-rustup target add "$RUST_TARGET" >/dev/null
-export PATH="$(dirname "$zigbuild"):$PATH" CARGO_ZIGBUILD_ZIG_PATH=$zig
-export CARGO_NET_RETRY=10 CARGO_HTTP_MULTIPLEXING=false
-(cd "$source_dir/sdk/node" && cargo zigbuild --locked --release --target "$TARGET_TRIPLE")
-
-built=$(find "$BUILD_DIR/code-source/sdk/node/target" -type f -name 'liba3s_code_node.so' -print -quit)
-[[ -n "$built" ]] || die "a3s-code-node build output missing"
 out=$CACHE/code-glibc234
+rm -rf "$out"
 mkdir -p "$out"
-install -m 0755 "$built" "$out/index.linux-x64-gnu.node"
+python3 "$CHANNEL_DIR/scripts/patch-code-glibc.py" \
+  "$tmp/package/index.linux-x64-gnu.node" "$out/index.linux-x64-gnu.node"
+install -d -m 0755 "$out/zvec"
+install -m 0755 "$tmp/package/zvec/libzvec_c_api.so" "$out/zvec/libzvec_c_api.so"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$out/index.linux-x64-gnu.node"
-echo "Rebuilt a3s-code x64 addon cached at $out"
+if LANG=C readelf -W --version-info --dyn-syms "$out/index.linux-x64-gnu.node" \
+    | grep -q 'GLIBC_2\.35'; then
+  die 'patched addon still references GLIBC_2.35'
+fi
+echo "glibc-2.34-compatible a3s-code addon cached at $out"
