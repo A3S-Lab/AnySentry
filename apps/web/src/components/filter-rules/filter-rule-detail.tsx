@@ -388,7 +388,7 @@ export function FilterRuleDetailPanel({
               {rule.lifecycleStage === "shadow" ? <Button type="button" size="sm" onClick={onPromote} disabled={actionLoading || !reason.trim() || !preview?.canPromote} className="min-h-11 bg-emerald-500 text-[#06150d] hover:bg-emerald-400 sm:min-h-9">{t("批准生效")}</Button> : null}
               <Button type="button" variant="secondary" size="sm" onClick={onRevoke} disabled={actionLoading || !reason.trim()} className="min-h-11 border border-rose-400/25 bg-rose-500/10 text-rose-100 hover:bg-rose-500/20 sm:min-h-9"><Ban className="size-3.5" aria-hidden="true" />{t("停用")}</Button>
             </div>
-            {rule.lifecycleStage === "shadow" ? <p className="mt-2 text-[10px] text-amber-200">{t("批准人必须不同于创建人；浏览器不能自行声明审批身份。")}</p> : null}
+            {rule.lifecycleStage === "shadow" ? <p className="mt-2 text-[10px] text-emerald-200/70">{t("批准生效后规则将进入执行投影；创建人与批准人可为同一人。")}</p> : null}
           </div>
         ) : null}
       </section>

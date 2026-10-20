@@ -19,14 +19,31 @@ export type FilterRuleWizardKind =
   | "infrastructure";
 
 const KIND_COPY: Record<FilterRuleWizardKind, { label: string; description: string }> = {
-  runtime_signature: { label: "Runtime Signature", description: "精确进程签名，最高只产生 probable Agent。" },
-  agent_template: { label: "Agent Template", description: "按镜像/容器等稳定字段识别工作负载，推荐用前缀匹配覆盖标签迭代。" },
-  infrastructure: { label: "Infrastructure 规则", description: "从受信资产生成跨重启的精确规则。" },
-  capture_profile: { label: "Capture Profile", description: "按身份或角色选择受保护的 Probe 动作矩阵。" },
-  semantic_retention: { label: "Forwarder Retention", description: "控制 F2 的保留、聚合、采样或抑制。" },
-  persistence_retention: { label: "API Retention", description: "控制 F3 的保留级别。" },
-  investigation_override: { label: "Investigation Override", description: "临时（≤24 小时）FULL 采集升档。" },
+  runtime_signature: { label: "Runtime 签名", description: "按进程特征识别工作负载，最高标记为疑似 Agent。" },
+  agent_template: { label: "镜像模板（Agent Template）", description: "按镜像/容器名识别；前缀匹配可覆盖镜像版本更替。" },
+  infrastructure: { label: "Infrastructure 规则", description: "从受信资产一键生成精确规则，跨重启有效。" },
+  capture_profile: { label: "采集档位（Capture Profile）", description: "按身份或角色指定探针采集动作组合。" },
+  semantic_retention: { label: "转发保留（F2）", description: "控制转发端对命中事件的保留、聚合、采样或抑制。" },
+  persistence_retention: { label: "入库保留（F3）", description: "控制 API 入库端的保留级别。" },
+  investigation_override: { label: "临时全量采集", description: "最长 24 小时，到期自动恢复原采集档位。" },
 };
+
+const FIELD_LABELS: Record<string, string> = {
+  "process.comm": "process.comm（进程名）",
+  "process.exe_basename": "process.exe_basename（可执行文件名）",
+  "process.argv0_basename": "process.argv0_basename（启动文件名）",
+  "process.argv_prefix": "process.argv_prefix（命令行前缀）",
+  "workload.namespace": "workload.namespace（命名空间）",
+  "workload.owner_name": "workload.owner_name（属主名称）",
+  "workload.container": "workload.container（容器名）",
+  "workload.image": "workload.image（镜像名）",
+  "identity.classification": "identity.classification（身份分类）",
+  "workload.role": "workload.role（负载角色）",
+  "event.kind": "event.kind（事件类型）",
+  "asset.id": "asset.id（资产 ID）",
+  "runtime.id": "runtime.id（运行时 ID）",
+};
+const fieldLabel = (field: string) => FIELD_LABELS[field] ?? field;
 
 function initialMatcher(kind: FilterRuleWizardKind, assetId?: string) {
   if (kind === "agent_template") return { field: "workload.container", value: "" };
@@ -95,7 +112,7 @@ export function FilterRuleWizard({
 
   const draft = useMemo<FilterRuleDraft | undefined>(() => {
     if (kind === "infrastructure" || !name.trim() || !description.trim() || !reason.trim() || !matchValue.trim()) return undefined;
-    const condition = { field: matchField, operator: matchField === "process.argv_prefix" ? "prefix" as const : matchOperator, value: matchValue.trim() };
+    const condition = { field: matchField, operator: kind === "agent_template" ? "equals" as const : matchField === "process.argv_prefix" ? "prefix" as const : matchOperator, value: matchValue.trim() };
     const common = {
       name: name.trim(),
       description: description.trim(),
@@ -215,7 +232,7 @@ export function FilterRuleWizard({
           </section>
 
           <section className="rounded border border-[#27303d] bg-[#10151d] p-4">
-            <p className="text-xs font-semibold text-[#cbd2dd]">2. {t(kind === "infrastructure" ? "选择受信资产与采集意图" : "配置 Typed Matcher 与 Effect")}</p>
+            <p className="text-xs font-semibold text-[#cbd2dd]">2. {t(kind === "infrastructure" ? "选择受信资产与采集意图" : "配置匹配条件与动作")}</p>
             {kind === "infrastructure" ? (
               <div className="mt-3">
                 <label className="block text-[11px] text-[#9aa4b4]">{t("受信资产")} *</label>
@@ -235,35 +252,40 @@ export function FilterRuleWizard({
                 {selectedAsset ? <p className="mt-2 text-[11px] text-[#7f899b]">{selectedAsset.role.role} · {selectedAsset.identity.classification} · {selectedAsset.runtimeSummary.total} {t("实例")}</p> : null}
               </div>
             ) : (
-              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="mt-3 grid gap-3 sm:grid-cols-3">
                 <div>
                   <label className="block text-[11px] text-[#9aa4b4]">{t("匹配字段")}</label>
                   <Select value={matchField} onValueChange={(value) => { setMatchField(value); setSimulation(undefined); }}>
                     <SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      {kind === "runtime_signature" ? <><SelectItem value="process.comm">process.comm</SelectItem><SelectItem value="process.exe_basename">process.exe_basename</SelectItem><SelectItem value="process.argv0_basename">process.argv0_basename</SelectItem><SelectItem value="process.argv_prefix">process.argv_prefix</SelectItem></> : null}
-                      {kind === "agent_template" ? <><SelectItem value="workload.namespace">workload.namespace</SelectItem><SelectItem value="workload.owner_name">workload.owner_name</SelectItem><SelectItem value="workload.container">workload.container</SelectItem><SelectItem value="workload.image">workload.image</SelectItem><SelectItem value="process.exe_basename">process.exe_basename</SelectItem></> : null}
-                      {kind === "capture_profile" || kind === "semantic_retention" || kind === "persistence_retention" ? <><SelectItem value="identity.classification">identity.classification</SelectItem><SelectItem value="workload.role">workload.role</SelectItem><SelectItem value="event.kind">event.kind</SelectItem></> : null}
-                      {kind === "investigation_override" ? <><SelectItem value="asset.id">asset.id</SelectItem><SelectItem value="runtime.id">runtime.id</SelectItem></> : null}
+                      {kind === "runtime_signature" ? <><SelectItem value="process.comm">{fieldLabel("process.comm")}</SelectItem><SelectItem value="process.exe_basename">{fieldLabel("process.exe_basename")}</SelectItem><SelectItem value="process.argv0_basename">{fieldLabel("process.argv0_basename")}</SelectItem><SelectItem value="process.argv_prefix">{fieldLabel("process.argv_prefix")}</SelectItem></> : null}
+                      {kind === "agent_template" ? <><SelectItem value="workload.namespace">{fieldLabel("workload.namespace")}</SelectItem><SelectItem value="workload.owner_name">{fieldLabel("workload.owner_name")}</SelectItem><SelectItem value="workload.container">{fieldLabel("workload.container")}</SelectItem><SelectItem value="workload.image">{fieldLabel("workload.image")}</SelectItem><SelectItem value="process.exe_basename">{fieldLabel("process.exe_basename")}</SelectItem></> : null}
+                      {kind === "capture_profile" || kind === "semantic_retention" || kind === "persistence_retention" ? <><SelectItem value="identity.classification">{fieldLabel("identity.classification")}</SelectItem><SelectItem value="workload.role">{fieldLabel("workload.role")}</SelectItem><SelectItem value="event.kind">{fieldLabel("event.kind")}</SelectItem></> : null}
+                      {kind === "investigation_override" ? <><SelectItem value="asset.id">{fieldLabel("asset.id")}</SelectItem><SelectItem value="runtime.id">{fieldLabel("runtime.id")}</SelectItem></> : null}
                     </SelectContent>
                   </Select>
-                </div>
-                <div>
-                  <label htmlFor="filter-rule-match-value" className="block text-[11px] text-[#9aa4b4]">{t("匹配值")} *</label>
-                  <Input id="filter-rule-match-value" value={matchValue} onChange={(event) => { setMatchValue(event.target.value); setSimulation(undefined); }} placeholder={matchField === "workload.image" || matchField === "workload.container" ? "agent:2026（前缀匹配可覆盖标签迭代，不支持 * 通配）" : undefined} className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm" />
                 </div>
                 <div>
                   <label htmlFor="filter-rule-match-operator" className="block text-[11px] text-[#9aa4b4]">{t("匹配方式")}</label>
-                  <Select value={matchOperator} onValueChange={(next) => { setMatchOperator(next as "equals" | "prefix"); setSimulation(undefined); }}>
-                    <SelectTrigger id="filter-rule-match-operator" className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="equals">{t("等于（精确匹配）")}</SelectItem>
-                      <SelectItem value="prefix">{t("前缀（覆盖同家族标签迭代）")}</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  {kind === "agent_template" ? (
+                    <p className="mt-1 flex min-h-11 items-center rounded border border-dashed border-[#303a49] bg-[#12171f] px-3 text-[11px] leading-4 text-[#7f899b]">{t("glob 匹配：在匹配值中用 * 通配任意段")}</p>
+                  ) : (
+                    <Select value={matchOperator} onValueChange={(next) => { setMatchOperator(next as "equals" | "prefix"); setSimulation(undefined); }}>
+                      <SelectTrigger id="filter-rule-match-operator" className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="equals">{t("等于（完全一致）")}</SelectItem>
+                        <SelectItem value="prefix">{t("前缀（匹配以此开头的所有值）")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  )}
                 </div>
+                <div>
+                  <label htmlFor="filter-rule-match-value" className="block text-[11px] text-[#9aa4b4]">{t("匹配值")} *</label>
+                  <Input id="filter-rule-match-value" value={matchValue} onChange={(event) => { setMatchValue(event.target.value); setSimulation(undefined); }} placeholder={matchField === "workload.image" || matchField === "workload.container" ? "例如 agent:20*（* 通配任意段，可覆盖镜像版本更替）" : undefined} className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm" />
+                </div>
+                {matchValue.trim() ? <p className="rounded border border-[#27303d] bg-[#141a23] px-3 py-2 font-mono text-[11px] leading-5 text-[#9fb4d8] sm:col-span-3">{t("匹配预览")}：{matchField} {kind === "agent_template" ? t("glob 匹配") : ((matchField === "process.argv_prefix" ? "prefix" : matchOperator) === "prefix" ? t("前缀匹配") : t("等于"))} {matchValue.trim()}{kind === "agent_template" ? ` · ${t("部署环境")}=${placement}` : ""}</p> : null}
                 {kind === "agent_template" ? <><div><label className="block text-[11px] text-[#9aa4b4]">{t("部署环境")}</label><Select value={placement} onValueChange={setPlacement}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="kubernetes">Kubernetes</SelectItem><SelectItem value="docker">Docker</SelectItem><SelectItem value="host">Host</SelectItem></SelectContent></Select></div><div><label className="block text-[11px] text-[#9aa4b4]">{t("身份结果")}</label><Select value={classification} onValueChange={setClassification}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="probable_agent">probable_agent</SelectItem><SelectItem value="non_agent">non_agent</SelectItem></SelectContent></Select></div></> : null}
                 {kind === "capture_profile" ? <div><label className="block text-[11px] text-[#9aa4b4]">Capture Profile</label><Select value={profile} onValueChange={(value) => setProfile(value as CaptureProfile)}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent>{["agent_full", "probable_investigation", "business_context", "infrastructure_aggregate", "unknown_discovery", "self_health"].map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent></Select></div> : null}
                 {kind === "semantic_retention" ? <div><label className="block text-[11px] text-[#9aa4b4]">F2 Action</label><Select value={retentionAction} onValueChange={setRetentionAction}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="keep">KEEP</SelectItem><SelectItem value="aggregate">AGGREGATE</SelectItem><SelectItem value="sample">SAMPLE</SelectItem><SelectItem value="suppress">SUPPRESS</SelectItem></SelectContent></Select></div> : null}
