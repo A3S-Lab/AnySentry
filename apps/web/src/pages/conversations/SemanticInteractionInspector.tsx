@@ -39,9 +39,9 @@ function nsDate(value?: string) {
 }
 
 function tone(event: AgentSemanticEvent) {
-  if (event.actor === "user") return "border-sky-400/20 bg-sky-500/[0.06] text-sky-100";
-  if (event.actor === "model") return "border-teal-400/20 bg-teal-500/[0.06] text-teal-100";
-  return "border-violet-400/20 bg-violet-500/[0.06] text-violet-100";
+  if (event.actor === "user") return "border-sky-200 bg-sky-50 text-sky-700";
+  if (event.actor === "model") return "border-teal-200 bg-teal-50 text-teal-700";
+  return "border-violet-200 bg-violet-50 text-violet-700";
 }
 
 function actorTitle(event: AgentSemanticEvent) {
@@ -58,8 +58,8 @@ function CopyAction({ value, label }: { value: string; label: string }) {
     window.setTimeout(() => setCopied(false), 1_500);
   };
   return (
-    <Button type="button" variant="ghost" size="sm" onClick={() => void copy()} className="h-9 text-zinc-400 hover:bg-white/5 hover:text-zinc-100" aria-label={label}>
-      {copied ? <Check className="size-3.5 text-teal-300" /> : <Copy className="size-3.5" />}
+    <Button type="button" variant="ghost" size="sm" onClick={() => void copy()} className="h-9 text-slate-500 hover:bg-slate-100 hover:text-slate-900" aria-label={label}>
+      {copied ? <Check className="size-3.5 text-teal-600" /> : <Copy className="size-3.5" />}
       {copied ? "已复制" : "复制"}
     </Button>
   );
@@ -67,9 +67,9 @@ function CopyAction({ value, label }: { value: string; label: string }) {
 
 function EvidenceField({ label, value }: { label: string; value?: ReactNode }) {
   return (
-    <div className="min-w-0 border-b border-white/8 py-2 last:border-b-0">
-      <dt className="text-[10px] uppercase tracking-[0.08em] text-zinc-600">{label}</dt>
-      <dd className="mt-1 break-all font-mono text-[11px] leading-5 text-zinc-300">{value ?? "--"}</dd>
+    <div className="min-w-0 border-b border-slate-200 py-2 last:border-b-0">
+      <dt className="text-[10px] uppercase tracking-[0.08em] text-slate-400">{label}</dt>
+      <dd className="mt-1 break-all font-mono text-[11px] leading-5 text-slate-700">{value ?? "--"}</dd>
     </div>
   );
 }
@@ -119,11 +119,11 @@ function KernelEvidenceView({
   canonicalEvidenceAlias?: string;
 }) {
   if (loading && !evidence) {
-    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在关联内核事实</div>;
+    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-slate-500"><LoaderCircle className="size-4 animate-spin" />正在关联内核事实</div>;
   }
   return (
     <div className="space-y-3">
-      <dl className="rounded border border-white/8 bg-black/15 px-3">
+      <dl className="rounded border border-slate-200 bg-slate-50 px-3">
         <EvidenceField label="Relation Status" value={evidence?.relationStatus ?? (event.actor === "tool" ? "semantic_only" : "not_applicable")} />
         <EvidenceField label="Tool Invocation" value={evidence?.toolInvocationId} />
         <EvidenceField label="Interaction Event" value={(evidence?.interactionEvidenceEventIds ?? event.evidenceEventIds).join(", ")} />
@@ -137,18 +137,18 @@ function KernelEvidenceView({
         {canonicalEvidenceLinkLoading ? <EvidenceField label="Canonical Link" value="loading" /> : null}
       </dl>
       {evidence?.relations.some((relation) => relation.kernelEventId) ? (
-        <div className="divide-y divide-white/8 rounded border border-white/8 bg-black/15">
+        <div className="divide-y divide-slate-100 rounded border border-slate-200 bg-slate-50">
           {evidence.relations.filter((relation) => relation.kernelEventId).map((relation) => {
             const kernel = evidence.kernelEvents.find((item) => item.eventId === relation.kernelEventId);
             return (
               <div key={relation.relationId} className="px-3 py-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="rounded border border-teal-400/20 bg-teal-500/[0.07] px-1.5 py-1 text-[10px] text-teal-100">{relation.status}</span>
-                  <span className="rounded border border-white/10 px-1.5 py-1 font-mono text-[10px] text-zinc-400">{relation.linkMethod}</span>
-                  <span className="font-mono text-[10px] text-zinc-600">confidence {relation.confidence.toFixed(2)}</span>
+                  <span className="rounded border border-teal-200 bg-teal-50 px-1.5 py-1 text-[10px] text-teal-700">{relation.status}</span>
+                  <span className="rounded border border-slate-200 px-1.5 py-1 font-mono text-[10px] text-slate-500">{relation.linkMethod}</span>
+                  <span className="font-mono text-[10px] text-slate-400">confidence {relation.confidence.toFixed(2)}</span>
                 </div>
-                <p className="mt-2 text-xs leading-5 text-zinc-300">{kernel?.eventKind ?? "Kernel Event"} · {kernel?.subject ?? relation.kernelEventId}</p>
-                <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-teal-200 hover:text-teal-100" to={eventHref(relation.kernelEventId!, interaction, kernel?.at ?? relation.kernelEventAt, event)}>
+                <p className="mt-2 text-xs leading-5 text-slate-700">{kernel?.eventKind ?? "Kernel Event"} · {kernel?.subject ?? relation.kernelEventId}</p>
+                <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-teal-700 hover:text-teal-900" to={eventHref(relation.kernelEventId!, interaction, kernel?.at ?? relation.kernelEventAt, event)}>
                   查看原始内核事件
                 </Link>
               </div>
@@ -156,7 +156,7 @@ function KernelEvidenceView({
           })}
         </div>
       ) : (
-        <div className="rounded border border-amber-400/15 bg-amber-500/[0.035] px-3 py-3 text-xs leading-5 text-amber-100/75">
+        <div className="rounded border border-amber-200 bg-amber-50 px-3 py-3 text-xs leading-5 text-amber-700/75">
           {evidence?.relationStatus === "coverage_gap"
             ? "当前内核采集窗口不完整，保留语义工具事实但不猜测执行事件。"
             : "已确认工具语义，但没有满足运行实例、进程祖先和命令、资源或网络强条件的内核事件。"}
@@ -176,12 +176,12 @@ function RiskEvidenceView({
   loading: boolean;
 }) {
   if (loading && !evidence) {
-    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在读取既有风险研判</div>;
+    return <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-slate-500"><LoaderCircle className="size-4 animate-spin" />正在读取既有风险研判</div>;
   }
   const risky = evidence?.relations.filter((relation) => relation.kernelEventId && relation.risk) ?? [];
   if (!risky.length) {
     return (
-      <div className="rounded border border-white/8 bg-black/15 px-4 py-8 text-center text-xs leading-5 text-zinc-500">
+      <div className="rounded border border-slate-200 bg-slate-50 px-4 py-8 text-center text-xs leading-5 text-slate-500">
         当前没有已关联的 Kernel Judgment。页面不会根据工具文字重新生成一套风险分数。
       </div>
     );
@@ -189,20 +189,20 @@ function RiskEvidenceView({
   return (
     <div className="space-y-3">
       {risky.map((relation) => (
-        <div key={relation.relationId} className="rounded border border-white/8 bg-black/15 p-3">
+        <div key={relation.relationId} className="rounded border border-slate-200 bg-slate-50 p-3">
           <div className="flex flex-wrap items-center gap-2">
             <span className={cn(
               "rounded border px-1.5 py-1 text-[10px]",
               relation.risk!.verdict === "allow"
-                ? "border-teal-400/20 bg-teal-500/[0.07] text-teal-100"
-                : "border-rose-400/25 bg-rose-500/[0.08] text-rose-100",
+                ? "border-teal-200 bg-teal-50 text-teal-700"
+                : "border-rose-200 bg-rose-50 text-rose-700",
             )}>{relation.risk!.verdict}</span>
-            <span className="font-mono text-xs font-semibold text-zinc-100">风险 {relation.risk!.riskScore}</span>
-            <span className="text-[10px] text-zinc-500">{relation.risk!.tier} · {relation.risk!.severity}</span>
+            <span className="font-mono text-xs font-semibold text-slate-900">风险 {relation.risk!.riskScore}</span>
+            <span className="text-[10px] text-slate-500">{relation.risk!.tier} · {relation.risk!.severity}</span>
           </div>
-          <p className="mt-2 text-xs font-medium text-zinc-200">{relation.risk!.riskName}</p>
-          <p className="mt-1 text-[11px] leading-5 text-zinc-500">{relation.risk!.reason}</p>
-          <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-violet-200 hover:text-violet-100" to={eventHref(relation.kernelEventId!, interaction, relation.kernelEventAt, {
+          <p className="mt-2 text-xs font-medium text-slate-800">{relation.risk!.riskName}</p>
+          <p className="mt-1 text-[11px] leading-5 text-slate-500">{relation.risk!.reason}</p>
+          <Link className="mt-2 inline-flex min-h-9 items-center text-xs font-medium text-violet-700 hover:text-violet-900" to={eventHref(relation.kernelEventId!, interaction, relation.kernelEventAt, {
             conversationId: relation.conversationId,
             semanticEventId: relation.stableSemanticEventId,
           })}>
@@ -257,10 +257,10 @@ export function SemanticInteractionInspector({
 
   if (!event) {
     return (
-      <aside className="hidden h-full min-h-0 border-l border-white/10 bg-[#0d120f] xl:flex xl:items-center xl:justify-center" aria-label="事件检查器">
+      <aside className="hidden h-full min-h-0 border-l border-slate-200 bg-white xl:flex xl:items-center xl:justify-center" aria-label="事件检查器">
         <div className="px-6 text-center">
-          <FileJson className="mx-auto size-7 text-zinc-700" aria-hidden="true" />
-          <p className="mt-3 text-xs leading-5 text-zinc-500">选择一条用户、模型或工具事件，查看结构化内容、原始正文和采集证据。</p>
+          <FileJson className="mx-auto size-7 text-slate-400" aria-hidden="true" />
+          <p className="mt-3 text-xs leading-5 text-slate-500">选择一条用户、模型或工具事件，查看结构化内容、原始正文和采集证据。</p>
         </div>
       </aside>
     );
@@ -268,20 +268,20 @@ export function SemanticInteractionInspector({
 
   return (
     <>
-      <button type="button" aria-label="关闭事件检查器" onClick={onClose} className="fixed inset-0 z-40 cursor-default bg-black/60 xl:hidden" />
-      <aside className="fixed inset-x-3 bottom-3 top-20 z-50 min-h-0 overflow-hidden rounded-md border border-white/15 bg-[#0d120f] shadow-2xl xl:static xl:z-auto xl:h-full xl:rounded-none xl:border-y-0 xl:border-r-0 xl:shadow-none" aria-label="事件检查器">
-        <div className="flex h-14 items-center gap-2 border-b border-white/10 px-3">
-          <FileJson className="size-4 shrink-0 text-violet-300" aria-hidden="true" />
+      <button type="button" aria-label="关闭事件检查器" onClick={onClose} className="fixed inset-0 z-40 cursor-default bg-slate-900/40 xl:hidden" />
+      <aside className="fixed inset-x-3 bottom-3 top-20 z-50 min-h-0 overflow-hidden rounded-md border border-slate-200 bg-white shadow-2xl xl:static xl:z-auto xl:h-full xl:rounded-none xl:border-y-0 xl:border-r-0 xl:shadow-none" aria-label="事件检查器">
+        <div className="flex h-14 items-center gap-2 border-b border-slate-200 px-3">
+          <FileJson className="size-4 shrink-0 text-violet-600" aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <h2 className="truncate text-xs font-semibold text-zinc-100">{actorTitle(event)}</h2>
-            <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-600">{event.semanticEventId}</p>
+            <h2 className="truncate text-xs font-semibold text-slate-900">{actorTitle(event)}</h2>
+            <p className="mt-0.5 truncate font-mono text-[10px] text-slate-400">{event.semanticEventId}</p>
           </div>
-          <Button type="button" variant="ghost" size="icon" onClick={onClose} aria-label="关闭事件检查器" className="size-11 text-zinc-400 hover:bg-white/5 hover:text-zinc-100 xl:size-9">
+          <Button type="button" variant="ghost" size="icon" onClick={onClose} aria-label="关闭事件检查器" className="size-11 text-slate-500 hover:bg-slate-100 hover:text-slate-900 xl:size-9">
             <X className="size-4" />
           </Button>
         </div>
 
-        <div className="flex h-11 items-center border-b border-white/10 px-2" role="tablist" aria-label="检查器视图">
+        <div className="flex h-11 items-center border-b border-slate-200 px-2" role="tablist" aria-label="检查器视图">
           {tabs.map(([value, label, Icon], index) => (
             <button
               key={value}
@@ -293,7 +293,7 @@ export function SemanticInteractionInspector({
               onClick={() => setTab(value)}
               className={cn(
                 "flex h-11 min-w-0 flex-1 cursor-pointer items-center justify-center gap-1 border-b whitespace-nowrap text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70 sm:gap-1.5 sm:text-xs",
-                tab === value ? "border-violet-300 text-violet-100" : "border-transparent text-zinc-500 hover:text-zinc-200",
+                tab === value ? "border-violet-600 text-violet-700" : "border-transparent text-slate-500 hover:text-slate-800",
               )}
             >
               <Icon className="size-3.5" aria-hidden="true" />{label}
@@ -303,20 +303,20 @@ export function SemanticInteractionInspector({
 
         <div className="h-[calc(100%-6.25rem)] overflow-y-auto p-3">
           {loading && !interaction && (tab === "content" || tab === "raw") ? (
-            <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-zinc-500"><LoaderCircle className="size-4 animate-spin" />正在读取完整 Interaction</div>
+            <div className="flex min-h-40 items-center justify-center gap-2 text-xs text-slate-500"><LoaderCircle className="size-4 animate-spin" />正在读取完整 Interaction</div>
           ) : tab === "content" ? (
             <div>
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="flex flex-wrap gap-2">
                   <span className={cn("rounded border px-1.5 py-1 text-[10px]", tone(event))}>{actorTitle(event)}</span>
-                  <span className="rounded border border-white/10 bg-white/[0.035] px-1.5 py-1 text-[10px] text-zinc-400">{event.completeness}</span>
+                  <span className="rounded border border-slate-200 bg-slate-50 px-1.5 py-1 text-[10px] text-slate-500">{event.completeness}</span>
                 </div>
                 {structured ? <CopyAction value={structured} label="复制结构化内容" /> : null}
               </div>
-              <pre className="max-h-[calc(100dvh-14rem)] overflow-auto whitespace-pre-wrap break-words rounded border border-white/8 bg-black/20 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(structured || "该事件没有结构化正文。")}</pre>
+              <pre className="max-h-[calc(100dvh-14rem)] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] leading-5 text-slate-700">{browserPreview(structured || "该事件没有结构化正文。")}</pre>
               {interaction?.interactionType === "model" ? (
                 interaction.usage ? (
-                  <dl className="mt-3 grid grid-cols-2 rounded border border-teal-400/15 bg-teal-500/[0.035] sm:grid-cols-3">
+                  <dl className="mt-3 grid grid-cols-2 rounded border border-teal-200 bg-teal-50 sm:grid-cols-3">
                     {[
                       ["总 Token", interaction.usage.totalTokens],
                       ["输入", interaction.usage.inputTokens],
@@ -325,21 +325,21 @@ export function SemanticInteractionInspector({
                       ["推理输出", interaction.usage.reasoningOutputTokens],
                       ["覆盖", interaction.usage.completeness],
                     ].map(([label, value]) => (
-                      <div key={String(label)} className="border-b border-r border-white/8 px-3 py-2 last:border-r-0">
-                        <dt className="text-[9px] uppercase tracking-[0.08em] text-zinc-600">{String(label)}</dt>
-                        <dd className="mt-1 font-mono text-[11px] text-zinc-300">
+                      <div key={String(label)} className="border-b border-r border-slate-200 px-3 py-2 last:border-r-0">
+                        <dt className="text-[9px] uppercase tracking-[0.08em] text-slate-400">{String(label)}</dt>
+                        <dd className="mt-1 font-mono text-[11px] text-slate-700">
                           {typeof value === "number" ? formatTokenCount(value, false) : value ?? "--"}
                         </dd>
                       </div>
                     ))}
                   </dl>
                 ) : (
-                  <p className="mt-3 rounded border border-white/8 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">
+                  <p className="mt-3 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
                     本次模型调用没有返回可核验的 Token usage；页面不会用文本长度估算。
                   </p>
                 )
               ) : null}
-              {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-zinc-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
+              {event.kind === "tool_result" ? <p className="mt-3 text-[11px] leading-5 text-slate-500">工具结果时间表示该结果重新进入模型请求的明文边界；框架内部精确结束时间仅在有独立工具传输证据时展示。</p> : null}
             </div>
           ) : tab === "kernel" ? (
             <KernelEvidenceView event={event} interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} canonicalEvidenceLink={canonicalEvidenceLink} canonicalEvidenceLinkLoading={canonicalEvidenceLinkLoading} canonicalEvidenceCoverage={canonicalEvidenceCoverage} canonicalEvidenceAlias={canonicalEvidenceAlias} />
@@ -347,13 +347,13 @@ export function SemanticInteractionInspector({
             <RiskEvidenceView interaction={interaction} evidence={semanticEvidence} loading={evidenceLoading} />
           ) : tab === "raw" ? (
             <div className="space-y-3">
-              {!interaction ? <p className="py-12 text-center text-xs text-zinc-500">该事件没有关联的原始 Interaction。</p> : (
+              {!interaction ? <p className="py-12 text-center text-xs text-slate-500">该事件没有关联的原始 Interaction。</p> : (
                 <>
                   {interaction.partialReasons.length ? (
-                    <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-zinc-500" title={interaction.partialReasons.join(", ")}>
+                    <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500" title={interaction.partialReasons.join(", ")}>
                       <span>记录截断原因</span>
                       {interaction.partialReasons.slice(0, 6).map((reason) => (
-                        <span key={reason} className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-0.5 text-amber-100">{reason}</span>
+                        <span key={reason} className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-amber-700">{reason}</span>
                       ))}
                       {interaction.partialReasons.length > 6 ? <span>+{interaction.partialReasons.length - 6}</span> : null}
                     </div>
@@ -362,17 +362,17 @@ export function SemanticInteractionInspector({
                     const side = content as AgentInteractionRecord["request"];
                     const decodedBody = decodeContentBody(side);
                     return (
-                      <details key={String(title)} open className="rounded border border-white/8 bg-black/15">
-                        <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-zinc-200">{String(title)}</summary>
-                        <div className="border-t border-white/8 p-3">
-                          <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
+                      <details key={String(title)} open className="rounded border border-slate-200 bg-slate-50">
+                        <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-slate-800">{String(title)}</summary>
+                        <div className="border-t border-slate-200 p-3">
+                          <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
                             <span>{side.contentType}</span>
-                            <span className="rounded border border-white/10 bg-white/[0.035] px-1.5 py-0.5 text-zinc-400">{side.encoding}</span>
+                            <span className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-slate-500">{side.encoding}</span>
                             <span>{side.decodedBytes.toLocaleString()} bytes</span>
                             <span>{side.completeness}</span>
                             <CopyAction value={decodedBody} label={`复制完整${label}正文`} />
                           </div>
-                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-black/25 p-3 font-mono text-[11px] leading-5 text-zinc-300">{browserPreview(decodedBody)}</pre>
+                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-3 font-mono text-[11px] leading-5 text-slate-700">{browserPreview(decodedBody)}</pre>
                         </div>
                       </details>
                     );
@@ -381,7 +381,7 @@ export function SemanticInteractionInspector({
               )}
             </div>
           ) : (
-            <dl className="rounded border border-white/8 bg-black/15 px-3">
+            <dl className="rounded border border-slate-200 bg-slate-50 px-3">
               <EvidenceField label="Conversation / Segment" value={`${event.conversationId} · ${event.segmentId}`} />
               <EvidenceField label="Turn" value={event.turnId} />
               <EvidenceField label="Semantic Event" value={event.semanticEventId} />
@@ -405,7 +405,7 @@ export function SemanticInteractionInspector({
               <EvidenceField label="Response SHA-256" value={interaction?.response.sha256} />
               <EvidenceField label="Correlation" value={event.correlationQuality} />
               {interaction ? (
-                <EvidenceField label="下钻" value={<Link className="font-sans text-violet-200 hover:text-violet-100" to={`/events?${new URLSearchParams({ timeType: "last_30d", agentAssetId: interaction.agentAssetId, agentInstanceId: interaction.agentInstanceId ?? "", scope: "agent" }).toString()}`}>查看 Agent 原始行为与 Egress</Link>} />
+                <EvidenceField label="下钻" value={<Link className="font-sans text-violet-700 hover:text-violet-900" to={`/events?${new URLSearchParams({ timeType: "last_30d", agentAssetId: interaction.agentAssetId, agentInstanceId: interaction.agentInstanceId ?? "", scope: "agent" }).toString()}`}>查看 Agent 原始行为与 Egress</Link>} />
               ) : null}
             </dl>
           )}

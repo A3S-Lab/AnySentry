@@ -549,43 +549,43 @@ export default function ConversationTrackingPage() {
     !["complete", "asset_only", "no_activity"].includes(item.coverage.status)).length ?? 0;
 
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-[#0b0f0c] text-zinc-100">
-      <header className="shrink-0 border-b border-white/10 bg-[#0d120f] px-3 py-3 sm:px-4">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-white text-slate-900">
+      <header className="shrink-0 border-b border-slate-200 bg-white px-3 py-3 sm:px-4">
         <div className="flex flex-col gap-3 2xl:flex-row 2xl:items-center 2xl:justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <MessageSquareText className="size-5 shrink-0 text-violet-300" aria-hidden="true" />
-              <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-50">{t("对话追踪")}</h1>
-              <Pill className="border-white/10 bg-white/[0.035] text-zinc-400">semantic v{timeline?.parserVersion ?? 2}</Pill>
+              <MessageSquareText className="size-5 shrink-0 text-violet-600" aria-hidden="true" />
+              <h1 className="truncate text-lg font-semibold tracking-normal text-slate-900">{t("对话追踪")}</h1>
+              <Pill className="border-slate-200 bg-slate-50 text-slate-500">semantic v{timeline?.parserVersion ?? 2}</Pill>
               {canonicalTimelineCoverage?.status === "partial" && (
-                <Pill className="border-amber-400/25 bg-amber-500/10 text-amber-200" title={canonicalTimelineCoverage.reasons.join(", ") || "Canonical coverage partial"}>
+                <Pill className="border-amber-200 bg-amber-50 text-amber-700" title={canonicalTimelineCoverage.reasons.join(", ") || "Canonical coverage partial"}>
                   Canonical partial
                 </Pill>
               )}
               {canonicalTimelineCoverage?.status === "unknown" && (
-                <Pill className="border-zinc-500/30 bg-zinc-500/10 text-zinc-300">Canonical coverage unknown</Pill>
+                <Pill className="border-slate-300 bg-slate-100 text-slate-600">Canonical coverage unknown</Pill>
               )}
             </div>
-            <p className="mt-1 truncate text-xs text-zinc-500">按逻辑 Agent、运行实例和 Thread 还原用户、模型、工具三类完整链路</p>
+            <p className="mt-1 truncate text-xs text-slate-500">按逻辑 Agent、运行实例和 Thread 还原用户、模型、工具三类完整链路</p>
           </div>
 
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <div className="relative min-w-[220px] flex-1 2xl:w-[310px] 2xl:flex-none">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-zinc-600" aria-hidden="true" />
-              <Input value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="搜索 Agent、workspace、模型或正文摘要" aria-label="搜索对话" className="h-11 border-white/10 bg-white/[0.035] pl-9 text-xs text-zinc-100 sm:h-9" />
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-slate-400" aria-hidden="true" />
+              <Input value={queryText} onChange={(event) => setQueryText(event.target.value)} placeholder="搜索 Agent、workspace、模型或正文摘要" aria-label="搜索对话" className="h-11 border-slate-200 bg-white pl-9 text-xs text-slate-900 sm:h-9" />
             </div>
             <Select value={coverageStatus} onValueChange={(value) => setCoverage(value as AgentConversationCoverageStatus | "all")}>
-              <SelectTrigger className="h-11 w-[148px] border-white/10 bg-white/[0.035] text-xs text-zinc-100 sm:h-9"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="h-11 w-[148px] border-slate-200 bg-white text-xs text-slate-900 sm:h-9"><SelectValue /></SelectTrigger>
               <SelectContent>{COVERAGE_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
             </Select>
             <Select value={classification} onValueChange={(value) => setClassification(value as AgentClassification | "all")}>
-              <SelectTrigger className="h-11 w-[132px] border-white/10 bg-white/[0.035] text-xs text-zinc-100 sm:h-9"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="h-11 w-[132px] border-slate-200 bg-white text-xs text-slate-900 sm:h-9"><SelectValue /></SelectTrigger>
               <SelectContent>{CLASSIFICATION_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
             </Select>
-            <Button type="button" variant="secondary" size="sm" onClick={() => setLiveFollow((value) => !value)} aria-pressed={liveFollow} className={cn("h-11 border text-xs sm:h-9", liveFollow ? "border-teal-400/25 bg-teal-500/10 text-teal-100 hover:bg-teal-500/15" : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10")}>
-              <span className={cn("size-1.5 rounded-full", liveFollow ? "bg-teal-300" : "bg-zinc-600")} />实时跟随
+            <Button type="button" variant="secondary" size="sm" onClick={() => setLiveFollow((value) => !value)} aria-pressed={liveFollow} className={cn("h-11 border text-xs sm:h-9", liveFollow ? "border-teal-200 bg-teal-50 text-teal-700 hover:bg-teal-100" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50")}>
+              <span className={cn("size-1.5 rounded-full", liveFollow ? "bg-teal-500" : "bg-slate-400")} />实时跟随
             </Button>
-            <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-11 border border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 sm:h-9"><X className="size-3.5" />清除</Button>
+            <Button type="button" variant="secondary" size="sm" onClick={clearFilters} className="h-11 border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 sm:h-9"><X className="size-3.5" />清除</Button>
             <Button
               type="button"
               size="sm"
@@ -595,7 +595,7 @@ export default function ConversationTrackingPage() {
                 selectedEvent?.sourceInteractionIds[0] ? refreshInteraction() : Promise.resolve(),
               ])}
               disabled={conversationsLoading || timelinePending || interactionLoading}
-              className="h-11 bg-violet-500 text-white hover:bg-violet-400 sm:h-9"
+              className="h-11 bg-violet-600 text-white hover:bg-violet-500 sm:h-9"
             >
               {conversationsLoading || timelinePending || interactionLoading
                 ? <LoaderCircle className="size-3.5 animate-spin" />
@@ -604,10 +604,10 @@ export default function ConversationTrackingPage() {
           </div>
         </div>
 
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/8 pt-2 text-[11px] text-zinc-500">
-          <span className="flex items-center gap-1.5"><CircleCheck className="size-3.5 text-teal-300" />正文完整 <strong className="font-mono font-medium text-zinc-300">{completeCount}</strong></span>
-          <span className="flex items-center gap-1.5"><CircleDashed className="size-3.5 text-zinc-500" />仅资产 <strong className="font-mono font-medium text-zinc-300">{assetOnlyCount}</strong></span>
-          <span className="flex items-center gap-1.5"><AlertTriangle className="size-3.5 text-amber-300" />异常/部分 <strong className="font-mono font-medium text-zinc-300">{abnormalCount}</strong></span>
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+          <span className="flex items-center gap-1.5"><CircleCheck className="size-3.5 text-teal-600" />正文完整 <strong className="font-mono font-medium text-slate-700">{completeCount}</strong></span>
+          <span className="flex items-center gap-1.5"><CircleDashed className="size-3.5 text-slate-500" />仅资产 <strong className="font-mono font-medium text-slate-700">{assetOnlyCount}</strong></span>
+          <span className="flex items-center gap-1.5"><AlertTriangle className="size-3.5 text-amber-600" />异常/部分 <strong className="font-mono font-medium text-slate-700">{abnormalCount}</strong></span>
           <span className="ml-auto flex items-center gap-1.5"><Clock3 className="size-3.5" />{directory?.updateTime ? dayjs(directory.updateTime).format("MM-DD HH:mm:ss") : "等待数据"}</span>
         </div>
       </header>
@@ -636,7 +636,7 @@ export default function ConversationTrackingPage() {
               onSelectConversation={selectConversation}
             />
             <div {...leftSeparatorProps} className="group absolute -right-1.5 top-0 z-30 hidden h-full w-3 cursor-col-resize touch-none items-center justify-center md:flex">
-              <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400/50 group-focus-visible:bg-violet-300" />
+              <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400 group-focus-visible:bg-violet-500" />
             </div>
           </div>
           <div className={cn(
@@ -677,7 +677,7 @@ export default function ConversationTrackingPage() {
           </div>
           <div className={cn("relative min-h-0", !selectedConversationId && "hidden")}>
             <div {...rightSeparatorProps} className="group absolute -left-1.5 top-0 z-30 hidden h-full w-3 cursor-col-resize touch-none items-center justify-center xl:flex">
-              <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400/50 group-focus-visible:bg-violet-300" />
+              <span className="h-full w-px bg-transparent transition-colors group-hover:bg-violet-400 group-focus-visible:bg-violet-500" />
             </div>
             <SemanticInteractionInspector
               event={selectedEvent}

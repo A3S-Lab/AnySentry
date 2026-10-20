@@ -70,31 +70,35 @@ function actorMeta(event: AgentSemanticEvent) {
     label: "用户",
     detail: "人工输入",
     icon: UserRound,
-    tone: "border-sky-400/25 bg-sky-500/[0.06] text-sky-100",
-    iconTone: "border-sky-400/25 bg-sky-500/10 text-sky-200",
+    tone: "border-sky-200 bg-sky-50 text-sky-700",
+    iconTone: "border-sky-200 bg-sky-100 text-sky-700",
+    bubble: "rounded-br-md",
   };
   if (event.actor === "model") return {
     label: "模型",
     detail: event.kind === "model_final" ? "最终回复" : "过程说明",
     icon: Bot,
-    tone: "border-teal-400/25 bg-teal-500/[0.055] text-teal-100",
-    iconTone: "border-teal-400/25 bg-teal-500/10 text-teal-200",
+    tone: "border-teal-200 bg-teal-50 text-teal-700",
+    iconTone: "border-teal-200 bg-teal-100 text-teal-700",
+    bubble: "rounded-bl-md",
   };
   if (event.actor === "agent" || event.kind === "delegation_send" || event.kind === "delegation_reply") {
     return {
       label: "委托",
       detail: event.kind === "delegation_reply" ? "收到回复" : "发送委托",
       icon: ArrowLeftRight,
-      tone: "border-amber-400/25 bg-amber-500/[0.055] text-amber-100",
-      iconTone: "border-amber-400/25 bg-amber-500/10 text-amber-200",
+      tone: "border-amber-200 bg-amber-50 text-amber-700",
+      iconTone: "border-amber-200 bg-amber-100 text-amber-700",
+      bubble: "rounded-bl-md",
     };
   }
   return {
     label: "工具",
     detail: event.toolName ?? event.toolKind ?? "Tool",
     icon: Wrench,
-    tone: "border-violet-400/25 bg-violet-500/[0.055] text-violet-100",
-    iconTone: "border-violet-400/25 bg-violet-500/10 text-violet-200",
+    tone: "border-violet-200 bg-violet-50 text-violet-700",
+    iconTone: "border-violet-200 bg-violet-100 text-violet-700",
+    bubble: "rounded-bl-md",
   };
 }
 
@@ -115,30 +119,31 @@ function ActorCard({
       data-semantic-kind={event.kind}
       onClick={() => onSelect(event)}
       className={cn(
-        "relative flex min-h-[76px] w-full cursor-pointer gap-3 rounded border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
+        "relative flex min-h-[76px] max-w-[88%] cursor-pointer gap-3 rounded-2xl border px-4 py-3 text-left shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
         meta.tone,
-        selected ? "border-violet-300/55 bg-violet-400/[0.10]" : "hover:border-white/25 hover:bg-white/[0.045]",
+        meta.bubble,
+        selected ? "border-violet-400 bg-violet-50" : "hover:border-slate-400 hover:shadow-md",
       )}
     >
-      <span className={cn("relative z-10 flex size-9 shrink-0 items-center justify-center rounded border", meta.iconTone)}>
+      <span className={cn("relative z-10 flex size-9 shrink-0 items-center justify-center rounded-full border", meta.iconTone)}>
         <Icon className="size-4" aria-hidden="true" />
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold">{meta.label}</span>
-          <Badge className="border-current/15 bg-black/10 text-current/80">{meta.detail}</Badge>
-          {event.completeness !== "complete" ? <Badge className="border-amber-400/25 bg-amber-500/10 text-amber-100" title={event.partialReasons?.join(", ") || undefined}>部分</Badge> : null}
+          <Badge className="border-current/15 bg-white/60 text-current/80">{meta.detail}</Badge>
+          {event.completeness !== "complete" ? <Badge className="border-amber-200 bg-amber-50 text-amber-700" title={event.partialReasons?.join(", ") || undefined}>部分</Badge> : null}
         </span>
-        <span className="mt-1.5 line-clamp-5 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-200">
+        <span className="mt-1.5 line-clamp-5 block whitespace-pre-wrap break-words text-xs leading-5 text-slate-800">
           {event.contentPreview ?? "该事件没有可展示的文字摘要；可在检查器查看结构化证据。"}
         </span>
-        <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-500">
+        <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-500">
           <time>{nsDate(event.atUnixNs)}</time>
           <span>{event.correlationQuality}</span>
           <span>parser v{event.parserVersion}</span>
         </span>
       </span>
-      <ChevronRight className="mt-2 size-4 shrink-0 text-zinc-600" aria-hidden="true" />
+      <ChevronRight className="mt-2 size-4 shrink-0 text-slate-400" aria-hidden="true" />
     </button>
   );
 }
@@ -164,50 +169,50 @@ function ToolStepCard({
       data-semantic-kind={call ? "tool_call" : "tool_result"}
       onClick={() => onSelect(result ?? call!)}
       className={cn(
-        "relative flex min-h-[84px] w-full cursor-pointer gap-3 rounded border border-violet-400/25 bg-violet-500/[0.055] px-3 py-3 text-left text-violet-100 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
-        selected ? "border-violet-300/55 bg-violet-400/[0.11]" : "hover:border-white/25 hover:bg-white/[0.045]",
+        "relative flex min-h-[84px] w-full cursor-pointer gap-3 rounded-xl border border-violet-200 bg-violet-50/70 px-3 py-3 text-left text-violet-700 shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70",
+        selected ? "border-violet-400 bg-violet-100/70" : "hover:border-violet-400 hover:shadow-md",
       )}
     >
-      <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded border border-violet-400/25 bg-violet-500/10 text-violet-200">
+      <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded-full border border-violet-200 bg-white text-violet-600">
         <Wrench className="size-4" aria-hidden="true" />
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold">工具</span>
-          <Badge className="border-violet-300/20 bg-black/10 text-violet-100">{primary.toolKind ?? "other"}</Badge>
-          <span className="font-mono text-[10px] text-violet-200/80">{primary.toolName ?? "Tool"}</span>
+          <Badge className="border-violet-200 bg-white/60 text-violet-700">{primary.toolKind ?? "other"}</Badge>
+          <span className="font-mono text-[10px] text-violet-700/80">{primary.toolName ?? "Tool"}</span>
           <Badge className={failed
-            ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
+            ? "border-rose-200 bg-rose-50 text-rose-700"
             : result
-              ? "border-teal-400/25 bg-teal-500/10 text-teal-100"
-              : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+              ? "border-teal-200 bg-teal-50 text-teal-700"
+              : "border-amber-200 bg-amber-50 text-amber-700"}>
             {status}
           </Badge>
         </span>
         {call ? (
-          <span className="mt-1.5 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-200">
+          <span className="mt-1.5 block whitespace-pre-wrap break-words text-xs leading-5 text-slate-800">
             {call.contentPreview ?? "工具参数未形成可读摘要"}
           </span>
         ) : (
-          <span className="mt-1.5 block text-xs text-amber-100/80">调用证据缺失，但观察到工具结果。</span>
+          <span className="mt-1.5 block text-xs text-amber-700/80">调用证据缺失，但观察到工具结果。</span>
         )}
         {result ? (
-          <span className="mt-2 block border-t border-violet-300/10 pt-2">
-            <span className="mb-1 flex items-center gap-1.5 text-[10px] font-medium text-zinc-500">
+          <span className="mt-2 block border-t border-violet-200 pt-2">
+            <span className="mb-1 flex items-center gap-1.5 text-[10px] font-medium text-slate-500">
               <TerminalSquare className="size-3" aria-hidden="true" />结果
             </span>
-            <span className="line-clamp-4 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-300">
+            <span className="line-clamp-4 block whitespace-pre-wrap break-words text-xs leading-5 text-slate-700">
               {result.contentPreview ?? "工具结果没有可读摘要"}
             </span>
           </span>
         ) : null}
-        <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-500">
+        <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-500">
           <time>{nsDate(call?.atUnixNs ?? result?.atUnixNs)}</time>
           {result ? <time>→ {nsDate(result.atUnixNs)}</time> : null}
           <span>{primary.toolCallId ?? "unlinked"}</span>
         </span>
       </span>
-      <ChevronRight className="mt-2 size-4 shrink-0 text-zinc-600" aria-hidden="true" />
+      <ChevronRight className="mt-2 size-4 shrink-0 text-slate-400" aria-hidden="true" />
     </button>
   );
 }
@@ -238,8 +243,8 @@ function DelegationStepCard({
     <div
       data-semantic-kind="delegation"
       className={cn(
-        "relative flex min-h-[84px] w-full gap-3 rounded border border-amber-400/25 bg-amber-500/[0.055] px-3 py-3 text-left text-amber-100",
-        selected ? "border-amber-300/55 bg-amber-400/[0.11]" : "",
+        "relative flex min-h-[84px] w-full gap-3 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-3 text-left text-amber-700 shadow-sm",
+        selected ? "border-amber-400 bg-amber-100/70" : "",
       )}
     >
       <button
@@ -247,42 +252,42 @@ function DelegationStepCard({
         onClick={() => onSelect(reply ?? send!)}
         className="flex min-w-0 flex-1 cursor-pointer gap-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
       >
-        <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded border border-amber-400/25 bg-amber-500/10 text-amber-200">
+        <span className="relative z-10 flex size-9 shrink-0 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-600">
           <ArrowLeftRight className="size-4" aria-hidden="true" />
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-semibold">委托步骤</span>
             {primary.workflowNode ? (
-              <Badge className="border-amber-300/20 bg-black/10 text-amber-100">{primary.workflowNode}</Badge>
+              <Badge className="border-amber-200 bg-white/60 text-amber-700">{primary.workflowNode}</Badge>
             ) : null}
             <Badge className={failed
-              ? "border-rose-400/25 bg-rose-500/10 text-rose-100"
+              ? "border-rose-200 bg-rose-50 text-rose-700"
               : reply
-                ? "border-teal-400/25 bg-teal-500/10 text-teal-100"
-                : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                ? "border-teal-200 bg-teal-50 text-teal-700"
+                : "border-amber-200 bg-amber-50 text-amber-700"}>
               {status}
             </Badge>
             {peerLabel ? (
-              <Badge className="border-white/10 bg-black/10 font-mono text-zinc-300">Egress {peerLabel}</Badge>
+              <Badge className="border-slate-200 bg-white/60 font-mono text-slate-700">Egress {peerLabel}</Badge>
             ) : null}
           </span>
           {send ? (
-            <span className="mt-1.5 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-200">
+            <span className="mt-1.5 block whitespace-pre-wrap break-words text-xs leading-5 text-slate-800">
               发送 · {send.contentPreview ?? "委托目标未形成可读摘要"}
             </span>
           ) : null}
           {reply ? (
-            <span className="mt-2 block border-t border-amber-300/10 pt-2">
-              <span className="mb-1 flex items-center gap-1.5 text-[10px] font-medium text-zinc-500">
+            <span className="mt-2 block border-t border-amber-200 pt-2">
+              <span className="mb-1 flex items-center gap-1.5 text-[10px] font-medium text-slate-500">
                 <TerminalSquare className="size-3" aria-hidden="true" />回复
               </span>
-              <span className="line-clamp-4 block whitespace-pre-wrap break-words text-xs leading-5 text-zinc-300">
+              <span className="line-clamp-4 block whitespace-pre-wrap break-words text-xs leading-5 text-slate-700">
                 {reply.contentPreview ?? "委托回复没有可读摘要"}
               </span>
             </span>
           ) : null}
-          <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-zinc-500">
+          <span className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-500">
             <time>{nsDate(send?.atUnixNs ?? reply?.atUnixNs)}</time>
             {reply ? <time>→ {nsDate(reply.atUnixNs)}</time> : null}
             {primary.delegationId ? <span>{primary.delegationId.slice(0, 12)}</span> : null}
@@ -294,13 +299,13 @@ function DelegationStepCard({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 shrink-0 self-center text-[10px] text-amber-100 hover:bg-amber-500/10 hover:text-amber-50"
+          className="h-8 shrink-0 self-center text-[10px] text-amber-700 hover:bg-amber-100 hover:text-amber-900"
           onClick={() => onJumpRelated(relatedId)}
         >
           跳转 Worker
         </Button>
       ) : (
-        <ChevronRight className="mt-2 size-4 shrink-0 self-start text-zinc-600" aria-hidden="true" />
+        <ChevronRight className="mt-2 size-4 shrink-0 self-start text-slate-400" aria-hidden="true" />
       )}
     </div>
   );
@@ -310,34 +315,34 @@ function UnparsedEvidenceLane({ items }: { items: AgentInteractionRecord[] }) {
   if (!items.length) return null;
   return (
     <div className="mx-auto mt-5 max-w-4xl">
-      <details className="rounded border border-white/10 bg-white/[0.02] px-3 py-2 text-[11px] text-zinc-400">
-        <summary className="min-h-7 cursor-pointer text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
+      <details className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
+        <summary className="min-h-7 cursor-pointer text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
           原始证据（未解析） · {items.length} 条
         </summary>
-        <div className="mt-2 space-y-2 border-t border-white/8 pt-2">
+        <div className="mt-2 space-y-2 border-t border-slate-200 pt-2">
           {items.map((record) => {
             const requestBody = decodeContentBody(record.request);
             const responseBody = decodeContentBody(record.response);
             return (
-              <div key={record.interactionId} className="rounded border border-white/8 bg-black/15 px-3 py-2">
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10px] text-zinc-500">
+              <div key={record.interactionId} className="rounded border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10px] text-slate-500">
                   <time>{nsDate(record.startedAtUnixNs)}</time>
-                  {record.endpoint ? <span className="break-all text-zinc-400">{record.method} {record.endpoint}</span> : null}
+                  {record.endpoint ? <span className="break-all text-slate-500">{record.method} {record.endpoint}</span> : null}
                   <Badge className={record.completeness === "complete"
-                    ? "border-white/10 bg-white/[0.035] text-zinc-400"
-                    : "border-amber-400/25 bg-amber-500/10 text-amber-100"}>
+                    ? "border-slate-200 bg-slate-50 text-slate-500"
+                    : "border-amber-200 bg-amber-50 text-amber-700"}>
                     {record.completeness}
                   </Badge>
                 </div>
                 {record.partialReasons.length ? (
-                  <p className="mt-1 text-[10px] text-zinc-600" title={record.partialReasons.join(", ")}>
+                  <p className="mt-1 text-[10px] text-slate-400" title={record.partialReasons.join(", ")}>
                     {record.partialReasons.slice(0, 6).join(" · ")}{record.partialReasons.length > 6 ? ` · +${record.partialReasons.length - 6}` : ""}
                   </p>
                 ) : null}
                 {[["请求", requestBody], ["响应", responseBody]].map(([label, body]) => body ? (
                   <div key={label} className="mt-1.5">
-                    <p className="text-[10px] font-medium text-zinc-600">{label}</p>
-                    <pre className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-black/25 p-2 font-mono text-[10px] leading-4 text-zinc-400">
+                    <p className="text-[10px] font-medium text-slate-400">{label}</p>
+                    <pre className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-2 font-mono text-[10px] leading-4 text-slate-500">
                       {body.length > 2_000 ? `${body.slice(0, 2_000)}\n…` : body}
                     </pre>
                   </div>
@@ -405,9 +410,9 @@ export function ConversationSemanticTimeline({
 
   if (!conversation && loading) {
     return (
-      <section className="h-full min-h-0 bg-[#0b0f0c] px-5 py-4" aria-label="正在切换 Agent 对话">
+      <section className="h-full min-h-0 bg-white px-5 py-4" aria-label="正在切换 Agent 对话">
         <div className="mx-auto max-w-4xl space-y-3">
-          {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-white/5 bg-white/[0.025]" />)}
+          {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-slate-200 bg-slate-100" />)}
         </div>
       </section>
     );
@@ -415,11 +420,11 @@ export function ConversationSemanticTimeline({
 
   if (!conversation) {
     return (
-      <section className="flex h-full min-h-0 items-center justify-center bg-[#0b0f0c] px-6 text-center" aria-label="Agent 对话时间线">
+      <section className="flex h-full min-h-0 items-center justify-center bg-white px-6 text-center" aria-label="Agent 对话时间线">
         <div className="max-w-lg">
-          <MessageSquareText className="mx-auto size-8 text-zinc-700" aria-hidden="true" />
-          <p className="mt-3 text-sm text-zinc-300">{agent ? "该 Agent 当前没有可展示的模型对话" : "选择左侧 Agent、实例或会话查看完整链路"}</p>
-          {agent ? <p className="mt-2 text-xs leading-5 text-zinc-500">已识别 {agent.totalInstanceCount} 个实例；发生模型调用后会自动形成对话线程。</p> : null}
+          <MessageSquareText className="mx-auto size-8 text-slate-400" aria-hidden="true" />
+          <p className="mt-3 text-sm text-slate-700">{agent ? "该 Agent 当前没有可展示的模型对话" : "选择左侧 Agent、实例或会话查看完整链路"}</p>
+          {agent ? <p className="mt-2 text-xs leading-5 text-slate-500">已识别 {agent.totalInstanceCount} 个实例；发生模型调用后会自动形成对话线程。</p> : null}
         </div>
       </section>
     );
@@ -427,32 +432,32 @@ export function ConversationSemanticTimeline({
 
   return (
     <section
-      className="h-full min-h-0 overflow-hidden bg-[#0b0f0c]"
+      className="h-full min-h-0 overflow-hidden bg-white"
       aria-label="Agent 对话时间线"
       data-conversation-id={conversation.conversationId}
     >
-      <div className="flex min-h-16 items-center gap-3 border-b border-white/10 px-3 py-2 sm:px-4">
-        <Button type="button" variant="ghost" size="icon" onClick={onBack} aria-label="返回 Agent 目录" className="size-11 text-zinc-400 hover:bg-white/5 hover:text-zinc-100 md:hidden">
+      <div className="flex min-h-16 items-center gap-3 border-b border-slate-200 px-3 py-2 sm:px-4">
+        <Button type="button" variant="ghost" size="icon" onClick={onBack} aria-label="返回 Agent 目录" className="size-11 text-slate-500 hover:bg-slate-100 hover:text-slate-900 md:hidden">
           <ArrowLeft className="size-4" />
         </Button>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="truncate text-sm font-semibold text-zinc-100">{agent?.displayName ?? conversation.displayName}</h2>
-            <Badge className="border-white/10 bg-white/[0.035] text-zinc-400">Thread</Badge>
-            <Badge className="border-sky-400/20 bg-sky-500/[0.06] text-sky-100">{segments.length} 实例段</Badge>
+            <h2 className="truncate text-sm font-semibold text-slate-900">{agent?.displayName ?? conversation.displayName}</h2>
+            <Badge className="border-slate-200 bg-slate-50 text-slate-500">Thread</Badge>
+            <Badge className="border-sky-200 bg-sky-50 text-sky-700">{segments.length} 实例段</Badge>
             {related.map((item) => (
               <button
                 key={`${item.relation}:${item.conversationId}`}
                 type="button"
                 data-related-conversation={item.conversationId}
                 onClick={() => onJumpToConversationId?.(item.conversationId)}
-                className="inline-flex min-h-5 cursor-pointer items-center rounded border border-amber-400/25 bg-amber-500/[0.08] px-1.5 py-0.5 text-[10px] font-medium text-amber-100 hover:bg-amber-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
+                className="inline-flex min-h-5 cursor-pointer items-center rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70"
               >
                 {relatedChipLabel(item)}
               </button>
             ))}
           </div>
-          <p className="mt-1 truncate font-mono text-[10px] text-zinc-500" title={conversation.workspacePath}>
+          <p className="mt-1 truncate font-mono text-[10px] text-slate-500" title={conversation.workspacePath}>
             {conversation.workspacePath} · {conversation.turnCount} 轮 · {conversation.modelCallCount} 次模型调用 · {formatTokenTotal(conversation.usage, false)} tokens · 平均 {formatDuration(conversation.usage.averageDurationMs)} · {tokenCoverageText(conversation.usage)}
           </p>
         </div>
@@ -461,7 +466,7 @@ export function ConversationSemanticTimeline({
             const next = agent.userThreads.find((item) => item.conversationId === value);
             if (next) onSelectConversation(next);
           }}>
-            <SelectTrigger className="hidden h-9 w-[220px] border-white/10 bg-white/[0.035] text-xs text-zinc-200 lg:flex" aria-label="切换当前 Agent 的会话">
+            <SelectTrigger className="hidden h-9 w-[220px] border-slate-200 bg-white text-xs text-slate-700 lg:flex" aria-label="切换当前 Agent 的会话">
               <SelectValue placeholder="选择会话" />
             </SelectTrigger>
             <SelectContent>
@@ -479,11 +484,11 @@ export function ConversationSemanticTimeline({
         {technicalActivities.length || contextReplaySummaries.length ? (
           <div className="mx-auto mb-4 max-w-4xl space-y-2">
             {technicalActivities.length ? (
-              <details className="rounded border border-violet-400/15 bg-violet-500/[0.035] px-3 py-2 text-[11px] text-zinc-400">
-                <summary className="min-h-7 cursor-pointer text-violet-100/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
+              <details className="rounded border border-violet-200 bg-violet-50 px-3 py-2 text-[11px] text-slate-500">
+                <summary className="min-h-7 cursor-pointer text-violet-700/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/70">
                   启动与能力协商 · {technicalActivities.reduce((sum, item) => sum + item.interactionIds.length, 0)} 条技术活动
                 </summary>
-                <div className="mt-2 space-y-1 border-t border-violet-300/10 pt-2 font-mono text-[10px] text-zinc-500">
+                <div className="mt-2 space-y-1 border-t border-violet-200 pt-2 font-mono text-[10px] text-slate-500">
                   {technicalActivities.map((activity) => (
                     <p key={activity.technicalActivityId} className="break-all">
                       {activity.role} · {activity.methods.join(", ")} · {activity.paths.join(" · ")}
@@ -493,9 +498,9 @@ export function ConversationSemanticTimeline({
               </details>
             ) : null}
             {contextReplaySummaries.map((summary) => (
-              <div key={summary.interactionId} className="rounded border border-sky-400/15 bg-sky-500/[0.035] px-3 py-2 text-[11px] leading-5 text-sky-100/80">
+              <div key={summary.interactionId} className="rounded border border-sky-200 bg-sky-50 px-3 py-2 text-[11px] leading-5 text-sky-700/80">
                 <span className="font-medium">恢复上下文</span>
-                <span className="ml-2 text-zinc-500">
+                <span className="ml-2 text-slate-500">
                   已加载 {summary.replayedUserMessages} 条历史用户消息、{summary.replayedToolResults} 个工具结果；这些内容未重复计为新事件
                 </span>
               </div>
@@ -504,32 +509,32 @@ export function ConversationSemanticTimeline({
         ) : null}
         {loading && turns.length === 0 ? (
           <div className="mx-auto max-w-4xl space-y-3" aria-label="正在加载语义时间线">
-            {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-white/5 bg-white/[0.025]" />)}
+            {[0, 1, 2, 3].map((index) => <div key={index} className="h-24 animate-pulse rounded border border-slate-200 bg-slate-100" />)}
           </div>
         ) : error && turns.length === 0 ? (
-          <div className="mx-auto max-w-2xl rounded border border-rose-400/20 bg-rose-500/[0.06] p-4 text-xs leading-5 text-rose-100">
+          <div className="mx-auto max-w-2xl rounded border border-rose-200 bg-rose-50 p-4 text-xs leading-5 text-rose-700">
             <p className="font-semibold">语义时间线加载失败</p>
-            <p className="mt-1 text-rose-200/70">{error.message}</p>
+            <p className="mt-1 text-rose-600">{error.message}</p>
           </div>
         ) : !conversation.hasContent || turns.length === 0 ? (
           <div className="flex min-h-[420px] flex-col items-center justify-center px-6 text-center">
-            <CircleDashed className="size-9 text-zinc-600" aria-hidden="true" />
-            <p className="mt-3 text-sm font-medium text-zinc-300">该 Thread 暂无可组织的用户、模型或工具事件</p>
-            <p className="mt-1 max-w-lg text-xs leading-5 text-zinc-500">资产和原始 TLS 证据仍然保留；页面不会用结构化工具参数伪造模型回复。</p>
+            <CircleDashed className="size-9 text-slate-400" aria-hidden="true" />
+            <p className="mt-3 text-sm font-medium text-slate-700">该 Thread 暂无可组织的用户、模型或工具事件</p>
+            <p className="mt-1 max-w-lg text-xs leading-5 text-slate-500">资产和原始 TLS 证据仍然保留；页面不会用结构化工具参数伪造模型回复。</p>
           </div>
         ) : (
           <div className="mx-auto max-w-4xl space-y-5">
             {turns.map((turn) => (
               <section key={turn.turnId} aria-labelledby={`${turn.turnId}-heading`}>
                 <div className="mb-2 flex items-center gap-3">
-                  <span className="h-px flex-1 bg-white/8" />
-                  <h3 id={`${turn.turnId}-heading`} className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em] text-zinc-600">
+                  <span className="h-px flex-1 bg-slate-200" />
+                  <h3 id={`${turn.turnId}-heading`} className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
                     第 {turn.ordinal} 轮
-                    {turn.state === "complete" ? <CheckCircle2 className="size-3 text-teal-400" /> : <AlertTriangle className="size-3 text-amber-400" />}
+                    {turn.state === "complete" ? <CheckCircle2 className="size-3 text-teal-500" /> : <AlertTriangle className="size-3 text-amber-500" />}
                   </h3>
-                  <span className="h-px flex-1 bg-white/8" />
+                  <span className="h-px flex-1 bg-slate-200" />
                 </div>
-                <div className="relative space-y-2 before:absolute before:bottom-5 before:left-[17px] before:top-5 before:w-px before:bg-white/10">
+                <div className="relative space-y-3">
                   {turn.events.map((event) => {
                     if (event.kind === "tool_result" && event.toolCallId && callById.has(event.toolCallId)) return null;
                     if (event.kind === "delegation_reply") {
@@ -567,10 +572,10 @@ export function ConversationSemanticTimeline({
                       return <ToolStepCard key={event.semanticEventId} result={event} selectedEventId={selectedEventId} onSelect={onSelect} />;
                     }
                     return (
-                      <div key={event.semanticEventId} className="space-y-1">
+                      <div key={event.semanticEventId} className={cn("flex flex-col space-y-1", event.actor === "user" ? "items-end" : "items-start")}>
                         {event.workflowNode ? (
                           <div className="pl-12">
-                            <Badge className="border-white/10 bg-white/[0.03] text-zinc-500">
+                            <Badge className="border-slate-200 bg-slate-50 text-slate-500">
                               workflow · {event.workflowNode}
                             </Badge>
                           </div>
@@ -580,10 +585,10 @@ export function ConversationSemanticTimeline({
                     );
                   })}
                   {turn.diagnostics.map((diagnostic) => (
-                    <div key={diagnostic.diagnosticId} className="flex min-h-10 items-center gap-2 rounded border border-amber-400/15 bg-amber-500/[0.035] px-3 py-2 text-[11px] text-amber-100/80">
+                    <div key={diagnostic.diagnosticId} className="flex min-h-10 items-center gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700/80">
                       <AlertTriangle className="size-3.5 shrink-0" aria-hidden="true" />
                       <span className="min-w-0 flex-1">采集诊断 · {diagnostic.message}</span>
-                      <Clock3 className="size-3 text-amber-200/40" aria-hidden="true" />
+                      <Clock3 className="size-3 text-amber-700/40" aria-hidden="true" />
                     </div>
                   ))}
                 </div>
