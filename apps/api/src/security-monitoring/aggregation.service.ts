@@ -1342,6 +1342,7 @@ export class AggregationService implements OnModuleDestroy {
   private historyCacheTimeouts = 0;
   private readonly historyCacheTimeoutsByKey = new Map<string, NodeJS.Timeout>();
   private readonly agentInventoryResultCache = new Map<string, { at: number; value: T.AgentInventory }>();
+  private readonly storedInventoryResultCache = new Map<string, { at: number; value: T.AgentInventory }>();
   private readonly agentInstanceMetricsCache = new Map<string, {
     at: number;
     value: T.AgentInstanceMetrics;
@@ -5194,6 +5195,12 @@ export class AggregationService implements OnModuleDestroy {
       filter.includeUnclassified === true,
       filter.limit ?? 120,
     ]);
+    const cachedResult = this.storedInventoryResultCache.get(key);
+    if (cachedResult && Date.now() - cachedResult.at < AGENT_INVENTORY_RESULT_TTL_MS) {
+      this.storedInventoryResultCache.delete(key);
+      this.storedInventoryResultCache.set(key, cachedResult);
+      return cachedResult.value;
+    }
     const current = this.agentInventoryInFlight.get(key);
     if (current) return current;
     const reservation = this.reserveInFlight(
@@ -5221,7 +5228,14 @@ export class AggregationService implements OnModuleDestroy {
     this.agentInventoryInFlight.set(key, request);
     this.agentInventoryInFlightBytes += reservation.bytes;
     try {
-      return await request;
+      const result = await request;
+      this.storedInventoryResultCache.delete(key);
+      if (this.storedInventoryResultCache.size >= MAX_AGENT_INVENTORY_CACHE_ENTRIES) {
+        const oldest = this.storedInventoryResultCache.keys().next().value;
+        if (oldest !== undefined) this.storedInventoryResultCache.delete(oldest);
+      }
+      this.storedInventoryResultCache.set(key, { at: Date.now(), value: result });
+      return result;
     } finally {
       if (this.agentInventoryInFlight.get(key) === request) {
         this.agentInventoryInFlight.delete(key);
