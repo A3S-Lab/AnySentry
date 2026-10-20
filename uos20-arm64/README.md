@@ -99,4 +99,5 @@ bash uos20-arm64/build.sh --version 0.4.0-compat34 --component assemble
 
 该发布通道用于指定 UOS ABI，不替代上游通用 Linux 发布流程。
 
-现场已经遇到的打包和部署要点写在仓库根目录 [UOS20_ARM64_DEPLOYMENT_REVIEW.md](../UOS20_ARM64_DEPLOYMENT_REVIEW.md)。其中包括服务进程不能写 `/opt`、compat 版本与 glibc、ClickHouse 旧表补列、端口占用，以及 Docker 镜像通配模板。
+现场已经遇到的打包和部署要点写在仓库根目录 [UOS20_ARM64_DEPLOYMENT_REVIEW.md](../UOS20_ARM64_DEPLOYMENT_REVIEW.md)。双环境调试铁律（开发机 x86_64 调试场 / 本通道交付基准的边界）见
+[UOS_DUAL_ENV_DEBUGGING.md](../UOS_DUAL_ENV_DEBUGGING.md)。其中包括服务进程不能写 `/opt`、compat 版本与 glibc、ClickHouse 旧表补列、端口占用，以及 Docker 镜像通配模板。
