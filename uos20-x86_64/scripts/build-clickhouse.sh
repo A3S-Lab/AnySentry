@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-CACHE=${CLICKHOUSE_COMPAT_DIR:-$BUILD_DIR/clickhouse-compat}
+CACHE=${CLICKHOUSE_COMPAT_DIR:-$BUILD_DIR/clickhouse-official}
 if [[ ! -x "$CACHE/clickhouse" ]]; then
   "$CHANNEL_DIR/scripts/build-clickhouse-cache.sh"
 fi
