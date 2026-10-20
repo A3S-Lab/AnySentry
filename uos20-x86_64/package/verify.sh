@@ -107,9 +107,9 @@ host_checks() {
 }
 
 package_checks() {
-  [[ $(<"$INSTALL_ROOT/observer/KERNEL_VERSION_CODE") == 0x0004135a ]] || fail "Observer BPF ABI is not 0x0004135a"
+  [[ $(<"$INSTALL_ROOT/observer/KERNEL_VERSION_CODE") == 0x00050e00 ]] || fail "Observer BPF ABI is not 0x00050e00"
   (cd "$INSTALL_ROOT" && sha256sum --check --quiet manifest.sha256) || fail "installed package checksums"
-  pass "installed package checksums and UOS BPF ABI"
+  pass "installed package checksums and debug-variant BPF ABI"
 }
 
 if [[ ${ANYSENTRY_VERIFY_LIB:-0} == 1 ]]; then
