@@ -20,12 +20,12 @@ export type FilterRuleWizardKind =
 
 const KIND_COPY: Record<FilterRuleWizardKind, { label: string; description: string }> = {
   runtime_signature: { label: "Runtime Signature", description: "精确进程签名，最高只产生 probable Agent。" },
-  agent_template: { label: "Agent Template", description: "按部署与稳定工作负载字段建立身份模板。" },
-  infrastructure: { label: "Infrastructure 规则", description: "从 server-owned 资产创建可跨重启复用的精确规则。" },
+  agent_template: { label: "Agent Template", description: "按镜像/容器等稳定字段识别工作负载，推荐用前缀匹配覆盖标签迭代。" },
+  infrastructure: { label: "Infrastructure 规则", description: "从受信资产生成跨重启的精确规则。" },
   capture_profile: { label: "Capture Profile", description: "按身份或角色选择受保护的 Probe 动作矩阵。" },
   semantic_retention: { label: "Forwarder Retention", description: "控制 F2 的保留、聚合、采样或抑制。" },
-  persistence_retention: { label: "API Retention", description: "控制 F3 的完整保留、L1-only 或 non-Agent 丢弃。" },
-  investigation_override: { label: "Investigation Override", description: "对精确 Asset/Runtime 做最长 24 小时临时 FULL 升档。" },
+  persistence_retention: { label: "API Retention", description: "控制 F3 的保留级别。" },
+  investigation_override: { label: "Investigation Override", description: "临时（≤24 小时）FULL 采集升档。" },
 };
 
 function initialMatcher(kind: FilterRuleWizardKind, assetId?: string) {
@@ -71,7 +71,7 @@ export function FilterRuleWizard({
   const [reason, setReason] = useState("");
   const [matchField, setMatchField] = useState(initialMatchField ?? startingMatcher.field);
   const [matchValue, setMatchValue] = useState(initialMatchValue ?? startingMatcher.value);
-  const [matchOperator, setMatchOperator] = useState<"equals" | "prefix" | "one_of">(
+  const [matchOperator, setMatchOperator] = useState<"equals" | "prefix">(
     startingMatcher.field === "process.argv_prefix" ? "prefix" : "equals",
   );
   const [placement, setPlacement] = useState(initialPlacement ?? "kubernetes");
@@ -184,7 +184,7 @@ export function FilterRuleWizard({
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#27303d] pb-4">
         <div>
           <h2 className="text-base font-semibold text-[#edf1f7]">{t("新增过滤规则")}</h2>
-          <p className="mt-1 max-w-3xl text-xs leading-5 text-[#7f899b]">{t("使用 Typed Matcher 和受限 Effect 创建草稿；浏览器不能上传脚本、cgroup、epoch 或 grant。")}</p>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-[#7f899b]">{t("填写表单创建规则草稿：先模拟看命中效果，再创建并发布生效。标 * 为必填。")}</p>
         </div>
         <Button type="button" variant="secondary" size="sm" onClick={onClose} className="min-h-11 border border-[#303a49] bg-[#151b24] text-[#dce2eb] hover:bg-[#1d2530] sm:min-h-9"><ArrowLeft className="size-3.5" />{t("取消")}</Button>
       </div>
@@ -249,17 +249,18 @@ export function FilterRuleWizard({
                   </Select>
                 </div>
                 <div>
-                  <label htmlFor="filter-rule-match-value" className="block text-[11px] text-[#9aa4b4]">{t("精确值")} *</label>
-                  <Input id="filter-rule-match-value" value={matchValue} onChange={(event) => { setMatchValue(event.target.value); setSimulation(undefined); }} className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm" />
-                  <label className="mt-2 block text-[11px] text-[#9aa4b4]" htmlFor="filter-rule-match-operator">{t("匹配方式")}</label>
-                  <Select value={matchOperator} onValueChange={(next) => { setMatchOperator(next as "equals" | "prefix" | "one_of"); setSimulation(undefined); }}>
+                  <label htmlFor="filter-rule-match-value" className="block text-[11px] text-[#9aa4b4]">{t("匹配值")} *</label>
+                  <Input id="filter-rule-match-value" value={matchValue} onChange={(event) => { setMatchValue(event.target.value); setSimulation(undefined); }} placeholder={matchField === "workload.image" || matchField === "workload.container" ? "agent:2026（前缀匹配可覆盖标签迭代，不支持 * 通配）" : undefined} className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm" />
+                </div>
+                <div>
+                  <label htmlFor="filter-rule-match-operator" className="block text-[11px] text-[#9aa4b4]">{t("匹配方式")}</label>
+                  <Select value={matchOperator} onValueChange={(next) => { setMatchOperator(next as "equals" | "prefix"); setSimulation(undefined); }}>
                     <SelectTrigger id="filter-rule-match-operator" className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="equals">{t("等于（精确匹配）")}</SelectItem>
-                      <SelectItem value="prefix">{t("前缀（覆盖同家族镜像/标签迭代）")}</SelectItem>
-                      <SelectItem value="one_of">{t("多值之一（one_of，需 API 提交数组）")}</SelectItem>
+                      <SelectItem value="prefix">{t("前缀（覆盖同家族标签迭代）")}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
