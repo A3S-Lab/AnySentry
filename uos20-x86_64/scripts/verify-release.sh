@@ -28,7 +28,7 @@ required=(
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
   app/node_modules/@a3s-lab/code/index.linux-x64-gnu.node app/node_modules/@a3s-lab/code/zvec/libzvec_c_api.so
-  install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh DEPLOYMENT.md
+  install.sh POST_DEPLOY_AUDIT.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh DEPLOYMENT.md
   AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md 现场问题采集.md UOS现场诊断规则.md
   VERSION PROVENANCE manifest.sha256
 )

@@ -819,12 +819,28 @@ TTL ts + INTERVAL 14 DAY`;
 // ClickHouse budget. Large window aggregations spill early and use at most two read threads;
 // otherwise several dashboard panels can collectively consume the server budget and evict one
 // another before any result is returned.
+// Defaults match the bundled-2GiB field profile; hosts with headroom (the
+// x86_64 debug variant on a 76 GiB machine with a virtio disk, where direct
+// IO and on-disk spill are several times slower than on the physical field
+// host) can raise them via env:
+//   ANYSENTRY_CH_READ_THREADS, ANYSENTRY_CH_READ_MAX_MEMORY_MB,
+//   ANYSENTRY_CH_READ_EXTERNAL_MB, ANYSENTRY_CH_READ_DIRECT_IO_MB.
+const chReadBudgetMb = (envKey: string, fallbackMb: number): number => {
+  const raw = Number(process.env[envKey]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallbackMb;
+};
 const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
-  max_threads: 2,
-  max_memory_usage: String(384 * 1024 * 1024),
-  max_bytes_before_external_group_by: String(64 * 1024 * 1024),
-  max_bytes_before_external_sort: String(64 * 1024 * 1024),
-  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_threads: chReadBudgetMb("ANYSENTRY_CH_READ_THREADS", 2),
+  max_memory_usage: String(chReadBudgetMb("ANYSENTRY_CH_READ_MAX_MEMORY_MB", 384) * 1024 * 1024),
+  max_bytes_before_external_group_by: String(
+    chReadBudgetMb("ANYSENTRY_CH_READ_EXTERNAL_MB", 64) * 1024 * 1024,
+  ),
+  max_bytes_before_external_sort: String(
+    chReadBudgetMb("ANYSENTRY_CH_READ_EXTERNAL_MB", 64) * 1024 * 1024,
+  ),
+  min_bytes_to_use_direct_io: String(
+    chReadBudgetMb("ANYSENTRY_CH_READ_DIRECT_IO_MB", 1) * 1024 * 1024,
+  ),
   max_execution_time: 25,
 };
 
