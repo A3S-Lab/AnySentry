@@ -71,6 +71,9 @@ export function FilterRuleWizard({
   const [reason, setReason] = useState("");
   const [matchField, setMatchField] = useState(initialMatchField ?? startingMatcher.field);
   const [matchValue, setMatchValue] = useState(initialMatchValue ?? startingMatcher.value);
+  const [matchOperator, setMatchOperator] = useState<"equals" | "prefix" | "one_of">(
+    startingMatcher.field === "process.argv_prefix" ? "prefix" : "equals",
+  );
   const [placement, setPlacement] = useState(initialPlacement ?? "kubernetes");
   const [classification, setClassification] = useState("probable_agent");
   const [profile, setProfile] = useState<CaptureProfile>("probable_investigation");
@@ -92,7 +95,7 @@ export function FilterRuleWizard({
 
   const draft = useMemo<FilterRuleDraft | undefined>(() => {
     if (kind === "infrastructure" || !name.trim() || !description.trim() || !reason.trim() || !matchValue.trim()) return undefined;
-    const condition = { field: matchField, operator: matchField === "process.argv_prefix" ? "prefix" as const : "equals" as const, value: matchValue.trim() };
+    const condition = { field: matchField, operator: matchField === "process.argv_prefix" ? "prefix" as const : matchOperator, value: matchValue.trim() };
     const common = {
       name: name.trim(),
       description: description.trim(),
@@ -248,6 +251,17 @@ export function FilterRuleWizard({
                 <div>
                   <label htmlFor="filter-rule-match-value" className="block text-[11px] text-[#9aa4b4]">{t("精确值")} *</label>
                   <Input id="filter-rule-match-value" value={matchValue} onChange={(event) => { setMatchValue(event.target.value); setSimulation(undefined); }} className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm" />
+                  <label className="mt-2 block text-[11px] text-[#9aa4b4]" htmlFor="filter-rule-match-operator">{t("匹配方式")}</label>
+                  <Select value={matchOperator} onValueChange={(next) => { setMatchOperator(next as "equals" | "prefix" | "one_of"); setSimulation(undefined); }}>
+                    <SelectTrigger id="filter-rule-match-operator" className="mt-1 min-h-11 border-[#303a49] bg-[#141a23] text-sm">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="equals">{t("等于（精确匹配）")}</SelectItem>
+                      <SelectItem value="prefix">{t("前缀（覆盖同家族镜像/标签迭代）")}</SelectItem>
+                      <SelectItem value="one_of">{t("多值之一（one_of，需 API 提交数组）")}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 {kind === "agent_template" ? <><div><label className="block text-[11px] text-[#9aa4b4]">{t("部署环境")}</label><Select value={placement} onValueChange={setPlacement}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="kubernetes">Kubernetes</SelectItem><SelectItem value="docker">Docker</SelectItem><SelectItem value="host">Host</SelectItem></SelectContent></Select></div><div><label className="block text-[11px] text-[#9aa4b4]">{t("身份结果")}</label><Select value={classification} onValueChange={setClassification}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="probable_agent">probable_agent</SelectItem><SelectItem value="non_agent">non_agent</SelectItem></SelectContent></Select></div></> : null}
                 {kind === "capture_profile" ? <div><label className="block text-[11px] text-[#9aa4b4]">Capture Profile</label><Select value={profile} onValueChange={(value) => setProfile(value as CaptureProfile)}><SelectTrigger className="mt-1 min-h-11 border-[#303a49] bg-[#141a23]"><SelectValue /></SelectTrigger><SelectContent>{["agent_full", "probable_investigation", "business_context", "infrastructure_aggregate", "unknown_discovery", "self_health"].map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent></Select></div> : null}
