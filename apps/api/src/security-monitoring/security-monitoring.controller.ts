@@ -15094,6 +15094,29 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       if (cached) return cached;
     }
 
+    if (ingestFloodBatchDiscard(events)) {
+      // Pure flood batch: acknowledge everything as durable-discarded before any
+      // per-event preparation runs; this is what actually frees the event loop.
+      return {
+        accepted: true,
+        ...(batchId ? { batchId } : {}),
+        payloadDigest: payload.digest,
+        acceptedEvents: 0,
+        retainedEvents: 0,
+        structuralEvents: 0,
+        discardedEvents: events.length,
+        rejectedEvents: 0,
+        retryableEvents: 0,
+        items: events.map((_, index) => ({
+          index,
+          accepted: false,
+          disposition: 'discarded',
+          reasonCode: 'ingest_flood_fuse_batch',
+          reason: 'batch dominated by process-exit flood',
+        })),
+      };
+    }
+
     const immediate = new Map<number, T.ObserverBatchIngestResultItem>();
     const rejectedSources = new Map<number, {
       resolution: IngestionSourceResolution;
@@ -15344,8 +15367,20 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         ...(interaction ? { interaction } : {}),
       };
       preparedByIndex.set(index, context);
-      if (prepared.disposition === 'retained') retained.push(context);
-      else if (prepared.disposition === 'structural_consumed') structural.push(context);
+      if (prepared.disposition === 'retained' || prepared.disposition === 'structural_consumed') {
+        if (ingestFloodFuseTripped(event)) {
+          // Flood-fused events are answered as durable-discarded so the Forwarder never
+          // replays them; the cap, not the guardrail, owns this drop.
+          immediate.set(index, {
+            index,
+            accepted: false,
+            disposition: 'discarded',
+            reasonCode: 'ingest_flood_fuse',
+            reason: 'per-identity process-exit flood fuse',
+          });
+        } else if (prepared.disposition === 'retained') retained.push(context);
+        else structural.push(context);
+      }
     }
     prepareCompletedAt = performance.now();
 
@@ -16245,3 +16280,51 @@ export const semanticProjectionTesting = {
   canonicalSemanticRecordForEvent,
   universalSemanticKindClass,
 };
+
+// --- ingest flood fuse (debug-variant adaptation) ----------------------------------
+// The lifecycle guardrail forwards every exec/exit unbound by identity rules, so a single
+// workload fork-bombing at hundreds of processes per second floods the ingest path. Even
+// discarded events pay the per-event preparation cost (attribution/judge prep), which alone
+// saturates the event loop at flood rates. Two fuses cooperate:
+//   1. batch-level: a batch that is almost entirely ProcessExit is ACKed discarded before
+//      any per-event preparation runs;
+//   2. per-identity: surviving mixed batches cap per-identity ProcessExit at the configured
+//      per-minute ceiling.
+// Set ANYSENTRY_INGEST_FLOOD_PER_MINUTE=0 to disable both.
+const INGEST_FLOOD_LIMIT_PER_MINUTE = (() => {
+  const raw = Number(process.env.ANYSENTRY_INGEST_FLOOD_PER_MINUTE);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 30;
+})();
+const INGEST_FLOOD_BATCH_MIN_EVENTS = 50;
+const INGEST_FLOOD_BATCH_SHARE = 0.9;
+const ingestFloodState = { windowStartMs: 0, counts: new Map<string, number>(), droppedTotal: 0 };
+function ingestFloodWindowTick(): void {
+  const now = Date.now();
+  if (now - ingestFloodState.windowStartMs >= 60_000) {
+    ingestFloodState.windowStartMs = now;
+    ingestFloodState.counts.clear();
+  }
+}
+function ingestFloodBatchDiscard(events: unknown[]): boolean {
+  if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0 || events.length < INGEST_FLOOD_BATCH_MIN_EVENTS) return false;
+  let exits = 0;
+  for (const event of events) {
+    if ((event as { eventKind?: unknown })?.eventKind === 'ProcessExit') exits += 1;
+  }
+  return exits >= events.length * INGEST_FLOOD_BATCH_SHARE;
+}
+function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown }): boolean {
+  if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0) return false;
+  if (event?.eventKind !== 'ProcessExit') return false;
+  ingestFloodWindowTick();
+  const identity = typeof event?.agentId === 'string' && event.agentId
+    ? event.agentId.slice(0, 120)
+    : 'unattributed';
+  const n = (ingestFloodState.counts.get(identity) ?? 0) + 1;
+  ingestFloodState.counts.set(identity, n);
+  if (n > INGEST_FLOOD_LIMIT_PER_MINUTE) {
+    ingestFloodState.droppedTotal += 1;
+    return true;
+  }
+  return false;
+}
