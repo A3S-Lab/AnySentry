@@ -126,9 +126,11 @@ export class FilterRuleController {
 
   @Post('simulate')
   @RequireManagementAuth()
-  simulate(@Body() body: FilterRuleSimulationRequest = {}) {
+  async simulate(@Body() body: FilterRuleSimulationRequest = {}) {
     try {
-      return this.system.simulate(body);
+      // The service is async; without the await the sync try/catch cannot map
+      // FilterRuleSystemError and every validation failure leaks as a 500.
+      return await this.system.simulate(body);
     } catch (error) {
       this.fail(error);
     }

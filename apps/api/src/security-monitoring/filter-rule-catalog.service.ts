@@ -420,8 +420,26 @@ export class FilterRuleCatalogService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  inspectDraft(input: FilterRuleDraftRequest): { valid: boolean; errors: string[]; rule?: FilterRuleRecord } {
+  inspectDraft(
+    input: FilterRuleDraftRequest,
+    options: { requireMetadata?: boolean } = {},
+  ): { valid: boolean; errors: string[]; rule?: FilterRuleRecord } {
     input = normalizedDraft(input);
+    // Simulation previews must work before the operator has written the human metadata:
+    // fill placeholders so structural validation passes. Creation keeps the strict
+    // bounded description/reason requirement enforced by validateDraft.
+    if (options.requireMetadata === false) {
+      input = {
+        ...input,
+        name: text(input.name, 240) ?? '模拟草稿',
+        description: text(input.description, 1_000) ?? '（模拟占位：尚未填写规则说明）',
+        reason: text(input.reason, 500) ?? '（模拟占位：尚未填写创建原因）',
+        matcher: {
+          ...input.matcher,
+          description: text(input.matcher?.description, 1_000) ?? '（模拟占位）',
+        },
+      };
+    }
     const validation = validateDraft(input);
     if (validation.errors.length || !validation.category || !validation.kind) {
       return { valid: false, errors: validation.errors };

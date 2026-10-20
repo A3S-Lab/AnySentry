@@ -1015,7 +1015,7 @@ export class FilterRuleSystemService {
   ): FilterRuleSimulationResult {
     let rule: FilterRuleRecord;
     if (request.draft) {
-      const inspection = this.catalog.inspectDraft(request.draft);
+      const inspection = this.catalog.inspectDraft(request.draft, { requireMetadata: false });
       if (!inspection.valid || !inspection.rule) {
         throw new FilterRuleSystemError('invalid_request', inspection.errors.join('; '));
       }
