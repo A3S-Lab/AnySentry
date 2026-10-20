@@ -56,6 +56,13 @@ install_code_runtime() {
   install -m 0755 "$zvec_src" "$dest/zvec/libzvec_c_api.so"
   patchelf --set-rpath '$ORIGIN/zvec' "$dest/index.linux-x64-gnu.node"
 }
+# pnpm also materializes the platform-specific optional package under .pnpm;
+# its own copy of the addon must be the glibc-compatible one as well.
+find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d \
+  -name '@a3s-lab+code-linux-x64-gnu@*' | while IFS= read -r platform_pkg; do
+  find "$platform_pkg" -type f -name '*.node' -delete
+  install -m 0755 "$node_src" "$platform_pkg/node_modules/@a3s-lab/code-linux-x64-gnu/index.linux-x64-gnu.node"
+done
 install_code_runtime "$STAGE_DIR/l3/node_modules/@a3s-lab/code"
 app_code=$(readlink -f "$STAGE_DIR/app/node_modules/@a3s-lab/code")
 [[ -d "$app_code" ]] || die "staged app does not contain a3s-code for the L3 worker"
