@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 REVIEW=$ROOT/UOS20_ARM64_DEPLOYMENT_REVIEW.md
-DEV=$ROOT/uos20-arm64/README.md
-DEPLOY=$ROOT/uos20-arm64/package/DEPLOYMENT.md
-INSTALL_GUIDE=$ROOT/uos20-arm64/package/AnySentry部署手册.md
-USAGE_GUIDE=$ROOT/uos20-arm64/package/AnySentry使用手册.md
-SCRIPT_GUIDE=$ROOT/uos20-arm64/package/AnySentry脚本说明.md
+DEV=$ROOT/uos20-x86_64/README.md
+DEPLOY=$ROOT/uos20-x86_64/package/DEPLOYMENT.md
+INSTALL_GUIDE=$ROOT/uos20-x86_64/package/AnySentry部署手册.md
+USAGE_GUIDE=$ROOT/uos20-x86_64/package/AnySentry使用手册.md
+SCRIPT_GUIDE=$ROOT/uos20-x86_64/package/AnySentry脚本说明.md
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-INSTALLER=$ROOT/uos20-arm64/package/install.sh
-VERIFY=$ROOT/uos20-arm64/package/verify.sh
+INSTALLER=$ROOT/uos20-x86_64/package/install.sh
+VERIFY=$ROOT/uos20-x86_64/package/verify.sh
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 
@@ -25,9 +25,9 @@ grep -Fq 'anysentry-l3-worker.service' "$INSTALLER" || fail "installer does not 
 grep -Fq 'wait_for_redis' "$INSTALLER" || fail "installer does not wait for Redis readiness"
 kafka_probe=$(sed -n '/^run_kafka_topics()/,/^}/p' "$INSTALLER")
 grep -Fq 'JAVA_HOME=$INSTALL_ROOT/java' <<<"$kafka_probe" || fail "Kafka readiness does not use the bundled Java"
-[[ -x $ROOT/uos20-arm64/package/anysentry-services.sh ]] || fail "service control script is not executable"
-grep -Fq 'systemctl start' "$ROOT/uos20-arm64/package/anysentry-services.sh" || fail "service control script does not start units"
-grep -Fq 'systemctl stop' "$ROOT/uos20-arm64/package/anysentry-services.sh" || fail "service control script does not stop units"
+[[ -x $ROOT/uos20-x86_64/package/anysentry-services.sh ]] || fail "service control script is not executable"
+grep -Fq 'systemctl start' "$ROOT/uos20-x86_64/package/anysentry-services.sh" || fail "service control script does not start units"
+grep -Fq 'systemctl stop' "$ROOT/uos20-x86_64/package/anysentry-services.sh" || fail "service control script does not stop units"
 grep -Fq 'validate_redis_runtime' "$INSTALLER" || fail "installer preflight does not exercise the Redis startup checks"
 grep -Fq -- '--port 0' "$INSTALLER" || fail "Redis preflight does not disable network listeners"
 grep -Fq 'observer/observer-agent-attribution.js' "$INSTALLER" || fail "installer does not require agent attribution runtime"
@@ -51,7 +51,7 @@ grep -Fq 'normalize_environment' "$INSTALLER" || fail "installer does not normal
 grep -Fq 'validate_collector_id' "$INSTALLER" || fail "installer does not validate the collector ID"
 grep -Fq 'COMPAT_RELEASE_ID=@RELEASE_VERSION@' "$INSTALLER" ||
   fail "installer release id must come from the assemble-time @RELEASE_VERSION@ injection"
-grep -Fq '@RELEASE_VERSION@' "$ROOT/uos20-arm64/scripts/assemble-release.sh" ||
+grep -Fq '@RELEASE_VERSION@' "$ROOT/uos20-x86_64/scripts/assemble-release.sh" ||
   fail "assemble script does not inject the release version into staged files"
 grep -Fq '/var/log/anysentry/install' "$INSTALLER" || fail "installer does not persist installation diagnostics"
 grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publish the temporary diagnostic link"
@@ -71,7 +71,7 @@ grep -Fq 'ignore-dependencies' "$INSTALLER" ||
   fail "a failed dependency skips starting the remaining services"
 grep -Fq 'startup-failures.txt' "$INSTALLER" ||
   fail "installer does not keep the list of services that failed to start"
-grep -Fq 'Requires=anysentry.service' "$ROOT/uos20-arm64/package/systemd/anysentry-observer.service" &&
+grep -Fq 'Requires=anysentry.service' "$ROOT/uos20-x86_64/package/systemd/anysentry-observer.service" &&
   fail "Observer unit stops when the API unit fails"
 true
 grep -Fq 'vm.overcommit_memory=1' "$INSTALLER" || fail "installer does not persist the Redis overcommit requirement"

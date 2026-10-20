@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-CHANNEL=$ROOT/uos20-arm64
+CHANNEL=$ROOT/uos20-x86_64
 
 fail() { echo "FAIL $*" >&2; exit 1; }
 

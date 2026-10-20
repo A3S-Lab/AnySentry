@@ -74,7 +74,7 @@ run_shell "BPF and perf sysctls" 'for k in kernel.unprivileged_bpf_disabled kern
 run_shell "known filesystem mounts" 'for p in /sys/fs/bpf /sys/kernel/tracing /sys/kernel/debug /sys/kernel/debug/tracing; do if [ -e "$p" ]; then printf "%s present=yes " "$p"; stat -fc "fs=%T" "$p" 2>/dev/null || true; findmnt -n -o FSTYPE,OPTIONS "$p" 2>/dev/null || true; else printf "%s present=no\n" "$p"; fi; done'
 run_shell "BTF availability" 'if [ -r /sys/kernel/btf/vmlinux ]; then stat -c "btf.present=yes size=%s mode=%a" /sys/kernel/btf/vmlinux; else echo btf.present=no; fi'
 run_shell "kprobe control files" 'for p in /sys/kernel/tracing/kprobe_events /sys/kernel/debug/tracing/kprobe_events; do if [ -e "$p" ]; then printf "%s present=yes readable=" "$p"; [ -r "$p" ] && printf yes || printf no; printf " writable="; [ -w "$p" ] && echo yes || echo no; else echo "$p present=no"; fi; done'
-run_shell "required ARM64 symbols (addresses redacted)" 'if [ -r /proc/kallsyms ]; then grep -E " [tT] (do_exit|__arm64_sys_execve|__arm64_sys_connect|__arm64_sys_setuid|__arm64_sys_ptrace|__arm64_sys_bind|__arm64_sys_openat|__arm64_sys_unlinkat)$" /proc/kallsyms | awk "{print \$3}" | sort -u; else echo kallsyms=UNREADABLE; fi'
+run_shell "required x86_64 syscall symbols (addresses redacted)" 'if [ -r /proc/kallsyms ]; then grep -E " [tT] (do_exit|__x64_sys_execve|__x64_sys_connect|__x64_sys_setuid|__x64_sys_ptrace|__x64_sys_bind|__x64_sys_openat|__x64_sys_unlinkat)$" /proc/kallsyms | awk "{print \$3}" | sort -u; else echo kallsyms=UNREADABLE; fi'
 run_shell "BPF-related dmesg tail" 'dmesg 2>/dev/null | grep -Ei "bpf|verifier|kprobe|perf|lockdown|seccomp|apparmor|selinux|denied" | tail -n 160 || true'
 
 section "SECURITY MODULES"

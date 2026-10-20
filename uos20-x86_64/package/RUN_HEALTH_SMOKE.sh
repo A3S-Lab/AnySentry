@@ -213,8 +213,8 @@ echo "architecture=$architecture"
 echo "page_size=$page_size"
 echo "glibc=$glibc"
 echo "kernel=$kernel"
-[[ $architecture == aarch64 ]] && pass "host architecture is aarch64" ||
-  fail "host architecture is ${architecture:-unknown}; expected aarch64"
+[[ $architecture == x86_64 ]] && pass "host architecture is x86_64" ||
+  fail "host architecture is ${architecture:-unknown}; expected x86_64"
 [[ $page_size == 65536 ]] && pass "host page size is 65536" ||
   fail "host page size is ${page_size:-unknown}; expected 65536"
 if [[ -n $glibc && $(printf '2.28\n%s\n' "$glibc" | sort -V | head -n1) == 2.28 ]]; then

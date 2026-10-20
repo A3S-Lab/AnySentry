@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT=$ROOT/uos20-arm64/package/RUN_HEALTH_SMOKE.sh
+SCRIPT=$ROOT/uos20-x86_64/package/RUN_HEALTH_SMOKE.sh
 [[ -x $SCRIPT ]] || {
   echo "FAIL health smoke script is missing or not executable: $SCRIPT" >&2
   exit 1
