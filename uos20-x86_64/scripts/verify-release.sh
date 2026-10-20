@@ -35,7 +35,7 @@ required=(
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done
 [[ -x "$release/RUN_HEALTH_SMOKE.sh" ]] || die 'health smoke script is not executable'
 [[ "$(cat "$release/observer/KERNEL_VERSION_CODE")" == "$UOS_BPF_KERNEL_VERSION_CODE" ]] || die 'Observer BPF kernel version code mismatch'
-[[ "$(cat "$release/clickhouse/PROFILE")" == 'armv8.0-compat' ]] || die 'ClickHouse profile mismatch'
+[[ "$(cat "$release/clickhouse/PROFILE")" == "$CLICKHOUSE_PROFILE" ]] || die 'ClickHouse profile mismatch'
 grep -Fq 'src="/anysentry/static/' "$release/app/web/index.html" || die 'Web assets are not built for /anysentry'
 (cd "$release/app" && node -e "const p=require('./node_modules/@a3s-lab/sentry/package.json'); if(p.version !== '$SENTRY_NPM_VERSION') process.exit(1)") ||
   die "staged Sentry npm module is not $SENTRY_NPM_VERSION"
