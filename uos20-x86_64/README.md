@@ -15,7 +15,7 @@
 | ClickHouse | 源码构建 armv8.0-compat | 官方镜像 amd64 二进制 |
 | a3s-code .node | glibc 2.28 重编 | hypot 符号版本补丁降到 2.2.5（`scripts/build-code-x64.sh`，发布件仅 hypot@GLIBC_2.35 超过目标 glibc） |
 | Redis 端口 | 127.0.0.1:6379 | **127.0.0.1:6380**（开发机宿主已有 Redis 占 6379） |
-| Observer 锁定 | `00ef87c`（release 分支） | `b57a231`（uos20-x86_64-dev 分支，含 per-arch 符号） |
+| Observer 锁定 | `00ef87c`（release 分支） | `f84a70a`（uos20-x86_64-dev：per-arch 符号 + 内核读 helper 参数化） |
 
 ## 构建前置
 
