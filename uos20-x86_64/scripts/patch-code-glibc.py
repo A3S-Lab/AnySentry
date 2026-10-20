@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Downgrade the hypot symbol version requirement from GLIBC_2.35 to GLIBC_2.2.5.
+"""Retarget GLIBC_2.35-only symbol version requirements down to GLIBC_2.2.5.
 
-The published @a3s-lab/code-linux-x64-gnu 8.6.0 addon references hypot@GLIBC_2.35
-(the only 2.35 symbol). glibc's hypot(double,double) has existed unchanged since
-GLIBC_2.2.5; the 2.35 entry is an artifact of the build machine's newer glibc.
-The Rocky 9 debug machine provides glibc 2.34, so retarget:
+The published @a3s-lab/code linux-x64-gnu artifacts reference hypot@2.35 and
+hypotf@2.35 (build-machine glibc artifacts). glibc has provided hypot/hypotf
+with an unchanged ABI since 2.2.5, so on a glibc 2.34 host the version
+references are rewritten instead of rebuilding (the 8.6.0 source tree needs
+unpublished workspace crates).
 
-  1. .gnu.version[hypot] index 14 (GLIBC_2.35) -> 8 (GLIBC_2.2.5)
-  2. the libm GLIBC_2.35 Vernaux hash/name -> GLIBC_2.2.5 (leaves a harmless
-     duplicate 2.2.5 requirement; loader finds it in any glibc >= 2.2.5)
-
-Usage: patch_hypot.py <input.so> <output.so> [--verify-only]
+Handles: the addon .node and the moli runtime binary.
+Usage: patch-code-glibc.py <input> <output>
+       patch-code-glibc.py --inplace <file>
 """
 import struct
 import sys
+
+SYMBOLS = ("hypot", "hypotf")
 
 
 def elf_hash(name: str) -> int:
@@ -27,96 +28,88 @@ def elf_hash(name: str) -> int:
     return h & 0xFFFFFFFF
 
 
-def main() -> None:
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(2)
-    src_path, dst_path = sys.argv[1], sys.argv[2]
-    verify_only = "--verify-only" in sys.argv
-
-    data = bytearray(open(src_path, "rb").read())
-
-    # --- ELF64 header ---
+def patch(data: bytearray) -> str:
     assert data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1, "not ELF64 LE"
-    e_shoff, e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<Q", data, 0x28)[0], *struct.unpack_from("<HHH", data, 0x3A)
+    e_shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 0x3A)
 
     def sh(i):
         off = e_shoff + i * e_shentsize
-        (name, typ, flags, addr, offset, size, link, info, align, entsize) = struct.unpack_from("<IIQQQQIIQQ", data, off)
-        return dict(name=name, typ=typ, offset=offset, size=size, link=link, entsize=entsize)
+        vals = struct.unpack_from("<IIQQQQIIQQ", data, off)
+        return dict(zip(("name", "typ", "flags", "addr", "offset", "size", "link", "info", "align", "entsize"), vals))
+
+    def cstr(base, off):
+        end = data.index(b"\0", base + off)
+        return data[base + off:end].decode()
 
     shstr = sh(e_shstrndx)
-    def cstr(base_off, off):
-        end = data.index(b"\0", base_off + off)
-        return data[base_off + off:end].decode()
-
-    sections = [sh(i) for i in range(e_shnum)]
     by_name = {}
-    for s in sections:
-        s["sname"] = cstr(shstr["offset"], s["name"])
-        by_name[s["sname"]] = s
-
+    for i in range(e_shnum):
+        s = sh(i)
+        by_name[cstr(shstr["offset"], s["name"])] = s
     dynsym, dynstr = by_name[".dynsym"], by_name[".dynstr"]
     gnuver, gnuver_r = by_name[".gnu.version"], by_name[".gnu.version_r"]
 
-    # --- find hypot symbol index ---
-    hypot_idx = None
+    wanted = {n: None for n in SYMBOLS}
     for i in range(dynsym["size"] // dynsym["entsize"]):
         st_name = struct.unpack_from("<I", data, dynsym["offset"] + i * dynsym["entsize"])[0]
-        if cstr(dynstr["offset"], st_name) == "hypot":
-            hypot_idx = i
-    assert hypot_idx is not None, "hypot not found in .dynsym"
+        nm = cstr(dynstr["offset"], st_name)
+        if nm in wanted:
+            wanted[nm] = i
+    missing = [n for n, v in wanted.items() if v is None]
+    if missing:
+        return f"no {missing} symbols (nothing to patch)"
 
-    ver_off = gnuver["offset"] + hypot_idx * 2
-    hypot_ver = struct.unpack_from("<H", data, ver_off)[0]
-
-    # --- walk .gnu.version_r: find libm Verneed and its vernaux entries ---
-    off = gnuver_r["offset"]
-    end = gnuver_r["offset"] + gnuver_r["size"]
-    target_aux = None
-    ref_225 = None
-    libm_found = False
+    off, end = gnuver_r["offset"], gnuver_r["offset"] + gnuver_r["size"]
+    aux_235 = aux_225 = None
     while off < end:
-        vn_version, vn_cnt, vn_file, vn_aux, vn_next = struct.unpack_from("<HHIII", data, off)
-        fname = cstr(dynstr["offset"], vn_file)
-        if fname == "libm.so.6":
-            libm_found = True
+        _, vn_cnt, vn_file, vn_aux, vn_next = struct.unpack_from("<HHIII", data, off)
+        if cstr(dynstr["offset"], vn_file) == "libm.so.6":
             aux = off + vn_aux
             for _ in range(vn_cnt):
-                vna_hash, vna_flags, vna_other, vna_name, vna_next = struct.unpack_from("<IHHII", data, aux)
+                vna_hash, _, vna_other, vna_name, vna_next = struct.unpack_from("<IHHII", data, aux)
                 nm = cstr(dynstr["offset"], vna_name)
                 if nm == "GLIBC_2.35":
-                    target_aux = aux
-                if nm == "GLIBC_2.2.5":
-                    ref_225 = aux
+                    aux_235 = aux
+                elif nm == "GLIBC_2.2.5":
+                    aux_225 = aux
                 if vna_next == 0:
                     break
                 aux += vna_next
         if vn_next == 0:
             break
         off += vn_next
-    assert libm_found, "libm Verneed not found"
 
-    if verify_only:
-        print(f"hypot symbol index={hypot_idx} current version idx={hypot_ver}; "
-              f"GLIBC_2.35 aux={'present' if target_aux else 'absent'}; "
-              f"GLIBC_2.2.5 aux={'present' if ref_225 else 'absent'}")
-        return
+    if aux_235 is None:
+        return "no GLIBC_2.35 vernaux (already compatible)"
+    assert aux_225 is not None, "no GLIBC_2.2.5 vernaux to retarget to"
+    ref_hash, _, ref_other, ref_name, _ = struct.unpack_from("<IHHII", data, aux_225)
+    assert elf_hash("GLIBC_2.2.5") == ref_hash
 
-    assert target_aux is not None, "no GLIBC_2.35 vernaux to patch (already patched?)"
-    assert ref_225 is not None, "no GLIBC_2.2.5 vernaux to retarget to"
+    changed = []
+    for nm, idx in wanted.items():
+        ver_off = gnuver["offset"] + idx * 2
+        old = struct.unpack_from("<H", data, ver_off)[0]
+        struct.pack_into("<H", data, ver_off, ref_other)
+        changed.append(f"{nm} {old}->{ref_other}")
+    struct.pack_into("<I", data, aux_235 + 0, ref_hash)
+    struct.pack_into("<I", data, aux_235 + 8, ref_name)
+    return "patched " + ", ".join(changed) + "; GLIBC_2.35 vernaux -> GLIBC_2.2.5"
 
-    # 2.2.5 aux fields (hash + name offset) to clone onto the 2.35 aux
-    ref_hash, _, ref_other, ref_name, _ = struct.unpack_from("<IHHII", data, ref_225)
-    assert elf_hash("GLIBC_2.2.5") == ref_hash, "hash sanity failed"
 
-    struct.pack_into("<H", data, ver_off, ref_other)            # hypot -> version idx of 2.2.5
-    struct.pack_into("<I", data, target_aux + 0, ref_hash)      # vna_hash
-    struct.pack_into("<I", data, target_aux + 8, ref_name)      # vna_name (hash/flags/other/name layout)
-
-    open(dst_path, "wb").write(bytes(data))
-    print(f"patched: hypot version index {hypot_ver} -> {ref_other}; "
-          f"GLIBC_2.35 vernaux retargeted to GLIBC_2.2.5; wrote {dst_path}")
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    inplace = "--inplace" in sys.argv
+    if inplace:
+        (path,) = args
+        data = bytearray(open(path, "rb").read())
+        print(f"{path}: {patch(data)}")
+        open(path, "wb").write(bytes(data))
+    else:
+        src, dst = args
+        data = bytearray(open(src, "rb").read())
+        print(f"{src}: {patch(data)}")
+        open(dst, "wb").write(bytes(data))
 
 
 if __name__ == "__main__":

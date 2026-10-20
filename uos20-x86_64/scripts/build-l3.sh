@@ -62,6 +62,11 @@ find "$STAGE_DIR/app/node_modules/.pnpm" -maxdepth 1 -type d \
   -name '@a3s-lab+code-linux-x64-gnu@*' | while IFS= read -r platform_pkg; do
   find "$platform_pkg" -type f -name '*.node' -delete
   install -m 0755 "$node_src" "$platform_pkg/node_modules/@a3s-lab/code-linux-x64-gnu/index.linux-x64-gnu.node"
+  if [[ -f $platform_pkg/node_modules/@a3s-lab/code-linux-x64-gnu/moli/moli ]]; then
+    python3 "$CHANNEL_DIR/scripts/patch-code-glibc.py" --inplace \
+      "$platform_pkg/node_modules/@a3s-lab/code-linux-x64-gnu/moli/moli"
+    "$CHANNEL_DIR/scripts/check-elf.sh" "$platform_pkg/node_modules/@a3s-lab/code-linux-x64-gnu/moli/moli"
+  fi
 done
 install_code_runtime "$STAGE_DIR/l3/node_modules/@a3s-lab/code"
 app_code=$(readlink -f "$STAGE_DIR/app/node_modules/@a3s-lab/code")
