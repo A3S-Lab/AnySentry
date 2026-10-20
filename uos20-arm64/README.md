@@ -3,6 +3,38 @@
 本目录将三个仓库经过审核的 integration branch 与 UOS 兼容层组合为可追溯的离线发布包。
 兼容代码不写入 `AnySentry`、`Observer`、`Sentry` 的上游开发分支。
 
+## 打包注意事项（2026-10-20 风险检测，必读）
+
+本节随包走。打包前逐条核对；仿真环境首轮部署后逐项验证。
+
+### 1. 本包内两项 API 修复为纯业务代码，仿真环境同样适用
+
+`aggregation.service.ts` 的 `estimateCacheBytes`（有界结构估算器替换全量
+JSON.stringify）与 `clickhouse-store.ts` 的 `keep_alive.eagerly_destroy_stale_sockets=true`
+均为 Node.js 业务层改动：**与内核版本 ABI、kern_version、寄存器布局、页大小、CPU 型号
+无关**，arm64/4.19/64K 页环境行为一致。残留风险仅业务语义层：
+
+- 估算器为采样外推近似值（缓存驱逐用）：非均匀大数组/CJK 长串误差最坏 ~±30%，
+  只影响缓存上限记账，不影响数据正确性；单条 >8/16MB 上限的项仍会判大并丢弃。
+- keep_alive 选项只增加少量 TCP 新建连接（替代过期复用），协议与数据不变。
+- 触发背景（非缺陷）：开发机业务高峰事件洪峰 + 前端常开轮询使 API 事件循环饥饿，
+  两缺陷叠加成死亡螺旋；仿真环境业务量低时不会自然触发，但代码缺陷同样潜伏，故修复随包。
+
+### 2. 用户态 uprobe 采集（新特性，kprobe 兜底不变）
+
+- observer unit 新增 `A3S_OBSERVER_SSL=1` 与 `CAP_SYS_PTRACE`（读 /proc/pid/maps
+  与 /proc/pid/root 所需；缺失时 uprobe 静默不挂接，kprobe 兜底不受影响）。
+- 用户态读一律 `bpf_probe_read_user`(112)/`bpf_probe_read_user_str`(114)，PAN 安全；
+  syscall kprobe 底层（kern_version/符号/64K 对齐）冻结未动。
+- 首轮部署验证项：任一白名单进程发真实 HTTPS 调用，CH `agent_interactions_v1` 出现
+  `tlsAdapterId='openssl-uprobe'` 且 endpoint 正确的记录；同时确认 kprobe 通道
+  （纯 HTTP 明文）心跳 Egress/ToolExec 计数仍在增长。
+
+### 3. systemd Environment 引号纪律
+
+Environment 值含空格必须整体加双引号（如 `Environment="NODE_OPTIONS=... --flag"`），
+未加引号时空格后内容被 systemd 静默丢弃，无任何报错（开发机已踩坑两次）。
+
 ## 构建模型
 
 构建程序按下列顺序执行：

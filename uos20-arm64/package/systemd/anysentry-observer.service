@@ -12,6 +12,10 @@ EnvironmentFile=/etc/anysentry/anysentry.env
 Environment=A3S_OBSERVER_JSON=1
 Environment=A3S_OBSERVER_FILES=1
 Environment=A3S_OBSERVER_PLAINTEXT_HTTP=1
+# 用户态 TLS 明文采集（OpenSSL uprobe，AgentSight 路线）：SSL_write/SSL_write_ex、
+# SSL_read/SSL_read_ex。连接身份=SSL* 指针。kprobe syscall 路径保留兜底，两条通道并存；
+# 仿真环境首次部署后必须用一条真实 HTTPS 调用验证 tlsAdapterId=openssl-uprobe 落库。
+Environment=A3S_OBSERVER_SSL=1
 # 64K-page host: 128 pages = 8 MiB/CPU/map。compat28 现场实测：业务高峰（>1000 记录/h）
 # gap 率 85-96% 为 ring 溢出真实丢块，低峰 2-6%；64 页不够。8MiB*16cpu*6map ≈ 768MiB 上限。
 Environment=A3S_OBSERVER_PERF_RING_PAGES=128
@@ -33,8 +37,10 @@ LimitMEMLOCK=infinity
 LimitNOFILE=65536
 MemoryHigh=2G
 MemoryMax=3G
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE
+# CAP_SYS_PTRACE：uprobe 采集需要读白名单进程的 /proc/pid/maps（libssl 发现）与
+# /proc/pid/root（容器内库路径解析）；无此权限时 uprobe 静默不挂接（kprobe 兜底不受影响）。
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
