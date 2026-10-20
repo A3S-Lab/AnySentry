@@ -16297,12 +16297,22 @@ const INGEST_FLOOD_LIMIT_PER_MINUTE = (() => {
 })();
 const INGEST_FLOOD_BATCH_MIN_EVENTS = 50;
 const INGEST_FLOOD_BATCH_SHARE = 0.9;
-const ingestFloodState = { windowStartMs: 0, counts: new Map<string, number>(), droppedTotal: 0 };
+const INGEST_FLOOD_GLOBAL_PER_MINUTE = (() => {
+  const raw = Number(process.env.ANYSENTRY_INGEST_FLOOD_GLOBAL_PER_MINUTE);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 3_000;
+})();
+const ingestFloodState = {
+  windowStartMs: 0,
+  counts: new Map<string, number>(),
+  globalCount: 0,
+  droppedTotal: 0,
+};
 function ingestFloodWindowTick(): void {
   const now = Date.now();
   if (now - ingestFloodState.windowStartMs >= 60_000) {
     ingestFloodState.windowStartMs = now;
     ingestFloodState.counts.clear();
+    ingestFloodState.globalCount = 0;
   }
 }
 function ingestFloodBatchDiscard(events: unknown[]): boolean {
@@ -16317,6 +16327,13 @@ function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown 
   if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0) return false;
   if (event?.eventKind !== 'ProcessExit') return false;
   ingestFloodWindowTick();
+  // Global budget first: many distinct identities each under the per-identity
+  // ceiling can still flood the loop (container-churn / build workloads).
+  ingestFloodState.globalCount += 1;
+  if (INGEST_FLOOD_GLOBAL_PER_MINUTE > 0 && ingestFloodState.globalCount > INGEST_FLOOD_GLOBAL_PER_MINUTE) {
+    ingestFloodState.droppedTotal += 1;
+    return true;
+  }
   const identity = typeof event?.agentId === 'string' && event.agentId
     ? event.agentId.slice(0, 120)
     : 'unattributed';
