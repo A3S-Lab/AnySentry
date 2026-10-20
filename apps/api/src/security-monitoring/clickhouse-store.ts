@@ -832,12 +832,31 @@ const BOUNDED_DASHBOARD_READ_SETTINGS: ClickHouseSettings = {
 // dashboard reads. A one-minute chunk fits this tighter budget under the sustained full-file test;
 // if it does not, the caller returns the bounded hot view instead of raising the budget or retrying
 // another raw scan in the same request.
+// Bucket-build budgets stay conservative by default (matching the verified field
+// profile). Hosts with more headroom — e.g. the x86_64 debug variant — can raise
+// them via env without touching the delivery defaults:
+//   ANYSENTRY_CH_BUCKET_MAX_MEMORY_MB, ANYSENTRY_CH_BUCKET_EXTERNAL_MB,
+//   ANYSENTRY_CH_BUCKET_DIRECT_IO_MB.
+const chBucketBudgetBytes = (envKey: string, fallbackMb: number): string => {
+  const raw = Number(process.env[envKey]);
+  const mb = Number.isFinite(raw) && raw > 0 ? raw : fallbackMb;
+  return String(Math.floor(mb) * 1024 * 1024);
+};
 const BOUNDED_DASHBOARD_BUCKET_BUILD_SETTINGS: ClickHouseSettings = {
   max_threads: 1,
-  max_memory_usage: String(128 * 1024 * 1024),
-  max_bytes_before_external_group_by: String(32 * 1024 * 1024),
-  max_bytes_before_external_sort: String(32 * 1024 * 1024),
-  min_bytes_to_use_direct_io: String(1024 * 1024),
+  max_memory_usage: chBucketBudgetBytes("ANYSENTRY_CH_BUCKET_MAX_MEMORY_MB", 128),
+  max_bytes_before_external_group_by: chBucketBudgetBytes(
+    "ANYSENTRY_CH_BUCKET_EXTERNAL_MB",
+    32,
+  ),
+  max_bytes_before_external_sort: chBucketBudgetBytes(
+    "ANYSENTRY_CH_BUCKET_EXTERNAL_MB",
+    32,
+  ),
+  min_bytes_to_use_direct_io: chBucketBudgetBytes(
+    "ANYSENTRY_CH_BUCKET_DIRECT_IO_MB",
+    1,
+  ),
   max_block_size: "1024",
   preferred_block_size_bytes: String(1024 * 1024),
   max_execution_time: 5,
