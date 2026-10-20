@@ -215,8 +215,8 @@ echo "glibc=$glibc"
 echo "kernel=$kernel"
 [[ $architecture == x86_64 ]] && pass "host architecture is x86_64" ||
   fail "host architecture is ${architecture:-unknown}; expected x86_64"
-[[ $page_size == 65536 ]] && pass "host page size is 65536" ||
-  fail "host page size is ${page_size:-unknown}; expected 65536"
+[[ $page_size == 4096 ]] && pass "host page size is 4096" ||
+  fail "host page size is ${page_size:-unknown}; expected 4096"
 if [[ -n $glibc && $(printf '2.28\n%s\n' "$glibc" | sort -V | head -n1) == 2.28 ]]; then
   pass "glibc $glibc satisfies minimum 2.28"
 else

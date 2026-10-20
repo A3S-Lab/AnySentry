@@ -35,7 +35,7 @@ step "S0. 目标机器基线档案（每次接手先核对，与档案不符要�
 uname -r | sed 's/^/  内核: /'
 uname -m | sed 's/^/  架构: /'
 ldd --version 2>/dev/null | head -1 | sed 's/^/  glibc: /'
-echo "  页大小: $(getconf PAGE_SIZE 2>/dev/null)（期望 65536）"
+echo "  页大小: $(getconf PAGE_SIZE 2>/dev/null)（期望 4096）"
 grep CapEff /proc/self/status 2>/dev/null | sed 's/^/  /'
 echo "  cgroup2 挂载点（hybrid 应为 /sys/fs/cgroup/unified）:"
 awk '$3=="cgroup2"{print "   ", $2}' /proc/mounts 2>/dev/null

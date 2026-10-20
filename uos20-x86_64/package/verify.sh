@@ -97,7 +97,7 @@ wait_for_collector_health() {
 
 host_checks() {
   [[ $(uname -m) == x86_64 ]] || fail "host architecture is not x86_64"
-  [[ $(getconf PAGESIZE) == 65536 ]] || fail "host page size is not 65536"
+  [[ $(getconf PAGESIZE) == 4096 ]] || fail "host page size is not 4096"
   local glibc=${GLIBC_VERSION_OVERRIDE:-$(getconf GNU_LIBC_VERSION | awk '{print $2}')}
   [[ $(printf '2.28\n%s\n' "$glibc" | sort -V | head -n1) == 2.28 ]] || fail "glibc is older than 2.28"
   for command_name in curl systemctl sha256sum; do
