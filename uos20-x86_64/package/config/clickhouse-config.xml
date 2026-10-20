@@ -1,0 +1,75 @@
+<clickhouse>
+  <!-- Drop any default listen_host, including ::1, then bind IPv4 loopback only.
+       A failed listen is ClickHouse error 210 and exits the process. -->
+  <listen_host remove="remove"/>
+  <listen_host remove="remove"/>
+  <listen_host>127.0.0.1</listen_host>
+  <listen_backlog>511</listen_backlog>
+  <http_port>8123</http_port>
+  <!-- Native 9000 is already taken on the customer host (EADDRINUSE). AnySentry
+       uses CLICKHOUSE_URL on HTTP 8123 only, so do not open the native port. -->
+  <tcp_port remove="remove"/>
+  <!-- Compatibility and interserver ports are unused on this single-node install.
+       A bind failure on any of them is fatal and takes down HTTP as well. -->
+  <mysql_port remove="remove"/>
+  <postgresql_port remove="remove"/>
+  <interserver_http_port remove="remove"/>
+  <interserver_http_host replace="replace">127.0.0.1</interserver_http_host>
+  <path replace="replace">/var/lib/anysentry/clickhouse/</path>
+  <tmp_path replace="replace">/var/lib/anysentry/clickhouse/tmp/</tmp_path>
+  <user_files_path replace="replace">/var/lib/anysentry/clickhouse/user_files/</user_files_path>
+  <format_schema_path replace="replace">/var/lib/anysentry/clickhouse/format_schemas/</format_schema_path>
+  <user_directories replace="replace">
+    <users_xml>
+      <path>users.xml</path>
+    </users_xml>
+    <local_directory>
+      <path>/var/lib/anysentry/clickhouse/access/</path>
+    </local_directory>
+  </user_directories>
+
+  <!-- Sized for the verified 16 CPU / 64 GiB profile. -->
+  <max_server_memory_usage>34359738368</max_server_memory_usage>
+  <max_thread_pool_size>512</max_thread_pool_size>
+  <background_buffer_flush_schedule_pool_size>8</background_buffer_flush_schedule_pool_size>
+  <background_pool_size>16</background_pool_size>
+  <background_move_pool_size>4</background_move_pool_size>
+  <background_fetches_pool_size>4</background_fetches_pool_size>
+  <background_common_pool_size>4</background_common_pool_size>
+  <background_schedule_pool_size>32</background_schedule_pool_size>
+  <background_message_broker_schedule_pool_size>8</background_message_broker_schedule_pool_size>
+  <background_distributed_schedule_pool_size>8</background_distributed_schedule_pool_size>
+  <uncompressed_cache_size>536870912</uncompressed_cache_size>
+  <mark_cache_size>1073741824</mark_cache_size>
+  <logger>
+    <level>information</level>
+    <console>1</console>
+    <log replace="replace">/var/log/anysentry/clickhouse-server.log</log>
+    <errorlog replace="replace">/var/log/anysentry/clickhouse-server.err.log</errorlog>
+    <size>100M</size>
+    <count>3</count>
+  </logger>
+
+  <!-- The distribution's base config.xml enables every system log, most with no TTL;
+       on the field they grew to 7.9 GiB in two weeks (asynchronous_metric_log alone
+       2.85e9 rows). Cap each with a TTL and drop the two pure-profiler logs entirely. -->
+  <trace_log remove="remove"/>
+  <processors_profile_log remove="remove"/>
+  <query_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+  <query_views_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_views_log>
+  <text_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></text_log>
+  <part_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></part_log>
+  <metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></metric_log>
+  <asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>
+  <query_thread_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></query_thread_log>
+  <!-- opentelemetry_span_log must NOT get a sibling <ttl>: its base definition carries a
+       custom <engine>, and ClickHouse rejects <ttl> next to <engine> at startup
+       (BAD_ARGUMENTS, compat25 first attempt crash-looped on this). The log stays empty
+       in this deployment (no OTLP tracing), so it needs no TTL. -->
+
+  <!-- High-churn projection tables (config/commit/revision rewrites every few seconds)
+       held ~3.4 GiB of dead parts at the default 480s lifetime; bound it to 120s. -->
+  <merge_tree>
+    <old_parts_lifetime>120</old_parts_lifetime>
+  </merge_tree>
+</clickhouse>

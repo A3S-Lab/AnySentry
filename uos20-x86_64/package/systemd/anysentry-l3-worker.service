@@ -1,0 +1,33 @@
+[Unit]
+Description=AnySentry asynchronous L3 judgment worker
+Requires=anysentry-redis.service anysentry-clickhouse.service
+After=network.target anysentry-redis.service anysentry-clickhouse.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/opt/anysentry/app
+EnvironmentFile=/etc/anysentry/anysentry.env
+Environment=ANYSENTRY_WORKER_ROLE=l3
+Environment=NODE_OPTIONS=--max-old-space-size=4096
+ExecStart=/opt/anysentry/run-l3-worker.sh
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+MemoryHigh=6G
+MemoryMax=8G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PACKAGE_ROOT=$SCRIPT_DIR
+INSTALL_ROOT=${ANYSENTRY_INSTALL_ROOT:-/opt/anysentry}
+INSTALL_PARENT=$(dirname "$INSTALL_ROOT")
+CONFIG_DIR=${ANYSENTRY_CONFIG_DIR:-/etc/anysentry}
+ENV_FILE=${ANYSENTRY_ENV_FILE:-$CONFIG_DIR/anysentry.env}
+STATE_DIR=${ANYSENTRY_STATE_DIR:-/var/lib/anysentry}
+LOG_DIR=${ANYSENTRY_LOG_DIR:-/var/log/anysentry}
+SYSTEMD_DIR=${ANYSENTRY_SYSTEMD_DIR:-/etc/systemd/system}
+SYSCTL_DIR=${ANYSENTRY_SYSCTL_DIR:-/etc/sysctl.d}
+COMPAT_RELEASE_ID=@RELEASE_VERSION@
+INSTALL_LOG_BASE=${ANYSENTRY_INSTALL_LOG_BASE:-/var/log/anysentry/install}
+INSTALL_LOG_ROOT=${ANYSENTRY_INSTALL_LOG_ROOT:-$INSTALL_LOG_BASE/$COMPAT_RELEASE_ID}
+TEMP_INSTALL_LOG=${ANYSENTRY_TEMP_INSTALL_LOG:-/tmp/anysentry-install-$COMPAT_RELEASE_ID}
+MIN_FREE_KB=$((8 * 1024 * 1024))
+CHECK_ONLY=0
+STAGING=
+ROLLBACK_ROOT=
+ROLLBACK_UNITS=
+ROLLBACK_ENV=
+ACTIVATED=0
+HAD_PREVIOUS=0
+CURRENT_STAGE=bootstrap
+INSTALL_START_TIME=
+INSTALL_LOG_READY=0
+ROLLBACK_RESULT=not-required
+A3S_CODE_RUNTIME=unknown
+START_FAILURES=0
+EXPECTED_BPF_VERSION=5.14.0
+EXPECTED_BPF_CODE=0x00050e00
+SERVICES=(
+  anysentry-clickhouse.service
+  anysentry-redis.service
+  anysentry-kafka.service
+  anysentry-kafka-init.service
+  anysentry-flink-jobmanager.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-job.service
+  anysentry.service
+  anysentry-fast-judge.service
+  anysentry-l3-worker.service
+  anysentry-stream-worker.service
+  anysentry-composite-judge.service
+  anysentry-supply-chain.service
+  anysentry-observer.service
+)
+START_SERVICES=(
+  anysentry-clickhouse.service
+  anysentry-redis.service
+  anysentry-kafka.service
+  anysentry-kafka-init.service
+  anysentry-flink-jobmanager.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-job.service
+  anysentry.service
+  anysentry-fast-judge.service
+  anysentry-l3-worker.service
+  anysentry-stream-worker.service
+  anysentry-composite-judge.service
+  anysentry-supply-chain.service
+  anysentry-observer.service
+)
+STOP_SERVICES=(
+  anysentry-observer.service
+  anysentry-supply-chain.service
+  anysentry-composite-judge.service
+  anysentry-stream-worker.service
+  anysentry-l3-worker.service
+  anysentry-fast-judge.service
+  anysentry.service
+  anysentry-flink-job.service
+  anysentry-flink-taskmanager.service
+  anysentry-flink-jobmanager.service
+  anysentry-kafka-init.service
+  anysentry-kafka.service
+  anysentry-redis.service
+  anysentry-clickhouse.service
+)
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [--check]
+
+  --check  Verify the release and target ABI without persistent system changes.
+
+The same command performs a first installation or an in-place upgrade. Existing
+configuration and persistent ClickHouse data are retained. Failed activation is
+rolled back to the previously installed program and systemd units.
+EOF
+}
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+
+set_stage() {
+  CURRENT_STAGE=$1
+  if [[ $INSTALL_LOG_READY -eq 1 ]]; then
+    printf '%s\n' "$CURRENT_STAGE" >"$INSTALL_LOG_ROOT/current-stage.txt"
+  fi
+  echo "Install stage: $CURRENT_STAGE"
+}
+
+initialize_install_logging() {
+  local persistent_parent
+  command -v tee >/dev/null 2>&1 || fail "required command not found: tee"
+  INSTALL_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+  persistent_parent=$(dirname "$INSTALL_LOG_ROOT")
+  if install -d -m 0750 "$LOG_DIR" "$persistent_parent" 2>/dev/null; then
+    rm -rf "$INSTALL_LOG_ROOT"
+    install -d -m 0750 "$INSTALL_LOG_ROOT"
+  else
+    INSTALL_LOG_ROOT=$TEMP_INSTALL_LOG
+    rm -rf "$INSTALL_LOG_ROOT"
+    install -d -m 0750 "$INSTALL_LOG_ROOT"
+  fi
+  if [[ $TEMP_INSTALL_LOG != "$INSTALL_LOG_ROOT" ]]; then
+    rm -rf "$TEMP_INSTALL_LOG"
+    ln -s "$INSTALL_LOG_ROOT" "$TEMP_INSTALL_LOG"
+  fi
+  INSTALL_LOG_READY=1
+  : >"$INSTALL_LOG_ROOT/install.log"
+  exec > >(tee -a "$INSTALL_LOG_ROOT/install.log") 2>&1
+  {
+    printf 'release=%s\n' "$COMPAT_RELEASE_ID"
+    printf 'package=%s\n' "$PACKAGE_ROOT"
+    printf 'started_at=%s\n' "$INSTALL_START_TIME"
+    printf 'check_only=%s\n' "$CHECK_ONLY"
+    printf 'kernel=%s\n' "$(uname -r 2>/dev/null || true)"
+    printf 'architecture=%s\n' "$(uname -m 2>/dev/null || true)"
+    printf 'glibc=%s\n' "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    printf 'page_size=%s\n' "$(getconf PAGESIZE 2>/dev/null || true)"
+  } >"$INSTALL_LOG_ROOT/context.txt"
+  printf '%s\n' "$CURRENT_STAGE" >"$INSTALL_LOG_ROOT/current-stage.txt"
+  echo "Installation diagnostics: $INSTALL_LOG_ROOT"
+  echo "Temporary diagnostics link: $TEMP_INSTALL_LOG"
+}
+
+capture_diagnostics() {
+  local phase=$1 unit name port collector_id source_id
+  [[ $INSTALL_LOG_READY -eq 1 ]] || return 0
+  {
+    printf 'phase=%s\nstage=%s\ncaptured_at=%s\n' \
+      "$phase" "$CURRENT_STAGE" "$(date '+%Y-%m-%d %H:%M:%S')"
+    for unit in "${SERVICES[@]}"; do
+      printf '%s=' "$unit"
+      systemctl is-active "$unit" 2>/dev/null || true
+    done
+  } >"$INSTALL_LOG_ROOT/services-$phase.txt"
+  systemctl status "${SERVICES[@]}" --no-pager -l \
+    >>"$INSTALL_LOG_ROOT/services-$phase.txt" 2>&1 || true
+
+  for unit in "${SERVICES[@]}"; do
+    case "$unit" in
+      anysentry.service) name=api ;;
+      anysentry-fast-judge.service) name=fast-judge ;;
+      anysentry-l3-worker.service) name=l3-worker ;;
+      anysentry-observer.service) name=observer ;;
+      anysentry-*.service) name=${unit#anysentry-}; name=${name%.service} ;;
+      *) name=${unit%.service} ;;
+    esac
+    journalctl -b -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise \
+      >"$INSTALL_LOG_ROOT/journal-$name.log" 2>&1 || true
+  done
+
+  [[ -f $ENV_FILE ]] || return 0
+  port=$(env_value PORT "$ENV_FILE")
+  [[ -n $port ]] || port=29653
+  collector_id=$(env_value A3S_OBSERVER_COLLECTOR_ID "$ENV_FILE")
+  source_id=$(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE")
+  curl --connect-timeout 2 --max-time 15 -fsS \
+    "http://127.0.0.1:$port/security-center/healthz" \
+    >"$INSTALL_LOG_ROOT/health-api-$phase.json" 2>&1 || true
+  if [[ -x $INSTALL_ROOT/kafka/bin/kafka-topics.sh && -x $INSTALL_ROOT/java/bin/java ]]; then
+    JAVA_HOME=$INSTALL_ROOT/java PATH=$INSTALL_ROOT/java/bin:$PATH \
+      run_kafka_topics --bootstrap-server 127.0.0.1:9092 --list \
+      >"$INSTALL_LOG_ROOT/kafka-topics-$phase.txt" 2>&1 || true
+  fi
+  if [[ -f $LOG_DIR/clickhouse-server.err.log ]]; then
+    tail -n 200 "$LOG_DIR/clickhouse-server.err.log" \
+      >"$INSTALL_LOG_ROOT/clickhouse-server.err.log" 2>/dev/null || true
+  fi
+  if [[ -f $LOG_DIR/clickhouse-server.log ]]; then
+    tail -n 200 "$LOG_DIR/clickhouse-server.log" \
+      >"$INSTALL_LOG_ROOT/clickhouse-server.log" 2>/dev/null || true
+  fi
+  curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/overview \
+    >"$INSTALL_LOG_ROOT/flink-overview-$phase.json" 2>&1 || true
+  curl --connect-timeout 2 --max-time 15 -fsS http://127.0.0.1:8081/jobs/overview \
+    >"$INSTALL_LOG_ROOT/flink-jobs-$phase.json" 2>&1 || true
+  if [[ -n $source_id ]]; then
+    curl --connect-timeout 2 --max-time 15 -fsS -X POST \
+      "http://127.0.0.1:$port/security-center/sources/list" \
+      -H 'Content-Type: application/json' \
+      --data-binary "{\"sourceId\":\"$source_id\",\"limit\":5}" \
+      >"$INSTALL_LOG_ROOT/health-source-$phase.json" 2>&1 || true
+  fi
+  if [[ -n $collector_id ]]; then
+    curl --connect-timeout 2 --max-time 15 -fsS -X POST \
+      "http://127.0.0.1:$port/security-center/collectors/health" \
+      -H 'Content-Type: application/json' \
+      --data-binary "{\"timeType\":\"last_3h\",\"collectorId\":\"$collector_id\",\"limit\":5}" \
+      >"$INSTALL_LOG_ROOT/health-collector-$phase.json" 2>&1 || true
+  fi
+  if [[ $phase == failure || $phase == success || $phase == activation ]]; then
+    [[ ! -f $INSTALL_LOG_ROOT/health-api-$phase.json ]] ||
+      cp "$INSTALL_LOG_ROOT/health-api-$phase.json" "$INSTALL_LOG_ROOT/health-api.json"
+    [[ ! -f $INSTALL_LOG_ROOT/health-source-$phase.json ]] ||
+      cp "$INSTALL_LOG_ROOT/health-source-$phase.json" "$INSTALL_LOG_ROOT/health-source.json"
+    [[ ! -f $INSTALL_LOG_ROOT/health-collector-$phase.json ]] ||
+      cp "$INSTALL_LOG_ROOT/health-collector-$phase.json" "$INSTALL_LOG_ROOT/health-collector.json"
+  fi
+}
+
+write_install_summary() {
+  local rc=$1 result=success
+  [[ $rc -eq 0 ]] || result=failed
+  {
+    printf 'release=%s\n' "$COMPAT_RELEASE_ID"
+    printf 'result=%s\n' "$result"
+    printf 'exit_code=%s\n' "$rc"
+    printf 'failure_stage=%s\n' "$CURRENT_STAGE"
+    printf 'rollback=%s\n' "$ROLLBACK_RESULT"
+    printf 'started_at=%s\n' "$INSTALL_START_TIME"
+    printf 'finished_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'install_log=%s\n' "$INSTALL_LOG_ROOT/install.log"
+    printf 'diagnostic_directory=%s\n' "$INSTALL_LOG_ROOT"
+    printf 'a3s_code_runtime=%s\n' "$A3S_CODE_RUNTIME"
+    printf 'startup_failures=%s\n' "$START_FAILURES"
+  } >"$INSTALL_LOG_ROOT/summary.txt"
+  echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
+}
+
+version_at_least() {
+  local actual=$1 minimum=$2
+  [[ $(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1) == "$minimum" ]]
+}
+
+env_value() {
+  local key=$1 file=$2
+  [[ -f $file ]] || return 0
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      sub(/^[^=]*=/, "")
+      value=$0
+    }
+    END {
+      if (value != "") print value
+    }
+  ' "$file"
+}
+
+normalize_environment() {
+  local file=${1:-$ENV_FILE} tmp
+  [[ -f $file ]] || return 0
+  tmp=$(mktemp "${file}.normalize.XXXXXX")
+  awk '
+    NR == FNR {
+      line=$0
+      sub(/\r$/, "", line)
+      if (line ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        key=line
+        sub(/=.*/, "", key)
+        last[key]=FNR
+      }
+      next
+    }
+    {
+      line=$0
+      sub(/\r$/, "", line)
+      if (line !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        print line
+        next
+      }
+      key=line
+      sub(/=.*/, "", key)
+      if (FNR != last[key]) next
+      value=line
+      sub(/^[^=]*=/, "", value)
+      while (index(value, key "=") == 1) {
+        sub(/^[^=]*=/, "", value)
+      }
+      print key "=" value
+    }
+  ' "$file" "$file" >"$tmp"
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+  chown --reference="$file" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file"
+}
+
+drop_inert_observer_keys() {
+  # A3S_OBSERVER_SSL predates the HTTP/HTTPS switch split. The legacy Linux 4.19 backend
+  # has no TLS uprobe capture, so on this package the key only logs a WARN at every
+  # Observer start. Remove it during install/upgrade instead of asking the field to
+  # hand-edit the protected env file.
+  local file=${1:-$ENV_FILE} tmp
+  [[ -f $file ]] || return 0
+  grep -qE '^A3S_OBSERVER_SSL=' "$file" || return 0
+  tmp=$(mktemp "${file}.drop-inert.XXXXXX")
+  grep -vE '^A3S_OBSERVER_SSL=' "$file" >"$tmp"
+  chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+  chown --reference="$file" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$file"
+  echo "Removed inert configuration key: A3S_OBSERVER_SSL (legacy backend has no TLS uprobe capture)"
+}
+
+validate_collector_id() {
+  local file=${1:-$ENV_FILE} collector_id
+  collector_id=$(env_value A3S_OBSERVER_COLLECTOR_ID "$file")
+  [[ -z $collector_id || $collector_id =~ ^[A-Za-z0-9._:-]+$ ]] ||
+    fail "A3S_OBSERVER_COLLECTOR_ID is invalid in $file: $collector_id"
+}
+
+random_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+materialize_template_line() {
+  local line=$1 key=${1%%=*}
+  case "$line" in
+    CLICKHOUSE_PASSWORD=__GENERATED__|ANYSENTRY_ADMIN_TOKEN=__GENERATED__)
+      printf '%s=%s\n' "$key" "$(random_secret)" ;;
+    ANYSENTRY_SOURCE_ID=__GENERATED__|ANYSENTRY_INGEST_TOKEN=__GENERATED__)
+      printf '%s=\n' "$key" ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+}
+
+merge_environment() {
+  local template=$1 line key
+  [[ -f $ENV_FILE ]] || fail "configuration file is missing: $ENV_FILE"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == *=* && $line != \#* ]] || continue
+    key=${line%%=*}
+    if ! grep -qE "^${key}=" "$ENV_FILE"; then
+      materialize_template_line "$line" >>"$ENV_FILE"
+      echo "Added configuration key: $key"
+    fi
+  done <"$template"
+}
+
+install_environment() {
+  local template=$PACKAGE_ROOT/config/anysentry.env.example line
+  [[ -f $template ]] || fail "configuration template is missing: $template"
+  install -d -m 0750 "$CONFIG_DIR"
+  if [[ ! -f $ENV_FILE ]]; then
+    umask 077
+    : >"$ENV_FILE"
+    while IFS= read -r line || [[ -n $line ]]; do
+      materialize_template_line "$line" >>"$ENV_FILE"
+    done <"$template"
+    echo "Created protected configuration: $ENV_FILE"
+  else
+    echo "Preserving existing configuration: $ENV_FILE"
+    normalize_environment "$ENV_FILE"
+    merge_environment "$template"
+  fi
+  drop_inert_observer_keys "$ENV_FILE"
+  normalize_environment "$ENV_FILE"
+  validate_collector_id "$ENV_FILE"
+  [[ -n $(env_value CLICKHOUSE_PASSWORD "$ENV_FILE") ]] || fail "CLICKHOUSE_PASSWORD is empty in $ENV_FILE"
+  [[ -n $(env_value ANYSENTRY_ADMIN_TOKEN "$ENV_FILE") ]] || fail "ANYSENTRY_ADMIN_TOKEN is empty in $ENV_FILE"
+  ! grep -q '__GENERATED__' "$ENV_FILE" || fail "generated-secret placeholders remain in $ENV_FILE"
+  chown root:root "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+}
+
+persist_resource_configuration() {
+  local sysctl_file=$SYSCTL_DIR/90-anysentry.conf
+  install -d -m 0755 "$SYSCTL_DIR"
+  printf '%s\n' \
+    '# AnySentry UOS runtime requirements. Managed by install.sh.' \
+    'vm.overcommit_memory=1' \
+    'vm.max_map_count=262144' \
+    'fs.file-max=1048576' \
+    >"$sysctl_file"
+  chown root:root "$sysctl_file"
+  chmod 0644 "$sysctl_file"
+  sysctl -w vm.overcommit_memory=1 >/dev/null
+  sysctl -w vm.max_map_count=262144 >/dev/null
+  sysctl -w fs.file-max=1048576 >/dev/null
+  echo "Persisted runtime memory configuration: $sysctl_file"
+}
+
+verify_package() {
+  local file required=(
+    app/dist/main.js app/web/index.html runtime/node/bin/node
+    native/a3s-sentry.linux-x64-gnu.node clickhouse/bin/clickhouse
+    redis/bin/redis-server redis/bin/redis-cli redis/etc/redis.conf
+    java/bin/java kafka/bin/kafka-server-start.sh kafka/VERSION
+    flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar flink/VERSION
+    observer/bin/a3s-observer-collector observer/observer-forward.js
+    observer/observer-agent-attribution.js observer/observer-agent-templates.js
+    observer/observer-behavior-discovery.js observer/observer-cgroup-mounts.js observer/observer-docker-discovery.js
+    observer/observer-event-dedup.js observer/observer-infrastructure-roots.js
+    observer/observer-priority-queue.js observer/observer-workload-filter.js
+    observer/KERNEL_VERSION_CODE l3/l3-agent.mjs
+    app/dist/security-monitoring/worker-main.js run-l3-worker.sh
+    diagnostics/a3s-bpf-syscall-probe diagnostics/RUN_DIAGNOSTICS.sh
+    config/anysentry.env.example systemd/anysentry.service
+    systemd/anysentry-clickhouse.service systemd/anysentry-redis.service
+    systemd/anysentry-kafka.service systemd/anysentry-kafka-init.service
+    systemd/anysentry-flink-jobmanager.service systemd/anysentry-flink-taskmanager.service
+    systemd/anysentry-flink-job.service systemd/anysentry-stream-worker.service
+    systemd/anysentry-composite-judge.service systemd/anysentry-supply-chain.service
+    systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
+    systemd/anysentry-observer.service
+    provision-observer.mjs wait-clickhouse.sh run-kafka.sh init-kafka-topics.sh
+    run-flink.sh verify.sh inspect-host.sh anysentry-services.sh
+    AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
+    VERSION PROVENANCE manifest.sha256
+  )
+  for file in "${required[@]}"; do
+    [[ -f $PACKAGE_ROOT/$file ]] || fail "package file missing: $file"
+  done
+  [[ $(<"$PACKAGE_ROOT/observer/KERNEL_VERSION_CODE") == "$EXPECTED_BPF_CODE" ]] ||
+    fail "Observer BPF code is not $EXPECTED_BPF_CODE"
+  (cd "$PACKAGE_ROOT" && sha256sum --check --quiet manifest.sha256) ||
+    fail "package checksum validation failed"
+  grep -Fq 'src="/anysentry/static/' "$PACKAGE_ROOT/app/web/index.html" ||
+    fail "dashboard assets were not built for /anysentry"
+}
+
+kernel_config_source() {
+  if [[ -r /boot/config-$(uname -r) ]]; then
+    printf '%s\n' "/boot/config-$(uname -r)"
+  elif [[ -r /proc/config.gz ]]; then
+    printf '%s\n' /proc/config.gz
+  fi
+}
+
+validate_kernel_features() {
+  local source reader flag
+  source=$(kernel_config_source)
+  if [[ -z $source ]]; then
+    warn "kernel configuration is not readable; raw BPF capability probe remains authoritative"
+    return 0
+  fi
+  reader=grep
+  [[ $source != /proc/config.gz ]] || reader=zgrep
+  for flag in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_EVENTS CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_PERF_EVENTS; do
+    "$reader" -qx "$flag=y" "$source" || fail "required kernel option is disabled: $flag"
+  done
+}
+
+validate_bpf_abi() {
+  local output rc=0
+  output=$(timeout --signal=TERM 45 "$PACKAGE_ROOT/diagnostics/a3s-bpf-syscall-probe" 2>&1) || rc=$?
+  printf '%s\n' "$output"
+  [[ $rc -eq 0 ]] || fail "raw BPF syscall probe failed with exit code $rc"
+  grep -Fq "scan.kprobe_candidate.version=$EXPECTED_BPF_VERSION" <<<"$output" ||
+    fail "kernel did not accept expected BPF version $EXPECTED_BPF_VERSION"
+  grep -Fq "scan.kprobe_candidate.version_code=$EXPECTED_BPF_CODE" <<<"$output" ||
+    fail "kernel did not accept expected BPF code $EXPECTED_BPF_CODE"
+}
+
+validate_redis_runtime() {
+  local output rc=0
+  output=$("$PACKAGE_ROOT/redis/bin/redis-server" \
+    "$PACKAGE_ROOT/redis/etc/redis.conf" \
+    --port 0 --save "" --appendonly no --dir /tmp 2>&1) || rc=$?
+  printf '%s\n' "$output"
+  if grep -Fq 'Redis will now exit to prevent data corruption' <<<"$output"; then
+    fail "bundled Redis configuration did not safely acknowledge the ARM64 kernel COW check"
+  fi
+  [[ $rc -eq 1 ]] || fail "bundled Redis startup check returned unexpected exit code $rc"
+  grep -Fq 'Configured to not listen anywhere, exiting.' <<<"$output" ||
+    fail "bundled Redis did not complete its startup checks"
+}
+
+preflight() {
+  local command_name arch glibc_line glibc_version page_size free_kb node_version java_version clickhouse_version redis_version collector_version
+  for command_name in uname getconf sort df sha256sum systemctl curl awk sed grep install cp mv chmod chown id getent groupadd useradd od tr bash timeout tee journalctl ln sysctl; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
+  done
+  arch=$(uname -m)
+  [[ $arch == x86_64 ]] || fail "unsupported architecture: $arch (required: x86_64)"
+  glibc_line=$(getconf GNU_LIBC_VERSION 2>/dev/null) || fail "unable to detect glibc"
+  glibc_version=${glibc_line##* }
+  version_at_least "$glibc_version" 2.28 || fail "glibc $glibc_version is older than 2.28"
+  page_size=$(getconf PAGESIZE)
+  [[ $page_size == 4096 ]] || fail "unsupported page size: $page_size (this debug-variant release requires 4096)"
+  [[ -e /sys/kernel/debug/tracing/kprobe_events || -e /sys/kernel/tracing/kprobe_events ]] ||
+    fail "kprobe_events is unavailable; debugfs or tracefs is required"
+  grep -qE '[[:space:]]__x64_sys_execve$' /proc/kallsyms 2>/dev/null ||
+    fail "x86_64 execve kprobe symbol is unavailable"
+  verify_package
+  validate_kernel_features
+  node_version=$("$PACKAGE_ROOT/runtime/node/bin/node" --version 2>&1) ||
+    fail "bundled Node runtime cannot execute: $node_version"
+  java_version=$("$PACKAGE_ROOT/java/bin/java" -version 2>&1) ||
+    fail "bundled Java runtime cannot execute: $java_version"
+  clickhouse_version=$("$PACKAGE_ROOT/clickhouse/bin/clickhouse" --version 2>&1) ||
+    fail "bundled ClickHouse cannot execute on this CPU: $clickhouse_version"
+  redis_version=$("$PACKAGE_ROOT/redis/bin/redis-server" --version 2>&1) ||
+    fail "bundled Redis cannot execute on this CPU: $redis_version"
+  validate_redis_runtime
+  collector_version=$("$PACKAGE_ROOT/observer/bin/a3s-observer-collector" --version 2>&1) ||
+    fail "bundled Observer cannot execute: $collector_version"
+  validate_bpf_abi
+  free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
+  [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+  [[ $free_kb -ge $MIN_FREE_KB ]] || fail "at least 8 GiB free disk space is required"
+  echo "Preflight passed: architecture=$arch glibc=$glibc_version kernel=$(uname -r) page_size=$page_size free=$((free_kb / 1024))MiB node=$node_version java=$(head -n1 <<<"$java_version") clickhouse=$clickhouse_version redis=$redis_version observer=$collector_version bpf=$EXPECTED_BPF_CODE"
+}
+
+stop_services() {
+  local unit
+  for unit in "${STOP_SERVICES[@]}"; do
+    systemctl stop "$unit" 2>/dev/null || true
+  done
+}
+
+start_available_services() {
+  local unit
+  for unit in "${START_SERVICES[@]}"; do
+    [[ -f $SYSTEMD_DIR/$unit ]] || continue
+    systemctl enable --now "$unit"
+  done
+}
+
+stage_release() {
+  STAGING=$INSTALL_PARENT/.anysentry.install.$$
+  install -d -m 0755 "$STAGING"
+  cp -a "$PACKAGE_ROOT/." "$STAGING/"
+  chown -R root:root "$STAGING"
+}
+
+backup_current() {
+  local stamp
+  stamp=$(date +%Y%m%d%H%M%S)-$$
+  ROLLBACK_ROOT=$INSTALL_PARENT/.anysentry.rollback.$stamp
+  ROLLBACK_UNITS=$INSTALL_PARENT/.anysentry.units.$stamp
+  ROLLBACK_ENV=$INSTALL_PARENT/.anysentry.env.$stamp
+  install -d -m 0700 "$ROLLBACK_UNITS"
+  # Every operation after this point is covered by the EXIT rollback trap.
+  ACTIVATED=1
+  if [[ -e $INSTALL_ROOT ]]; then
+    HAD_PREVIOUS=1
+    mv "$INSTALL_ROOT" "$ROLLBACK_ROOT"
+  fi
+  local unit
+  for unit in "${SERVICES[@]}"; do
+    [[ -f $SYSTEMD_DIR/$unit ]] && cp -a "$SYSTEMD_DIR/$unit" "$ROLLBACK_UNITS/$unit"
+  done
+  [[ -f $ENV_FILE ]] && cp -a "$ENV_FILE" "$ROLLBACK_ENV"
+}
+
+restore_previous() {
+  local unit
+  [[ $ACTIVATED -eq 1 ]] || return 0
+  ROLLBACK_RESULT=started
+  echo "Activation failed; starting automatic rollback." >&2
+  stop_services
+  [[ ! -e $INSTALL_ROOT ]] || mv "$INSTALL_ROOT" "$INSTALL_ROOT.failed.$(date +%Y%m%d%H%M%S)"
+  if [[ $HAD_PREVIOUS -eq 1 && -e $ROLLBACK_ROOT ]]; then
+    mv "$ROLLBACK_ROOT" "$INSTALL_ROOT"
+  fi
+  for unit in "${SERVICES[@]}"; do
+    if [[ -f $ROLLBACK_UNITS/$unit ]]; then
+      cp -a "$ROLLBACK_UNITS/$unit" "$SYSTEMD_DIR/$unit"
+    else
+      rm -f "$SYSTEMD_DIR/$unit"
+    fi
+  done
+  [[ ! -f $ROLLBACK_ENV ]] || cp -a "$ROLLBACK_ENV" "$ENV_FILE"
+  systemctl daemon-reload
+  if [[ $HAD_PREVIOUS -eq 1 ]]; then
+    start_available_services
+  fi
+  ROLLBACK_RESULT=completed
+  echo "Automatic rollback completed." >&2
+}
+
+cleanup() {
+  local rc=$?
+  set +e
+  if [[ $rc -ne 0 ]]; then
+    capture_diagnostics failure
+    if ! restore_previous > >(tee -a "$INSTALL_LOG_ROOT/rollback.log") 2>&1; then
+      ROLLBACK_RESULT=failed
+    fi
+    capture_diagnostics after-rollback
+  else
+    capture_diagnostics success
+  fi
+  [[ -z $STAGING || ! -e $STAGING ]] || rm -rf "$STAGING"
+  write_install_summary "$rc"
+  return "$rc"
+}
+
+wait_for_url() {
+  local url=$1 i
+  for i in $(seq 1 60); do
+    curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null 2>/dev/null && return 0
+    sleep 2
+  done
+  return 1
+}
+
+wait_for_redis() {
+  local i
+  for i in $(seq 1 60); do
+    "$INSTALL_ROOT/redis/bin/redis-cli" -h 127.0.0.1 -p 6380 ping 2>/dev/null |
+      grep -qx PONG && return 0
+    sleep 1
+  done
+  return 1
+}
+
+run_kafka_topics() {
+  local log_dir=${ANYSENTRY_KAFKA_LOG_DIR:-$STATE_DIR/kafka-logs}
+  install -d -m 0750 "$log_dir" 2>/dev/null || true
+  # The host has no system Java. kafka-topics.sh runs `java` from PATH.
+  JAVA_HOME=$INSTALL_ROOT/java PATH=$INSTALL_ROOT/java/bin:$PATH LOG_DIR=$log_dir \
+    "$INSTALL_ROOT/kafka/bin/kafka-topics.sh" "$@"
+}
+
+wait_for_clickhouse() {
+  local i
+  for i in $(seq 1 60); do
+    curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:8123/ping >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+wait_for_kafka() {
+  local i
+  for i in $(seq 1 90); do
+    run_kafka_topics --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+wait_for_flink() {
+  wait_for_url http://127.0.0.1:8081/overview
+}
+
+record_unit_startup_log() {
+  local unit=$1 name=$2 dest errors
+  dest=$INSTALL_LOG_ROOT/startup-$name.log
+  errors=$INSTALL_LOG_ROOT/startup-$name.errors.txt
+  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 200 \
+    >"$dest" 2>&1 || true
+  echo "----- $name ($unit) startup journal: $dest -----"
+  if grep -E -i 'error|fail|exception|cannot find module|libzvec|GLIBC_|@a3s-lab/code' \
+      "$dest" >"$errors" 2>/dev/null; then
+    cat "$errors"
+  else
+    : >"$errors"
+    echo "(no error lines yet)"
+  fi
+  echo "----- $name journal tail -----"
+  tail -n 40 "$dest" || true
+}
+
+remember_start_failure() {
+  START_FAILURES=$((START_FAILURES + 1))
+  echo "ERROR: $1" | tee -a "$INSTALL_LOG_ROOT/startup-failures.txt"
+}
+
+start_unit() {
+  local unit=$1 name=$2
+  systemctl enable "$unit"
+  if ! systemctl start "$unit"; then
+    # A failed dependency would otherwise skip this unit. Start it anyway so its own journal exists.
+    systemctl start --job-mode=ignore-dependencies "$unit" || true
+  fi
+  record_unit_startup_log "$unit" "$name"
+  systemctl is-active --quiet "$unit" || remember_start_failure "$unit is not active"
+}
+
+finish_if_start_failures() {
+  [[ $START_FAILURES -eq 0 ]] && return 0
+  echo "ERROR: $START_FAILURES service startup check(s) failed."
+  echo "Each service was started and its journal is under $INSTALL_LOG_ROOT."
+  echo "This update will roll back."
+  [[ -f $INSTALL_LOG_ROOT/startup-failures.txt ]] && cat "$INSTALL_LOG_ROOT/startup-failures.txt"
+  fail "one or more services did not start"
+}
+
+probe_a3s_code_runtime() {
+  local node=$INSTALL_ROOT/runtime/node/bin/node code_dir report
+  report=$INSTALL_LOG_ROOT/a3s-code-startup.txt
+  code_dir=$(readlink -f "$INSTALL_ROOT/app/node_modules/@a3s-lab/code" 2>/dev/null || true)
+  {
+    echo "probed_at=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "package=${code_dir:-missing}"
+  } >"$report"
+  if [[ ! -x $node || -z $code_dir || ! -f $code_dir/index.js ]]; then
+    A3S_CODE_RUNTIME=unavailable
+    echo "status=missing" >>"$report"
+    echo "WARNING: @a3s-lab/code is not installed. L2, L3, and the assistant cannot open a session."
+    echo "The probe result is in $report. A service that does not stay up still rolls the update back."
+    return 0
+  fi
+  echo "----- a3s code native load -----"
+  if A3S_CODE_DIR=$code_dir "$node" --input-type=commonjs -e \
+      'require(process.env.A3S_CODE_DIR); console.log("status=loaded")' \
+      >>"$report" 2>&1; then
+    A3S_CODE_RUNTIME=loaded
+    echo "a3s code native runtime loaded. Details: $report"
+    return 0
+  fi
+  A3S_CODE_RUNTIME=unavailable
+  echo "status=failed" >>"$report"
+  echo "WARNING: a3s code native runtime failed to load. The result is recorded and is not itself a service failure."
+  echo "If the API or another service does not stay up, this update still rolls back after every service has been started."
+  echo "Error output:"
+  tail -n 40 "$report"
+  echo "Full probe: $report"
+}
+
+provision_observer() {
+  local port
+  port=$(env_value PORT "$ENV_FILE")
+  [[ -n $port ]] || port=29653
+  wait_for_url "http://127.0.0.1:$port/security-center/healthz" || return 1
+  "$INSTALL_ROOT/runtime/node/bin/node" "$INSTALL_ROOT/provision-observer.mjs" \
+    "$ENV_FILE" "http://127.0.0.1:$port/security-center" || return 1
+  normalize_environment "$ENV_FILE"
+  validate_collector_id "$ENV_FILE"
+  [[ -n $(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE") ]] || return 1
+  [[ -n $(env_value ANYSENTRY_INGEST_TOKEN "$ENV_FILE") ]] || return 1
+  chown root:root "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+}
+
+activate_release() {
+  local unit
+  set_stage stop-existing-services
+  stop_services
+  set_stage backup-current-release
+  backup_current
+  set_stage activate-program-files
+  mv "$STAGING" "$INSTALL_ROOT"
+  STAGING=
+  for unit in "${SERVICES[@]}"; do
+    install -m 0644 "$INSTALL_ROOT/systemd/$unit" "$SYSTEMD_DIR/$unit"
+  done
+  systemctl daemon-reload
+  : >"$INSTALL_LOG_ROOT/startup-failures.txt"
+  set_stage start-clickhouse
+  start_unit anysentry-clickhouse.service clickhouse
+  if systemctl is-active --quiet anysentry-clickhouse.service; then
+    wait_for_clickhouse || remember_start_failure "ClickHouse readiness timeout"
+  fi
+  set_stage start-redis
+  start_unit anysentry-redis.service redis
+  if systemctl is-active --quiet anysentry-redis.service; then
+    wait_for_redis || remember_start_failure "Redis readiness timeout"
+  fi
+  set_stage start-kafka
+  start_unit anysentry-kafka.service kafka
+  if systemctl is-active --quiet anysentry-kafka.service; then
+    wait_for_kafka || remember_start_failure "Kafka readiness timeout"
+  fi
+  set_stage initialize-kafka-topics
+  start_unit anysentry-kafka-init.service kafka-init
+  set_stage start-flink
+  start_unit anysentry-flink-jobmanager.service flink-jobmanager
+  start_unit anysentry-flink-taskmanager.service flink-taskmanager
+  if systemctl is-active --quiet anysentry-flink-jobmanager.service; then
+    wait_for_flink || remember_start_failure "Flink readiness timeout"
+  fi
+  start_unit anysentry-flink-job.service flink-job
+  set_stage start-api-and-observer
+  systemctl enable anysentry.service anysentry-observer.service
+  if ! systemctl start anysentry.service anysentry-observer.service; then
+    systemctl start --job-mode=ignore-dependencies anysentry.service || true
+    systemctl start --job-mode=ignore-dependencies anysentry-observer.service || true
+  fi
+  sleep 2
+  record_unit_startup_log anysentry.service api
+  record_unit_startup_log anysentry-observer.service observer
+  systemctl is-active --quiet anysentry.service || remember_start_failure "anysentry.service is not active"
+  systemctl is-active --quiet anysentry-observer.service || remember_start_failure "anysentry-observer.service is not active"
+  probe_a3s_code_runtime
+  set_stage provision-observer-source
+  if provision_observer; then
+    systemctl restart anysentry-observer.service || true
+    record_unit_startup_log anysentry-observer.service observer
+    systemctl is-active --quiet anysentry-observer.service ||
+      remember_start_failure "anysentry-observer.service is not active after source provisioning"
+  else
+    remember_start_failure "Observer source was not provisioned"
+    record_unit_startup_log anysentry.service api
+    record_unit_startup_log anysentry-observer.service observer
+  fi
+  set_stage start-judgment-workers
+  start_unit anysentry-fast-judge.service fast-judge
+  start_unit anysentry-l3-worker.service l3-worker
+  set_stage start-streaming-workers
+  start_unit anysentry-stream-worker.service stream-worker
+  start_unit anysentry-composite-judge.service composite-judge
+  start_unit anysentry-supply-chain.service supply-chain
+  capture_diagnostics activation
+  finish_if_start_failures
+  set_stage verify-activation
+  "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log" ||
+    fail "activation verification failed"
+  ACTIVATED=0
+}
+
+main() {
+  while (($#)); do
+    case "$1" in
+      --check) CHECK_ONLY=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) usage >&2; fail "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  initialize_install_logging
+  trap cleanup EXIT
+  set_stage preflight
+  preflight 2>&1 | tee "$INSTALL_LOG_ROOT/preflight.log"
+  if [[ $CHECK_ONLY -eq 1 ]]; then
+    set_stage check-completed
+    echo "No service, application, data, or sysctl changes were made."
+    echo "Diagnostic log was written to $INSTALL_LOG_ROOT."
+    return 0
+  fi
+  [[ $(id -u) -eq 0 ]] || fail "installer must run as root"
+  set_stage prepare-service-account
+  if ! getent group anysentry >/dev/null 2>&1; then groupadd --system anysentry; fi
+  if ! id anysentry >/dev/null 2>&1; then
+    nologin_shell=$(command -v nologin || true)
+    [[ -n $nologin_shell ]] || nologin_shell=/usr/sbin/nologin
+    useradd --system --gid anysentry --home-dir "$STATE_DIR" --shell "$nologin_shell" anysentry
+  fi
+  install -d -o anysentry -g anysentry -m 0750 \
+    "$STATE_DIR" "$STATE_DIR/clickhouse" \
+    "$STATE_DIR/clickhouse/tmp" "$STATE_DIR/clickhouse/user_files" \
+    "$STATE_DIR/clickhouse/format_schemas" "$STATE_DIR/clickhouse/access" \
+    "$STATE_DIR/clickhouse/user_defined" \
+    "$STATE_DIR/redis" "$STATE_DIR/kafka" "$STATE_DIR/kafka-logs" \
+    "$STATE_DIR/flink" "$STATE_DIR/flink/log" \
+    "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
+    "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" \
+    "$STATE_DIR/a3s-memory" "$STATE_DIR/a3s-l2-workspace" "$LOG_DIR"
+  set_stage normalize-configuration
+  install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"
+  set_stage persist-resource-configuration
+  persist_resource_configuration
+  set_stage stage-release
+  stage_release
+  activate_release
+  [[ ! -d $ROLLBACK_UNITS ]] || rm -rf "$ROLLBACK_UNITS"
+  [[ ! -f $ROLLBACK_ENV ]] || rm -f "$ROLLBACK_ENV"
+  set_stage completed
+  echo "AnySentry installation or upgrade completed. Dashboard: http://<host>:$(env_value PORT "$ENV_FILE")/"
+  [[ $HAD_PREVIOUS -eq 0 ]] || echo "Previous program retained for rollback: $ROLLBACK_ROOT"
+}
+
+if [[ ${ANYSENTRY_INSTALLER_LIB:-0} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+main "$@"

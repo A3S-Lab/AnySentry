@@ -1,0 +1,33 @@
+[Unit]
+Description=AnySentry supply-chain assessment worker
+Requires=anysentry-redis.service anysentry-clickhouse.service
+After=network.target anysentry-redis.service anysentry-clickhouse.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+WorkingDirectory=/opt/anysentry/app
+EnvironmentFile=/etc/anysentry/anysentry.env
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStart=/opt/anysentry/runtime/node/bin/node /opt/anysentry/app/dist/security-monitoring/supply-chain-worker-main.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+MemoryHigh=3G
+MemoryMax=4G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/anysentry
+
+[Install]
+WantedBy=multi-user.target
+

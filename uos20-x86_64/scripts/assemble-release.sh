@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+ensure_stage
+
+for dir in app runtime native clickhouse redis observer l3 java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+
+install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
+for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-config.xml" "$STAGE_DIR/clickhouse/etc/config.d/anysentry.xml"
+install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-users.xml" "$STAGE_DIR/clickhouse/etc/users.d/anysentry.xml"
+install -m 0644 "$CHANNEL_DIR/package/config/redis.conf" "$STAGE_DIR/redis/etc/redis.conf"
+install -d -m 0755 "$STAGE_DIR/kafka/config"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-log4j2.yaml" "$STAGE_DIR/kafka/config/log4j2.yaml"
+install -m 0644 "$CHANNEL_DIR/package/config/kafka-tools-log4j2.yaml" "$STAGE_DIR/kafka/config/tools-log4j2.yaml"
+install -m 0644 "$CHANNEL_DIR/package/config/flink-config.yaml" "$STAGE_DIR/flink/conf/config.yaml"
+for file in \
+  systemd/anysentry.service \
+  systemd/anysentry-clickhouse.service \
+  systemd/anysentry-redis.service \
+  systemd/anysentry-kafka.service \
+  systemd/anysentry-kafka-init.service \
+  systemd/anysentry-flink-jobmanager.service \
+  systemd/anysentry-flink-taskmanager.service \
+  systemd/anysentry-flink-job.service \
+  systemd/anysentry-fast-judge.service \
+  systemd/anysentry-l3-worker.service \
+  systemd/anysentry-stream-worker.service \
+  systemd/anysentry-composite-judge.service \
+  systemd/anysentry-supply-chain.service \
+  systemd/anysentry-observer.service
+do
+  install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
+done
+install -m 0644 "$CHANNEL_DIR/package/DEPLOYMENT.md" "$STAGE_DIR/DEPLOYMENT.md"
+install -m 0644 "$CHANNEL_DIR/package/AnySentry部署手册.md" "$STAGE_DIR/AnySentry部署手册.md"
+install -m 0644 "$CHANNEL_DIR/package/AnySentry使用手册.md" "$STAGE_DIR/AnySentry使用手册.md"
+install -m 0644 "$CHANNEL_DIR/package/AnySentry脚本说明.md" "$STAGE_DIR/AnySentry脚本说明.md"
+install -m 0644 "$CHANNEL_DIR/package/现场问题采集.md" "$STAGE_DIR/现场问题采集.md"
+install -m 0644 "$CHANNEL_DIR/package/UOS现场诊断规则.md" "$STAGE_DIR/UOS现场诊断规则.md"
+install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
+for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh anysentry-services.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
+install -d -m 0755 "$STAGE_DIR/glm-lab"
+for file in Dockerfile requirements.txt app.py server.py mcp_server.py glm.env.example GLM观测测试.md .dockerignore; do
+  install -m 0644 "$CHANNEL_DIR/package/glm-lab/$file" "$STAGE_DIR/glm-lab/$file"
+done
+install -m 0755 "$CHANNEL_DIR/package/glm-lab/start-glm-lab.sh" "$STAGE_DIR/glm-lab/start-glm-lab.sh"
+if [[ -f $BUILD_DIR/langchain-glm-lab-arm64.tar ]]; then
+  install -m 0644 "$BUILD_DIR/langchain-glm-lab-arm64.tar" "$STAGE_DIR/glm-lab/langchain-glm-lab-arm64.tar"
+fi
+
+source "$BUILD_DIR/source-provenance.env"
+{
+  printf 'RELEASE_VERSION=%s\n' "$RELEASE_VERSION"
+  printf 'TARGET_OS=Linux_Debug_Variant\nTARGET_ARCH=x86_64\nTARGET_GLIBC=%s\nTARGET_PAGE_SIZE=%s\n' "$TARGET_GLIBC" "$TARGET_PAGE_SIZE"
+  printf 'TARGET_KERNEL_RELEASE=%s\nBPF_KERNEL_VERSION=%s\nBPF_KERNEL_VERSION_CODE=%s\n' "$UOS_KERNEL_RELEASE" "$UOS_BPF_KERNEL_VERSION" "$UOS_BPF_KERNEL_VERSION_CODE"
+  printf 'ANYSENTRY_COMMIT=%s\nOBSERVER_COMMIT=%s\nSENTRY_COMMIT=%s\n' "$ANYSENTRY_COMMIT" "$OBSERVER_COMMIT" "$SENTRY_COMMIT"
+  printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nREDIS_VERSION=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\nSENTRY_NPM_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$REDIS_VERSION" "$NODE_VERSION" "$CODE_VERSION" "$SENTRY_NPM_VERSION"
+  printf 'JAVA_VERSION=%s\nKAFKA_VERSION=%s\nFLINK_VERSION=%s\nFLINK_KAFKA_CONNECTOR_VERSION=%s\nPUBLIC_BASE_PATH=/anysentry\n' "$JAVA_DISPLAY_VERSION" "$KAFKA_VERSION" "$FLINK_VERSION" "$FLINK_KAFKA_CONNECTOR_VERSION"
+} > "$STAGE_DIR/VERSION"
+{
+  cat "$STAGE_DIR/VERSION"
+  printf 'REDIS_SOURCE_SHA256=%s\n' "$REDIS_SOURCE_SHA256"
+  printf 'SOURCE_DATE_EPOCH=%s\nBUILT_AT_UTC=%s\n' "$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$STAGE_DIR/PROVENANCE"
+
+# Inject the release version wherever a staged file carries the @RELEASE_VERSION@
+# placeholder (installer diagnostics id, smoke script, shipped guides). Version naming
+# is single-sourced from build.sh --version: a forgotten hardcoded string can no
+# longer mislabel an assembled release (compat15 shipped a compat14-labelled installer).
+while IFS= read -r -d '' staged_file; do
+  sed -i "s|@RELEASE_VERSION@|$RELEASE_VERSION|g" "$staged_file"
+done < <(grep -rlZ '@RELEASE_VERSION@' "$STAGE_DIR")
+if grep -rq '@RELEASE_VERSION@' "$STAGE_DIR"; then
+  die "unresolved @RELEASE_VERSION@ placeholder remains in $STAGE_DIR"
+fi
+
+(cd "$STAGE_DIR" && find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > manifest.sha256 && sha256sum --check --quiet manifest.sha256)
+"$CHANNEL_DIR/scripts/verify-release.sh" "$STAGE_DIR"
+
+mkdir -p "$RELEASE_DIR"
+rm -rf "$RELEASE_DIR/$STAGE_NAME"
+cp -a "$STAGE_DIR" "$RELEASE_DIR/$STAGE_NAME"
+epoch=$(git -C "$ANYSENTRY_REPO" log -1 --format=%ct)
+archive=$RELEASE_DIR/$STAGE_NAME.tar.gz
+tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -C "$RELEASE_DIR" -czf "$archive" "$STAGE_NAME"
+(cd "$RELEASE_DIR" && sha256sum "$STAGE_NAME.tar.gz" > "$STAGE_NAME.tar.gz.sha256")
+echo "Release archive: $archive"
+echo "Checksum:       $archive.sha256"

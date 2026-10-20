@@ -1,0 +1,6 @@
+langchain>=0.3
+langchain-openai
+langchain-mcp-adapters
+mcp>=1.8
+fastapi
+uvicorn
