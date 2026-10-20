@@ -15097,11 +15097,14 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     if (ingestFloodBatchDiscard(events)) {
       // Pure flood batch: acknowledge everything as durable-discarded before any
       // per-event preparation runs; this is what actually frees the event loop.
+      // Fused items are accepted:true + disposition discarded — the same terminal
+      // shape the legacy lane uses for rule-discarded events — so the Forwarder's
+      // invariant (accepted + rejected + retryable === batch length) holds.
       return {
         accepted: true,
         ...(batchId ? { batchId } : {}),
         payloadDigest: payload.digest,
-        acceptedEvents: 0,
+        acceptedEvents: events.length,
         retainedEvents: 0,
         structuralEvents: 0,
         discardedEvents: events.length,
@@ -15109,7 +15112,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         retryableEvents: 0,
         items: events.map((_, index) => ({
           index,
-          accepted: false,
+          accepted: true,
           disposition: 'discarded',
           reasonCode: 'ingest_flood_fuse_batch',
           reason: 'batch dominated by process-exit flood',
@@ -15373,7 +15376,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           // replays them; the cap, not the guardrail, owns this drop.
           immediate.set(index, {
             index,
-            accepted: false,
+            accepted: true,
             disposition: 'discarded',
             reasonCode: 'ingest_flood_fuse',
             reason: 'per-identity process-exit flood fuse',
@@ -16315,17 +16318,49 @@ function ingestFloodWindowTick(): void {
     ingestFloodState.globalCount = 0;
   }
 }
+// Observer batch items wrap their payload in a raw JSON `line`; the kind is the single key
+// of the line's `event` object (see observerLineEventKind), not a top-level `eventKind`
+// field. Reading `event.eventKind` therefore never matched and the fuse stayed inert on the
+// forwarder wire shape. Resolve the kind line-aware: cheap substring pre-check, parse only
+// on candidate hits (argv payloads can coincidentally contain the marker string).
+function ingestFloodEventKind(event: { eventKind?: unknown; line?: unknown }): string | undefined {
+  const direct = event?.eventKind;
+  if (typeof direct === 'string' && direct) return direct;
+  const line = event?.line;
+  if (typeof line !== 'string' || !line.includes('"ProcessExit"')) return undefined;
+  return observerLineEventKind(line);
+}
+function ingestFloodIdentity(event: { agentId?: unknown; line?: unknown }): string {
+  const direct = event?.agentId;
+  if (typeof direct === 'string' && direct) return direct.slice(0, 120);
+  const line = event?.line;
+  if (typeof line === 'string') {
+    try {
+      const parsed = JSON.parse(line) as {
+        workload?: { physicalWorkloadId?: unknown };
+        process?: { comm?: unknown };
+      };
+      const workloadId = parsed?.workload?.physicalWorkloadId;
+      if (typeof workloadId === 'string' && workloadId) return workloadId.slice(0, 120);
+      const comm = parsed?.process?.comm;
+      if (typeof comm === 'string' && comm) return comm.slice(0, 120);
+    } catch {
+      // fall through to the shared bucket
+    }
+  }
+  return 'unattributed';
+}
 function ingestFloodBatchDiscard(events: unknown[]): boolean {
   if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0 || events.length < INGEST_FLOOD_BATCH_MIN_EVENTS) return false;
   let exits = 0;
   for (const event of events) {
-    if ((event as { eventKind?: unknown })?.eventKind === 'ProcessExit') exits += 1;
+    if (ingestFloodEventKind(event as { eventKind?: unknown; line?: unknown }) === 'ProcessExit') exits += 1;
   }
   return exits >= events.length * INGEST_FLOOD_BATCH_SHARE;
 }
-function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown }): boolean {
+function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown; line?: unknown }): boolean {
   if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0) return false;
-  if (event?.eventKind !== 'ProcessExit') return false;
+  if (ingestFloodEventKind(event) !== 'ProcessExit') return false;
   ingestFloodWindowTick();
   // Global budget first: many distinct identities each under the per-identity
   // ceiling can still flood the loop (container-churn / build workloads).
@@ -16334,9 +16369,7 @@ function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown 
     ingestFloodState.droppedTotal += 1;
     return true;
   }
-  const identity = typeof event?.agentId === 'string' && event.agentId
-    ? event.agentId.slice(0, 120)
-    : 'unattributed';
+  const identity = ingestFloodIdentity(event);
   const n = (ingestFloodState.counts.get(identity) ?? 0) + 1;
   ingestFloodState.counts.set(identity, n);
   if (n > INGEST_FLOOD_LIMIT_PER_MINUTE) {

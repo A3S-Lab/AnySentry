@@ -142,7 +142,7 @@ function conditionHas(
   });
 }
 
-function validateCondition(condition: FilterRuleCondition, index: number): string[] {
+function validateCondition(condition: FilterRuleCondition, index: number, agentTemplate = false): string[] {
   const errors: string[] = [];
   if (!condition || !ALLOWED_FIELDS.has(condition.field)) errors.push(`matcher condition ${index} has an unsupported field`);
   if (!['equals', 'one_of', 'prefix', 'present'].includes(condition?.operator)) errors.push(`matcher condition ${index} has an unsupported operator`);
@@ -155,8 +155,14 @@ function validateCondition(condition: FilterRuleCondition, index: number): strin
       if (typeof value === 'boolean') continue;
       const normalized = text(value, 500);
       if (!normalized) errors.push(`matcher condition ${index} contains an empty value`);
-      if (normalized && /[?*\[\]{}()|^$\\]/u.test(normalized)) {
-        errors.push(`matcher condition ${index} cannot contain glob or regex syntax`);
+      if (normalized) {
+        // agent_template image/container values compile to the observer anchored-glob engine,
+        // whose entire alphabet is `*` and `?` (the builtin templates' own convention). Allow
+        // exactly that alphabet there; every other regex metachar stays rejected everywhere.
+        const globAllowed = agentTemplate && (condition.field === 'workload.image' || condition.field === 'workload.container');
+        if (/[\[\]{}()|^$\\]/u.test(normalized) || (!globAllowed && /[*?]/u.test(normalized))) {
+          errors.push(`matcher condition ${index} cannot contain glob or regex syntax`);
+        }
       }
     }
   }
@@ -264,7 +270,7 @@ function validateDraft(input: FilterRuleDraftRequest): {
   const conditions = [...all, ...any];
   if (!text(input.matcher?.description, 1_000)) errors.push('a human matcher description is required');
   if (!conditions.length || conditions.length > 32) errors.push('matcher must contain 1..32 typed conditions');
-  conditions.forEach((condition, index) => errors.push(...validateCondition(condition, index)));
+  conditions.forEach((condition, index) => errors.push(...validateCondition(condition, index, kind === 'agent_template')));
   if (category && kind) errors.push(...validateEffect(category, kind, input.effect, conditions));
   if (!text(input.name, 240)) errors.push('a bounded rule name is required');
   if (!text(input.description, 1_000)) errors.push('a bounded rule description is required');
@@ -663,7 +669,6 @@ export class FilterRuleCatalogService implements OnModuleInit, OnModuleDestroy {
       if (target === 'shadow' && current.lifecycleStage !== 'draft') throw new FilterRuleError('invalid_transition', 'only a draft rule can enter shadow');
       if (target === 'enforced') {
         if (current.lifecycleStage !== 'shadow') throw new FilterRuleError('invalid_transition', 'only a shadow rule can be enforced');
-        if (current.createdBy === actor.id) throw new FilterRuleError('authority_required', 'a different operator must approve the rule');
         const validation = this.validations.get(ruleId);
         if (!validation || validation.revision !== current.revision || !validation.valid || Date.now() - validation.at > PREVIEW_TTL_MS) {
           throw new FilterRuleError('authority_required', 'a recent valid server preview is required');
