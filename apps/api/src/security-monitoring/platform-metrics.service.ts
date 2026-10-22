@@ -4,6 +4,7 @@ import { statfsSync } from 'node:fs';
 import { cpus } from 'node:os';
 import { Observable } from 'rxjs';
 import { finalize } from 'rxjs/operators';
+import { middlewareView } from './platform-middleware.sampler';
 import * as T from './types';
 
 interface Histogram {
@@ -187,14 +188,15 @@ export class PlatformMetricsService {
 
   async overview(range = 'last_1h'): Promise<T.PlatformMetricsOverview> {
     const window = this.window(range);
+    const middleware = await middlewareView(window.fromMs).catch(() => undefined);
     const prometheusUrl = process.env.ANYSENTRY_PROMETHEUS_URL?.trim();
-    if (!prometheusUrl) return this.runtimeFallback(window, 'Prometheus 未配置，当前仅展示 AnySentry API 进程的真实运行数据。');
-    try {
-      return await this.prometheusOverview(prometheusUrl.replace(/\/$/, ''), window);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return this.runtimeFallback(window, `Prometheus 暂时不可用：${message}`);
-    }
+    const overview = !prometheusUrl
+      ? this.runtimeFallback(window, 'Prometheus 未配置，主机趋势暂缺；中间件指标由 API 直接采集。')
+      : await this.prometheusOverview(prometheusUrl.replace(/\/$/, ''), window).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return this.runtimeFallback(window, `Prometheus 暂时不可用：${message}`);
+      });
+    return middleware ? { ...overview, middleware } : overview;
   }
 
   private sampleProcessCpu(): void {
@@ -234,9 +236,9 @@ export class PlatformMetricsService {
       apiP95: '1000 * histogram_quantile(0.95, sum by (le) (rate(anysentry_http_request_duration_seconds_bucket[5m])))',
       apiError: '100 * sum(rate(anysentry_http_requests_total{status_class=~"4xx|5xx"}[5m])) / clamp_min(sum(rate(anysentry_http_requests_total[5m])), 0.000001)',
       apiRate: 'sum(rate(anysentry_http_requests_total[5m]))',
-      componentCpu: `100 * sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{${composeSelector},container_label_com_docker_compose_service!=""}[5m])) / scalar(count(node_cpu_seconds_total{job="node",mode="idle"}))`,
-      componentMemory: `sum by (container_label_com_docker_compose_service) (container_memory_working_set_bytes{${composeSelector},container_label_com_docker_compose_service!=""})`,
-      componentLimit: `sum by (container_label_com_docker_compose_service) (container_spec_memory_limit_bytes{${composeSelector},container_label_com_docker_compose_service!=""})`,
+      componentCpu: `100 * sum by (container_label_com_docker_compose_service) (max by (container_label_com_docker_compose_service, name) (rate(container_cpu_usage_seconds_total{${composeSelector},container_label_com_docker_compose_service!=""}[5m]))) / scalar(count(node_cpu_seconds_total{job="node",mode="idle"}))`,
+      componentMemory: `sum by (container_label_com_docker_compose_service) (max by (container_label_com_docker_compose_service, name) (container_memory_working_set_bytes{${composeSelector},container_label_com_docker_compose_service!=""}))`,
+      componentLimit: `sum by (container_label_com_docker_compose_service) (max by (container_label_com_docker_compose_service, name) (container_spec_memory_limit_bytes{${composeSelector},container_label_com_docker_compose_service!=""} > 0))`,
       targets: 'up{job=~"anysentry-api|node|cadvisor|clickhouse"}',
     };
     const instantEntries = await Promise.all(

@@ -18,6 +18,7 @@ export type SecurityTimeType =
   | "last_7d"
   | "last_30d"
   | "custom";
+export const DEFAULT_SECURITY_TIME_TYPE: SecurityTimeType = "last_30m";
 export type SecurityRiskLevel = "safe" | "low" | "medium" | "high" | "critical" | "unknown" | string;
 export type SecurityPolicyAction = "allow" | "review" | "block" | string;
 
@@ -416,6 +417,15 @@ export interface PlatformMetricsOverview {
   components: PlatformComponentMetric[];
   anomalies: PlatformMetricAnomaly[];
   message?: string;
+  middleware?: {
+    components: Array<Pick<PlatformComponentMetric, "id" | "name" | "status"> & { message: string }>;
+    series: Array<{
+      key: string;
+      label: string;
+      unit: string;
+      points: PlatformMetricPoint[];
+    }>;
+  };
 }
 
 export interface SecurityWorkspaceRiskItem {
@@ -4462,6 +4472,634 @@ export interface PlatformHealth {
   policy: PolicyStatus;
 }
 
+export interface InteractionStatus {
+  schemaVersion: "anysentry.interaction-status.v1";
+  enabled: boolean;
+  ready: boolean;
+  captureMode: "metadata";
+  contentCaptureAllowed: boolean;
+  contentCaptureMode:
+    | "metadata_only"
+    | "isolated_fixture_encrypted"
+    | "local_runtime_encrypted";
+  contentStore: {
+    enabled: boolean;
+    fixtureMode: boolean;
+    localRuntimeMode: boolean;
+    encryptionReady: boolean;
+    backend: "postgresql_encrypted";
+    keyVersion?: string;
+  };
+  rawViewAuthentication:
+    | "management_plus_raw_capability"
+    | "unsafe_local_direct_view"
+    | "disabled";
+  contentDurableBoundary: "content_store_finalize+kafka_ack" | "not_applicable";
+  durableBoundary: "kafka_ack";
+  topic: string;
+  durability: {
+    state: "ready" | "unavailable";
+    lastError?: string;
+  };
+  projection: {
+    postgresql: boolean;
+    clickhouse: boolean;
+    state: "ready" | "degraded";
+    failingPartitions: string[];
+    lastError?: string;
+  };
+  backpressure: {
+    inFlightRequests: number;
+    inFlightBytes: number;
+    maxInFlightRequests: number;
+    maxInFlightBytes: number;
+  };
+  accepted: number;
+  rejected: number;
+  projected: number;
+  projectionBatches: number;
+  projectionDuplicates: number;
+  projectionFailures: number;
+  duplicates: number;
+  lastAcceptedAt?: number;
+  lastProjectedAt?: number;
+  lastError?: string;
+  managementAuthenticationConfigured: boolean;
+  rawViewEnabled: boolean;
+  directViewEnabled: boolean;
+  counters: {
+    finalized: number;
+    duplicates: number;
+    conflicts: number;
+    reads: number;
+    deleted: number;
+    orphanPurges: number;
+    failures: number;
+  };
+}
+
+export interface InteractionConversationSummary {
+  conversationId: string;
+  agentInstanceId?: string;
+  processInstanceId: string;
+  runtimeType?: "codex_app_server" | "codex_ebpf_rustls" | "a3s_code_ebpf_tls" | "claude_code_ebpf_tls" | "gemini_cli_ebpf_openssl" | "kimi_cli_ebpf_openssl";
+  runtimeThreadId?: string;
+  workspacePath?: string;
+  provider?: string;
+  collectorId: string;
+  firstObservedAt: number;
+  lastObservedAt: number;
+  transportObservations: number;
+  instructionObservations: number;
+  responseObservations: number;
+  completeTurns: number;
+  requestBytes: number;
+  responseBytes: number;
+  timingScope: "connection" | "unavailable";
+  contentAvailable: boolean;
+  title?: string;
+  tokenUsage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+}
+
+export interface InteractionConversationList {
+  schemaVersion: "anysentry.interaction-conversations.v1";
+  items: InteractionConversationSummary[];
+  total: number;
+  contentCapture: "metadata_only" | "encrypted_available";
+  queryCompleteness: "projected" | "unavailable";
+  updateTime: string;
+}
+
+export interface InteractionMetadataObservation {
+  schemaVersion: "anysentry.interaction-metadata.v1";
+  eventType: "LlmTransportObserved";
+  interactionId: string;
+  conversationId: string;
+  sourceEventId: string;
+  sourceId: string;
+  collectorId: string;
+  observedAt: number;
+  acceptedAt: number;
+  processInstanceId: string;
+  agentInstanceId?: string;
+  workspacePath?: string;
+  process: {
+    hostId?: string;
+    bootId?: string;
+    pid: number;
+    startTimeTicks?: string;
+    comm?: string;
+    exe?: string;
+    cgroupId?: string;
+  };
+  transport: {
+    sni?: string;
+    provider?: string;
+    peer?: string;
+    protocol?: "unknown" | "http1" | "http2" | "websocket";
+    requestBytes?: number;
+    responseBytes?: number;
+    timingScope: "connection" | "unavailable";
+    latencyAvailability: "available" | "unavailable";
+    latencyMs?: number;
+    ttftAvailability: "available" | "unavailable";
+    ttftApproxMs?: number;
+  };
+  capture: {
+    captureMethod: "ebpf_transport";
+    captureMode: "metadata";
+    captureCompleteness: "unavailable";
+    parseStatus: "not_attempted";
+    rawRetentionState: "not_retained";
+    presentationState: "metadata_only";
+  };
+}
+
+export interface InteractionRuntimeObservation {
+  runtimeType: "codex_app_server" | "codex_ebpf_rustls" | "a3s_code_ebpf_tls" | "claude_code_ebpf_tls" | "gemini_cli_ebpf_openssl" | "kimi_cli_ebpf_openssl";
+  threadId: string;
+  sessionId: string;
+  source: string;
+  cliVersion?: string;
+  modelProvider?: string;
+}
+
+export interface InteractionInstructionObservation {
+  schemaVersion: "anysentry.interaction-instruction.v1";
+  eventType: "AgentInputObserved";
+  interactionId: string;
+  conversationId: string;
+  sourceEventId: string;
+  sourceId: string;
+  collectorId: string;
+  observedAt: number;
+  acceptedAt: number;
+  contentAvailability?: "available" | "deleted";
+  content?: string;
+  rawBody?: string;
+  rawMeta?: Record<string, unknown>;
+  processInstanceId: string;
+  agentInstanceId?: string;
+  workspacePath?: string;
+  turn?: {
+    sourceTurnId: string;
+    sequence?: number;
+  };
+  turnId?: string;
+  turnSequence?: number;
+  turnCorrelation: "explicit_source_turn" | "unassigned";
+  process?: InteractionMetadataObservation["process"];
+  runtime?: InteractionRuntimeObservation;
+  input:
+    | {
+        protocol: "native_stdio";
+        inputScope: "agent_process_stdin";
+        fd: 0;
+      }
+    | {
+        protocol: "codex_app_server";
+        inputScope: "codex_thread_user_message";
+        itemId: string;
+      };
+  capture: {
+    captureMethod: "ebpf_stdin" | "codex_app_server";
+    captureProfile: "isolated_fixture" | "runtime_adapter";
+    captureMode: "encrypted_full";
+    captureCompleteness: "complete" | "partial" | "truncated";
+    parseStatus: "boundary_observed" | "parsed";
+    rawRetentionState: "encrypted";
+    presentationState: "redacted";
+  };
+  userInstruction: {
+    eventType: "UserInstructionObserved";
+    messageRole: "user";
+    contentBytes: number;
+    contentSha256: string;
+    contentRef: string;
+  };
+}
+
+export interface InteractionResponseObservation {
+  schemaVersion: "anysentry.interaction-response.v1";
+  eventType: "AgentOutputObserved";
+  interactionId: string;
+  conversationId: string;
+  sourceEventId: string;
+  sourceId: string;
+  collectorId: string;
+  observedAt: number;
+  acceptedAt: number;
+  contentAvailability?: "available" | "deleted";
+  content?: string;
+  rawBody?: string;
+  rawMeta?: Record<string, unknown>;
+  processInstanceId: string;
+  agentInstanceId?: string;
+  workspacePath?: string;
+  turn?: {
+    sourceTurnId: string;
+    sequence?: number;
+  };
+  turnId?: string;
+  turnSequence?: number;
+  turnCorrelation: "explicit_source_turn" | "unassigned";
+  process?: InteractionMetadataObservation["process"];
+  runtime?: InteractionRuntimeObservation;
+  output:
+    | {
+        protocol: "native_stdio";
+        outputScope: "agent_process_stdout";
+        fd: 1;
+      }
+    | {
+        protocol: "codex_app_server";
+        outputScope: "codex_thread_agent_message";
+        itemId: string;
+      };
+  capture: {
+    captureMethod: "ebpf_stdout" | "codex_app_server";
+    captureProfile: "isolated_fixture" | "runtime_adapter";
+    captureMode: "encrypted_full";
+    captureCompleteness: "complete" | "partial" | "truncated";
+    parseStatus: "boundary_observed" | "parsed";
+    rawRetentionState: "encrypted";
+    presentationState: "redacted";
+  };
+  assistantResponse: {
+    eventType: "AssistantResponseObserved";
+    messageRole: "assistant";
+    phase?: "commentary" | "final_answer" | "unknown";
+    contentBytes: number;
+    contentSha256: string;
+    contentRef: string;
+  };
+}
+
+export type InteractionContentObservation =
+  | InteractionInstructionObservation
+  | InteractionResponseObservation;
+
+export type InteractionObservation =
+  | InteractionMetadataObservation
+  | InteractionInstructionObservation
+  | InteractionResponseObservation;
+
+export interface InteractionConversationDetail {
+  schemaVersion: "anysentry.interaction-conversation-detail.v1";
+  conversation: InteractionConversationSummary;
+  observations: InteractionObservation[];
+  contentCapture: "metadata_only" | "encrypted_available";
+}
+
+export interface InteractionContentView {
+  schemaVersion: "anysentry.interaction-content.v1";
+  interactionId: string;
+  conversationId: string;
+  contentRef: string;
+  messageRole: "user" | "assistant";
+  contentRole: "user_instruction" | "assistant_response";
+  content: string;
+  contentBytes: number;
+  contentSha256: string;
+  keyVersion: string;
+  rawRetentionState: "encrypted";
+  presentationState: "raw_authorized";
+}
+
+export interface InteractionContentDeletion {
+  schemaVersion: "anysentry.interaction-content-deletion.v1";
+  interactionId: string;
+  deleted: true;
+  deletedAt: number;
+}
+
+export type LocalRecordActivityStatus = "active" | "recent" | "stopped";
+export type LocalRecordProcessStatus = "running" | "exited" | "unknown";
+export type LocalRecordAdapter = "codex" | "a3s_code" | "claude_code" | "gemini_cli" | "kimi_cli" | "opencode" | "langchain_http";
+export type LocalRecordProcessEvidence =
+  | "proc_fd"
+  | "ebpf_session_file"
+  | "sticky_binding"
+  | "live_agent"
+  | "observed_exit"
+  | "binding_replaced"
+  | "not_observed"
+  | "unavailable";
+export type LocalRecordMetricScope = "full_record" | "recent_window";
+
+export interface LocalRecordTokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  contextWindow?: number;
+}
+
+export interface LocalRecordSummary {
+  recordId: string;
+  adapter: LocalRecordAdapter;
+  sessionId: string;
+  title: string;
+  cwd?: string;
+  model?: string;
+  modelProvider?: string;
+  originator?: string;
+  cliVersion?: string;
+  startedAt: number;
+  updatedAt: number;
+  fileBytes: number;
+  processStatus: LocalRecordProcessStatus;
+  processEvidence: LocalRecordProcessEvidence;
+  processPid?: number;
+  processObservedAt?: number;
+  activityStatus: LocalRecordActivityStatus;
+  metricScope: LocalRecordMetricScope;
+  userMessageCount: number;
+  assistantMessageCount: number;
+  completeTurnCount: number;
+  toolCallCount: number;
+  toolFailureCount: number;
+  tokenUsage: LocalRecordTokenUsage;
+}
+
+export interface LocalRecordTrackingStatus {
+  schemaVersion: "anysentry.local-record-tracking-status.v1";
+  enabled: boolean;
+  adapter: LocalRecordAdapter | "multi";
+  adapters: LocalRecordAdapter[];
+  rootConfigured: boolean;
+  rootAccessible: boolean;
+  rootDisplay?: string;
+  recordCount: number;
+  readMode: "bounded_read_only";
+  contentSource: "local_session_files";
+  systemEvidence: "host_proc_fd" | "not_collected" | "unavailable";
+  processObservation: {
+    enabled: boolean;
+    available: boolean;
+    source: "host_proc_fd" | "not_configured" | "unavailable";
+    rootDisplay?: string;
+    lastError?: string;
+  };
+  lastError?: string;
+  limitations: string[];
+  updateTime: string;
+}
+
+export interface LocalRecordList {
+  schemaVersion: "anysentry.local-record-list.v1";
+  status: LocalRecordTrackingStatus;
+  items: LocalRecordSummary[];
+  total: number;
+  aggregates: {
+    runningProcesses: number;
+    exitedRecords: number;
+    unknownProcessRecords: number;
+    activeRecords: number;
+    recentRecords: number;
+    totalBytes: number;
+    observedTokens: number;
+    observedToolCalls: number;
+  };
+  updateTime: string;
+}
+
+export type LocalRecordEventKind =
+  | "turn_start"
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "turn_complete"
+  | "system_event";
+
+export interface LocalRecordTimelineEvent {
+  eventId: string;
+  kind: LocalRecordEventKind;
+  timestamp: number;
+  turnId?: string;
+  role?: "user" | "assistant" | "system";
+  phase?: string;
+  title: string;
+  content?: string;
+  toolName?: string;
+  command?: string;
+  workdir?: string;
+  callId?: string;
+  status?: "observed" | "success" | "failure" | "unknown";
+  durationMs?: number;
+  timeToFirstTokenMs?: number;
+  agentId?: string;
+  sourceOffset: number;
+  rawBody?: string;
+  rawMeta?: Record<string, unknown>;
+}
+
+export interface LocalObservedLlmRequest {
+  interactionId: string;
+  observedAt: number;
+  pid: number;
+  tid?: number;
+  protocol: "http1" | "websocket";
+  providerHost: string;
+  requestPath: string;
+  endpointAttribution:
+    | "observed_headers"
+    | "observed_handshake"
+    | "configured_endpoint"
+    | "configured_late_attach";
+  provider?: string;
+  model?: string;
+  sessionId: string;
+  threadId: string;
+  turnId?: string;
+  windowId?: string;
+  requestKind?: string;
+  content?: string;
+  contentBytes: number;
+  contentSha256: string;
+  contentAvailability:
+    | "available"
+    | "deleted"
+    | "unavailable"
+    | "not_authorized"
+    | "not_requested";
+  capture: {
+    method: "ebpf_rustls" | "ebpf_openssl" | "ebpf_boringssl";
+    profile: "exact_pid_runtime" | "exact_binary_runtime";
+    completeness: "complete" | "partial" | "truncated";
+    parseStatus: "parsed";
+  };
+}
+
+export interface LocalToolEvidence {
+  schemaVersion: "anysentry.local-tool-evidence.v1";
+  nativeSessionId: string;
+  scope: "loaded_window";
+  partial: boolean;
+  calls: Array<{
+    callEventId: string;
+    callId?: string;
+    status: "confirmed" | "candidate" | "ambiguous" | "unmatched" | "pending" | "unsupported";
+    confirmedEventIds: string[];
+    candidates: Array<{
+      eventId: string;
+      anchorEventId: string;
+      reason: "exact_command" | "shell_wrapper" | "command_hash" | "process_lineage";
+    }>;
+  }>;
+}
+
+export interface LocalRecordResources {
+  recordId: string;
+  state: "observed" | "unavailable" | "unbound" | "shared";
+  source: "host_proc";
+  scope: "session_process";
+  pid?: number;
+  generation?: string;
+  samples: Array<{ at: number; rssBytes?: number; cpuPercent?: number }>;
+}
+
+export interface LocalRecordDetail {
+  schemaVersion: "anysentry.local-record-detail.v1";
+  record: LocalRecordSummary;
+  events: LocalRecordTimelineEvent[];
+  observedLlmRequests: LocalObservedLlmRequest[];
+  toolEvidence?: LocalToolEvidence;
+  systemEvidence?: {
+    schemaVersion: "anysentry.local-session-system-evidence.v1";
+    conversationId: string;
+    evidenceScope?: "current_generation" | "historical_persisted" | "historical_reconstructed" | "mixed";
+    binding: {
+      bindingId: string;
+      bindingRevision: number;
+      nativeSessionId: string;
+      runtimeProcessInstanceId?: string;
+      matchedOsProcessInstanceKey: string;
+      matchedPid: number;
+      launcherProcessInstanceKey?: string;
+      launcherPid?: number;
+      agentRootProcessInstanceKey?: string;
+      agentInstanceId?: string;
+      method: "proc_fd" | "ebpf_session_file" | "controlled_launch" | "observer_request" | "tool_exec_exact";
+      confidence: number;
+    };
+    persistence: "persisted" | "not_checked" | "degraded";
+    completeness: "complete_as_observed" | "partial" | "unavailable";
+    counts: {
+      direct: number;
+      lineage: number;
+      ambiguous: number;
+      conflict: number;
+      unattributed: number;
+    };
+    page: {
+      requestedLimit: number;
+      totalRelations: number;
+      loadedRelations: number;
+      returnedEvents: number;
+      unavailableEvents: number;
+      totalLineageEdges: number;
+      returnedLineageEdges: number;
+      processFamilyTruncated?: boolean;
+      hasMore: boolean;
+    };
+    lineage: Array<{
+      edgeId: string;
+      parentProcessInstanceKey: string;
+      childProcessInstanceKey: string;
+      parentPid: number;
+      childPid: number;
+      validFrom: number;
+      validTo?: number;
+    }>;
+    events: Array<{
+      relationId: string;
+      relation: "DIRECT" | "LINEAGE";
+      toolCallBinding?: {
+        method: "authenticated_agent_adapter";
+        toolCallId: string;
+        invocationId?: string;
+      };
+      confidence: number;
+      eventId: string;
+      at: number;
+      eventKind: string;
+      eventCategory: string;
+      subject: string;
+      processInstanceKey: string;
+      pid?: number;
+      ppid?: number;
+      command?: string;
+      commandHash?: string;
+      verdict: string;
+      tier: string;
+      severity: string;
+      riskScore: number;
+      decisionRevision?: number;
+      traceId?: string;
+      spanId?: string;
+    }>;
+    startupContext?: Array<{
+      eventId: string;
+      at: number;
+      previousAgentInstanceId: string;
+      identityObservedAt: number;
+    }>;
+    exceptions: Array<{
+      resultId: string;
+      eventId: string;
+      status: "AMBIGUOUS" | "CONFLICT";
+      reason: string;
+      candidateConversationIds: string[];
+    }>;
+    calculatedAt: number;
+  };
+  metrics: {
+    scope: LocalRecordMetricScope;
+    scannedBytes: number;
+    fileBytes: number;
+    messageCount: number;
+    userMessageCount: number;
+    assistantMessageCount: number;
+    turnCount: number;
+    completeTurnCount: number;
+    toolCallCount: number;
+    toolResultCount: number;
+    toolFailureCount: number;
+    completedDurationMs: number;
+    averageTimeToFirstTokenMs?: number;
+    tokenUsage: LocalRecordTokenUsage;
+  };
+  page: {
+    beforeOffset: number;
+    nextBeforeOffset?: number;
+    hasMore: boolean;
+    returnedEvents: number;
+    scannedFromOffset: number;
+    scannedToOffset: number;
+    truncatedLines: number;
+  };
+  provenance: {
+    source:
+      | "codex_local_session"
+      | "a3s_code_local_session"
+      | "claude_code_local_session"
+      | "gemini_cli_local_session"
+      | "kimi_cli_local_session"
+      | "opencode_local_session"
+      | "langchain_http_plaintext";
+    captureMethod: "local_file_read" | "ebpf_plaintext";
+    readOnly: true;
+    ebpfIncluded: boolean;
+    observerRequestEvidence: "observed" | "not_observed" | "unavailable";
+    observerSource: "anysentry_observer";
+    toolSemantics: "agent_declared";
+  };
+  updateTime: string;
+}
+
 const DASHBOARD_HISTORY_TIMEOUT_MS = 45_000;
 const dashboardPost = <T>(endpoint: string, body: unknown) =>
   apiClient.postLong<T>(endpoint, body, DASHBOARD_HISTORY_TIMEOUT_MS);
@@ -4471,6 +5109,98 @@ export const securityCenterApi = {
     apiClient.get<PlatformHealth>("/security-center/healthz", { signal }),
   platformMetrics: (range: SecurityTimeType = "last_1h") =>
     apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
+  interactionStatus: () =>
+    apiClient.get<InteractionStatus>("/security-center/interactions/status"),
+  interactionConversations: (query: {
+    limit?: number;
+    collectorId?: string;
+    agentInstanceId?: string;
+    workspacePath?: string;
+    since?: number;
+    until?: number;
+  } = {}) =>
+    apiClient.get<InteractionConversationList>(
+      `/security-center/conversations${querySuffix(query)}`,
+    ),
+  interactionConversation: (conversationId: string) =>
+    apiClient.get<InteractionConversationDetail>(
+      `/security-center/conversations/${encodeURIComponent(conversationId)}`,
+    ),
+  localRecordStatus: () =>
+    apiClient.get<LocalRecordTrackingStatus>("/security-center/local-records/status"),
+  localRecords: (query: {
+    limit?: number;
+    search?: string;
+    activityStatus?: LocalRecordActivityStatus | "all";
+    processStatus?: LocalRecordProcessStatus | "all";
+  } = {}) =>
+    apiClient.get<LocalRecordList>(
+      `/security-center/local-records${querySuffix(query)}`,
+    ),
+  localRecord: (
+    recordId: string,
+    query: {
+      limit?: number;
+      beforeOffset?: number;
+      evidenceLimit?: number;
+      includeSystemEvidence?: boolean;
+      includeObservedLlmRequests?: boolean;
+      includeObservedLlmRequestContent?: boolean;
+    } = {},
+  ) =>
+    apiClient.get<LocalRecordDetail>(
+      `/security-center/local-records/${encodeURIComponent(recordId)}${querySuffix(query)}`,
+    ),
+  localRecordResources: (recordId: string) => apiClient.get<LocalRecordResources>(
+    `/security-center/local-records/${encodeURIComponent(recordId)}/resources`,
+  ),
+  localRecordSystemEvidence: (
+    recordId: string,
+    query: {
+      evidenceLimit?: number;
+    } = {},
+  ) =>
+    apiClient.getLong<LocalRecordDetail>(
+      `/security-center/local-records/${encodeURIComponent(recordId)}${querySuffix({
+        // The API evaluates candidates against this bounded semantic page as well as evidence.
+        limit: 250,
+        ...query,
+        includeSystemEvidence: true,
+        includeObservedLlmRequests: false,
+      })}`,
+    ),
+  interactionContent: (
+    interactionId: string,
+    authorization?: { rawViewToken: string; reason: string },
+    signal?: AbortSignal,
+  ) =>
+    apiClient.get<InteractionContentView>(
+      `/security-center/interactions/${encodeURIComponent(interactionId)}/content`,
+      {
+        headers: authorization
+          ? {
+              "X-AnySentry-Raw-View-Token": authorization.rawViewToken,
+              "X-AnySentry-Raw-View-Reason": encodeURIComponent(authorization.reason),
+            }
+          : undefined,
+        cache: "no-store",
+        signal,
+      },
+    ),
+  deleteInteractionContent: (
+    interactionId: string,
+    authorization: { rawViewToken: string; reason: string },
+  ) =>
+    apiClient.delete<InteractionContentDeletion>(
+      `/security-center/interactions/${encodeURIComponent(interactionId)}/content`,
+      {
+        headers: {
+          "X-AnySentry-Raw-View-Token": authorization.rawViewToken,
+          "X-AnySentry-Raw-View-Reason": encodeURIComponent(authorization.reason),
+        },
+        cache: "no-store",
+      },
+    ),
   assistantQuery: (body: SecurityAssistantQuery, timeoutMs?: number) =>
     apiClient.postLong<SecurityAssistantAnswer>("/security-center/assistant/query", body, timeoutMs),
   healthCard: (filter: SecurityTimeFilter) =>

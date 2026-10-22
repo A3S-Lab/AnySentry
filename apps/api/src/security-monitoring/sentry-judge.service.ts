@@ -45,6 +45,7 @@ const SCHEMA_VERSION: JudgedEvent['schemaVersion'] = 'anysentry.agent_event.v1';
 const SECURITY_JUDGED_KINDS = new Set(['ToolExec', 'Egress', 'Dns', 'FileAccess', 'SslContent', 'SecurityAction']);
 const DEFAULT_INTERNAL_L3_BIN = '/opt/anysentry/l3-agent.mjs';
 const RELATIONAL_REFRESH_MS = 15_000;
+const INCIDENT_PERSIST_DEBOUNCE_MS = 250;
 const CAPTURE_PROFILE_MODES = new Set(['legacy', 'shadow', 'enforce']);
 const CAPTURE_PROFILE_ACTIVATION_MODES = new Set(['shadow', 'preview', 'enforce']);
 const CAPTURE_PROFILE_CONTROL_STATES = new Set(['ready', 'lkg_degraded']);
@@ -610,6 +611,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   private readonly ch = new ClickHouseStore();
   private readonly incidents = new Map<string, Incident>();
   private incidentPersistenceReady = false;
+  private readonly pendingIncidentPersistence = new Map<string, Incident>();
+  private incidentProjectionDirty = false;
+  private incidentPersistenceTimer?: NodeJS.Timeout;
+  private incidentPersistenceRunning?: Promise<void>;
   private incidentRelationalRefreshTimer?: NodeJS.Timeout;
   private policyRelationalRefreshTimer?: NodeJS.Timeout;
   // The live editable judge policy (the config panels' target). Applied = ACL rebuilt + judge recreated.
@@ -645,9 +650,12 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.alerting.backfillEventScopes(historicalScopes);
       if (this.PROCESS_LIFECYCLE_HYDRATE) {
         const lifecycleFacts = await this.ch.readRecentProcessLifecycleFacts(
-          Date.now() - 30 * 60_000,
+          // Upstream perf note: a 30-minute full-table ORDER BY scan at startup competes with
+          // the first System Evidence requests. Five minutes warms the hot structural cache;
+          // durable history remains in ClickHouse.
+          Date.now() - 5 * 60_000,
           Date.now(),
-          this.MAX_PROCESS_LIFECYCLE_FACTS,
+          Math.min(this.MAX_PROCESS_LIFECYCLE_FACTS, 2_000),
         );
         if (lifecycleFacts) {
           this.processLifecycleHydratedFromStorage = true;
@@ -706,24 +714,36 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       }
     }
     this.decisionRevisionWriterClosing = true;
+    if (this.incidentPersistenceTimer) clearTimeout(this.incidentPersistenceTimer);
+    this.incidentPersistenceTimer = undefined;
     if (this.decisionRevisionWriteTimer) clearTimeout(this.decisionRevisionWriteTimer);
     this.decisionRevisionWriteTimer = undefined;
     if (this.timer) clearInterval(this.timer);
     if (this.incidentRelationalRefreshTimer) clearInterval(this.incidentRelationalRefreshTimer);
     if (this.policyRelationalRefreshTimer) clearInterval(this.policyRelationalRefreshTimer);
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    // Queue workers' destroy hooks have finished accepting/completing their existing work.
+    this.decisionRevisionWriterClosing = true;
+    if (this.decisionRevisionWriteTimer) clearTimeout(this.decisionRevisionWriteTimer);
+    this.decisionRevisionWriteTimer = undefined;
     try {
       await this.persistIncidentState(this.incidents ? [...this.incidents.values()] : []);
     } finally {
-      // Event rows are the durable evidence path. Always give their bounded drain the remaining
-      // 20 seconds. ClickHouseStore.close() also flushes the additive heartbeat side buffer; no
-      // legacy whole-array config snapshot is required during shutdown.
+      // Finish accepted decision writes while the shared clients remain available. The final
+      // application-shutdown phase owns ClickHouse's bounded event/heartbeat drain.
       try {
         await this.drainDecisionRevisionWrites();
       } finally {
         await (this.businessEffectApplyTail ?? Promise.resolve()).catch(() => undefined);
-        await this.ch.close();
       }
     }
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    // Business hooks (including their final persistence) have now completed.
+    await this.ch.close();
   }
 
   /** Rebuild the sentry ACL from the policy and recreate the judge in place (built-in rules always
@@ -2319,7 +2339,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       throw new Error(`Business effect transaction failed for ${identity.logicalKey}`);
     }
     alertMutation.commit();
-    if (incident) void this.ch.saveIncidentState([...this.incidents.values()]);
+    if (incident) this.scheduleIncidentProjection();
   }
 
   private normalizeEvent(rec: JudgedEvent): JudgedEvent {
@@ -2396,7 +2416,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
           agentScopeId: e.attribution?.agentScopeId,
         };
     this.incidents.set(incidentId, next);
-    if (persist && this.incidentPersistenceReady) void this.persistIncidentState([next]);
+    if (persist && this.incidentPersistenceReady) this.scheduleIncidentPersistence([next]);
     return next;
   }
 
@@ -2441,7 +2461,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       resolvedAt: status === 'resolved' ? cur.resolvedAt ?? at : status === 'open' ? undefined : cur.resolvedAt,
     };
     this.incidents.set(incidentId, next);
-    void this.persistIncidentState([next]);
+    this.scheduleIncidentPersistence([next]);
     this.alerting.observeIncident(next);
     return next;
   }
@@ -2454,14 +2474,71 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async persistIncidentState(records: Incident[]): Promise<void> {
-    const writes: Array<Promise<unknown>> = [];
-    if (this.relational && typeof this.relational.saveIncidents === 'function') {
-      writes.push(this.relational.saveIncidents(records));
+    this.queueIncidentPersistence(records, true);
+    await this.flushIncidentPersistence();
+  }
+
+  /**
+   * Keep the newest value per incident and publish one database batch per short window. Explicit
+   * startup/shutdown callers still flush and await the last value, so this removes write
+   * amplification without weakening the persistence boundary.
+   */
+  private scheduleIncidentPersistence(records: Incident[]): void {
+    this.queueIncidentPersistence(records, true);
+    this.scheduleIncidentPersistenceFlush();
+  }
+
+  private scheduleIncidentProjection(): void {
+    this.queueIncidentPersistence([], true);
+    this.scheduleIncidentPersistenceFlush();
+  }
+
+  private scheduleIncidentPersistenceFlush(): void {
+    if (this.incidentPersistenceTimer || this.incidentPersistenceRunning) return;
+    this.incidentPersistenceTimer = setTimeout(() => {
+      this.incidentPersistenceTimer = undefined;
+      void this.flushIncidentPersistence().catch((error) => {
+        console.error('[incidents] coalesced persistence failed:', (error as Error).message);
+      });
+    }, INCIDENT_PERSIST_DEBOUNCE_MS);
+  }
+
+  private queueIncidentPersistence(records: Incident[], project: boolean): void {
+    for (const record of records) {
+      const pending = this.pendingIncidentPersistence.get(record.incidentId);
+      if (!pending || record.updatedAt >= pending.updatedAt) {
+        this.pendingIncidentPersistence.set(record.incidentId, record);
+      }
     }
-    if (this.ch && typeof this.ch.saveIncidentState === 'function' && this.incidents) {
-      writes.push(this.ch.saveIncidentState([...this.incidents.values()]));
-    }
-    await Promise.all(writes);
+    this.incidentProjectionDirty ||= project;
+  }
+
+  private flushIncidentPersistence(): Promise<void> {
+    if (this.incidentPersistenceTimer) clearTimeout(this.incidentPersistenceTimer);
+    this.incidentPersistenceTimer = undefined;
+    if (this.incidentPersistenceRunning) return this.incidentPersistenceRunning;
+    this.incidentPersistenceRunning = (async () => {
+      while (this.pendingIncidentPersistence.size > 0 || this.incidentProjectionDirty) {
+        const records = [...this.pendingIncidentPersistence.values()];
+        const project = this.incidentProjectionDirty;
+        this.pendingIncidentPersistence.clear();
+        this.incidentProjectionDirty = false;
+        const writes: Array<Promise<unknown>> = [];
+        if (records.length > 0 && this.relational && typeof this.relational.saveIncidents === 'function') {
+          writes.push(this.relational.saveIncidents(records));
+        }
+        if (project && this.ch && typeof this.ch.saveIncidentState === 'function' && this.incidents) {
+          writes.push(this.ch.saveIncidentState([...this.incidents.values()]));
+        }
+        await Promise.all(writes);
+      }
+    })().finally(() => {
+      this.incidentPersistenceRunning = undefined;
+      if (this.pendingIncidentPersistence.size > 0 || this.incidentProjectionDirty) {
+        this.scheduleIncidentPersistenceFlush();
+      }
+    });
+    return this.incidentPersistenceRunning;
   }
 
   private async refreshRelationalIncidents(): Promise<void> {
@@ -3168,6 +3245,34 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
   /** O(1) hot-ring lookup for pinned event drill-downs and evidence assembly. */
   findEvent(eventId: string): JudgedEvent | undefined {
     return this.storeById.get(eventId);
+  }
+
+  /**
+   * Resolve a bounded set of event IDs from the live latest-revision ring.
+   *
+   * Session evidence normally discovers event IDs and then asks ClickHouse to hydrate them.  For
+   * an active Session those IDs are often the same rows that arrived moments ago through this
+   * service, so a second read of the at-ordered events table is unnecessary.  `eventAtById` is an
+   * optional locator produced by the attribution query; when present, require an exact event-time
+   * match before returning a hot row.  Callers can then query only the misses durably.
+   */
+  hotEventsByIds(
+    eventIds: readonly string[],
+    eventAtById?: ReadonlyMap<string, number>,
+  ): JudgedEvent[] {
+    const out: JudgedEvent[] = [];
+    const seen = new Set<string>();
+    for (const rawId of eventIds) {
+      const eventId = rawId.trim();
+      if (!eventId || seen.has(eventId)) continue;
+      seen.add(eventId);
+      const event = this.storeById.get(eventId);
+      if (!event) continue;
+      const expectedAt = eventAtById?.get(eventId);
+      if (expectedAt !== undefined && event.at !== expectedAt) continue;
+      out.push(event);
+    }
+    return out;
   }
 
   private addHotIdentityValue(kind: 'agent' | 'session', value: string): void {

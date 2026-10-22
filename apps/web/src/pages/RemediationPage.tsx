@@ -1,6 +1,7 @@
 import { useRequest } from "ahooks";
 import dayjs from "dayjs";
 import { formatSecurityDateTime, parseSecurityTimestamp } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   AlertTriangle,
   BellRing,
@@ -471,7 +472,7 @@ function TaskDetail({
 
 export default function RemediationPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [status, setStatus] = useState<RemediationStatus | "all">((searchParams.get("status") as RemediationStatus) || "all");
   const [sourceType, setSourceType] = useState<RemediationSourceType | "all">((searchParams.get("sourceType") as RemediationSourceType) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");

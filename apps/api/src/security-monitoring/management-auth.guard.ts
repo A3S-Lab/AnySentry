@@ -3,14 +3,32 @@ import { Reflector } from '@nestjs/core';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const REQUIRE_MANAGEMENT_AUTH = 'anysentry:require-management-auth';
+const ALLOW_UNSAFE_LOCAL_INTERACTION_DIRECT_VIEW =
+  'anysentry:allow-unsafe-local-interaction-direct-view';
 
 type HeaderBag = Record<string, string | string[] | undefined>;
 type RequestLike = { headers?: HeaderBag };
 
 export const RequireManagementAuth = () => SetMetadata(REQUIRE_MANAGEMENT_AUTH, true);
+export const AllowUnsafeLocalInteractionDirectView = () =>
+  SetMetadata(ALLOW_UNSAFE_LOCAL_INTERACTION_DIRECT_VIEW, true);
+
+function enabled(value: string | undefined): boolean {
+  return /^(?:1|true|on|yes)$/iu.test(value?.trim() ?? '');
+}
 
 export function managementAuthConfigured(): boolean {
   return Boolean(expectedToken());
+}
+
+export function unsafeLocalInteractionDirectViewConfigured(): boolean {
+  return (
+    enabled(process.env.ANYSENTRY_INTERACTION_UNSAFE_LOCAL_DIRECT_VIEW)
+    && enabled(process.env.ANYSENTRY_INTERACTION_CONTENTS)
+    && ['isolated_fixture', 'local_runtime'].includes(
+      process.env.ANYSENTRY_INTERACTION_CONTENT_CAPTURE_MODE?.trim() ?? '',
+    )
+  );
 }
 
 function expectedToken(): string | undefined {
@@ -48,6 +66,16 @@ export class ManagementAuthGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const required = this.reflector.getAllAndOverride<boolean>(REQUIRE_MANAGEMENT_AUTH, [context.getHandler(), context.getClass()]);
     if (!required) return true;
+    const allowUnsafeLocalDirectView = this.reflector.getAllAndOverride<boolean>(
+      ALLOW_UNSAFE_LOCAL_INTERACTION_DIRECT_VIEW,
+      [context.getHandler(), context.getClass()],
+    );
+    if (
+      allowUnsafeLocalDirectView
+      && unsafeLocalInteractionDirectViewConfigured()
+    ) {
+      return true;
+    }
 
     const expected = expectedToken();
     if (!expected) return true;

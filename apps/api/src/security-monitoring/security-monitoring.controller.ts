@@ -1,8 +1,11 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, ServiceUnavailableException, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, Req, ServiceUnavailableException, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import type { Request } from 'express';
 import { Observable, exhaustMap, map, mergeMap, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
+import { setHttpShutdownPhase } from '../shared/http-shutdown';
+import { buildInfo } from '../shared/build-info';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { currentAgentSubjectAssetIds, mergePersistentAgentDirectory } from './agent-directory';
@@ -87,6 +90,8 @@ import {
   SubmitScanResultRequest,
 } from './supply-chain.types';
 import * as T from './types';
+import { DEFAULT_SECURITY_TIME_TYPE } from './time-window';
+import { processLifecycleFact } from './process-lifecycle';
 
 /** Ingest a real observer event: judge it via sentry and record it for the dashboard. */
 interface IngestBody extends Partial<T.EventMeta> {
@@ -109,10 +114,20 @@ interface ObserverBatchIngestBody {
 
 const CLICKHOUSE_EVENT_BUFFER_FULL = 'ANYSENTRY_CLICKHOUSE_EVENT_BUFFER_FULL';
 const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
-const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
+// retryAfterMs for whole-batch retryable responses. 1s made an overloaded API worse: the
+// Forwarder retried thousands of events per second, exhausted per-item retry budgets, and parked
+// or dropped spool records (dev-machine incident 2026-10-21). 5s keeps retries useful while the
+// retry machinery stays calm; tunable per deployment.
+const OBSERVER_BATCH_RETRY_AFTER_MS = boundedControllerEnvInt('ANYSENTRY_OBSERVER_BATCH_RETRY_AFTER_MS', 5_000, 200, 60_000);
 const OBSERVER_BATCH_MAX_EVENTS = 256;
 const OBSERVER_BATCH_MAX_BYTES = 15 * 1024 * 1024;
-const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
+const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 8;
+// Request-level admission control for the batch lane. Each accepted batch monopolizes the event
+// loop between control yields; without a cap, a spool replay storm (or several collectors) queues
+// unbounded concurrent batches and starves heartbeats/control requests. Over the limit the whole
+// batch is returned retryable — the Forwarder spool is durable, so shedding is loss-free.
+const OBSERVER_INGEST_MAX_IN_FLIGHT = boundedControllerEnvInt('ANYSENTRY_OBSERVER_INGEST_MAX_IN_FLIGHT', 2, 1, 16);
+let observerIngestInFlight = 0;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
 const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
@@ -1177,6 +1192,7 @@ function yieldObserverBatchControl(index: number): Promise<void> | undefined {
   return new Promise((resolve) => setImmediate(resolve));
 }
 let observerBatchResultBytes = 0;
+let observerSlowBatchLogSequence = 0;
 const UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE = 20_000;
 const universalEventIdempotency = new Map<string, {
   digest: string;
@@ -1315,13 +1331,58 @@ function safePayloadDigest(value: unknown): string {
   return createHash('sha256').update(serialized).digest('hex');
 }
 
+// digestSafeValue walks and redacts every string in the batch — by far the hottest CPU item under
+// a retry storm (79% of profile samples, 2026-10-22 business-hours incident). Batch bytes are
+// immutable per wire digest, so memoize the expensive privacy digest on the cheap wire digest:
+// Forwarder retries and spool replays then cost one plain sha256 instead of a full redaction pass.
+const SAFE_DIGEST_CACHE_MAX = 2_000;
+const safeDigestByWireDigest = new Map<string, string>();
+
+function memoizedSafePayloadDigest(events: readonly IngestBody[], wireDigest: string): string {
+  const cached = safeDigestByWireDigest.get(wireDigest);
+  if (cached) {
+    safeDigestByWireDigest.delete(wireDigest);
+    safeDigestByWireDigest.set(wireDigest, cached);
+    return cached;
+  }
+  const computed = safePayloadDigest(events);
+  if (safeDigestByWireDigest.size >= SAFE_DIGEST_CACHE_MAX) {
+    const oldest = safeDigestByWireDigest.keys().next().value;
+    if (oldest !== undefined) safeDigestByWireDigest.delete(oldest);
+  }
+  safeDigestByWireDigest.set(wireDigest, computed);
+  return computed;
+}
+
+// Same memoization one level down: flood-class events repeat verbatim (subprocess churn), so a
+// per-event privacy digest is stable per event wire digest.
+const EVENT_SAFE_DIGEST_CACHE_MAX = 20_000;
+const eventSafeDigestByWireDigest = new Map<string, string>();
+
+function memoizedEventSafeDigest(event: unknown, wireDigest: string): string {
+  const cached = eventSafeDigestByWireDigest.get(wireDigest);
+  if (cached) {
+    eventSafeDigestByWireDigest.delete(wireDigest);
+    eventSafeDigestByWireDigest.set(wireDigest, cached);
+    return cached;
+  }
+  const computed = createHash('sha256').update(JSON.stringify(digestSafeValue(event))).digest('hex');
+  if (eventSafeDigestByWireDigest.size >= EVENT_SAFE_DIGEST_CACHE_MAX) {
+    const oldest = eventSafeDigestByWireDigest.keys().next().value;
+    if (oldest !== undefined) eventSafeDigestByWireDigest.delete(oldest);
+  }
+  eventSafeDigestByWireDigest.set(wireDigest, computed);
+  return computed;
+}
+
 function observerBatchPayload(events: readonly IngestBody[]): { json: string; bytes: number; digest: string; safeDigest: string } {
   const json = JSON.stringify(events);
+  const digest = createHash('sha256').update(json).digest('hex');
   return {
     json,
     bytes: Buffer.byteLength(json, 'utf8'),
-    digest: createHash('sha256').update(json).digest('hex'),
-    safeDigest: safePayloadDigest(events),
+    digest,
+    safeDigest: memoizedSafePayloadDigest(events, digest),
   };
 }
 
@@ -5457,7 +5518,16 @@ const SECURITY_PROGRESSIVE_ALIASES: Record<string, { module: string; operation: 
   'security.nextActions': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'planNextActions' },
 };
 
-const SECURITY_TIME_TYPES = ['last_3h', 'last_1d', 'last_7d', 'last_30d', 'custom'];
+const SECURITY_TIME_TYPES: Array<NonNullable<T.SecurityTimeFilter['timeType']>> = [
+  'last_30m',
+  'last_1h',
+  'last_2h',
+  'last_3h',
+  'last_1d',
+  'last_7d',
+  'last_30d',
+  'custom',
+];
 const SECURITY_SEVERITIES: T.Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
 const SECURITY_EVENT_CATEGORIES: T.EventCategory[] = ['tool', 'network', 'file', 'llm', 'security', 'process', 'runtime', 'unknown'];
 const SECURITY_VERDICTS: T.Verdict[] = ['allow', 'block', 'escalate'];
@@ -5481,7 +5551,7 @@ const STRING_OR_STRING_ARRAY_SCHEMA = { oneOf: [{ type: 'string' }, { type: 'arr
 const TIMESTAMP_SCHEMA = { oneOf: [{ type: 'string', format: 'date-time' }, { type: 'number', description: 'Epoch milliseconds.' }] };
 
 const SECURITY_TIME_FILTER_SCHEMA_PROPERTIES = {
-  timeType: { type: 'string', enum: SECURITY_TIME_TYPES, default: 'last_3h' },
+  timeType: { type: 'string', enum: SECURITY_TIME_TYPES, default: DEFAULT_SECURITY_TIME_TYPE },
   startTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
   endTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
 };
@@ -5981,7 +6051,7 @@ const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
         action: 'execute',
         tags: ['security-center', 'remediation', 'agent-plan', 'progressive-api'],
         parameters: [
-          { name: 'timeType', in: 'body', type: 'string', required: false, description: 'last_3h/last_1d/last_7d/last_30d/custom.' },
+          { name: 'timeType', in: 'body', type: 'string', required: false, description: 'last_30m/last_1h/last_2h/last_3h/last_1d/last_7d/last_30d/custom.' },
           { name: 'workspacePath', in: 'body', type: 'string', required: false, description: 'Limit the plan to one workspace.' },
           { name: 'agentId', in: 'body', type: 'string', required: false, description: 'Limit the plan to one agent.' },
           { name: 'maxActions', in: 'body', type: 'number', required: false, description: 'Maximum actions to return; default 5, max 20.' },
@@ -14162,6 +14232,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       schemaVersion: 'anysentry.health.v1',
       status: 'ok',
       service: 'anysentry-api',
+      build: buildInfo(),
       uptimeSeconds: Math.round(process.uptime()),
       storage: this.judge.storageStatus(),
       businessState: {
@@ -15042,8 +15113,47 @@ export class SecurityMonitoringController implements OnModuleDestroy {
   async ingestBatch(
     @Body() body: ObserverBatchIngestBody = {},
     @Headers() headers: HeaderBag,
+    @Req() request: Request,
+  ): Promise<T.ObserverBatchIngestResult> {
+    const shedEvents = Array.isArray(body.events) ? body.events : [];
+    const shedBatchId = typeof body.batchId === 'string' ? body.batchId.trim() : '';
+    if (observerIngestInFlight >= OBSERVER_INGEST_MAX_IN_FLIGHT) {
+      // Shed before any per-event work: a saturated loop must not accept another batch whose
+      // preparation would starve heartbeats and control requests. The whole batch is retryable;
+      // the Forwarder replays it from its durable spool once capacity returns.
+      return {
+        accepted: false,
+        ...(shedBatchId ? { batchId: shedBatchId } : {}),
+        acceptedEvents: 0,
+        retainedEvents: 0,
+        structuralEvents: 0,
+        discardedEvents: 0,
+        rejectedEvents: 0,
+        retryableEvents: shedEvents.length,
+        retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS,
+        items: shedEvents.map((_, index) => ({
+          index,
+          accepted: false,
+          disposition: 'retryable' as const,
+          reasonCode: 'clickhouse_event_buffer_full',
+        })),
+      };
+    }
+    observerIngestInFlight += 1;
+    try {
+      return await this.ingestBatchInner(body, headers, request);
+    } finally {
+      observerIngestInFlight -= 1;
+    }
+  }
+
+  private async ingestBatchInner(
+    body: ObserverBatchIngestBody = {},
+    headers: HeaderBag,
+    request: Request,
   ): Promise<T.ObserverBatchIngestResult> {
     const ingestStartedAt = performance.now();
+    setHttpShutdownPhase(request, 'validate');
     const ingestDiagnostics = process.env.ANYSENTRY_INGEST_DIAGNOSTICS === '1';
     let prepareCompletedAt = ingestStartedAt;
     let durableFenceCompletedAt = ingestStartedAt;
@@ -15262,6 +15372,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
         });
         continue;
       }
+      const eventWireDigest = createHash('sha256').update(JSON.stringify(event)).digest('hex');
       const metaGiven: Partial<T.EventMeta> = {
         ...given,
         sourceEventId,
@@ -15270,16 +15381,12 @@ export class SecurityMonitoringController implements OnModuleDestroy {
           ...(collectorId ? { collectorId } : {}),
           ...(nodeName ? { collectorNode: nodeName } : {}),
           ...(sourceResolution.source?.sourceId ? { sourceId: sourceResolution.source.sourceId } : {}),
-          [OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
-            .update(JSON.stringify(digestSafeValue(event)))
-            .digest('hex'),
+          [OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: memoizedEventSafeDigest(event, eventWireDigest),
           // A replay of a pre-privacy-migration WAL needs the old raw digest only for the
           // in-memory duplicate check.  clickhouse-store strips this marker before persistence;
           // it must never become a second durable payload fingerprint.
           ...(body.durableReplay === true ? {
-            [OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: createHash('sha256')
-              .update(JSON.stringify(event))
-              .digest('hex'),
+            [OBSERVER_LEGACY_SOURCE_PAYLOAD_SHA256_ATTRIBUTE]: eventWireDigest,
           } : {}),
         },
       };
@@ -15386,6 +15493,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
       }
     }
     prepareCompletedAt = performance.now();
+    setHttpShutdownPhase(request, 'prepare');
 
     // Exact Forwarder retries retain one batchId and payload digest. Source resolution above must
     // still run on every request, but a previously terminal ACK is the authoritative idempotency
@@ -15531,6 +15639,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     }
     if (retainedPrepared.length > 0) {
       try {
+        setHttpShutdownPhase(request, 'clickhouse.events-durable');
         retainedDurability = await this.judge.persistPreparedBatch(
           retainedPrepared,
           `observer-batch:${batchScope}:${batchId || 'digest'}:${payload.safeDigest}`,
@@ -15632,6 +15741,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     let deliveryError = '';
     if (!revisionConflict && retainedPrepared.length > 0) {
       try {
+        setHttpShutdownPhase(request, 'downstream-delivery');
         const queued = await this.judge.enqueuePreparedFastJobs(retainedPrepared);
         if (queued?.skipped > 0) {
           this.canonicalObservability.recordGap('judgment', 'dropped', 'fast_judge', {
@@ -16289,10 +16399,10 @@ export const semanticProjectionTesting = {
 // workload fork-bombing at hundreds of processes per second floods the ingest path. Even
 // discarded events pay the per-event preparation cost (attribution/judge prep), which alone
 // saturates the event loop at flood rates. Two fuses cooperate:
-//   1. batch-level: a batch that is almost entirely ProcessExit is ACKed discarded before
-//      any per-event preparation runs;
-//   2. per-identity: surviving mixed batches cap per-identity ProcessExit at the configured
-//      per-minute ceiling.
+//   1. batch-level: a batch that is almost entirely flood-class events (ProcessExit/ToolExec)
+//      is ACKed discarded before any per-event preparation runs;
+//   2. per-identity: surviving mixed batches cap per-identity flood-class events at the
+//      configured per-minute ceiling.
 // Set ANYSENTRY_INGEST_FLOOD_PER_MINUTE=0 to disable both.
 const INGEST_FLOOD_LIMIT_PER_MINUTE = (() => {
   const raw = Number(process.env.ANYSENTRY_INGEST_FLOOD_PER_MINUTE);
@@ -16323,11 +16433,14 @@ function ingestFloodWindowTick(): void {
 // field. Reading `event.eventKind` therefore never matched and the fuse stayed inert on the
 // forwarder wire shape. Resolve the kind line-aware: cheap substring pre-check, parse only
 // on candidate hits (argv payloads can coincidentally contain the marker string).
+// ToolExec joins ProcessExit as a flood class: container-side subprocess churn (build/package
+// loops inside a sandbox) emits exec+exit pairs; exit-only coverage left the exec half
+// unfused (dev-machine retry-storm incident 2026-10-21).
 function ingestFloodEventKind(event: { eventKind?: unknown; line?: unknown }): string | undefined {
   const direct = event?.eventKind;
   if (typeof direct === 'string' && direct) return direct;
   const line = event?.line;
-  if (typeof line !== 'string' || !line.includes('"ProcessExit"')) return undefined;
+  if (typeof line !== 'string' || (!line.includes('"ProcessExit"') && !line.includes('"ToolExec"'))) return undefined;
   return observerLineEventKind(line);
 }
 function ingestFloodIdentity(event: { agentId?: unknown; line?: unknown }): string {
@@ -16352,15 +16465,17 @@ function ingestFloodIdentity(event: { agentId?: unknown; line?: unknown }): stri
 }
 function ingestFloodBatchDiscard(events: unknown[]): boolean {
   if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0 || events.length < INGEST_FLOOD_BATCH_MIN_EVENTS) return false;
-  let exits = 0;
+  let flood = 0;
   for (const event of events) {
-    if (ingestFloodEventKind(event as { eventKind?: unknown; line?: unknown }) === 'ProcessExit') exits += 1;
+    const kind = ingestFloodEventKind(event as { eventKind?: unknown; line?: unknown });
+    if (kind === 'ProcessExit' || kind === 'ToolExec') flood += 1;
   }
-  return exits >= events.length * INGEST_FLOOD_BATCH_SHARE;
+  return flood >= events.length * INGEST_FLOOD_BATCH_SHARE;
 }
 function ingestFloodFuseTripped(event: { eventKind?: unknown; agentId?: unknown; line?: unknown }): boolean {
   if (INGEST_FLOOD_LIMIT_PER_MINUTE === 0) return false;
-  if (ingestFloodEventKind(event) !== 'ProcessExit') return false;
+  const kind = ingestFloodEventKind(event);
+  if (kind !== 'ProcessExit' && kind !== 'ToolExec') return false;
   ingestFloodWindowTick();
   // Global budget first: many distinct identities each under the per-identity
   // ceiling can still flood the loop (container-churn / build workloads).

@@ -32,7 +32,11 @@ import {
   visibleProcessContext,
 } from "./classification-semantics";
 import { foldLatestEventRevisions } from "./event-revision";
-import type { ProcessLifecycleFact } from "./process-lifecycle";
+import {
+  canonicalProcessLifecycleIdentity,
+  processLifecycleFact,
+  type ProcessLifecycleFact,
+} from "./process-lifecycle";
 import {
   BucketCommitCursor,
   compareEventCommitCursor,
@@ -66,6 +70,10 @@ import {
   RemediationRecord,
 } from "./types";
 import type { SessionMembership } from "./canonical-observability";
+import {
+  interactionPayloadFingerprint,
+  type InteractionRecord,
+} from "./interaction.types";
 
 function boundedPositiveInt(
   raw: string | undefined,
@@ -183,6 +191,30 @@ ENGINE = ReplacingMergeTree(revision)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (tenantId, environmentId, agentAssetId, at, interactionId)
 TTL ts + INTERVAL 30 DAY DELETE`;
+const INTERACTION_METADATA_TABLE = "interaction_metadata_v1";
+const INTERACTION_METADATA_DDL = `CREATE TABLE IF NOT EXISTS ${INTERACTION_METADATA_TABLE} (
+  schemaVersion LowCardinality(String),
+  interactionId String,
+  conversationId String,
+  sourceId String,
+  sourceEventId String,
+  collectorId String,
+  tenantId String,
+  environmentId String DEFAULT '',
+  agentInstanceId String DEFAULT '',
+  processInstanceId String,
+  workspacePath String DEFAULT '',
+  provider LowCardinality(String) DEFAULT '',
+  observedAt UInt64,
+  observedTs DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(observedAt),
+  acceptedAt UInt64,
+  projectedAt UInt64,
+  record String
+) ENGINE = ReplacingMergeTree(projectedAt)
+PARTITION BY toYYYYMM(observedTs)
+ORDER BY (tenantId, conversationId, observedAt, interactionId)
+TTL toDateTime(observedTs) + INTERVAL 90 DAY DELETE
+SETTINGS index_granularity = 8192`;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 // PostgreSQL-free deployments persist the canonical SessionMembership projection here so the
 // conversation catalog/timeline survives an API restart. The payload is the whole validated
@@ -313,6 +345,8 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   INDEX idx_process_boot_id processBootId TYPE bloom_filter(0.01) GRANULARITY 1,
   INDEX idx_process_pid_namespace processPidNamespace TYPE bloom_filter(0.01) GRANULARITY 1,
   INDEX idx_process_host_id processHostId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_pid processPid TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_ppid processPpid TYPE bloom_filter(0.01) GRANULARITY 1,
   INDEX idx_evidence_resource_hash evidenceResourceHash TYPE bloom_filter(0.01) GRANULARITY 1,
   INDEX idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
@@ -400,6 +434,8 @@ const EVENT_ALTERS = [
   "ADD COLUMN IF NOT EXISTS processNamespacePpid UInt64 DEFAULT JSONExtractUInt(process, 'namespacePpid')",
   "ADD COLUMN IF NOT EXISTS processStartTimeTicks String DEFAULT JSONExtractString(process, 'startTimeTicks')",
   "ADD COLUMN IF NOT EXISTS processStartTimeNs String DEFAULT JSONExtractString(process, 'startTimeNs')",
+  'ADD INDEX IF NOT EXISTS idx_process_pid processPid TYPE bloom_filter(0.01) GRANULARITY 1',
+  'ADD INDEX IF NOT EXISTS idx_process_ppid processPpid TYPE bloom_filter(0.01) GRANULARITY 1',
   `ADD COLUMN IF NOT EXISTS evidenceResourceHash String DEFAULT multiIf(
     eventKind = 'AgentTool', JSONExtractString(attributes, 'anysentry.tool.resource_hash'),
     eventKind IN ('FileAccess', 'FileDelete') AND startsWith(JSONExtractString(attributes, 'path'), '/'),
@@ -510,21 +546,23 @@ const EVENT_ALTERS = [
   "ADD INDEX IF NOT EXISTS idx_evidence_command_hash evidenceCommandHash TYPE bloom_filter(0.01) GRANULARITY 1",
 ];
 const EVENT_EVIDENCE_INDEX_NAMES = [
-  "idx_event_id",
-  "idx_invocation_id",
-  "idx_tool_call_id",
-  "idx_trace_id",
-  "idx_session_id",
-  "idx_run_id",
-  "idx_subject_asset_id",
-  "idx_agent_instance_key",
-  "idx_process_boot_id",
-  "idx_process_pid_namespace",
-  "idx_process_host_id",
-  "idx_evidence_resource_hash",
-  "idx_evidence_command_hash",
+  'idx_event_id',
+  'idx_invocation_id',
+  'idx_tool_call_id',
+  'idx_trace_id',
+  'idx_session_id',
+  'idx_run_id',
+  'idx_subject_asset_id',
+  'idx_agent_instance_key',
+  'idx_process_boot_id',
+  'idx_process_pid_namespace',
+  'idx_process_host_id',
+  'idx_process_pid',
+  'idx_process_ppid',
+  'idx_evidence_resource_hash',
+  'idx_evidence_command_hash',
 ] as const;
-const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = "schema.events.evidence_indexes.v3";
+const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v4';
 
 const COLLECTOR_HEARTBEAT_TABLE = "collector_heartbeats";
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
@@ -745,7 +783,9 @@ const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYC
   commandHash String,
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000)),
   INDEX idx_process_lifecycle_instance processInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1,
-  INDEX idx_process_lifecycle_workload physicalWorkloadId TYPE bloom_filter(0.01) GRANULARITY 1
+  INDEX idx_process_lifecycle_workload physicalWorkloadId TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_lifecycle_pid pid TYPE bloom_filter(0.01) GRANULARITY 1,
+  INDEX idx_process_lifecycle_ppid ppid TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree(receivedAt)
 ORDER BY (processInstanceKey, factKind, at, eventId)
 TTL ts + INTERVAL 30 DAY`;
@@ -766,7 +806,54 @@ const PROCESS_LIFECYCLE_FACT_ALTERS = [
   "ADD COLUMN IF NOT EXISTS processGenerationKey String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS parentProcessGenerationKey String DEFAULT ''",
   "ADD COLUMN IF NOT EXISTS parentLinkAuthority LowCardinality(String) DEFAULT ''",
+  "ADD INDEX IF NOT EXISTS idx_process_lifecycle_instance processInstanceKey TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_lifecycle_workload physicalWorkloadId TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_lifecycle_pid pid TYPE bloom_filter(0.01) GRANULARITY 1",
+  "ADD INDEX IF NOT EXISTS idx_process_lifecycle_ppid ppid TYPE bloom_filter(0.01) GRANULARITY 1",
 ];
+const PROCESS_LIFECYCLE_INDEX_NAMES = [
+  'idx_process_lifecycle_instance',
+  'idx_process_lifecycle_workload',
+  'idx_process_lifecycle_pid',
+  'idx_process_lifecycle_ppid',
+] as const;
+const PROCESS_LIFECYCLE_INDEX_MIGRATION_KEY =
+  'schema.process_lifecycle_facts.evidence_indexes.v1';
+
+// Session attribution only needs process-generation identity and the small amount of metadata
+// used to construct a lineage edge. Reading every lifecycle column made breadth-first expansion
+// decompress asset labels and hashes for millions of unrelated rows in long-running Codex
+// processes. Keep the full table schema for other consumers, but use this compact projection for
+// the two interactive Session lookups below.
+const SESSION_PROCESS_LIFECYCLE_COLUMNS = `
+  factId, eventId, sourceEventId, factKind, at, receivedAt,
+  source, sourceId, collectorId, workspacePath,
+  runtimeInstanceId, rootProcess, identityRevision,
+  processInstanceKey, physicalWorkloadId, hostId, bootId,
+  pid, ppid, pidNamespace, namespacePid, namespacePpid, startTime,
+  lifecycleSource, exitStatus, exitStatusPresent, exitSignal, exitSignalPresent
+`;
+
+// Fold duplicate/replayed lifecycle versions before applying the traversal budget.
+// A tuple keeps all fields from the same version, including nullable/empty identity fields.
+const SESSION_LIFECYCLE_VERSION_FIELDS = SESSION_PROCESS_LIFECYCLE_COLUMNS
+  .split(',').map((column) => column.trim()).filter((column) => column !== 'factId');
+const SESSION_LIFECYCLE_VERSION_SELECT = ['factId', ...SESSION_LIFECYCLE_VERSION_FIELDS
+  .map((column, index) => `tupleElement(latest, ${index + 1}) AS ${column}`)].join(', ');
+
+// Session family expansion is driven by parent PID and host/boot identity.  The base table is
+// ordered by processInstanceKey for generation point-lookups, which makes the parent-PID frontier
+// scan a poor fit once a host has retained millions of lifecycle facts.  Keep a narrow projection
+// ordered by the predicates used by the interactive resolver.  It deliberately contains the same
+// compact columns as SESSION_PROCESS_LIFECYCLE_COLUMNS so ClickHouse can satisfy the BFS reads
+// without touching the wide base parts.
+const PROCESS_LIFECYCLE_PARENT_PROJECTION = 'process_lifecycle_by_parent_v1';
+const PROCESS_LIFECYCLE_PROJECTION_MIGRATION_KEY =
+  'schema.process_lifecycle_facts.parent_projection.v1';
+const PROCESS_LIFECYCLE_PARENT_PROJECTION_DDL = `
+  SELECT ${SESSION_PROCESS_LIFECYCLE_COLUMNS}
+  ORDER BY (hostId, bootId, ppid, at, eventId)
+`;
 
 // Startup progress hydration must stay independent of the cardinality of the 90-day event table.
 // The commit journal is ordered by committedAt, so this compatibility sample reads a deterministic
@@ -940,9 +1027,32 @@ const BOUNDED_KERNEL_FACT_LOCATOR_READ_SETTINGS: ClickHouseSettings = {
 // than weakening ToolEvidence's 2-second/64 MiB query contract.
 const BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS: ClickHouseSettings = {
   max_threads: 1,
-  max_memory_usage: String(96 * 1024 * 1024),
+  max_memory_usage: String(128 * 1024 * 1024),
   max_execution_time: 5,
 };
+
+// Compatibility-only read for Observer rows written before lifecycle projection was enabled.
+// Successful reconstruction is immediately persisted, so normal and repeat detail reads continue
+// to use the five-second process_lifecycle_facts path above.
+const BOUNDED_LEGACY_PROCESS_EVENT_READ_SETTINGS: ClickHouseSettings = {
+  // Legacy parts need two independent indexed PID lookups. Two threads keep the one-time
+  // compatibility read interactive without changing the normal dashboard/query contracts.
+  max_threads: 2,
+  max_memory_usage: String(192 * 1024 * 1024),
+  max_execution_time: 20,
+};
+
+// Old event parts predate the Process PID skip indexes and cannot be scanned across a long-lived
+// Session inside an interactive request. A recent exact-PID slice is sufficient to recover the
+// still-running process generation; older evidence remains explicitly partial until backfilled.
+const LEGACY_SESSION_RECENT_PROJECTION_HORIZON_MS = 72 * 60 * 60 * 1_000;
+const MAX_SESSION_EVIDENCE_TIME_WINDOWS = 32;
+// A Session detail is an interactive, bounded read. Once the compact lifecycle projection has
+// already discovered a reasonably sized family, walking the legacy wide `events` table for every
+// PID can cost 20-30 seconds (and competes with ingestion). Keep the compatibility walk for
+// empty/small hybrid fixtures, where it is needed to recover a missing descendant, but leave a
+// large projected family to the background backfill/reconciler.
+const LEGACY_FAMILY_FALLBACK_MAX_PROJECTED_FACTS = 64;
 
 const MAX_DURABLE_EVENT_SEARCH_ROWS = 10_000;
 
@@ -1127,6 +1237,8 @@ export interface StoredEventQuery {
   /** Kind IN-list for Tool↔Kernel candidate pages. Combined with eventKind when both are set. */
   eventKinds?: string[];
   eventCategory?: string;
+  /** Exact human-readable event subject. Used only for bounded semantic-to-kernel evidence joins. */
+  exactSubject?: string;
   activityContext?: string;
   verdict?: string;
   tier?: string;
@@ -1145,6 +1257,11 @@ export interface KernelFactLocator {
   eventId: string;
   at: number;
   decisionRevision: number;
+}
+
+export interface SessionProcessObservedEvent {
+  event: JudgedEvent;
+  processInstanceKey: string;
 }
 
 export interface StoredToolEvidenceRelations {
@@ -1325,6 +1442,7 @@ async function runClickHouseBootstrap(
       );
     }
     await schema.command({ query: COLLECTOR_HEARTBEAT_DDL });
+    await schema.command({ query: INTERACTION_METADATA_DDL });
     await schema.command({ query: NOTIFICATION_DELIVERY_DDL });
     await schema.command({ query: IDENTITY_AI_REVIEW_DDL });
     await schema.command({ query: AUDIT_FACT_DDL });
@@ -1340,6 +1458,87 @@ async function runClickHouseBootstrap(
     await schema.command({
       query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_FACT_ALTERS.join(", ")}`,
     });
+    try {
+      const lifecycleMigrationResult = await schema.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
+        query_params: { key: PROCESS_LIFECYCLE_INDEX_MIGRATION_KEY },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const lifecycleMigrationRows = (
+        await lifecycleMigrationResult.json()
+      ) as Array<{ value?: string }>;
+      if (!['scheduled', 'complete'].includes(lifecycleMigrationRows[0]?.value ?? '')) {
+        await schema.command({
+          query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE} ${PROCESS_LIFECYCLE_INDEX_NAMES
+            .map((name) => `MATERIALIZE INDEX ${name}`)
+            .join(', ')}`,
+          // Older Observer deployments created this projection before PID/PPID skip indexes were
+          // added. Schedule one non-blocking backfill so every installation gets indexed Session
+          // family lookups without delaying API startup.
+          clickhouse_settings: { mutations_sync: '0' },
+        });
+        await schema.insert({
+          table: CONFIG_TABLE,
+          values: [{
+            key: PROCESS_LIFECYCLE_INDEX_MIGRATION_KEY,
+            value: 'scheduled',
+            updated_at: Date.now(),
+          }],
+          format: 'JSONEachRow',
+        });
+      }
+    } catch (error) {
+      console.warn('[clickhouse] Process lifecycle index backfill deferred:',
+        error instanceof Error ? error.message : String(error));
+    }
+    // Parent-PID breadth-first expansion is the hot path for Session system evidence.  Install the
+    // host/boot/ppid ordered projection lazily so existing deployments get the optimization without
+    // a blocking table rewrite.  Older ClickHouse versions may not support projections or the
+    // deduplicate merge mode; in that case the normal indexed table path remains the fallback.
+    try {
+      await schema.command({
+        query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE}
+          MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'`,
+      });
+      await schema.command({
+        query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE}
+          ADD PROJECTION IF NOT EXISTS ${PROCESS_LIFECYCLE_PARENT_PROJECTION} (
+            ${PROCESS_LIFECYCLE_PARENT_PROJECTION_DDL}
+          )`,
+      });
+      const projectionMigrationResult = await schema.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
+        query_params: { key: PROCESS_LIFECYCLE_PROJECTION_MIGRATION_KEY },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const projectionMigrationRows = (
+        await projectionMigrationResult.json()
+      ) as Array<{ value?: string }>;
+      if (!['scheduled', 'complete'].includes(projectionMigrationRows[0]?.value ?? '')) {
+        await schema.command({
+          query: `ALTER TABLE ${PROCESS_LIFECYCLE_FACT_TABLE}
+            MATERIALIZE PROJECTION ${PROCESS_LIFECYCLE_PARENT_PROJECTION}`,
+          // Projection materialization can process all retained lifecycle parts.  Let the server
+          // run it asynchronously; interactive reads can already use newly written projection
+          // parts while the historical backfill catches up.
+          clickhouse_settings: { mutations_sync: '0' },
+        });
+        await schema.insert({
+          table: CONFIG_TABLE,
+          values: [{
+            key: PROCESS_LIFECYCLE_PROJECTION_MIGRATION_KEY,
+            value: 'scheduled',
+            updated_at: Date.now(),
+          }],
+          format: 'JSONEachRow',
+        });
+      }
+    } catch (error) {
+      console.warn('[clickhouse] Process lifecycle parent projection deferred:',
+        error instanceof Error ? error.message : String(error));
+    }
     await schema.command({ query: DASHBOARD_BUCKET_SNAPSHOT_DDL });
     await schema.command({
       query: `ALTER TABLE ${DASHBOARD_BUCKET_SNAPSHOT_TABLE}
@@ -1908,11 +2107,16 @@ function toRow(e: JudgedEvent): Row {
     traceId: e.traceId,
     // These query columns are projections of the server-resolved correlation object. Producer
     // convenience fields are deliberately not an independent authority at the persistence edge.
-    invocationId: correlation?.invocationId?.trim() ?? "",
-    toolCallId: correlation?.toolCallId?.trim() ?? "",
-    processInstanceKey: correlation?.processInstanceId?.trim() ?? "",
-    processHostId: process?.hostId?.trim() ?? "",
-    processBootId: process?.bootId?.trim() ?? "",
+    invocationId: correlation?.invocationId?.trim() ?? '',
+    toolCallId: correlation?.toolCallId?.trim() ?? '',
+    // A generation key is not a Session/ToolCall claim. Preserve the trusted
+    // correlation projection exactly when present; otherwise derive only from
+    // the same complete OS identity used by lifecycle reconstruction.
+    processInstanceKey: correlation
+      ? correlation.processInstanceId?.trim() ?? ''
+      : canonicalProcessLifecycleIdentity(process)?.processInstanceKey ?? '',
+    processHostId: process?.hostId?.trim() ?? '',
+    processBootId: process?.bootId?.trim() ?? '',
     processPid: process?.pid ?? 0,
     processPpid: process?.ppid ?? 0,
     processPidNamespace: process?.pidNamespace?.trim() ?? "",
@@ -2364,6 +2568,11 @@ export class ClickHouseStore {
   private eventWriteAbortController?: AbortController;
   private eventWritePermanentError?: Error;
   private eventWriteClosingDeadline?: number;
+  private processLifecycleWriteQueue: Array<{
+    facts: ProcessLifecycleFact[];
+    resolve: (ok: boolean) => void;
+  }> = [];
+  private processLifecycleWriteInFlight?: Promise<void>;
   private closeInFlight?: Promise<void>;
   private closing = false;
   private flushTimer?: NodeJS.Timeout;
@@ -2477,7 +2686,11 @@ export class ClickHouseStore {
   private eventBatchMaxRows(): number {
     return boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_ROWS,
-      this.eventMicrobatchEnabled() ? 1_000 : EVENT_WRITE_BATCH_ROWS,
+      // Direct observer durability waiters share one insert lane; under concurrent ingest the
+      // coalescer packs many sealed batches into one physical write. Keep this high enough that a
+      // full ANYSENTRY_OBSERVER_BATCH_CONCURRENCY wave can share a small number of RTTs without
+      // weakening insertManyNow durability waiters.
+      this.eventMicrobatchEnabled() ? 4_000 : EVENT_WRITE_BATCH_ROWS,
       1,
       10_000,
     );
@@ -2495,7 +2708,7 @@ export class ClickHouseStore {
   private eventBatchMaxBytes(): number {
     return boundedPositiveInt(
       process.env.ANYSENTRY_CLICKHOUSE_BATCH_MAX_BYTES,
-      1024 * 1024,
+      this.eventMicrobatchEnabled() ? EVENT_WRITE_BATCH_BYTES : 1024 * 1024,
       16 * 1024,
       16 * 1024 * 1024,
     );
@@ -3109,7 +3322,7 @@ export class ClickHouseStore {
       Number.isSafeInteger(eventAt) && Number(eventAt) >= 0
         ? Number(eventAt)
         : undefined;
-    return (await this.eventsByIds([normalized], boundedAt, boundedAt))[0];
+    return (await this.eventsByIds([normalized], boundedAt, boundedAt) ?? [])[0];
   }
 
   /**
@@ -3722,6 +3935,68 @@ export class ClickHouseStore {
     return tracked;
   }
 
+  /**
+   * Group consecutive ready batches into one physical ClickHouse insert.
+   * Observer ingest commonly waits on many ~128–256 row direct batches; coalescing preserves each
+   * batch's waiters/tokens while cutting insert RTT queueing that currently dominates durability.
+   */
+  private collectEventWriteInsertGroup(now: number): EventWriteBatch[] {
+    const head = this.eventWriteBatches[0];
+    if (!head) return [];
+    const group = [head];
+    let rows = head.rows.length;
+    let bytes = head.bytes;
+    const maxRows = this.eventBatchMaxRows();
+    const maxBytes = this.eventBatchMaxBytes();
+    for (let index = 1; index < this.eventWriteBatches.length; index += 1) {
+      const next = this.eventWriteBatches[index];
+      if (!this.closing && next.retryNotBefore > now) break;
+      if (next.source !== head.source) break;
+      if (rows + next.rows.length > maxRows) break;
+      if (bytes + next.bytes > maxBytes) break;
+      group.push(next);
+      rows += next.rows.length;
+      bytes += next.bytes;
+    }
+    return group;
+  }
+
+  private coalescedEventWriteBatch(group: readonly EventWriteBatch[]): EventWriteBatch {
+    if (group.length === 1) return group[0];
+    const rows = group.flatMap((batch) => batch.rows);
+    const bytes = group.reduce((sum, batch) => sum + batch.bytes, 0);
+    const tokenSeed = group.map((batch) => batch.token).slice().sort().join('\n');
+    const token = `event-coalesce-${createHash('sha256').update(tokenSeed).digest('hex')}`;
+    return {
+      rows,
+      bytes,
+      token,
+      settings: {
+        insert_deduplicate: 1,
+        insert_deduplication_token: token,
+      },
+      source: group[0].source,
+      waiters: [],
+      retryNotBefore: 0,
+      createdAt: Math.min(...group.map((batch) => batch.createdAt)),
+    };
+  }
+
+  private releaseEventWriteGroup(group: readonly EventWriteBatch[], error?: Error): void {
+    const tokens = new Set(group.map((batch) => batch.token));
+    this.eventWriteBatches = this.eventWriteBatches.filter((batch) => !tokens.has(batch.token));
+    for (const batch of group) {
+      this.eventWriteBatchesByToken.delete(batch.token);
+      this.eventWriteRows = Math.max(0, this.eventWriteRows - batch.rows.length);
+      this.eventWriteBytes = Math.max(0, this.eventWriteBytes - batch.bytes);
+      if (error) {
+        for (const waiter of batch.waiters.splice(0)) waiter.reject(error);
+      } else {
+        for (const waiter of batch.waiters.splice(0)) waiter.resolve();
+      }
+    }
+  }
+
   private async drainEventWrites(): Promise<void> {
     while (this.eventWriteBatches.length > 0) {
       if (this.eventWritePermanentError) throw this.eventWritePermanentError;
@@ -3772,7 +4047,7 @@ export class ClickHouseStore {
         throw outcome.error;
       }
 
-      // The active retry cycle is bounded. Keep the exact sealed batch and any direct-write
+      // The active retry cycle is bounded. Keep the exact sealed batches and any direct-write
       // waiters at the head, then retry after a cooldown rather than spinning. Rejecting a waiter
       // here while retaining and later applying the batch would let its caller advance lifecycle
       // work under the false belief that this revision was never persisted.
@@ -5278,19 +5553,21 @@ export class ClickHouseStore {
       until: effectiveUntilMs,
     };
     const stableFields: Array<[keyof StoredEventQuery, string]> = [
-      ["eventId", "eventId"],
-      ["sourceId", "sourceId"],
-      ["collectorId", "collectorId"],
-      ["agentId", "agentId"],
-      ["subjectAssetId", "subjectAssetId"],
-      ["agentInstanceId", "agentInstanceKey"],
-      ["sessionId", "sessionId"],
-      ["workspacePath", "workspacePath"],
-      ["traceId", "traceId"],
-      ["invocationId", "invocationId"],
-      ["toolCallId", "toolCallId"],
-      ["runId", "runId"],
-      ["eventCategory", "eventCategory"],
+      ['eventId', 'eventId'],
+      ['sourceId', 'sourceId'],
+      ['collectorId', 'collectorId'],
+      ['agentId', 'agentId'],
+      ['subjectAssetId', 'subjectAssetId'],
+      ['agentInstanceId', 'agentInstanceKey'],
+      ['sessionId', 'sessionId'],
+      ['workspacePath', 'workspacePath'],
+      ['traceId', 'traceId'],
+      ['invocationId', 'invocationId'],
+      ['toolCallId', 'toolCallId'],
+      ['runId', 'runId'],
+      ['eventKind', 'eventKind'],
+      ['eventCategory', 'eventCategory'],
+      ['exactSubject', 'subject'],
     ];
     const mutableFields: Array<[keyof StoredEventQuery, string]> = [
       ["verdict", "verdict"],
@@ -5622,6 +5899,298 @@ export class ClickHouseStore {
     };
   }
 
+  /** Resolve a bounded set of immutable event references to their latest judgment revisions.
+   * Session evidence attribution uses this after Process lifecycle facts have already selected
+   * exact eventIds, avoiding another broad event-history scan. */
+  async eventsByIds(
+    eventIdsInput: readonly string[],
+    sinceMs?: number,
+    untilMs?: number,
+    eventAtById?: ReadonlyMap<string, number>,
+  ): Promise<JudgedEvent[] | null> {
+    if (!this.client || !this.ready) return null;
+    const eventIds = [...new Set(
+      eventIdsInput
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0 && value.length <= 512),
+    )].slice(0, 5_000);
+    if (eventIds.length === 0) return [];
+    try {
+      return (await this.loadEventsByIds(
+        eventIds,
+        sinceMs,
+        untilMs,
+        eventAtById,
+        'session_evidence',
+      ))
+        .sort((left, right) => left.at - right.at || left.eventId.localeCompare(right.eventId));
+    } catch (error) {
+      console.error('[clickhouse] bounded event-id lookup failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /** Locate exact Observer write events for a Native Session artifact. This is a narrow fallback
+   * for runtimes such as A3S Code that atomically rewrite and close JSON files too quickly for a
+   * periodic /proc/<pid>/fd scan. Returned events are still generation-validated by the Session
+   * attribution service before a binding is persisted. */
+  async readSessionFileWriteEvents(input: {
+    paths: readonly string[];
+    sinceMs: number;
+    untilMs: number;
+    limit?: number;
+    /** Unique substrings (e.g. `/session_<uuid>/`) for containerized writers whose mount-view
+     *  path never equals the host path. Only directory-style markers are safe here. */
+    pathMarkers?: readonly string[];
+  }): Promise<JudgedEvent[] | null> {
+    if (!this.client || !this.ready) return null;
+    const paths = [...new Set(input.paths.map((value) => value.trim()).filter((value) =>
+      value.startsWith('/') && value.length <= 8_192))].slice(0, 16);
+    const markers = [...new Set((input.pathMarkers ?? []).map((value) => value.trim()).filter((value) =>
+      value.length >= 10 && value.length <= 512))].slice(0, 8);
+    if (paths.length === 0 && markers.length === 0) return [];
+    const rowLimit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 25)));
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            eventId,
+            argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt
+          FROM ${TABLE}
+          PREWHERE at >= {sinceMs:UInt64} AND at <= {untilMs:UInt64}
+          WHERE eventKind = 'FileAccess'
+            AND (
+              JSONExtractString(attributes, 'path') IN {paths:Array(String)}
+              OR arrayExists(marker -> positionCaseInsensitive(JSONExtractString(attributes, 'path'), marker) > 0, {markers:Array(String)})
+            )
+            AND (
+              JSONExtractBool(attributes, 'write') = 1
+              OR lowerUTF8(JSONExtractString(attributes, 'accessMode')) LIKE '%write%'
+            )
+          GROUP BY eventId
+          ORDER BY eventAt DESC, eventId ASC
+          LIMIT {rowLimit:UInt32}`,
+        query_params: {
+          sinceMs: Math.max(1, Math.trunc(input.sinceMs)),
+          untilMs: Math.max(1, Math.trunc(input.untilMs)),
+          paths,
+          markers,
+          rowLimit,
+        },
+        clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+        format: 'JSONEachRow',
+      });
+      const rows = (await result.json()) as Array<Record<string, unknown>>;
+      const eventAtById = new Map(rows.flatMap((row) => {
+        const eventId = String(row.eventId ?? '');
+        const at = Number(row.eventAt ?? 0);
+        return eventId && Number.isSafeInteger(at) && at > 0 ? [[eventId, at] as const] : [];
+      }));
+      return await this.loadEventsByIds(
+        [...eventAtById.keys()],
+        input.sinceMs,
+        input.untilMs,
+        eventAtById,
+        'session_evidence',
+      );
+    } catch (error) {
+      console.error('[clickhouse] Session file-writer lookup failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Read non-lifecycle Observer evidence for an already proven Session process family.
+   * PID is only an indexed candidate selector; the hydrated event must still match the exact
+   * host/boot/namespace/start-time process generation before it can be attributed.
+   */
+  async readSessionProcessObservedEvents(input: {
+    processes: readonly {
+      processInstanceKey: string;
+      pid: number;
+      ppid?: number;
+      /** Exact process generation tuple when the lifecycle projection is sparse. */
+      startTime?: string;
+      pidNamespace?: string;
+      validFrom: number;
+      validTo?: number;
+    }[];
+    hostId: string;
+    bootId: string;
+    pidNamespace?: string;
+    sinceMs: number;
+    untilMs: number;
+    timeWindows?: readonly { sinceMs: number; untilMs: number }[];
+    limit?: number;
+  }): Promise<SessionProcessObservedEvent[] | null> {
+    if (!this.client || !this.ready) return null;
+    const expectedKeys = new Set(input.processes.map((item) => item.processInstanceKey));
+    const expectedByPid = new Map<number, typeof input.processes[number][]>();
+    for (const process of input.processes) {
+      const candidates = expectedByPid.get(process.pid) ?? [];
+      candidates.push(process);
+      expectedByPid.set(process.pid, candidates);
+    }
+    const expectedByGeneration = new Map<string, typeof input.processes[number][]>();
+    for (const process of input.processes) {
+      if (!process.startTime) continue;
+      const generation = String(process.pid) + ':' + process.startTime;
+      const candidates = expectedByGeneration.get(generation) ?? [];
+      candidates.push(process);
+      expectedByGeneration.set(generation, candidates);
+    }
+    const processPids = [...new Set(input.processes
+      .map((item) => item.pid)
+      .filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
+    if (expectedKeys.size === 0 || processPids.length === 0) return [];
+    const rowLimit = Math.max(1, Math.min(5_000, Math.round(input.limit ?? 5_000)));
+    const requestedWindows = (input.timeWindows?.length
+      ? input.timeWindows
+      : [{ sinceMs: input.sinceMs, untilMs: input.untilMs }])
+      .map((window) => ({
+        sinceMs: Math.max(input.sinceMs, Math.trunc(window.sinceMs)),
+        untilMs: Math.min(input.untilMs, Math.trunc(window.untilMs)),
+      }))
+      .filter((window) =>
+        Number.isSafeInteger(window.sinceMs)
+        && Number.isSafeInteger(window.untilMs)
+        && window.sinceMs <= window.untilMs)
+      .sort((left, right) => left.sinceMs - right.sinceMs || left.untilMs - right.untilMs);
+    const mergedWindows: Array<{ sinceMs: number; untilMs: number }> = [];
+    for (const window of requestedWindows) {
+      const previous = mergedWindows.at(-1);
+      if (previous && window.sinceMs <= previous.untilMs + 1) {
+        previous.untilMs = Math.max(previous.untilMs, window.untilMs);
+      } else {
+        mergedWindows.push({ ...window });
+      }
+    }
+    // Never turn an untrusted Session file into an unbounded query fan-out. Merge the closest
+    // idle gaps until the request fits the fixed budget; this widens coverage instead of silently
+    // dropping an older Turn.
+    while (mergedWindows.length > MAX_SESSION_EVIDENCE_TIME_WINDOWS) {
+      let closestIndex = 0;
+      let closestGap = Number.POSITIVE_INFINITY;
+      for (let index = 0; index < mergedWindows.length - 1; index += 1) {
+        const gap = mergedWindows[index + 1].sinceMs - mergedWindows[index].untilMs;
+        if (gap < closestGap) {
+          closestGap = gap;
+          closestIndex = index;
+        }
+      }
+      mergedWindows.splice(closestIndex, 2, {
+        sinceMs: mergedWindows[closestIndex].sinceMs,
+        untilMs: mergedWindows[closestIndex + 1].untilMs,
+      });
+    }
+    if (mergedWindows.length === 0) return [];
+    try {
+      // A resumed Native Session can span days while each Turn lasts only seconds. Query the
+      // merged Turn windows newest-first rather than reading the idle gaps for a long-lived Codex
+      // PID. Sequential reads preserve the ClickHouse one-thread detail budget; stopping at the
+      // global cap retains the same newest-event semantics as the former single broad query.
+      const eventAtById = new Map<string, number>();
+      for (const window of [...mergedWindows].reverse()) {
+        const remaining = rowLimit - eventAtById.size;
+        if (remaining <= 0) break;
+        const result = await this.client.query({
+          query: `
+            SELECT
+              eventId,
+              argMax(at, tuple(decisionRevision, decisionUpdatedAt, at)) AS eventAt
+            FROM ${TABLE}
+            PREWHERE at >= {sinceMs:UInt64} AND at <= {untilMs:UInt64}
+            WHERE processPid IN {processPids:Array(UInt64)}
+              AND processHostId = {hostId:String}
+              AND processBootId = {bootId:String}
+              AND eventKind IN (
+                'FileAccess', 'FileDelete', 'Egress', 'Dns', 'SslContent',
+                'SecurityAction', 'ToolExec', 'ProcessExit'
+              )
+            GROUP BY eventId
+            ORDER BY eventAt DESC, eventId ASC
+            LIMIT {rowLimit:UInt32}`,
+          query_params: {
+            sinceMs: window.sinceMs,
+            untilMs: window.untilMs,
+            processPids,
+            hostId: input.hostId,
+            bootId: input.bootId,
+            rowLimit: remaining,
+          },
+          clickhouse_settings: BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        const locators = (await result.json()) as Array<Record<string, unknown>>;
+        for (const row of locators) {
+          const eventId = String(row.eventId ?? '');
+          const eventAt = Number(row.eventAt ?? 0);
+          if (!eventId || !Number.isSafeInteger(eventAt) || eventAt <= 0) continue;
+          eventAtById.set(eventId, Math.max(eventAtById.get(eventId) ?? 0, eventAt));
+        }
+      }
+      const events = await this.loadEventsByIds(
+        [...eventAtById.keys()].filter(Boolean),
+        input.sinceMs,
+        input.untilMs,
+        eventAtById,
+        'session_evidence',
+      );
+      return events.flatMap((event) => {
+        const identity = canonicalProcessLifecycleIdentity(event.process, event.attribution);
+        if (identity) {
+          if (
+            identity.hostId !== input.hostId
+            || identity.bootId !== input.bootId
+          ) return [];
+          // An interaction record can be emitted before namespace enrichment and therefore carry
+          // a key hashed from a partial tuple. Later eBPF events contain the complete namespace
+          // fields and hash to a different key. Reconcile by the exact PID + trusted start-time
+          // generation, but retain the Session's expected key for lineage ownership. This is
+          // generation-safe and avoids dropping otherwise valid evidence merely because the two
+          // Observer lanes observed the same process at different enrichment stages.
+          if (expectedKeys.has(identity.processInstanceKey)) {
+            return [{ event, processInstanceKey: identity.processInstanceKey }];
+          }
+          const generationCandidates = expectedByGeneration.get(
+            String(identity.pid) + ':' + identity.startTime,
+          ) ?? [];
+          const compatible = generationCandidates.filter((candidate) =>
+            !candidate.pidNamespace
+            || !identity.pidNamespace
+            || candidate.pidNamespace === identity.pidNamespace,
+          );
+          if (compatible.length !== 1) return [];
+          return [{ event, processInstanceKey: compatible[0].processInstanceKey }];
+        }
+
+        // Very short-lived commands can exec and exit before the collector enriches their
+        // later event revisions with startTimeTicks. Never trust PID alone: inherit a known
+        // generation only when host/boot, PID, parent PID and its observed lifetime select one
+        // exact family member. Reused or otherwise ambiguous PIDs remain excluded.
+        const process = event.process;
+        if (
+          !process
+          || process.hostId !== input.hostId
+          || process.bootId !== input.bootId
+          || !Number.isSafeInteger(process.pid)
+          || !Number.isSafeInteger(process.ppid)
+        ) return [];
+        const candidates = (expectedByPid.get(process.pid!) ?? []).filter((candidate) =>
+          candidate.ppid !== undefined
+          && candidate.ppid === process.ppid
+          && event.at >= candidate.validFrom
+          && (candidate.validTo === undefined || event.at <= candidate.validTo));
+        if (candidates.length !== 1) return [];
+        return [{ event, processInstanceKey: candidates[0].processInstanceKey }];
+      }).sort((left, right) =>
+        right.event.at - left.event.at || left.event.eventId.localeCompare(right.event.eventId));
+    } catch (error) {
+      console.error('[clickhouse] Session process evidence query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
   async readToolEvidenceRelations(
     invocationIdInput: string,
     toolCallIdInput?: string,
@@ -5886,63 +6455,254 @@ export class ClickHouseStore {
     };
   }
 
-  async writeProcessLifecycleFacts(
-    facts: readonly ProcessLifecycleFact[],
-  ): Promise<boolean> {
-    if (facts.length === 0) return true;
-    if (!this.client || !this.ready || facts.length > 5_000) return false;
-    try {
-      await this.client.insert({
-        table: PROCESS_LIFECYCLE_FACT_TABLE,
-        values: facts.map((fact) => ({
-          factId: fact.factId,
-          eventId: fact.eventId,
-          sourceEventId: fact.sourceEventId ?? "",
-          factKind: fact.factKind,
-          at: fact.at,
-          receivedAt: fact.receivedAt,
-          source: fact.source,
-          sourceId: fact.sourceId ?? "",
-          collectorId: fact.collectorId ?? "",
-          workspacePath: fact.workspacePath,
-          subjectAssetId: fact.subjectAssetId ?? "",
-          subjectAssetType: fact.subjectAssetType ?? "",
-          assetBindingQuality: fact.assetBindingQuality ?? "",
-          assetBindingRevision: fact.assetBindingRevision ?? 0,
-          assetBindingReason: fact.assetBindingReason ?? "",
-          runtimeInstanceId: fact.runtimeInstanceId ?? "",
-          rootProcess: fact.rootProcess === true ? 1 : 0,
-          identityRevision: fact.identityRevision ?? 0,
-          processInstanceKey: fact.processInstanceKey,
-          processGenerationKey: fact.processGenerationKey ?? "",
-          parentProcessGenerationKey: fact.parentProcessGenerationKey ?? "",
-          parentLinkAuthority: fact.parentLinkAuthority ?? "",
-          physicalWorkloadId: fact.physicalWorkloadId ?? "",
-          hostId: fact.hostId ?? "",
-          bootId: fact.bootId,
-          pid: fact.pid,
-          ppid: fact.ppid ?? 0,
-          pidNamespace: fact.pidNamespace ?? "",
-          namespacePid: fact.namespacePid ?? 0,
-          namespacePpid: fact.namespacePpid ?? 0,
-          startTime: fact.startTime,
-          lifecycleSource: fact.lifecycleSource ?? "",
-          exitStatus: fact.exitStatus ?? 0,
-          exitStatusPresent: fact.exitStatus !== undefined ? 1 : 0,
-          exitSignal: fact.exitSignal ?? 0,
-          exitSignalPresent: fact.exitSignal !== undefined ? 1 : 0,
-          executableHash: fact.executableHash ?? "",
-          commandHash: fact.commandHash ?? "",
-        })),
-        format: "JSONEachRow",
+  private latestProcessLifecycleFacts(
+    rows: Array<Record<string, unknown>>,
+  ): ProcessLifecycleFact[] {
+    const latest = new Map<string, ProcessLifecycleFact>();
+    for (const row of rows) {
+      const fact = this.processLifecycleFactFromRow(row);
+      if (!fact.factId) continue;
+      const current = latest.get(fact.factId);
+      if (!current || fact.receivedAt > current.receivedAt) latest.set(fact.factId, fact);
+    }
+    return [...latest.values()];
+  }
+
+  private lifecycleFactsFromEventRows(
+    rows: Array<Record<string, unknown>>,
+  ): ProcessLifecycleFact[] {
+    return this.lifecycleFactsFromEvents(
+      foldLatestEventRevisions(rows.map((row) => fromRow(row))),
+    );
+  }
+
+  private lifecycleFactsFromEvents(events: readonly JudgedEvent[]): ProcessLifecycleFact[] {
+    return events.flatMap((event) => {
+      const fact = processLifecycleFact({
+        eventId: event.eventId,
+        ...(event.sourceEventId ? { sourceEventId: event.sourceEventId } : {}),
+        eventKind: event.eventKind,
+        at: event.at,
+        ...(event.receivedAt !== undefined ? { receivedAt: event.receivedAt } : {}),
+        source: event.source,
+        ...(event.sourceId ? { sourceId: event.sourceId } : {}),
+        ...(event.collectorId ? { collectorId: event.collectorId } : {}),
+        workspacePath: event.workspacePath,
+        ...(event.subjectAssetId ? { subjectAssetId: event.subjectAssetId } : {}),
+        ...(event.subjectAssetType ? { subjectAssetType: event.subjectAssetType } : {}),
+        ...(event.assetBindingQuality ? { assetBindingQuality: event.assetBindingQuality } : {}),
+        ...(event.assetBindingRevision !== undefined
+          ? { assetBindingRevision: event.assetBindingRevision }
+          : {}),
+        ...(event.assetBindingReason ? { assetBindingReason: event.assetBindingReason } : {}),
+        ...(event.identityRevision !== undefined ? { identityRevision: event.identityRevision } : {}),
+        process: event.process,
+        attribution: event.attribution,
+        attributes: event.attributes,
       });
-      return true;
-    } catch (error) {
-      console.error(
-        "[clickhouse] Process lifecycle fact insert failed:",
-        (error as Error).message,
+      return fact ? [fact] : [];
+    });
+  }
+
+  async writeProcessLifecycleFacts(facts: readonly ProcessLifecycleFact[]): Promise<boolean> {
+    if (facts.length === 0) return true;
+    if (!this.client || !this.ready || this.closing || facts.length > 5_000) return false;
+    // Concurrent observer batches each carry a few structural facts. Coalesce them into one
+    // ClickHouse insert so process-lifecycle durability does not serialize one RTT per HTTP batch
+    // while the event writer is already busy — without dropping the per-caller durability wait.
+    return await new Promise<boolean>((resolve) => {
+      this.processLifecycleWriteQueue.push({ facts: [...facts], resolve });
+      void this.ensureProcessLifecycleWriteDrain();
+    });
+  }
+
+  private ensureProcessLifecycleWriteDrain(): Promise<void> {
+    if (this.processLifecycleWriteInFlight) return this.processLifecycleWriteInFlight;
+    let tracked!: Promise<void>;
+    tracked = this.drainProcessLifecycleWrites().finally(() => {
+      if (this.processLifecycleWriteInFlight !== tracked) return;
+      this.processLifecycleWriteInFlight = undefined;
+      if (
+        this.processLifecycleWriteQueue.length > 0
+        && this.client
+        && this.ready
+        && !this.closing
+      ) void this.ensureProcessLifecycleWriteDrain();
+    });
+    this.processLifecycleWriteInFlight = tracked;
+    return tracked;
+  }
+
+  private async drainProcessLifecycleWrites(): Promise<void> {
+    const client = this.client;
+    if (!client) {
+      for (const pending of this.processLifecycleWriteQueue.splice(0)) pending.resolve(false);
+      return;
+    }
+    const maxRows = this.eventBatchMaxRows();
+    while (this.processLifecycleWriteQueue.length > 0) {
+      const group: Array<{ facts: ProcessLifecycleFact[]; resolve: (ok: boolean) => void }> = [];
+      let rows = 0;
+      while (this.processLifecycleWriteQueue.length > 0) {
+        const next = this.processLifecycleWriteQueue[0];
+        if (rows > 0 && rows + next.facts.length > maxRows) break;
+        this.processLifecycleWriteQueue.shift();
+        group.push(next);
+        rows += next.facts.length;
+      }
+      const values = group.flatMap(({ facts }) => facts.map((fact) => ({
+        factId: fact.factId,
+        eventId: fact.eventId,
+        sourceEventId: fact.sourceEventId ?? '',
+        factKind: fact.factKind,
+        at: fact.at,
+        receivedAt: fact.receivedAt,
+        source: fact.source,
+        sourceId: fact.sourceId ?? '',
+        collectorId: fact.collectorId ?? '',
+        workspacePath: fact.workspacePath,
+        subjectAssetId: fact.subjectAssetId ?? '',
+        subjectAssetType: fact.subjectAssetType ?? '',
+        assetBindingQuality: fact.assetBindingQuality ?? '',
+        assetBindingRevision: fact.assetBindingRevision ?? 0,
+        assetBindingReason: fact.assetBindingReason ?? '',
+        runtimeInstanceId: fact.runtimeInstanceId ?? '',
+        rootProcess: fact.rootProcess === true ? 1 : 0,
+        identityRevision: fact.identityRevision ?? 0,
+        processInstanceKey: fact.processInstanceKey,
+        processGenerationKey: fact.processGenerationKey ?? '',
+        parentProcessGenerationKey: fact.parentProcessGenerationKey ?? '',
+        parentLinkAuthority: fact.parentLinkAuthority ?? '',
+        physicalWorkloadId: fact.physicalWorkloadId ?? '',
+        hostId: fact.hostId ?? '',
+        bootId: fact.bootId,
+        pid: fact.pid,
+        ppid: fact.ppid ?? 0,
+        pidNamespace: fact.pidNamespace ?? '',
+        namespacePid: fact.namespacePid ?? 0,
+        namespacePpid: fact.namespacePpid ?? 0,
+        startTime: fact.startTime,
+        lifecycleSource: fact.lifecycleSource ?? '',
+        exitStatus: fact.exitStatus ?? 0,
+        exitStatusPresent: fact.exitStatus !== undefined ? 1 : 0,
+        exitSignal: fact.exitSignal ?? 0,
+        exitSignalPresent: fact.exitSignal !== undefined ? 1 : 0,
+        executableHash: fact.executableHash ?? '',
+        commandHash: fact.commandHash ?? '',
+      })));
+      try {
+        await client.insert({
+          table: PROCESS_LIFECYCLE_FACT_TABLE,
+          values,
+          format: 'JSONEachRow',
+        });
+        for (const pending of group) pending.resolve(true);
+      } catch (error) {
+        console.error('[clickhouse] Process lifecycle fact insert failed:', (error as Error).message);
+        for (const pending of group) pending.resolve(false);
+      }
+    }
+  }
+
+  private async readLegacySessionProcessEventFacts(input: {
+    processPids: number[];
+    parentPids: number[];
+    excludedEventIds?: string[];
+    sinceMs: number;
+    untilMs: number;
+    hostId?: string;
+    bootId?: string;
+    pidNamespace?: string;
+    limit: number;
+  }): Promise<ProcessLifecycleFact[] | null> {
+    if (!this.client || !this.ready) return null;
+    const processPids = [...new Set(input.processPids.filter((pid) => pid > 0))];
+    const parentPids = [...new Set(input.parentPids.filter((pid) => pid > 0))];
+    const excludedEventIds = [...new Set(
+      (input.excludedEventIds ?? []).map((eventId) => eventId.trim()).filter(Boolean),
+    )];
+    if (processPids.length === 0 && parentPids.length === 0) return [];
+    const rowLimit = Math.max(1, Math.min(15_000, Math.round(input.limit)));
+    const scope = [
+      input.hostId ? 'processHostId = {hostId:String}' : '',
+      input.bootId ? 'processBootId = {bootId:String}' : '',
+      input.pidNamespace !== undefined
+        ? 'processPidNamespace = {pidNamespace:String}'
+        : '',
+    ].filter(Boolean);
+    try {
+      // Keep compatibility reads indexable. An OR across processPid/processPpid made ClickHouse
+      // scan old wide event parts even when both skip indexes were available. First locate only
+      // event ids/timestamps through two narrow point reads. Full JSON columns are late-materialized
+      // for the small resulting id set by loadEventsByIds instead of being parsed for every matched
+      // revision in historical parts.
+      const readByProcessColumn = async (
+        column: 'processPid' | 'processPpid',
+        values: number[],
+      ): Promise<Array<Record<string, unknown>>> => {
+        if (values.length === 0) return [];
+        const result = await this.client!.query({
+          query: `
+            SELECT
+              eventId,
+              at,
+              decisionRevision,
+              decisionUpdatedAt
+            FROM ${TABLE}
+            PREWHERE at >= {sinceMs:UInt64} AND at <= {untilMs:UInt64}
+            WHERE eventKind IN ('ToolExec', 'ProcessExit')
+              AND ${column} IN {processIds:Array(UInt64)}
+              ${excludedEventIds.length > 0
+                ? 'AND eventId NOT IN {excludedEventIds:Array(String)}'
+                : ''}
+              ${scope.length > 0 ? `AND ${scope.join(' AND ')}` : ''}
+            LIMIT {rowLimit:UInt32}`,
+          query_params: {
+            processIds: values,
+            sinceMs: input.sinceMs,
+            untilMs: input.untilMs,
+            hostId: input.hostId ?? '',
+            bootId: input.bootId ?? '',
+            pidNamespace: input.pidNamespace ?? '',
+            excludedEventIds,
+            rowLimit,
+          },
+          clickhouse_settings: BOUNDED_LEGACY_PROCESS_EVENT_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        return (await result.json()) as Array<Record<string, unknown>>;
+      };
+      const [processRows, childRows] = await Promise.all([
+        readByProcessColumn('processPid', processPids),
+        readByProcessColumn('processPpid', parentPids),
+      ]);
+      const locatorRows = [...processRows, ...childRows];
+      const eventAtById = new Map<string, number>();
+      for (const row of locatorRows) {
+        const eventId = String(row.eventId ?? '');
+        const at = Number(row.at);
+        if (!eventId || !Number.isFinite(at) || at <= 0) continue;
+        const current = eventAtById.get(eventId);
+        if (current === undefined || at > current) eventAtById.set(eventId, at);
+      }
+      const events = await this.loadEventsByIds(
+        [...eventAtById.keys()],
+        input.sinceMs,
+        input.untilMs,
+        eventAtById,
       );
-      return false;
+      const facts = this.lifecycleFactsFromEvents(events);
+      const latest = new Map<string, ProcessLifecycleFact>();
+      for (const fact of facts) {
+        const current = latest.get(fact.factId);
+        if (!current || fact.receivedAt > current.receivedAt) latest.set(fact.factId, fact);
+      }
+      return [...latest.values()]
+        .sort((left, right) => right.at - left.at)
+        .slice(0, rowLimit);
+    } catch (error) {
+      console.error('[clickhouse] Legacy Session Process event query failed:', (error as Error).message);
+      return null;
     }
   }
 
@@ -5993,20 +6753,24 @@ export class ClickHouseStore {
     if (!this.client || !this.ready) return null;
     const rowLimit = Math.max(1, Math.min(10_000, Math.round(limit)));
     try {
+      // Startup hydration only needs a recent structural sample. Ordering the whole time window
+      // across millions of lifecycle rows starves interactive Session evidence reads during and
+      // after API restart. Prefer an in-order time filter without a global sort, then rank in
+      // Node over the bounded result set.
       const result = await this.client.query({
         query: `
-          SELECT *
-          FROM ${PROCESS_LIFECYCLE_FACT_TABLE} FINAL
+          SELECT ${SESSION_PROCESS_LIFECYCLE_COLUMNS}
+          FROM ${PROCESS_LIFECYCLE_FACT_TABLE}
           WHERE at >= {sinceMs:UInt64}
             AND at <= {untilMs:UInt64}
-          ORDER BY at DESC, factKind, eventId
           LIMIT {rowLimit:UInt32}`,
         query_params: { sinceMs, untilMs, rowLimit },
         clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
         format: "JSONEachRow",
       });
       const rows = (await result.json()) as Array<Record<string, unknown>>;
-      return rows.map((row) => this.processLifecycleFactFromRow(row)).reverse();
+      return this.latestProcessLifecycleFacts(rows)
+        .sort((left, right) => left.at - right.at || left.receivedAt - right.receivedAt);
     } catch (error) {
       console.error(
         "[clickhouse] Recent Process lifecycle fact query failed:",
@@ -6014,6 +6778,295 @@ export class ClickHouseStore {
       );
       return null;
     }
+  }
+
+  /**
+   * Find the exact FD-matched process generation or one of its directly observed children.
+   * Unlike the compatibility recent-facts reader, this query never sorts or FINAL-merges the
+   * entire time window before applying a Session process predicate.
+   */
+  async readSessionProcessLifecycleCandidates(
+    matchedPid: number,
+    sinceMs: number,
+    untilMs: number,
+    limit = 1_000,
+    scope: {
+      hostId?: string;
+      bootId?: string;
+    } = {},
+  ): Promise<ProcessLifecycleFact[] | null> {
+    if (!this.client || !this.ready || !Number.isSafeInteger(matchedPid) || matchedPid <= 0) {
+      return null;
+    }
+    const rowLimit = Math.max(1, Math.min(5_000, Math.round(limit)));
+    try {
+      // Keep both PID indexes usable. The projection table can contain millions of historical
+      // generations, and combining these predicates with OR forces an in-order scan despite both
+      // columns having skip indexes.
+      const readProjectedByColumn = async (
+        column: 'pid' | 'ppid',
+      ): Promise<Array<Record<string, unknown>>> => {
+        // Interaction metadata carries a host/boot scope even when namespace enrichment has not
+        // arrived yet. Applying it here is generation-safe and prevents a PID lookup from
+        // scanning every host/boot generation retained in the projection table.
+        const hostBootClause = scope.hostId && scope.bootId
+          ? `AND hostId = {hostId:String}\n              AND bootId = {bootId:String}`
+          : '';
+        const result = await this.client!.query({
+          query: `
+            SELECT ${SESSION_PROCESS_LIFECYCLE_COLUMNS}
+            FROM ${PROCESS_LIFECYCLE_FACT_TABLE}
+            WHERE at >= {sinceMs:UInt64}
+              AND at <= {untilMs:UInt64}
+              ${hostBootClause}
+              AND ${column} = {matchedPid:UInt64}
+            LIMIT {rowLimit:UInt32}`,
+          query_params: {
+            matchedPid,
+            sinceMs,
+            untilMs,
+            rowLimit,
+            hostId: scope.hostId ?? '',
+            bootId: scope.bootId ?? '',
+          },
+          clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
+          format: 'JSONEachRow',
+        });
+        return (await result.json()) as Array<Record<string, unknown>>;
+      };
+      const projectedRows = (await Promise.all([
+        readProjectedByColumn('pid'),
+        readProjectedByColumn('ppid'),
+      ])).flat();
+      const projected = this.latestProcessLifecycleFacts(projectedRows);
+      if (projected.length > 0) {
+        return projected
+          .sort((left, right) => left.at - right.at)
+          .slice(0, rowLimit);
+      }
+      const recentSinceMs = Math.max(
+        sinceMs,
+        untilMs - LEGACY_SESSION_RECENT_PROJECTION_HORIZON_MS,
+      );
+      let legacy = await this.readLegacySessionProcessEventFacts({
+        processPids: [matchedPid],
+        parentPids: [matchedPid],
+        sinceMs: recentSinceMs,
+        untilMs,
+        limit: rowLimit,
+      });
+      if (legacy === null) return null;
+      if (legacy.length === 0 && recentSinceMs > sinceMs) {
+        legacy = await this.readLegacySessionProcessEventFacts({
+          processPids: [matchedPid],
+          parentPids: [matchedPid],
+          sinceMs,
+          untilMs,
+          limit: rowLimit,
+        });
+      }
+      if (legacy === null) return null;
+      if (legacy.length > 0) await this.writeProcessLifecycleFacts(legacy);
+      return legacy.sort((left, right) => left.at - right.at);
+    } catch (error) {
+      console.error('[clickhouse] Session Process candidate query failed:', (error as Error).message);
+      return null;
+    }
+  }
+
+  /** Read only one Session's observed process family, expanding descendants breadth-first. */
+  async readSessionProcessFamilyFacts(input: {
+    rootProcessInstanceKey: string;
+    rootPid: number;
+    /** Exact start tuple from the Session/interaction lane, when available. */
+    rootStartTime?: string;
+    hostId: string;
+    bootId: string;
+    pidNamespace?: string;
+    sinceMs: number;
+    untilMs: number;
+    limit?: number;
+    /** Interactive detail reads keep a shallow frontier; background reconciliation uses 12. */
+    maxDepth?: number;
+    /** Skip the wide legacy events-table walk on the interactive path. */
+    skipLegacyFallback?: boolean;
+    /** Reserve room for descendants and prefer recent branches on bounded live reads. */
+    prioritizeRecent?: boolean;
+    /** Report a bounded frontier so callers cannot acknowledge it as complete persistence. */
+    onCoverageLimited?: () => void;
+  }): Promise<ProcessLifecycleFact[] | null> {
+    if (
+      !this.client
+      || !this.ready
+      || !/^pri_[a-f0-9]{24}$/u.test(input.rootProcessInstanceKey)
+      || !Number.isSafeInteger(input.rootPid)
+      || input.rootPid <= 0
+    ) return null;
+    const totalLimit = Math.max(1, Math.min(5_000, Math.round(input.limit ?? 5_000)));
+    const maxDepth = Math.max(
+      1,
+      Math.min(12, Math.trunc(input.maxDepth ?? 12)),
+    );
+    const all = new Map<string, ProcessLifecycleFact>();
+    let processKeys = [input.rootProcessInstanceKey];
+    let parentPids = [input.rootPid];
+    for (let depth = 0; depth < maxDepth && all.size < totalLimit; depth += 1) {
+      const remaining = totalLimit - all.size;
+      // Reserve budget for children/grandchildren without dividing the first frontier by
+      // every possible depth. A shallow busy root otherwise hides older direct commands.
+      const levelLimit = input.prioritizeRecent
+        ? Math.max(1, Math.floor(remaining / Math.min(3, maxDepth - depth)))
+        : remaining;
+      try {
+        // Keep both skip indexes usable. The previous OR predicate and ORDER BY made every
+        // breadth-first step scan/sort a large part of the lifecycle projection.
+        const readFamilyByColumn = async (
+          column: 'processInstanceKey' | 'pid' | 'ppid',
+        ): Promise<Array<Record<string, unknown>>> => {
+          const values = column === 'processInstanceKey' ? processKeys : parentPids;
+          if (values.length === 0) return [];
+          // The interaction lane can only see host PID + start time and therefore hashes a
+          // namespace-incomplete identity. Reconcile that key against the lifecycle projection
+          // with one exact PID/start lookup before falling back to the wide immutable event table.
+          // Do this only for the root generation; descendant PIDs are already reached through
+          // the ppid frontier and must not broaden the query to PID-reuse generations.
+          const startConstraint = column === 'pid'
+            && depth === 0
+            && input.rootStartTime
+            ? 'AND startTime = {rootStartTime:String}'
+            : '';
+          const result = await this.client!.query({
+            query: `
+              SELECT ${SESSION_LIFECYCLE_VERSION_SELECT}
+              FROM (
+                SELECT factId,
+                  argMax(tuple(${SESSION_LIFECYCLE_VERSION_FIELDS.join(', ')}),
+                    tuple(receivedAt, identityRevision)) AS latest
+                FROM ${PROCESS_LIFECYCLE_FACT_TABLE}
+              WHERE at >= {sinceMs:UInt64}
+                AND at <= {untilMs:UInt64}
+                AND hostId = {hostId:String}
+                AND bootId = {bootId:String}
+                ${startConstraint}
+                AND ${column} IN {values:${column === 'processInstanceKey' ? 'Array(String)' : 'Array(UInt64)'}}
+                GROUP BY factId
+              )
+              ${input.prioritizeRecent ? 'ORDER BY at DESC, eventId DESC' : ''}
+              LIMIT {rowLimit:UInt32}`,
+            query_params: {
+              sinceMs: input.sinceMs,
+              untilMs: input.untilMs,
+              hostId: input.hostId,
+              bootId: input.bootId,
+              rootStartTime: input.rootStartTime ?? '',
+              values,
+              rowLimit: levelLimit,
+            },
+            clickhouse_settings: BOUNDED_PROCESS_LIFECYCLE_READ_SETTINGS,
+            format: 'JSONEachRow',
+          });
+          const rows = (await result.json()) as Array<Record<string, unknown>>;
+          if (rows.length >= levelLimit) input.onCoverageLimited?.();
+          return rows;
+        };
+        const familyReads = [
+          readFamilyByColumn('processInstanceKey'),
+          readFamilyByColumn('ppid'),
+        ];
+        // `pid` is intentionally only the exact root-generation reconciliation query (see
+        // startConstraint above). It fixes the common missing-namespace process key without
+        // turning every BFS step into a PID-reuse scan.
+        if (depth === 0) familyReads.push(readFamilyByColumn('pid'));
+        const rows = (await Promise.all(familyReads)).flat();
+        const facts = this.latestProcessLifecycleFacts(rows);
+        const nextKeys = new Set<string>();
+        const nextPids = new Set<number>();
+        for (const fact of facts) {
+          const previous = all.get(fact.factId);
+          if (input.prioritizeRecent && !previous && all.size >= totalLimit) continue;
+          if (!previous || fact.receivedAt > previous.receivedAt) all.set(fact.factId, fact);
+          if (!processKeys.includes(fact.processInstanceKey)) {
+            nextKeys.add(fact.processInstanceKey);
+            nextPids.add(fact.pid);
+          }
+        }
+        if (nextKeys.size === 0) break;
+        if (depth === maxDepth - 1) input.onCoverageLimited?.();
+        processKeys = [...nextKeys];
+        parentPids = [...nextPids];
+      } catch (error) {
+        console.error('[clickhouse] Session Process family query failed:', (error as Error).message);
+        return null;
+      }
+    }
+    // Retained Agent events and compact structural events can arrive through different persistence
+    // paths. Therefore a non-empty lifecycle projection does not prove that every descendant was
+    // projected: a common Codex shape is root -> sandbox in process_lifecycle_facts, followed by
+    // bwrap -> sandbox -> command only in immutable events. Seed the compatibility walk with every
+    // process already discovered above so missing siblings and deeper descendants are recovered
+    // instead of returning a silently truncated family.
+    // For a large family the projection is the bounded interactive source of truth. A legacy
+    // fallback here would issue one wide events-table lookup per frontier PID and is the primary
+    // cause of the multi-second/timeout behaviour seen on long-lived Codex sessions. Small
+    // families still take the compatibility path so the hybrid recovery contract remains intact.
+    // Interactive detail requests skip the legacy walk entirely: they already mark completeness
+    // partial, and the background reconciler owns historical recovery.
+    if (
+      input.skipLegacyFallback
+      || all.size >= LEGACY_FAMILY_FALLBACK_MAX_PROJECTED_FACTS
+    ) {
+      return [...all.values()].sort((left, right) => left.at - right.at);
+    }
+    const recentSinceMs = Math.max(
+      input.sinceMs,
+      input.untilMs - LEGACY_SESSION_RECENT_PROJECTION_HORIZON_MS,
+    );
+    let legacyProcessPids = [...new Set([
+      input.rootPid,
+      ...[...all.values()].map((fact) => fact.pid),
+    ])];
+    const expandedLegacyPids = new Set<number>();
+    const recovered = new Map<string, ProcessLifecycleFact>();
+    for (let depth = 0; depth < 12 && all.size < totalLimit; depth += 1) {
+      const frontierPids = legacyProcessPids.filter((pid) => !expandedLegacyPids.has(pid));
+      if (frontierPids.length === 0) break;
+      for (const pid of frontierPids) expandedLegacyPids.add(pid);
+      const legacy = await this.readLegacySessionProcessEventFacts({
+        // Every projected process already has a durable lifecycle fact. On the hybrid path only
+        // search for not-yet-projected children; reloading each frontier process itself made a
+        // repeat detail read late-materialize hundreds of wide event rows.
+        processPids: all.size === 0 ? frontierPids : [],
+        parentPids: frontierPids,
+        excludedEventIds: [...all.values()].map((fact) => fact.eventId),
+        sinceMs: recentSinceMs,
+        untilMs: input.untilMs,
+        hostId: input.hostId,
+        bootId: input.bootId,
+        limit: totalLimit - all.size,
+      });
+      if (legacy === null) return all.size > 0
+        ? [...all.values()].sort((left, right) => left.at - right.at)
+        : null;
+      for (const fact of legacy) {
+        const previous = all.get(fact.factId);
+        if (!previous || fact.receivedAt > previous.receivedAt) {
+          all.set(fact.factId, fact);
+          recovered.set(fact.factId, fact);
+        }
+      }
+      const nextPids = new Set<number>();
+      for (const fact of all.values()) {
+        if (
+          fact.ppid !== undefined
+          && frontierPids.includes(fact.ppid)
+          && !expandedLegacyPids.has(fact.pid)
+        ) nextPids.add(fact.pid);
+      }
+      if (nextPids.size === 0) break;
+      legacyProcessPids = [...nextPids];
+    }
+    if (recovered.size > 0) await this.writeProcessLifecycleFacts([...recovered.values()]);
+    return [...all.values()].sort((left, right) => left.at - right.at);
   }
 
   async agentWindowFacts(
@@ -6118,7 +7171,7 @@ export class ClickHouseStore {
         representativeIds,
         sinceMs,
         untilMs,
-      );
+      ) ?? [];
       const byId = new Map(
         representativeEvents.map((event) => [event.eventId, event]),
       );
@@ -6296,7 +7349,7 @@ export class ClickHouseStore {
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
-      const representativeEvents = await this.eventsByIds(
+      const representativeEvents = await this.loadEventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
@@ -6499,7 +7552,7 @@ export class ClickHouseStore {
             ] as const,
         ),
       );
-      const representativeEvents = await this.eventsByIds(
+      const representativeEvents = await this.loadEventsByIds(
         representativeIds,
         sinceMs,
         untilMs,
@@ -6718,7 +7771,7 @@ export class ClickHouseStore {
         representativeIds,
         sinceMs,
         untilMs,
-      );
+      ) ?? [];
       const byId = new Map(
         representativeEvents.map((event) => [event.eventId, event]),
       );
@@ -6842,7 +7895,7 @@ export class ClickHouseStore {
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
-      );
+      ) ?? [];
       const byId = new Map(
         representativeEvents.map((event) => [event.eventId, event]),
       );
@@ -6968,7 +8021,7 @@ export class ClickHouseStore {
         representativeIds,
         sinceMs,
         untilMs,
-      );
+      ) ?? [];
       const byId = new Map(
         representativeEvents.map((event) => [event.eventId, event]),
       );
@@ -7084,7 +8137,7 @@ export class ClickHouseStore {
       const representativeIds = rows
         .map((row) => String(row.representativeEventId ?? ""))
         .filter(Boolean);
-      const representativeEvents = await this.eventsByIds(
+      const representativeEvents = await this.loadEventsByIds(
         representativeIds,
         sinceMs,
         Math.max(sinceMs, endExclusiveMs - 1),
@@ -7126,11 +8179,12 @@ export class ClickHouseStore {
     }
   }
 
-  private async eventsByIds(
+  private async loadEventsByIds(
     eventIds: string[],
     sinceMs?: number,
     untilMs?: number,
     eventAtById?: ReadonlyMap<string, number>,
+    projection: 'full' | 'session_evidence' = 'full',
   ): Promise<JudgedEvent[]> {
     if (!this.client || eventIds.length === 0) return [];
     const uniqueEventIds = [...new Set(eventIds.filter(Boolean))];
@@ -7139,6 +8193,18 @@ export class ClickHouseStore {
       batches.push(uniqueEventIds.slice(index, index + 200));
     }
     const events: JudgedEvent[] = [];
+    // Session attribution only needs identity, process, command and verdict columns. `events`
+    // also contains potentially large raw previews and judgment payloads; selecting every column
+    // made a 200-id evidence hydration read tens of MiB and dominate the detail request. Keep the
+    // generic full projection for other callers and use this lossless-for-session-view subset for
+    // the two Session evidence paths above.
+    const selectedColumns = projection === 'session_evidence'
+      ? `schemaVersion, eventId, sourceEventId, at, eventKind, eventCategory,
+          activityContext, activitySubtype, source, subject, workspacePath, agentId,
+          collectorId, sourceId, sessionId, userId, traceId, spanId,
+          decisionRevision, decisionUpdatedAt, verdict, tier, severity, riskScore,
+          attributes, process, attribution`
+      : '*';
     for (let index = 0; index < batches.length; index += 2) {
       const rows = await Promise.all(
         batches.slice(index, index + 2).map(async (batch) => {
@@ -7149,19 +8215,27 @@ export class ClickHouseStore {
                 ),
               ].filter((at) => at > 0)
             : [];
-          const prewhereClause = exactEventTimes.length
-            ? "PREWHERE at IN {eventTimes:Array(UInt64)}"
+          // Event ids have a GRANULARITY 1 bloom-filter index.  Using the timestamp list as
+          // PREWHERE looks attractive, but a resumed Session can span many hours and therefore
+          // forces ClickHouse to read every mark containing any of those timestamps before it
+          // evaluates eventId.  Put the highly selective immutable id predicate in PREWHERE and
+          // keep the optional timestamp bound as a normal filter.  On the current corpus this
+          // changes a 200-id hydration from tens of thousands of rows to the handful of matching
+          // granules, while retaining the exact-time guard for revision/ID collision safety.
+          const prewhereClause = 'PREWHERE eventId IN {eventIds:Array(String)}';
+          const timeWhereClause = exactEventTimes.length
+            ? 'WHERE at IN {eventTimes:Array(UInt64)}'
             : sinceMs === undefined || untilMs === undefined
-              ? ""
-              : "PREWHERE at >= {since:UInt64} AND at <= {until:UInt64}";
+              ? ''
+              : 'WHERE at >= {since:UInt64} AND at <= {until:UInt64}';
           const result = await this.client!.query({
             query: `
-              SELECT *
+              SELECT ${selectedColumns}
               FROM (
-                SELECT *
+                SELECT ${selectedColumns}
                 FROM ${TABLE}
                 ${prewhereClause}
-                WHERE eventId IN {eventIds:Array(String)}
+                ${timeWhereClause}
                 ORDER BY decisionRevision DESC, decisionUpdatedAt DESC, at DESC
                 LIMIT 1 BY eventId
               )`,
@@ -7229,6 +8303,158 @@ export class ClickHouseStore {
           (left.sourceId ?? "").localeCompare(right.sourceId ?? "") ||
           (left.collectorId ?? "").localeCompare(right.collectorId ?? ""),
       );
+  }
+
+  async saveInteractionMetadata(record: InteractionRecord): Promise<boolean> {
+    return this.saveInteractionMetadataBatch([record]);
+  }
+
+  async saveInteractionMetadataBatch(
+    records: readonly InteractionRecord[],
+  ): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (!this.client || !this.enabled) return false;
+    const projectedAt = Date.now();
+    const unique = new Map<
+      string,
+      { record: InteractionRecord; fingerprint: string }
+    >();
+    for (const record of records) {
+      const fingerprint = interactionPayloadFingerprint(record);
+      const previous = unique.get(record.interactionId);
+      if (previous && previous.fingerprint !== fingerprint) {
+        console.error(
+          '[clickhouse] Interaction immutable-key conflict inside projection batch:',
+          `${record.sourceId}/${record.sourceEventId}`,
+        );
+        return false;
+      }
+      if (!previous) unique.set(record.interactionId, { record, fingerprint });
+    }
+    const values = [...unique.values()].map(({ record }) => ({
+      schemaVersion: record.schemaVersion,
+      interactionId: record.interactionId,
+      conversationId: record.conversationId,
+      sourceId: record.sourceId,
+      sourceEventId: record.sourceEventId,
+      collectorId: record.collectorId,
+      tenantId: record.tenantId,
+      environmentId: record.environmentId ?? '',
+      agentInstanceId: record.agentInstanceId ?? '',
+      processInstanceId: record.processInstanceId,
+      workspacePath: record.workspacePath ?? '',
+      provider:
+        record.eventType === 'LlmTransportObserved'
+          ? record.transport.provider ?? ''
+          : '',
+      observedAt: record.observedAt,
+      acceptedAt: record.acceptedAt,
+      projectedAt,
+      record: JSON.stringify({ ...record, projectedAt }),
+    }));
+    const batchToken = createHash('sha256')
+      .update(
+        [...unique.values()]
+          .map(({ record, fingerprint }) => `${record.interactionId}\0${fingerprint}`)
+          .sort()
+          .join('\n'),
+      )
+      .digest('hex');
+    try {
+      await this.client.insert({
+        table: INTERACTION_METADATA_TABLE,
+        values,
+        format: 'JSONEachRow',
+        clickhouse_settings: {
+          insert_deduplication_token: `interaction-batch:${batchToken}`,
+        },
+      });
+      return true;
+    } catch (error) {
+      console.error(
+        '[clickhouse] saveInteractionMetadata failed:',
+        error instanceof Error ? error.message : String(error),
+      );
+      return false;
+    }
+  }
+
+  async loadInteractionMetadata(query: {
+    limit: number;
+    collectorId?: string;
+    agentInstanceId?: string;
+    workspacePath?: string;
+    since?: number;
+    until?: number;
+    conversationId?: string;
+  }): Promise<InteractionRecord[] | null> {
+    if (!this.client || !this.enabled) return null;
+    const filters: string[] = [];
+    const params: Record<string, unknown> = {
+      limit: Math.max(1, Math.min(10_000, Math.trunc(query.limit))),
+    };
+    if (query.collectorId) {
+      filters.push('collectorId = {collectorId:String}');
+      params.collectorId = query.collectorId;
+    }
+    if (query.agentInstanceId) {
+      filters.push('agentInstanceId = {agentInstanceId:String}');
+      params.agentInstanceId = query.agentInstanceId;
+    }
+    if (query.workspacePath) {
+      filters.push('workspacePath = {workspacePath:String}');
+      params.workspacePath = query.workspacePath;
+    }
+    if (query.since) {
+      filters.push('observedAt >= {since:UInt64}');
+      params.since = query.since;
+    }
+    if (query.until) {
+      filters.push('observedAt <= {until:UInt64}');
+      params.until = query.until;
+    }
+    if (query.conversationId) {
+      filters.push('conversationId = {conversationId:String}');
+      params.conversationId = query.conversationId;
+    }
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT record
+          FROM ${INTERACTION_METADATA_TABLE} FINAL
+          ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+          ORDER BY observedAt DESC, interactionId ASC
+          LIMIT {limit:UInt32}`,
+        query_params: params,
+        clickhouse_settings: {
+          max_execution_time: 5,
+          max_threads: 2,
+          max_result_rows: '10000',
+          result_overflow_mode: 'break',
+        },
+        format: 'JSONEachRow',
+      });
+      const rows = await result.json() as Array<{ record?: string }>;
+      return rows
+        .map(({ record: json }) => {
+          if (!json) return undefined;
+          try {
+            return JSON.parse(json) as InteractionRecord;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter(
+          (record): record is InteractionRecord =>
+            Boolean(record?.interactionId && record.conversationId),
+        );
+    } catch (error) {
+      console.error(
+        '[clickhouse] loadInteractionMetadata failed:',
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    }
   }
 
   private noteCommittedRows(rows: Row[]): void {
@@ -8374,6 +9600,223 @@ export class ClickHouseStore {
     }
   }
 
+  /** Raw payload rows for the UOS plaintext adapter. Unlike queryAgentInteractions this keeps
+   *  the stored payload text untouched (tolerant parsing happens in the adapter) so legacy rows
+   *  with over-escaped bodies are not silently dropped. */
+  async queryAgentInteractionPayloads(input: {
+    startMs: number;
+    endMs: number;
+    sessionId?: string;
+    interactionId?: string;
+    limit?: number;
+  }): Promise<Array<{
+    interactionId: string;
+    sessionId: string;
+    agentInstanceId: string;
+    payload: string;
+    at: number;
+  }> | null> {
+    if (!this.client || !this.ready) return null;
+    const limit = Math.max(1, Math.min(2_000, Math.trunc(Number(input.limit) || 500)));
+    const conditions = ["at >= {start:UInt64}", "at <= {end:UInt64}"];
+    const queryParams: Record<string, unknown> = {
+      start: Math.max(0, Math.trunc(input.startMs)),
+      end: Math.max(0, Math.trunc(input.endMs)),
+      limit,
+    };
+    if (input.sessionId) {
+      conditions.push("sessionId = {sessionId:String}");
+      queryParams.sessionId = input.sessionId;
+    }
+    if (input.interactionId) {
+      conditions.push("interactionId = {interactionId:String}");
+      queryParams.interactionId = input.interactionId;
+    }
+    try {
+      // Two-stage read: the index stage stays off the heavy payload column entirely, then only
+      // the page-visible interactionIds have their payloads fetched. Polling clients therefore
+      // re-read a few KB of scalar columns instead of re-aggregating MiB of plaintext bodies.
+      const indexResult = await this.client.query({
+        query: `
+          SELECT interactionId,
+            argMax(sessionId, revision) AS latestSessionId,
+            argMax(agentInstanceId, revision) AS latestAgentInstanceId,
+            max(at) AS latestAt
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE ${conditions.join(" AND ")}
+          GROUP BY interactionId
+          ORDER BY latestAt DESC, interactionId DESC
+          LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        clickhouse_settings: {
+          max_execution_time: 10,
+          max_result_rows: String(limit),
+          result_overflow_mode: "break" as const,
+        },
+        format: "JSONEachRow",
+      });
+      const indexRows = (await indexResult.json()) as Array<{
+        interactionId?: string;
+        latestSessionId?: string;
+        latestAgentInstanceId?: string;
+        latestAt?: string | number;
+      }>;
+      const ids = indexRows
+        .map((row) => row.interactionId)
+        .filter((value): value is string => Boolean(value));
+      if (ids.length === 0) return [];
+      const payloadResult = await this.client.query({
+        query: `
+          SELECT interactionId, argMax(payload, revision) AS payload
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE interactionId IN {interactionIds:Array(String)}
+          GROUP BY interactionId`,
+        query_params: { interactionIds: ids },
+        clickhouse_settings: { max_execution_time: 10 },
+        format: "JSONEachRow",
+      });
+      const payloadRows = (await payloadResult.json()) as Array<{
+        interactionId?: string;
+        payload?: string;
+      }>;
+      const payloadById = new Map(
+        payloadRows
+          .filter((row) => row.interactionId && row.payload)
+          .map((row) => [row.interactionId as string, row.payload as string]),
+      );
+      const rows = indexRows.map((row) => ({
+        interactionId: row.interactionId,
+        payload: row.interactionId ? payloadById.get(row.interactionId) : undefined,
+        latestSessionId: row.latestSessionId,
+        latestAgentInstanceId: row.latestAgentInstanceId,
+        latestAt: row.latestAt,
+      }));
+      return rows.flatMap((row) => {
+        if (!row.interactionId || !row.payload) return [];
+        return [{
+          interactionId: row.interactionId,
+          sessionId: row.latestSessionId ?? "",
+          agentInstanceId: row.latestAgentInstanceId ?? "",
+          payload: row.payload,
+          at: Number(row.latestAt) || 0,
+        }];
+      });
+    } catch (error) {
+      console.error(
+        "[clickhouse] agent interaction raw payload query failed:",
+        (error as Error).message,
+      );
+      return null;
+    }
+  }
+
+  /** Scalar index rows for the UOS plaintext adapter — no payload column access. Pair with
+   *  queryAgentInteractionPayloadsByIds so pollers only fetch bodies for interactions they have
+   *  never parsed, instead of re-reading hundreds of MiB of plaintext every list call. */
+  async queryAgentInteractionIndex(input: {
+    startMs: number;
+    endMs: number;
+    sessionId?: string;
+    limit?: number;
+  }): Promise<Array<{
+    interactionId: string;
+    sessionId: string;
+    agentInstanceId: string;
+    at: number;
+  }> | null> {
+    if (!this.client || !this.ready) return null;
+    const limit = Math.max(1, Math.min(2_000, Math.trunc(Number(input.limit) || 500)));
+    const conditions = ["at >= {start:UInt64}", "at <= {end:UInt64}"];
+    const queryParams: Record<string, unknown> = {
+      start: Math.max(0, Math.trunc(input.startMs)),
+      end: Math.max(0, Math.trunc(input.endMs)),
+      limit,
+    };
+    if (input.sessionId) {
+      conditions.push("sessionId = {sessionId:String}");
+      queryParams.sessionId = input.sessionId;
+    }
+    try {
+      const indexResult = await this.client.query({
+        query: `
+          SELECT interactionId,
+            argMax(sessionId, revision) AS latestSessionId,
+            argMax(agentInstanceId, revision) AS latestAgentInstanceId,
+            max(at) AS latestAt
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE ${conditions.join(" AND ")}
+          GROUP BY interactionId
+          ORDER BY latestAt DESC, interactionId DESC
+          LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        clickhouse_settings: {
+          max_execution_time: 10,
+          max_result_rows: String(limit),
+          result_overflow_mode: "break" as const,
+        },
+        format: "JSONEachRow",
+      });
+      const indexRows = (await indexResult.json()) as Array<{
+        interactionId?: string;
+        latestSessionId?: string;
+        latestAgentInstanceId?: string;
+        latestAt?: string | number;
+      }>;
+      return indexRows.flatMap((row) => {
+        if (!row.interactionId) return [];
+        return [{
+          interactionId: row.interactionId,
+          sessionId: row.latestSessionId ?? "",
+          agentInstanceId: row.latestAgentInstanceId ?? "",
+          at: Number(row.latestAt) || 0,
+        }];
+      });
+    } catch (error) {
+      console.error(
+        "[clickhouse] agent interaction index query failed:",
+        (error as Error).message,
+      );
+      return null;
+    }
+  }
+
+  /** Payloads for an explicit id set, resolved at latest revision. Intended for the adapter's
+   *  parsed-record cache misses only; ids are bounded by the caller. */
+  async queryAgentInteractionPayloadsByIds(
+    interactionIds: readonly string[],
+  ): Promise<Map<string, string> | null> {
+    if (!this.client || !this.ready) return null;
+    const ids = [...new Set(interactionIds.map((id) => id.trim()).filter(Boolean))].slice(0, 2_000);
+    if (ids.length === 0) return new Map();
+    try {
+      const payloadResult = await this.client.query({
+        query: `
+          SELECT interactionId, argMax(payload, revision) AS payload
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE interactionId IN {interactionIds:Array(String)}
+          GROUP BY interactionId`,
+        query_params: { interactionIds: ids },
+        clickhouse_settings: { max_execution_time: 10 },
+        format: "JSONEachRow",
+      });
+      const payloadRows = (await payloadResult.json()) as Array<{
+        interactionId?: string;
+        payload?: string;
+      }>;
+      return new Map(
+        payloadRows
+          .filter((row) => row.interactionId && row.payload)
+          .map((row) => [row.interactionId as string, row.payload as string]),
+      );
+    } catch (error) {
+      console.error(
+        "[clickhouse] agent interaction payload-by-id query failed:",
+        (error as Error).message,
+      );
+      return null;
+    }
+  }
+
   /** Append-only SessionMembership projection rows for PostgreSQL-free deployments. Inserting an
    *  already-persisted (membershipId, resolutionRevision) is an idempotent replay: the in-memory
    *  store rejects conflicting payloads for the same key, so duplicate rows carry identical
@@ -8494,6 +9937,19 @@ export class ClickHouseStore {
         }
       }
       while (
+        (this.processLifecycleWriteQueue.length > 0 || this.processLifecycleWriteInFlight)
+        && this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
+      ) {
+        try {
+          await this.ensureProcessLifecycleWriteDrain();
+          if (this.processLifecycleWriteQueue.length > 0 && !this.processLifecycleWriteInFlight) {
+            await this.drainProcessLifecycleWrites();
+          }
+        } catch {
+          break;
+        }
+      }
+      while (
         this.eventWriteBatches.length > 0 &&
         !this.eventWritePermanentError &&
         this.eventWriteNow() < (this.eventWriteClosingDeadline ?? 0)
@@ -8547,6 +10003,8 @@ export class ClickHouseStore {
           );
         }
       }
+      for (const pending of this.processLifecycleWriteQueue.splice(0)) pending.resolve(false);
+      await this.processLifecycleWriteInFlight?.catch(() => undefined);
       const receiptShutdownError =
         closeError ??
         new Error(

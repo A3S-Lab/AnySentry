@@ -114,6 +114,56 @@ export interface CanonicalProcessLifecycleIdentity {
   namespacePid?: number;
 }
 
+export interface ProcessGenerationIdentityInput {
+  bootId: string;
+  pid: number;
+  startTime: string;
+  hostId?: string;
+  pidNamespace?: string;
+  namespacePid?: number;
+  suppliedProcessInstanceId?: string;
+}
+
+/**
+ * Build the canonical identity when a caller already has a validated process generation.
+ * This is also used when the Session FD identifies a parent process while the first observed
+ * lifecycle fact belongs to one of its direct children.
+ */
+export function canonicalProcessGenerationIdentity(
+  input: ProcessGenerationIdentityInput,
+): CanonicalProcessLifecycleIdentity | undefined {
+  const bootId = text(input.bootId, 512);
+  const pid = positiveInteger(input.pid);
+  const startTime = text(input.startTime, 160);
+  const hostId = text(input.hostId, 512);
+  const pidNamespace = text(input.pidNamespace, 512);
+  const namespacePid = positiveInteger(input.namespacePid);
+  const suppliedProcessInstanceId = text(input.suppliedProcessInstanceId, 512);
+  if (
+    !bootId
+    || !pid
+    || !startTime
+    || !/^(?:ticks|ns):[1-9][0-9]*$/u.test(startTime)
+    || (!hostId && !(pidNamespace && namespacePid))
+  ) return undefined;
+  return {
+    processInstanceKey: suppliedProcessInstanceId ?? `pri_${sha256([
+      bootId,
+      hostId ?? '',
+      pidNamespace ?? '',
+      namespacePid ?? 0,
+      pid,
+      startTime,
+    ]).slice(0, 24)}`,
+    bootId,
+    pid,
+    startTime,
+    ...(hostId ? { hostId } : {}),
+    ...(pidNamespace ? { pidNamespace } : {}),
+    ...(namespacePid ? { namespacePid } : {}),
+  };
+}
+
 /**
  * One exact Process-generation identity shared by correlation, lifecycle facts, Asset binding,
  * and cold hydration. A validated trusted-correlation key wins; otherwise every consumer hashes
@@ -130,24 +180,17 @@ export function canonicalProcessLifecycleIdentity(
   const hostId = text(process.hostId, 512);
   const pidNamespace = text(process.pidNamespace, 512);
   const namespacePid = positiveInteger(process.namespacePid);
-  if (!bootId || !pid || !startTime || (!hostId && !(pidNamespace && namespacePid))) return undefined;
   const suppliedProcessId = parseTrustedCorrelation(attribution?.correlation)?.processInstanceId;
-  return {
-    processInstanceKey: suppliedProcessId ?? `pri_${sha256([
-      bootId,
-      hostId ?? '',
-      pidNamespace ?? '',
-      namespacePid ?? 0,
-      pid,
-      startTime,
-    ]).slice(0, 24)}`,
+  if (!bootId || !pid || !startTime) return undefined;
+  return canonicalProcessGenerationIdentity({
     bootId,
     pid,
     startTime,
     ...(hostId ? { hostId } : {}),
     ...(pidNamespace ? { pidNamespace } : {}),
     ...(namespacePid ? { namespacePid } : {}),
-  };
+    ...(suppliedProcessId ? { suppliedProcessInstanceId: suppliedProcessId } : {}),
+  });
 }
 
 /** Build a compact, non-sensitive lifecycle fact from an exact Process generation. */

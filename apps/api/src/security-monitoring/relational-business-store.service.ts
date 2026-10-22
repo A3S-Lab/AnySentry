@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import {
@@ -41,6 +41,34 @@ import {
   validateSessionMembership,
 } from './canonical-observability';
 import { PolicyConfig } from './policy-config';
+import {
+  interactionPayloadFingerprint,
+  type InteractionRecord,
+  type InteractionReceiptReservation,
+} from './interaction.types';
+import type {
+  EncryptedInteractionContent,
+  InteractionContentFinalizeResult,
+  StoredInteractionContent,
+} from './interaction-content.types';
+import type {
+  EventSessionAttributionResult,
+  EventSessionRelation,
+  ProcessLineageEdge,
+  SessionProcessBinding,
+} from './session-event-attribution.types';
+import { SESSION_EVENT_ATTRIBUTION_VERSION } from './session-event-attribution.types';
+
+export const INVALIDATE_OLD_SESSION_RELATIONS_SQL = `
+  UPDATE anysentry_event_session_relations
+     SET record = record || jsonb_build_object(
+       'active', false, 'effectiveTo', $2::bigint,
+       'invalidationReason', 'attribution_algorithm_upgrade',
+       'requiresReattribution', true),
+         updated_at = $2::bigint
+   WHERE COALESCE((record->>'active')::boolean, true)
+     AND COALESCE((record->>'attributionVersion')::integer, 0) < $1
+`;
 
 // Unfiltered "latest n" reads stay inside one day. Point reads by id are not limited.
 // A BRIN index can skip old pages only when the scan has a time predicate (design §6.4).
@@ -103,6 +131,16 @@ const COVERAGE_GAP_TTL_PRUNE_BATCH = 256;
 const COVERAGE_GAP_IDLE_PRUNE_BATCH = 8_192;
 const COVERAGE_GAP_IDLE_PRUNE_MS = 20_000;
 const COVERAGE_GAP_IDLE_SAMPLE_ROWS = 8_192;
+// When the event loop is saturated (e.g. a dense host rebuilding its inventory), PostgreSQL
+// operations start failing with connect timeouts even though the server is healthy. Each failing
+// operation used to log immediately, and the resulting warn flood further starved the loop,
+// producing a death spiral. Coalesce repeat warnings per operation and, once failures cluster,
+// open a short circuit breaker so callers fast-fail instead of paying a full connect timeout.
+const UNAVAILABLE_WARN_COALESCE_MS = 60_000;
+const OPERATION_FAILURE_WINDOW_MS = 10_000;
+const OPERATION_FAILURE_BREAKER_THRESHOLD = 5;
+const OPERATION_FAILURE_BREAKER_COOLDOWN_MS = 30_000;
+const PG_COOLDOWN_ERROR_CODE = 'A3S_PG_COOLDOWN';
 
 type ProjectionBatchEntry<T> = {
   rows: readonly T[];
@@ -186,9 +224,53 @@ export interface AgentConversationInteractionMembershipSlice {
   truncated: boolean;
 }
 
+interface InteractionContentDbRow {
+  content_ref: string;
+  interaction_id: string;
+  conversation_id: string;
+  source_id: string;
+  source_event_id: string;
+  tenant_id: string;
+  content_role: 'user_instruction' | 'assistant_response';
+  content_sha256: string;
+  content_bytes: string | number;
+  key_version: string;
+  algorithm: 'aes-256-gcm';
+  nonce: Buffer;
+  auth_tag: Buffer;
+  ciphertext: Buffer;
+  state: 'pending' | 'accepted' | 'deleted';
+  finalized_at: string | number;
+  accepted_at: string | number | null;
+  deleted_at: string | number | null;
+}
+
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+}
+
+function storedInteractionContent(row: InteractionContentDbRow): StoredInteractionContent {
+  return {
+    contentRef: row.content_ref,
+    interactionId: row.interaction_id,
+    conversationId: row.conversation_id,
+    sourceId: row.source_id,
+    sourceEventId: row.source_event_id,
+    tenantId: row.tenant_id,
+    contentRole: row.content_role,
+    contentSha256: row.content_sha256,
+    contentBytes: Number(row.content_bytes),
+    keyVersion: row.key_version,
+    algorithm: row.algorithm,
+    nonce: row.nonce,
+    authTag: row.auth_tag,
+    ciphertext: row.ciphertext,
+    state: row.state,
+    finalizedAt: Number(row.finalized_at),
+    acceptedAt: row.accepted_at === null ? undefined : Number(row.accepted_at),
+    deletedAt: row.deleted_at === null ? undefined : Number(row.deleted_at),
+  };
 }
 
 /**
@@ -199,7 +281,7 @@ function positiveInt(value: string | undefined, fallback: number, max: number): 
  * API replicas cannot overwrite an unrelated Agent record.
  */
 @Injectable()
-export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
+export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(RelationalBusinessStore.name);
   private readonly databaseUrl =
     process.env.ANYSENTRY_DATABASE_URL?.trim() ??
@@ -215,6 +297,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   private pool?: Pool;
   private initializePromise?: Promise<boolean>;
   private ready = false;
+  private readonly unavailableWarnedAt = new Map<string, number>();
+  private readonly unavailableSuppressed = new Map<string, number>();
+  private recentOperationFailureAt: number[] = [];
+  private operationCooldownUntil = 0;
   private readonly rawBatchMaxRows = positiveInt(
     process.env.ANYSENTRY_RELATIONAL_RAW_BATCH_ROWS,
     256,
@@ -277,6 +363,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     queue: [], pendingRows: 0, pendingBytes: 0, closed: false,
   };
   private evidenceLinksReadFailureAt = 0;
+  private shuttingDown = false;
   private readonly effectOwnerId = `api:${process.pid}:${randomUUID()}`;
   private readonly writerOwnershipCache = new Map<string, number>();
   private readonly writerOwnershipInFlight = new Map<string, Promise<WriterOwnership>>();
@@ -339,6 +426,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
         rows => this.saveSessionMembershipsNow(rows), row => `${row.membershipId}\0${row.resolutionRevision}`,
       ));
     }
+  }
+
+  // All business destroy/before-shutdown hooks must finish before the shared pool closes.
+  async onApplicationShutdown(): Promise<void> {
+    this.shuttingDown = true;
     const pool = this.pool;
     this.pool = undefined;
     this.ready = false;
@@ -349,6 +441,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   async initialize(): Promise<boolean> {
+    if (this.shuttingDown) return false;
     if (this.ready && this.pool) return true;
     if (!this.configured()) return false;
     if (this.initializePromise) return this.initializePromise;
@@ -3264,7 +3357,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
              record = EXCLUDED.record,
              created_at_ms = LEAST(anysentry_remediations.created_at_ms, EXCLUDED.created_at_ms),
              updated_at = EXCLUDED.updated_at
-           WHERE EXCLUDED.updated_at >= anysentry_remediations.updated_at`,
+           WHERE EXCLUDED.updated_at >= anysentry_remediations.updated_at
+             AND (anysentry_remediations.record IS DISTINCT FROM EXCLUDED.record
+               OR EXCLUDED.updated_at > anysentry_remediations.updated_at
+               OR EXCLUDED.created_at_ms < anysentry_remediations.created_at_ms)`,
           [JSON.stringify(batch)],
         );
       },
@@ -3510,6 +3606,955 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
       return 'unavailable';
     } finally {
       client?.release();
+    }
+  }
+
+  async saveInteractionMetadata(record: InteractionRecord): Promise<boolean> {
+    return this.saveInteractionMetadataBatch([record]);
+  }
+
+  async saveInteractionMetadataBatch(
+    records: readonly InteractionRecord[],
+  ): Promise<boolean> {
+    if (records.length === 0) return true;
+    if (!(await this.initialize()) || !this.pool) return false;
+    const projectedAt = Date.now();
+    const unique = new Map<
+      string,
+      { record: InteractionRecord; fingerprint: string }
+    >();
+    for (const record of records) {
+      const fingerprint = interactionPayloadFingerprint(record);
+      const previous = unique.get(record.interactionId);
+      if (previous && previous.fingerprint !== fingerprint) {
+        this.logger.error(
+          `Interaction immutable-key conflict inside projection batch: `
+          + `${record.sourceId}/${record.sourceEventId}`,
+        );
+        return false;
+      }
+      if (!previous) unique.set(record.interactionId, { record, fingerprint });
+    }
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      const rows = [...unique.values()];
+      for (let offset = 0; offset < rows.length; offset += BUSINESS_WRITE_BATCH_SIZE) {
+        const chunk = rows.slice(offset, offset + BUSINESS_WRITE_BATCH_SIZE);
+        const payload = chunk.map(({ record, fingerprint }) => ({
+          interaction_id: record.interactionId,
+          conversation_id: record.conversationId,
+          source_id: record.sourceId,
+          source_event_id: record.sourceEventId,
+          collector_id: record.collectorId,
+          tenant_id: record.tenantId,
+          environment_id: record.environmentId ?? null,
+          agent_instance_id: record.agentInstanceId ?? null,
+          process_instance_id: record.processInstanceId,
+          workspace_path: record.workspacePath ?? null,
+          provider:
+            record.eventType === 'LlmTransportObserved'
+              ? record.transport.provider ?? null
+              : null,
+          observed_at: record.observedAt,
+          accepted_at: record.acceptedAt,
+          projected_at: projectedAt,
+          payload_fingerprint: fingerprint,
+          record: { ...record, projectedAt },
+        }));
+        const result = await client.query<{ applied: string | number }>(
+          `WITH incoming AS (
+             SELECT *
+               FROM jsonb_to_recordset($1::jsonb) AS value(
+                 interaction_id text,
+                 conversation_id text,
+                 source_id text,
+                 source_event_id text,
+                 collector_id text,
+                 tenant_id text,
+                 environment_id text,
+                 agent_instance_id text,
+                 process_instance_id text,
+                 workspace_path text,
+                 provider text,
+                 observed_at bigint,
+                 accepted_at bigint,
+                 projected_at bigint,
+                 payload_fingerprint text,
+                 record jsonb
+               )
+           ),
+           applied AS (
+             INSERT INTO anysentry_interaction_metadata (
+               interaction_id,
+               conversation_id,
+               source_id,
+               source_event_id,
+               collector_id,
+               tenant_id,
+               environment_id,
+               agent_instance_id,
+               process_instance_id,
+               workspace_path,
+               provider,
+               observed_at,
+               accepted_at,
+               projected_at,
+               payload_fingerprint,
+               record
+             )
+             SELECT
+               interaction_id,
+               conversation_id,
+               source_id,
+               source_event_id,
+               collector_id,
+               tenant_id,
+               environment_id,
+               agent_instance_id,
+               process_instance_id,
+               workspace_path,
+               provider,
+               observed_at,
+               accepted_at,
+               projected_at,
+               payload_fingerprint,
+               record
+             FROM incoming
+             ON CONFLICT (interaction_id) DO UPDATE SET
+               projected_at = GREATEST(
+                 anysentry_interaction_metadata.projected_at,
+                 EXCLUDED.projected_at
+               )
+             WHERE anysentry_interaction_metadata.payload_fingerprint =
+                   EXCLUDED.payload_fingerprint
+             RETURNING interaction_id
+           )
+           SELECT count(*) AS applied FROM applied`,
+          [JSON.stringify(payload)],
+        );
+        if (Number(result.rows[0]?.applied ?? 0) !== chunk.length) {
+          await client.query('ROLLBACK');
+          this.logger.error('Interaction immutable-key conflict in PostgreSQL projection');
+          return false;
+        }
+      }
+      await client.query('COMMIT');
+      return true;
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable('save Interaction metadata projection', error);
+      return false;
+    } finally {
+      client?.release();
+    }
+  }
+
+  async reserveInteractionReceipt(
+    record: InteractionRecord,
+  ): Promise<InteractionReceiptReservation> {
+    if (!(await this.initialize()) || !this.pool) return { state: 'unavailable' };
+    const fingerprint = interactionPayloadFingerprint(record);
+    try {
+      const result = await this.pool.query<{
+        payload_fingerprint: string;
+        status: 'pending' | 'accepted';
+        accepted_at: string | number;
+        inserted: boolean;
+      }>(
+        `INSERT INTO anysentry_interaction_receipts (
+           source_id,
+           source_event_id,
+           interaction_id,
+           conversation_id,
+           payload_fingerprint,
+           status,
+           accepted_at,
+           updated_at
+         ) VALUES ($1, $2, $3, $4, $5, 'pending', $6, $6)
+         ON CONFLICT (source_id, source_event_id) DO UPDATE SET
+           updated_at = anysentry_interaction_receipts.updated_at
+         WHERE anysentry_interaction_receipts.payload_fingerprint =
+               EXCLUDED.payload_fingerprint
+         RETURNING
+           payload_fingerprint,
+           status,
+           accepted_at,
+           (xmax = 0) AS inserted`,
+        [
+          record.sourceId,
+          record.sourceEventId,
+          record.interactionId,
+          record.conversationId,
+          fingerprint,
+          record.acceptedAt,
+        ],
+      );
+      const row = result.rows[0];
+      if (!row) {
+        this.logger.error(
+          `Interaction immutable-key conflict rejected before Kafka: `
+          + `${record.sourceId}/${record.sourceEventId}`,
+        );
+        return { state: 'conflict' };
+      }
+      return {
+        state: row.inserted ? 'new' : row.status,
+        acceptedAt: Number(row.accepted_at),
+      };
+    } catch (error) {
+      this.markUnavailable('reserve Interaction durable receipt', error);
+      return { state: 'unavailable' };
+    }
+  }
+
+  async markInteractionReceiptAccepted(
+    record: InteractionRecord,
+  ): Promise<boolean> {
+    if (!(await this.initialize()) || !this.pool) return false;
+    const fingerprint = interactionPayloadFingerprint(record);
+    try {
+      const result = await this.pool.query(
+        `UPDATE anysentry_interaction_receipts
+            SET status = 'accepted',
+                updated_at = $4
+          WHERE source_id = $1
+            AND source_event_id = $2
+            AND payload_fingerprint = $3`,
+        [record.sourceId, record.sourceEventId, fingerprint, Date.now()],
+      );
+      return result.rowCount === 1;
+    } catch (error) {
+      this.markUnavailable('mark Interaction durable receipt accepted', error);
+      return false;
+    }
+  }
+
+  async loadInteractionMetadata(query: {
+    limit: number;
+    collectorId?: string;
+    agentInstanceId?: string;
+    workspacePath?: string;
+    since?: number;
+    until?: number;
+    conversationId?: string;
+  }): Promise<InteractionRecord[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    const bind = (value: unknown): string => {
+      values.push(value);
+      return `$${values.length}`;
+    };
+    if (query.collectorId) filters.push(`collector_id = ${bind(query.collectorId)}`);
+    if (query.agentInstanceId) {
+      filters.push(`agent_instance_id = ${bind(query.agentInstanceId)}`);
+    }
+    if (query.workspacePath) filters.push(`workspace_path = ${bind(query.workspacePath)}`);
+    if (query.since) filters.push(`observed_at >= ${bind(query.since)}`);
+    if (query.until) filters.push(`observed_at <= ${bind(query.until)}`);
+    if (query.conversationId) {
+      filters.push(`conversation_id = ${bind(query.conversationId)}`);
+    }
+    values.push(Math.max(1, Math.min(10_000, Math.trunc(query.limit))));
+    try {
+      const result = await this.pool.query<{ record: InteractionRecord | string }>(
+        `SELECT record
+           FROM anysentry_interaction_metadata
+          ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+          ORDER BY observed_at DESC, interaction_id ASC
+          LIMIT $${values.length}`,
+        values,
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<InteractionRecord>(record))
+        .filter(
+          (record): record is InteractionRecord =>
+            Boolean(record?.interactionId && record.conversationId),
+        );
+    } catch (error) {
+      this.markUnavailable('load Interaction metadata projection', error);
+      return null;
+    }
+  }
+
+  async saveSessionProcessBindings(
+    records: readonly SessionProcessBinding[],
+  ): Promise<boolean> {
+    if (records.length === 0) return true;
+    return this.saveBusinessRecords(
+      [...records],
+      'save Session Process bindings',
+      (record) => record.bindingId,
+      async (client, batch) => {
+        await client.query(
+          `WITH incoming AS (
+             SELECT
+               item AS record,
+               item->>'bindingId' AS binding_id,
+               (item->>'bindingRevision')::bigint AS binding_revision,
+               (item->>'observedAt')::bigint AS observed_at
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_session_process_binding_revisions (
+             binding_id, binding_revision, observed_at, record
+           )
+           SELECT binding_id, binding_revision, observed_at, record
+           FROM incoming
+           ON CONFLICT (binding_id, binding_revision) DO NOTHING`,
+          [JSON.stringify(batch)],
+        );
+        await client.query(
+          `WITH incoming AS (
+             SELECT
+               item AS record,
+               item->>'bindingId' AS binding_id,
+               item->>'conversationId' AS conversation_id,
+               item->>'nativeSessionId' AS native_session_id,
+               item->>'hostId' AS host_id,
+               item->>'bootId' AS boot_id,
+               item->>'collectorId' AS collector_id,
+               item->>'matchedOsProcessInstanceKey' AS process_instance_key,
+               (item->>'bindingRevision')::bigint AS binding_revision,
+               (item->>'validFrom')::bigint AS valid_from,
+               NULLIF(item->>'validTo', '')::bigint AS valid_to,
+               (item->>'observedAt')::bigint AS observed_at
+             FROM jsonb_array_elements($1::jsonb) AS source(item)
+           )
+           INSERT INTO anysentry_session_process_bindings (
+             binding_id, conversation_id, native_session_id, host_id, boot_id,
+             collector_id, process_instance_key, binding_revision, valid_from,
+             valid_to, observed_at, record
+           )
+           SELECT binding_id, conversation_id, native_session_id, host_id, boot_id,
+             collector_id, process_instance_key, binding_revision, valid_from,
+             valid_to, observed_at, record
+           FROM incoming
+           ON CONFLICT (binding_id) DO UPDATE SET
+             conversation_id = EXCLUDED.conversation_id,
+             binding_revision = EXCLUDED.binding_revision,
+             valid_from = LEAST(anysentry_session_process_bindings.valid_from, EXCLUDED.valid_from),
+             valid_to = EXCLUDED.valid_to,
+             observed_at = EXCLUDED.observed_at,
+             record = EXCLUDED.record
+           WHERE EXCLUDED.binding_revision >= anysentry_session_process_bindings.binding_revision`,
+          [JSON.stringify(batch)],
+        );
+      },
+    );
+  }
+
+  async loadLatestSessionProcessBinding(
+    bindingId: string,
+  ): Promise<SessionProcessBinding | undefined | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    try {
+      const result = await this.pool.query<{ record: SessionProcessBinding | string }>(
+        `SELECT record
+           FROM anysentry_session_process_bindings
+          WHERE binding_id = $1
+          LIMIT 1`,
+        [bindingId],
+      );
+      return this.parseRecord<SessionProcessBinding>(result.rows[0]?.record);
+    } catch (error) {
+      this.markUnavailable('load latest Session Process binding', error);
+      return null;
+    }
+  }
+
+  async loadSessionProcessBindingForGeneration(query: {
+    nativeSessionId: string;
+    runtimeType: string;
+    matchedPid: number;
+    matchedStartTime: string;
+    method: SessionProcessBinding['method'];
+    hostId?: string;
+    bootId?: string;
+    pidNamespace?: string;
+    tenantId?: string;
+    environmentId?: string;
+    collectorId?: string;
+  }): Promise<SessionProcessBinding | undefined | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    try {
+      const result = await this.pool.query<{ record: SessionProcessBinding | string }>(
+        `SELECT record
+           FROM anysentry_session_process_bindings
+          WHERE native_session_id = $1
+            AND record->>'runtimeType' = $2
+            AND record->>'matchedPid' = $3
+            AND record->>'matchedStartTime' = $4
+            AND record->>'method' = $5
+            AND ($6::text IS NULL OR host_id = $6)
+            AND ($7::text IS NULL OR boot_id = $7)
+            AND ($8::text IS NULL OR record->>'pidNamespace' = $8)
+            AND ($9::text IS NULL OR record->>'tenantId' = $9)
+            AND ($10::text IS NULL OR record->>'environmentId' = $10)
+            AND ($11::text IS NULL OR collector_id = $11)
+          ORDER BY (COALESCE(record->>'pidNamespace', '') <> '') DESC,
+            observed_at DESC, binding_revision DESC
+          LIMIT 33`,
+        [
+          query.nativeSessionId,
+          query.runtimeType,
+          String(query.matchedPid),
+          query.matchedStartTime,
+          query.method,
+          query.hostId ?? null,
+          query.bootId ?? null,
+          query.pidNamespace ?? null,
+          query.tenantId ?? null,
+          query.environmentId ?? null,
+          query.collectorId ?? null,
+        ],
+      );
+      if (result.rows.length >= 33) return undefined;
+      const records = result.rows.map(row => this.parseRecord<SessionProcessBinding>(row.record))
+        .filter((item): item is SessionProcessBinding => Boolean(item));
+      const complete = records.filter(item => Boolean(item.pidNamespace));
+      // Duplicate historical weak bindings must not outrank a complete generation. Multiple
+      // complete scopes are genuinely ambiguous; let lifecycle resolution disambiguate instead.
+      if (new Set(complete.map(item => JSON.stringify([
+        item.hostId, item.bootId, item.pidNamespace, item.matchedOsProcessInstanceKey,
+        item.tenantId, item.environmentId, item.collectorId,
+      ]))).size > 1) return undefined;
+      return complete[0] ?? records[0];
+    } catch (error) {
+      this.markUnavailable('load Session Process binding by generation', error);
+      return null;
+    }
+  }
+
+  async loadSessionProcessBindings(query: {
+    hostId: string;
+    bootId: string;
+    since: number;
+    until: number;
+    collectorId?: string;
+  }): Promise<SessionProcessBinding[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const values: unknown[] = [query.hostId, query.bootId, query.until, query.since];
+    const collectorClause = query.collectorId
+      ? `AND collector_id = $${values.push(query.collectorId)}`
+      : '';
+    try {
+      const result = await this.pool.query<{ record: SessionProcessBinding | string }>(
+        `SELECT record
+           FROM anysentry_session_process_bindings
+          WHERE host_id = $1
+            AND boot_id = $2
+            AND valid_from <= $3
+            AND (valid_to IS NULL OR valid_to >= $4)
+            ${collectorClause}
+          ORDER BY valid_from, binding_id
+          LIMIT 5001`,
+        values,
+      );
+      // Truncation is incomplete ownership context, not evidence of no competitor.
+      if (result.rows.length > 5000) return null;
+      return result.rows
+        .map(({ record }) => this.parseRecord<SessionProcessBinding>(record))
+        .filter((record): record is SessionProcessBinding => Boolean(record?.bindingId));
+    } catch (error) {
+      this.markUnavailable('load Session Process bindings', error);
+      return null;
+    }
+  }
+
+  /**
+   * Load the durable OS generations previously bound to one Native Session. This is the
+   * historical-detail path: it deliberately does not depend on a currently live /proc match,
+   * because a Session can be resumed after Observer capture has stopped.
+   */
+  async loadSessionProcessBindingsForNativeSession(query: {
+    nativeSessionId: string;
+    runtimeType: string;
+    limit?: number;
+  }): Promise<SessionProcessBinding[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const rowLimit = Math.max(1, Math.min(128, Math.trunc(query.limit ?? 64)));
+    try {
+      const result = await this.pool.query<{ record: SessionProcessBinding | string }>(
+        `SELECT record
+           FROM anysentry_session_process_bindings
+          WHERE native_session_id = $1
+            AND record->>'runtimeType' = $2
+          ORDER BY observed_at DESC, binding_revision DESC, binding_id
+          LIMIT $3`,
+        [query.nativeSessionId, query.runtimeType, rowLimit],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<SessionProcessBinding>(record))
+        .filter((record): record is SessionProcessBinding => Boolean(
+          record?.bindingId
+          && record.nativeSessionId === query.nativeSessionId
+          && record.runtimeType === query.runtimeType,
+        ));
+    } catch (error) {
+      this.markUnavailable('load Session Process bindings by Native Session', error);
+      return null;
+    }
+  }
+
+  /**
+   * Read already-materialized historical ownership without recomputing the process tree. Active
+   * rows are audit-approved relations; DISTINCT ON prevents an older Binding Revision for the
+   * same event from appearing beside its newer replacement.
+   */
+  async loadHistoricalEventSessionRelations(query: {
+    bindingId: string;
+    conversationId: string;
+    limit: number;
+    since: number;
+    until: number;
+  }): Promise<EventSessionRelation[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const rowLimit = Math.max(1, Math.min(5_000, Math.trunc(query.limit)));
+    try {
+      const result = await this.pool.query<{ record: EventSessionRelation | string }>(
+        `WITH latest AS (
+           SELECT DISTINCT ON (record->>'eventId') record
+             FROM anysentry_event_session_relations
+            WHERE record->>'bindingId' = $1
+              AND record->>'conversationId' = $2
+              AND COALESCE((record->>'active')::boolean, true)
+              AND (record->>'attributionVersion')::integer = $4
+              AND record ? 'eventAt'
+              AND record->>'eventAt' ~ '^[0-9]+$'
+              AND (record->>'eventAt')::bigint BETWEEN $5 AND $6
+            ORDER BY record->>'eventId',
+              (record->>'bindingRevision')::bigint DESC,
+              (record->>'effectiveFrom')::bigint DESC,
+              updated_at DESC
+         )
+         SELECT record
+           FROM latest
+          ORDER BY (record->>'eventAt')::bigint DESC, record->>'eventId'
+          LIMIT $3`,
+        [query.bindingId, query.conversationId, rowLimit,
+          SESSION_EVENT_ATTRIBUTION_VERSION, query.since, query.until],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<EventSessionRelation>(record))
+        .filter((record): record is EventSessionRelation => Boolean(
+          record?.relationId
+          && Number.isSafeInteger(record.eventAt)
+          && (record.relation === 'DIRECT' || record.relation === 'LINEAGE'),
+        ));
+    } catch (error) {
+      this.markUnavailable('load historical Event Session relations', error);
+      return null;
+    }
+  }
+
+  /**
+   * Bindings whose older relations were invalidated by an attribution-version upgrade and still
+   * lack any active relation. Used by the explicit historical backfill, not by interactive reads.
+   */
+  async loadBindingsNeedingReattribution(limit = 32): Promise<SessionProcessBinding[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const rowLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    try {
+      const result = await this.pool.query<{ record: SessionProcessBinding | string }>(
+        `WITH need AS (
+           SELECT DISTINCT record->>'bindingId' AS binding_id
+             FROM anysentry_event_session_relations
+            WHERE COALESCE((record->>'requiresReattribution')::boolean, false)
+         ),
+         active AS (
+           SELECT DISTINCT record->>'bindingId' AS binding_id
+             FROM anysentry_event_session_relations
+            WHERE COALESCE((record->>'active')::boolean, true)
+         ),
+         pending AS (
+           SELECT need.binding_id
+             FROM need
+             LEFT JOIN active USING (binding_id)
+            WHERE active.binding_id IS NULL
+         )
+         SELECT b.record
+           FROM anysentry_session_process_bindings b
+           JOIN pending ON pending.binding_id = b.binding_id
+          ORDER BY b.observed_at DESC NULLS LAST, b.binding_id
+          LIMIT $1`,
+        [rowLimit],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<SessionProcessBinding>(record))
+        .filter((record): record is SessionProcessBinding => Boolean(record?.bindingId));
+    } catch (error) {
+      this.markUnavailable('load bindings needing reattribution', error);
+      return null;
+    }
+  }
+
+  async saveProcessLineageEdges(records: readonly ProcessLineageEdge[]): Promise<boolean> {
+    return this.saveAttributionRecords(
+      'anysentry_process_lineage_edges',
+      'edge_id',
+      'edgeId',
+      [...records],
+      (record) => record.edgeId,
+      'save Process lineage edges',
+    );
+  }
+
+  async saveEventSessionAttributionResults(
+    records: readonly EventSessionAttributionResult[],
+  ): Promise<boolean> {
+    return this.saveAttributionRecords(
+      'anysentry_event_session_attribution_results',
+      'result_id',
+      'resultId',
+      [...records],
+      (record) => record.resultId,
+      'save Event Session attribution results',
+    );
+  }
+
+  async saveEventSessionRelations(records: readonly EventSessionRelation[]): Promise<boolean> {
+    if (records.some((record) => record.relation !== 'DIRECT' && record.relation !== 'LINEAGE')) {
+      return false;
+    }
+    return this.saveAttributionRecords(
+      'anysentry_event_session_relations',
+      'relation_id',
+      'relationId',
+      [...records],
+      (record) => record.relationId,
+      'save Event Session relations',
+    );
+  }
+
+  /**
+   * Interactive System Evidence prefers durable relations already written by the background
+   * reconciler. Returning null means "store unavailable / incomplete"; an empty array means no
+   * active relations exist yet for this binding and the caller should fall back to a live walk.
+   */
+  async loadActiveEventSessionRelations(query: {
+    bindingId: string;
+    conversationId: string;
+    limit: number;
+    since: number;
+    until: number;
+    bindingRevision: number;
+    bindingContextHash: string;
+    timeWindows?: readonly { sinceMs: number; untilMs: number }[];
+  }): Promise<EventSessionRelation[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const rowLimit = Math.max(1, Math.min(5_000, Math.trunc(query.limit)));
+    try {
+      const result = await this.pool.query<{ record: EventSessionRelation | string }>(
+        `SELECT record
+           FROM anysentry_event_session_relations
+          WHERE record->>'bindingId' = $1
+            AND record->>'conversationId' = $2
+            AND COALESCE((record->>'active')::boolean, true)
+            AND (record->>'attributionVersion')::integer = $4
+            AND record->>'bindingContextHash' = $5
+            AND (record->>'bindingRevision')::bigint = $6
+            AND (record->>'eventAt')::bigint BETWEEN $7 AND $8
+            AND ($9::jsonb = '[]'::jsonb OR EXISTS (
+              SELECT 1 FROM jsonb_array_elements($9::jsonb) w
+              WHERE (record->>'eventAt')::bigint BETWEEN
+                (w->>'sinceMs')::bigint AND (w->>'untilMs')::bigint
+            ))
+          ORDER BY (record->>'eventAt')::bigint DESC, relation_id ASC
+          LIMIT $3`,
+        [query.bindingId, query.conversationId, rowLimit, SESSION_EVENT_ATTRIBUTION_VERSION,
+          query.bindingContextHash, query.bindingRevision, query.since, query.until,
+          JSON.stringify(query.timeWindows ?? [])],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<EventSessionRelation>(record))
+        .filter((record): record is EventSessionRelation => {
+          if (!record?.relationId) return false;
+          return record.relation === 'DIRECT' || record.relation === 'LINEAGE';
+        });
+    } catch (error) {
+      this.markUnavailable('load active Event Session relations', error);
+      return null;
+    }
+  }
+
+  async loadProcessLineageEdgesForProcesses(
+    processInstanceKeys: readonly string[],
+    limit = 2_000,
+  ): Promise<ProcessLineageEdge[] | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    const keys = [...new Set(processInstanceKeys.map((item) => item.trim()).filter(Boolean))];
+    if (keys.length === 0) return [];
+    const rowLimit = Math.max(1, Math.min(5_000, Math.trunc(limit)));
+    try {
+      const result = await this.pool.query<{ record: ProcessLineageEdge | string }>(
+        `SELECT record
+           FROM anysentry_process_lineage_edges
+          WHERE record->>'parentProcessInstanceKey' = ANY($1::text[])
+             OR record->>'childProcessInstanceKey' = ANY($1::text[])
+          ORDER BY updated_at DESC, edge_id ASC
+          LIMIT $2`,
+        [keys, rowLimit],
+      );
+      return result.rows
+        .map(({ record }) => this.parseRecord<ProcessLineageEdge>(record))
+        .filter((record): record is ProcessLineageEdge => Boolean(record?.edgeId));
+    } catch (error) {
+      this.markUnavailable('load Process lineage edges', error);
+      return null;
+    }
+  }
+
+  /**
+   * Keep prior definite relations as audit history while preventing them from remaining effective
+   * after a newer attribution calculation becomes ambiguous, conflicting, or unattributed.
+   */
+  async reconcileEventSessionRelations(
+    results: readonly EventSessionAttributionResult[],
+    activeRelations: readonly EventSessionRelation[],
+    calculatedAt: number,
+  ): Promise<boolean> {
+    if (results.length === 0) return true;
+    if (!(await this.initialize()) || !this.pool) return false;
+    const decisions = [...new Map(results.map((result) => [result.eventId, result])).values()]
+      .map((result) => ({ eventId: result.eventId, resultId: result.resultId }));
+    const activeRelationIds = [...new Set(activeRelations.map((relation) => relation.relationId))];
+    // Only supersede within the bindings this calculation owns. Cross-binding deactivation made
+    // historical backfills thrash: binding A persisted active edges, binding B then cleared them
+    // for shared eventIds, and A returned to the pending queue forever.
+    const bindingIds = [...new Set(activeRelations.map((relation) => relation.bindingId).filter(Boolean))];
+    if (bindingIds.length === 0) return true;
+    try {
+      await this.pool.query(
+        `WITH decisions AS (
+           SELECT item->>'eventId' AS event_id, item->>'resultId' AS result_id
+           FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         UPDATE anysentry_event_session_relations AS relation
+            SET record = relation.record || jsonb_build_object(
+                  'active', false,
+                  'effectiveTo', $3::bigint,
+                  'supersededByResultId', decisions.result_id
+                ),
+                updated_at = $3
+           FROM decisions
+          WHERE relation.record->>'eventId' = decisions.event_id
+            AND relation.record->>'bindingId' = ANY($4::text[])
+            AND COALESCE((relation.record->>'active')::boolean, true)
+            AND NOT (relation.relation_id = ANY($2::text[]))
+            AND relation.updated_at <= $3`,
+        [JSON.stringify(decisions), activeRelationIds, calculatedAt, bindingIds],
+      );
+      return true;
+    } catch (error) {
+      this.markUnavailable('reconcile Event Session relations', error);
+      return false;
+    }
+  }
+
+  async finalizeInteractionContent(
+    content: EncryptedInteractionContent,
+  ): Promise<InteractionContentFinalizeResult> {
+    if (!(await this.initialize()) || !this.pool) return { state: 'unavailable' };
+    let client: PoolClient | undefined;
+    try {
+      client = await this.pool.connect();
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [content.contentRef]);
+      const existing = await client.query<InteractionContentDbRow>(
+        `SELECT
+           content_ref, interaction_id, conversation_id, source_id, source_event_id,
+           tenant_id, content_role, content_sha256, content_bytes, key_version,
+           algorithm, nonce, auth_tag, ciphertext, state, finalized_at, accepted_at,
+           deleted_at
+         FROM anysentry_interaction_contents
+         WHERE content_ref = $1
+         FOR UPDATE`,
+        [content.contentRef],
+      );
+      const current = existing.rows[0]
+        ? storedInteractionContent(existing.rows[0])
+        : undefined;
+      if (current) {
+        const identical =
+          current.interactionId === content.interactionId
+          && current.conversationId === content.conversationId
+          && current.sourceId === content.sourceId
+          && current.sourceEventId === content.sourceEventId
+          && current.tenantId === content.tenantId
+          && current.contentRole === content.contentRole
+          && current.contentSha256 === content.contentSha256
+          && current.contentBytes === content.contentBytes;
+        await client.query(identical ? 'COMMIT' : 'ROLLBACK');
+        return identical
+          ? { state: 'duplicate', record: current }
+          : { state: 'conflict' };
+      }
+      await client.query(
+        `INSERT INTO anysentry_interaction_contents (
+           content_ref, interaction_id, conversation_id, source_id, source_event_id,
+           tenant_id, content_role, content_sha256, content_bytes, key_version,
+           algorithm, nonce, auth_tag, ciphertext, state, finalized_at, updated_at
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+           $11, $12, $13, $14, 'pending', $15, $15
+         )`,
+        [
+          content.contentRef,
+          content.interactionId,
+          content.conversationId,
+          content.sourceId,
+          content.sourceEventId,
+          content.tenantId,
+          content.contentRole,
+          content.contentSha256,
+          content.contentBytes,
+          content.keyVersion,
+          content.algorithm,
+          content.nonce,
+          content.authTag,
+          content.ciphertext,
+          content.finalizedAt,
+        ],
+      );
+      await client.query('COMMIT');
+      return {
+        state: 'stored',
+        record: { ...content, state: 'pending' },
+      };
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => undefined);
+      this.markUnavailable('finalize encrypted Interaction content', error);
+      return { state: 'unavailable' };
+    } finally {
+      client?.release();
+    }
+  }
+
+  async markInteractionContentAccepted(
+    contentRef: string,
+    acceptedAt = Date.now(),
+  ): Promise<boolean> {
+    if (!(await this.initialize()) || !this.pool) return false;
+    try {
+      const result = await this.pool.query(
+        `UPDATE anysentry_interaction_contents
+            SET state = 'accepted',
+                accepted_at = COALESCE(accepted_at, $2),
+                updated_at = $2
+          WHERE content_ref = $1
+            AND state IN ('pending', 'accepted')`,
+        [contentRef, acceptedAt],
+      );
+      return result.rowCount === 1;
+    } catch (error) {
+      this.markUnavailable('mark encrypted Interaction content accepted', error);
+      return false;
+    }
+  }
+
+  async loadInteractionContent(
+    interactionId: string,
+  ): Promise<StoredInteractionContent | null | undefined> {
+    if (!(await this.initialize()) || !this.pool) return undefined;
+    try {
+      const result = await this.pool.query<InteractionContentDbRow>(
+        `SELECT
+           content_ref, interaction_id, conversation_id, source_id, source_event_id,
+           tenant_id, content_role, content_sha256, content_bytes, key_version,
+           algorithm, nonce, auth_tag, ciphertext, state, finalized_at, accepted_at,
+           deleted_at
+         FROM anysentry_interaction_contents
+         WHERE interaction_id = $1
+         LIMIT 1`,
+        [interactionId],
+      );
+      return result.rows[0] ? storedInteractionContent(result.rows[0]) : null;
+    } catch (error) {
+      this.markUnavailable('load encrypted Interaction content', error);
+      return undefined;
+    }
+  }
+
+  async loadAvailableInteractionContentIds(
+    interactionIds: readonly string[],
+  ): Promise<Set<string> | null> {
+    if (interactionIds.length === 0) return new Set();
+    if (!(await this.initialize()) || !this.pool) return null;
+    try {
+      const result = await this.pool.query<{ interaction_id: string }>(
+        `SELECT interaction_id
+           FROM anysentry_interaction_contents
+          WHERE interaction_id = ANY($1::text[])
+            AND state <> 'deleted'`,
+        [[...new Set(interactionIds)].slice(0, 10_000)],
+      );
+      return new Set(result.rows.map((row) => row.interaction_id));
+    } catch (error) {
+      this.markUnavailable('load encrypted Interaction content availability', error);
+      return null;
+    }
+  }
+
+  async deleteInteractionContent(
+    interactionId: string,
+    deletedAt = Date.now(),
+  ): Promise<'deleted' | 'not_found' | 'unavailable'> {
+    if (!(await this.initialize()) || !this.pool) return 'unavailable';
+    try {
+      const result = await this.pool.query(
+        `UPDATE anysentry_interaction_contents
+            SET state = 'deleted',
+                nonce = decode('', 'hex'),
+                auth_tag = decode('', 'hex'),
+                ciphertext = decode('', 'hex'),
+                deleted_at = COALESCE(deleted_at, $2),
+                updated_at = $2
+          WHERE interaction_id = $1
+            AND state <> 'deleted'`,
+        [interactionId, deletedAt],
+      );
+      if (result.rowCount === 1) return 'deleted';
+      const existing = await this.pool.query(
+        `SELECT 1 FROM anysentry_interaction_contents WHERE interaction_id = $1 LIMIT 1`,
+        [interactionId],
+      );
+      return existing.rowCount ? 'deleted' : 'not_found';
+    } catch (error) {
+      this.markUnavailable('delete encrypted Interaction content', error);
+      return 'unavailable';
+    }
+  }
+
+  async purgeOrphanInteractionContents(
+    olderThan: number,
+  ): Promise<number | null> {
+    if (!(await this.initialize()) || !this.pool) return null;
+    try {
+      const result = await this.pool.query(
+        `UPDATE anysentry_interaction_contents AS content
+            SET state = 'deleted',
+                nonce = decode('', 'hex'),
+                auth_tag = decode('', 'hex'),
+                ciphertext = decode('', 'hex'),
+                deleted_at = $1,
+                updated_at = $1
+          WHERE content.state = 'pending'
+            AND content.finalized_at < $2
+            AND NOT EXISTS (
+              SELECT 1
+                FROM anysentry_interaction_receipts AS receipt
+               WHERE receipt.source_id = content.source_id
+                 AND receipt.source_event_id = content.source_event_id
+                 AND receipt.status = 'accepted'
+            )`,
+        [Date.now(), olderThan],
+      );
+      return result.rowCount ?? 0;
+    } catch (error) {
+      this.markUnavailable('purge orphaned encrypted Interaction content', error);
+      return null;
     }
   }
 
@@ -4137,7 +5182,244 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
-      this.pool = pool;
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_interaction_receipts (
+          source_id TEXT NOT NULL,
+          source_event_id TEXT NOT NULL,
+          interaction_id TEXT NOT NULL,
+          conversation_id TEXT NOT NULL,
+          payload_fingerprint TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+          accepted_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (source_id, source_event_id)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_receipts_status_updated_idx
+          ON anysentry_interaction_receipts (status, updated_at ASC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_interaction_contents (
+          content_ref TEXT PRIMARY KEY,
+          interaction_id TEXT NOT NULL UNIQUE,
+          conversation_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          source_event_id TEXT NOT NULL,
+          tenant_id TEXT NOT NULL,
+          content_role TEXT NOT NULL CHECK (
+            content_role IN ('user_instruction', 'assistant_response')
+          ),
+          content_sha256 TEXT NOT NULL,
+          content_bytes BIGINT NOT NULL,
+          key_version TEXT NOT NULL,
+          algorithm TEXT NOT NULL CHECK (algorithm IN ('aes-256-gcm')),
+          nonce BYTEA NOT NULL,
+          auth_tag BYTEA NOT NULL,
+          ciphertext BYTEA NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'deleted')),
+          finalized_at BIGINT NOT NULL,
+          accepted_at BIGINT,
+          deleted_at BIGINT,
+          updated_at BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (source_id, source_event_id, content_role)
+        )
+      `);
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1
+              FROM pg_constraint
+             WHERE conrelid = 'anysentry_interaction_contents'::regclass
+               AND conname = 'anysentry_interaction_contents_content_role_check'
+               AND pg_get_constraintdef(oid) NOT LIKE '%assistant_response%'
+          ) THEN
+            ALTER TABLE anysentry_interaction_contents
+              DROP CONSTRAINT anysentry_interaction_contents_content_role_check;
+            ALTER TABLE anysentry_interaction_contents
+              ADD CONSTRAINT anysentry_interaction_contents_content_role_check
+              CHECK (content_role IN ('user_instruction', 'assistant_response'));
+          END IF;
+        END $$;
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_contents_state_updated_idx
+          ON anysentry_interaction_contents (state, updated_at ASC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_contents_conversation_idx
+          ON anysentry_interaction_contents (conversation_id, finalized_at ASC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_interaction_metadata (
+          interaction_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          source_event_id TEXT NOT NULL,
+          collector_id TEXT NOT NULL,
+          tenant_id TEXT NOT NULL,
+          environment_id TEXT,
+          agent_instance_id TEXT,
+          process_instance_id TEXT NOT NULL,
+          workspace_path TEXT,
+          provider TEXT,
+          observed_at BIGINT NOT NULL,
+          accepted_at BIGINT NOT NULL,
+          projected_at BIGINT NOT NULL,
+          payload_fingerprint TEXT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (source_id, source_event_id)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_conversation_time_idx
+          ON anysentry_interaction_metadata (conversation_id, observed_at ASC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_collector_time_idx
+          ON anysentry_interaction_metadata (collector_id, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_agent_time_idx
+          ON anysentry_interaction_metadata (agent_instance_id, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_interaction_workspace_time_idx
+          ON anysentry_interaction_metadata (workspace_path, observed_at DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_session_process_bindings (
+          binding_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          native_session_id TEXT NOT NULL,
+          host_id TEXT NOT NULL,
+          boot_id TEXT NOT NULL,
+          collector_id TEXT NOT NULL,
+          process_instance_key TEXT NOT NULL,
+          binding_revision BIGINT NOT NULL,
+          valid_from BIGINT NOT NULL,
+          valid_to BIGINT,
+          observed_at BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_process_bindings_scope_time_idx
+          ON anysentry_session_process_bindings
+          (host_id, boot_id, collector_id, valid_from, valid_to)
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_process_bindings_conversation_idx
+          ON anysentry_session_process_bindings (conversation_id, binding_revision DESC)
+      `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS anysentry_session_process_binding_revisions (
+          binding_id TEXT NOT NULL,
+          binding_revision BIGINT NOT NULL,
+          observed_at BIGINT NOT NULL,
+          record JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (binding_id, binding_revision)
+        )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_session_process_binding_revisions_observed_idx
+          ON anysentry_session_process_binding_revisions (observed_at DESC)
+      `);
+      await pool.query(`
+        INSERT INTO anysentry_session_process_binding_revisions (
+          binding_id, binding_revision, observed_at, record
+        )
+        SELECT binding_id, binding_revision, observed_at, record
+          FROM anysentry_session_process_bindings
+        ON CONFLICT (binding_id, binding_revision) DO NOTHING
+      `);
+      for (const [table, identityColumn] of [
+        ['anysentry_process_lineage_edges', 'edge_id'],
+        ['anysentry_event_session_attribution_results', 'result_id'],
+        ['anysentry_event_session_relations', 'relation_id'],
+      ] as const) {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS ${table} (
+            ${identityColumn} TEXT PRIMARY KEY,
+            record JSONB NOT NULL,
+            updated_at BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          )
+        `);
+        await pool.query(`
+          CREATE INDEX IF NOT EXISTS ${table}_updated_at_idx
+            ON ${table} (updated_at DESC)
+        `);
+      }
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_event_session_relations_event_id_idx
+          ON anysentry_event_session_relations ((record->>'eventId'))
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_event_session_relations_binding_active_idx
+          ON anysentry_event_session_relations (
+            (record->>'bindingId'),
+            updated_at DESC,
+            relation_id
+          )
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_process_lineage_edges_parent_idx
+          ON anysentry_process_lineage_edges ((record->>'parentProcessInstanceKey'))
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_process_lineage_edges_child_idx
+          ON anysentry_process_lineage_edges ((record->>'childProcessInstanceKey'))
+      `);
+      await pool.query(`
+        CREATE INDEX IF NOT EXISTS anysentry_event_session_results_event_id_idx
+          ON anysentry_event_session_attribution_results ((record->>'eventId'), updated_at DESC)
+      `);
+      // Upgrade records written before relation effectiveness was explicit. A newer non-definite
+      // result invalidates the old definite edge, but the edge remains available as audit history.
+      await pool.query(`
+        WITH latest_result AS (
+          SELECT DISTINCT ON (record->>'eventId')
+            record->>'eventId' AS event_id,
+            record->>'resultId' AS result_id,
+            record->>'status' AS status,
+            updated_at
+          FROM anysentry_event_session_attribution_results
+          ORDER BY record->>'eventId', updated_at DESC, record->>'resultId'
+        )
+        UPDATE anysentry_event_session_relations AS relation
+           SET record = relation.record || jsonb_build_object(
+                 'active', false,
+                 'effectiveTo', latest_result.updated_at,
+                 'supersededByResultId', latest_result.result_id
+               ),
+               updated_at = latest_result.updated_at
+          FROM latest_result
+         WHERE relation.record->>'eventId' = latest_result.event_id
+           AND COALESCE((relation.record->>'active')::boolean, true)
+           AND latest_result.status NOT IN ('DIRECT', 'LINEAGE')
+           AND latest_result.updated_at > relation.updated_at
+      `);
+      // Retain old decisions for audit, but do not present them as current truth.
+      // Bounded on-demand/background evaluation can materialize new-version relations.
+      await pool.query(INVALIDATE_OLD_SESSION_RELATIONS_SQL,
+        [SESSION_EVENT_ATTRIBUTION_VERSION, Date.now()]);
+      // Gate every query/connect through the failure breaker so a saturated event loop
+      // fast-fails during cooldown instead of stacking 5s connect timeouts. Methods are bound
+      // to the real pool so node-postgres internals never see the Proxy as `this`.
+      this.pool = new Proxy(pool, {
+        get: (target, prop) => {
+          if (prop === 'query' || prop === 'connect') this.gatePoolAccess();
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as Pool;
       this.ready = true;
       this.startCoverageGapIdlePrune();
       this.logger.log('PostgreSQL business-state store is ready');
@@ -4155,11 +5437,44 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
   }
 
   private markUnavailable(operation: string, error: unknown): void {
+    const isCooldownRejection =
+      typeof error === 'object' && error !== null && 'code' in error
+        && (error as { code?: unknown }).code === PG_COOLDOWN_ERROR_CODE;
+    if (!isCooldownRejection) {
+      const now = Date.now();
+      this.recentOperationFailureAt.push(now);
+      if (this.recentOperationFailureAt.length > 32) this.recentOperationFailureAt.shift();
+      const windowStart = now - OPERATION_FAILURE_WINDOW_MS;
+      this.recentOperationFailureAt = this.recentOperationFailureAt.filter((at) => at >= windowStart);
+      if (this.recentOperationFailureAt.length >= OPERATION_FAILURE_BREAKER_THRESHOLD) {
+        this.operationCooldownUntil = now + OPERATION_FAILURE_BREAKER_COOLDOWN_MS;
+      }
+    }
+    const now = Date.now();
+    const lastWarnAt = this.unavailableWarnedAt.get(operation) ?? 0;
+    if (now - lastWarnAt < UNAVAILABLE_WARN_COALESCE_MS) {
+      this.unavailableSuppressed.set(operation, (this.unavailableSuppressed.get(operation) ?? 0) + 1);
+      return;
+    }
+    const suppressed = this.unavailableSuppressed.get(operation) ?? 0;
+    this.unavailableSuppressed.delete(operation);
+    this.unavailableWarnedAt.set(operation, now);
     this.logger.warn(
       `PostgreSQL could not ${operation}; ClickHouse migration copy remains available: ${
         error instanceof Error ? error.message : String(error)
-      }`,
+      }${suppressed > 0 ? ` (${suppressed} similar failures suppressed in the last ${UNAVAILABLE_WARN_COALESCE_MS / 1000}s)` : ''}`,
     );
+  }
+
+  // Short-circuit pool access while the failure breaker is open. Rejecting immediately keeps a
+  // saturated event loop from queuing thousands of doomed 5s connect attempts behind itself.
+  private gatePoolAccess(): void {
+    if (Date.now() < this.operationCooldownUntil) {
+      throw Object.assign(
+        new Error('PostgreSQL operations cooling down after clustered failures'),
+        { code: PG_COOLDOWN_ERROR_CODE },
+      );
+    }
   }
 
   private async loadBusinessRecords<T>(
@@ -4277,7 +5592,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          opened_at = LEAST(anysentry_incidents.opened_at, EXCLUDED.opened_at),
          updated_at = EXCLUDED.updated_at
        WHERE EXCLUDED.updated_at >= anysentry_incidents.updated_at
-         AND (anysentry_incidents.record - 'updatedAt') IS DISTINCT FROM (EXCLUDED.record - 'updatedAt')`,
+         AND (anysentry_incidents.record IS DISTINCT FROM EXCLUDED.record
+           OR EXCLUDED.updated_at > anysentry_incidents.updated_at
+           OR EXCLUDED.opened_at < anysentry_incidents.opened_at)`,
       [JSON.stringify(records)],
     );
   }
@@ -4330,7 +5647,10 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
          last_seen_at = GREATEST(anysentry_alerts.last_seen_at, EXCLUDED.last_seen_at),
          updated_at = EXCLUDED.updated_at
        WHERE EXCLUDED.updated_at >= anysentry_alerts.updated_at
-         AND (anysentry_alerts.record - 'updatedAt') IS DISTINCT FROM (EXCLUDED.record - 'updatedAt')`,
+         AND (anysentry_alerts.record IS DISTINCT FROM EXCLUDED.record
+           OR EXCLUDED.updated_at > anysentry_alerts.updated_at
+           OR EXCLUDED.first_seen_at < anysentry_alerts.first_seen_at
+           OR EXCLUDED.last_seen_at > anysentry_alerts.last_seen_at)`,
       [JSON.stringify(records)],
     );
   }
@@ -4370,6 +5690,42 @@ export class RelationalBusinessStore implements OnModuleInit, OnModuleDestroy {
     }
     this.markUnavailable(operation, lastError);
     return false;
+  }
+
+  private async saveAttributionRecords<T>(
+    table: string,
+    identityColumn: string,
+    identityJsonKey: string,
+    records: T[],
+    identity: (record: T) => string,
+    operation: string,
+  ): Promise<boolean> {
+    if (records.length === 0) return true;
+    return this.saveBusinessRecords(records, operation, identity, async (client, batch) => {
+      await client.query(
+        `WITH incoming AS (
+           SELECT
+             item AS record,
+             item->>'${identityJsonKey}' AS object_id,
+             COALESCE(
+               NULLIF(item->>'calculatedAt', '')::bigint,
+               NULLIF(item->>'createdAt', '')::bigint,
+               NULLIF(item->>'observedAt', '')::bigint,
+               NULLIF(item->>'validFrom', '')::bigint,
+               0
+             ) AS updated_at
+           FROM jsonb_array_elements($1::jsonb) AS source(item)
+         )
+         INSERT INTO ${table} (${identityColumn}, record, updated_at)
+         SELECT object_id, record, updated_at
+         FROM incoming
+         ON CONFLICT (${identityColumn}) DO UPDATE SET
+           record = EXCLUDED.record,
+           updated_at = EXCLUDED.updated_at
+         WHERE EXCLUDED.updated_at >= ${table}.updated_at`,
+        [JSON.stringify(batch)],
+      );
+    });
   }
 
   private retryableTransactionError(error: unknown): boolean {

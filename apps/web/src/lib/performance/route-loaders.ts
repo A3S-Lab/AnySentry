@@ -12,6 +12,7 @@ const pageLoaders: Record<string, PageLoader> = {
   "/capabilities": () => import("@/pages/CapabilitiesPage"),
   "/collectors": () => import("@/pages/CollectorsPage"),
   "/conversations": () => import("@/pages/ConversationTrackingPage"),
+  "/record-tracking": () => import("@/pages/LocalRecordTrackingPage"),
   "/coverage": () => import("@/pages/CoveragePage"),
   "/evidence": () => import("@/pages/EvidenceBundlePage"),
   "/events": () => import("@/pages/AgentEventsPage"),

@@ -44,7 +44,7 @@ import {
 import { CommitAwareFactBucketCache } from './commit-aware-fact-cache';
 import { foldLatestEventRevisions } from './event-revision';
 import { eventActivityContext, eventActivitySubtype } from './activity-context';
-import { clampInteractionReadWindow, resolveTimeWindow } from './time-window';
+import { clampInteractionReadWindow, DEFAULT_SECURITY_TIME_TYPE, resolveTimeWindow } from './time-window';
 import {
   collectorHeartbeatFailureDelta,
   ringDropDelta,
@@ -112,7 +112,12 @@ const MAX_HISTORY_CACHE_ENTRIES = 64;
 
 // Raw-scan fuse for the synchronous agent inventory: the JS-side fact build is
 // linear in window events; beyond this bound the newest slice is used instead.
-const AGENT_INVENTORY_MAX_EVENTS = 12_000;
+// Env-tunable: dense shared hosts (many containers) lower it to keep the periodic
+// remediation rescan from freezing the event loop for tens of seconds per pass.
+const AGENT_INVENTORY_MAX_EVENTS = (() => {
+  const parsed = Number(process.env.ANYSENTRY_AGENT_INVENTORY_MAX_EVENTS);
+  return Number.isFinite(parsed) ? Math.min(50_000, Math.max(500, Math.trunc(parsed))) : 12_000;
+})();
 const AGENT_INVENTORY_RESULT_TTL_MS = 30_000;
 const MAX_AGENT_INVENTORY_CACHE_ENTRIES = 8;
 const MAX_HISTORY_CACHE_BYTES = 8 * 1024 * 1024;
@@ -735,7 +740,7 @@ function eventSourceId(e: T.JudgedEvent): string {
 function durableEventSearchKey(filter: T.AgentEventQuery, reviewRevision = 0): string {
   const text = (value?: string): string => value?.trim() ?? '';
   return JSON.stringify({
-    timeType: filter.timeType ?? 'last_3h',
+    timeType: filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
     // Preserve the raw custom boundaries: a date-only end includes the whole day, while an ISO
     // midnight ends at that instant even though Date.parse yields the same millisecond value.
     startTime: filter.startTime ?? '',
@@ -8494,7 +8499,7 @@ export class AggregationService implements OnModuleDestroy {
   async sharedAgentObservabilityForWindow(filter: T.SecurityTimeFilter): Promise<T.AgentObservability> {
     const window = resolveTimeWindow(filter);
     const key = JSON.stringify([
-      window.custom ? window.cacheKey : ['relative', filter.timeType ?? 'last_3h'],
+      window.custom ? window.cacheKey : ['relative', filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE],
       filter.scope ?? 'all',
     ]);
     const effectiveFilter = window.custom || filter.snapshotAsOf

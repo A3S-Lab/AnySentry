@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   ArrowLeft,
   BellRing,
@@ -366,7 +367,7 @@ export function WorkspaceAssetsView({
 }: WorkspaceAssetsViewProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [healthState, setHealthState] = useState<AgentHealthState | "all">((searchParams.get("healthState") as AgentHealthState) || "all");
   const [criticality, setCriticality] = useState<AgentCriticality | "all">((searchParams.get("criticality") as AgentCriticality) || "all");
   const [queryText, setQueryText] = useState(searchParams.get("q") ?? "");

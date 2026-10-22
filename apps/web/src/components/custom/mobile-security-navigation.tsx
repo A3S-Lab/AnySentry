@@ -114,14 +114,13 @@ export function MobileSecurityNavigation() {
               {SECURITY_NAVIGATION_GROUPS.map((group, groupIndex) => {
                 const GroupIcon = group.icon;
                 return (
-                  <section key={group.label} className={cn(groupIndex > 0 && "mt-3 border-t border-[#232a37] pt-3")}>
-                    <p className="flex min-h-8 items-center gap-2 px-2 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]">
-                      <GroupIcon className="size-3.5" />
+                  <section key={group.label} className={cn(groupIndex > 0 && "mt-3")}>
+                    <p className="flex h-9 items-center gap-2 px-2 text-[16px] font-medium text-[#d7dee8]">
+                      <GroupIcon className="size-4 shrink-0 text-[#9aa3b5]" aria-hidden="true" />
                       {t(group.label)}
                     </p>
-                    <div className="space-y-1">
+                    <div className="space-y-0.5">
                       {group.items.map((item) => {
-                        const Icon = item.icon;
                         const active = isSecurityNavigationItemActive(pathname, search, item);
                         return (
                           <Link
@@ -129,17 +128,13 @@ export function MobileSecurityNavigation() {
                             to={item.href}
                             aria-current={active ? "page" : undefined}
                             className={cn(
-                              "flex min-h-12 items-start gap-3 rounded-md border px-3 py-2.5 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[#f97316]/60",
+                              "flex min-h-11 items-center rounded-md py-2 pl-8 pr-3 text-[15px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[#f97316]/60",
                               active
-                                ? "border-transparent bg-[#1c222d] text-[#e8ecf3] shadow-[inset_2px_0_0_#f97316]"
-                                : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
+                                ? "bg-[radial-gradient(circle_at_100%_50%,rgba(37,99,235,0.72),transparent_24%),linear-gradient(90deg,rgba(6,28,54,0.96),rgba(15,43,98,0.92))] text-[#f4f8ff] shadow-[inset_2px_0_0_#22d3ee,inset_0_0_22px_rgba(37,99,235,0.18)]"
+                                : "text-[#c5ccd6] hover:bg-[#151a23] hover:text-white",
                             )}
                           >
-                            <Icon className={cn("mt-0.5 size-4 shrink-0", active ? "text-[#f97316]" : "text-[#818a9c]")} />
-                            <span className="min-w-0">
-                              <span className="block text-sm font-semibold">{t(item.label)}</span>
-                              {item.description ? <span className="mt-0.5 block text-xs leading-4 text-[#818a9c]">{t(item.description)}</span> : null}
-                            </span>
+                            {t(item.label)}
                           </Link>
                         );
                       })}

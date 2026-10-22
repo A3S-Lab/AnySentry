@@ -45,9 +45,15 @@ import { FilterRuleSystemService } from './filter-rule-system.service';
 import { FilterRuleController } from './filter-rule.controller';
 import { AgentConversationBindingService } from './agent-conversation-binding.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
+import { InteractionController } from './interaction.controller';
+import { InteractionContentStore } from './interaction-content.store';
+import { InteractionService } from './interaction.service';
+import { LocalRecordTrackingController } from './local-record-tracking.controller';
+import { LocalRecordTrackingService } from './local-record-tracking.service';
+import { SessionEventAttributionService } from './session-event-attribution.service';
 
 @Module({
-  controllers: [SecurityMonitoringController, InfrastructureRuleController, FilterRuleController, ObservedAssetLifecycleController],
-  providers: [ClickHouseStore, AgentRuntimeStateService, AgentConversationBindingService, CanonicalObservabilityService, AgentAttributionService, RelationalBusinessStore, UserDirectoryService, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, InfrastructureRuleService, FilterRuleCatalogService, FilterRuleSystemService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ObserverInventoryService, PrometheusContextService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService, PlatformMetricsService, SystemContextService, UnknownLearningRuntimeService, ObservedAssetLifecycleService, ObservedAssetReviewService, InfrastructureAssetSnapshotService, { provide: INFRASTRUCTURE_ASSET_SNAPSHOT_PROVIDER, useExisting: InfrastructureAssetSnapshotService }],
+  controllers: [SecurityMonitoringController, InfrastructureRuleController, FilterRuleController, ObservedAssetLifecycleController, InteractionController, LocalRecordTrackingController],
+  providers: [ClickHouseStore, AgentRuntimeStateService, AgentConversationBindingService, CanonicalObservabilityService, AgentAttributionService, RelationalBusinessStore, UserDirectoryService, AgentMetadataService, WorkspaceDirectoryService, AlertingService, AuditService, InfrastructureRuleService, FilterRuleCatalogService, FilterRuleSystemService, IngestionSourceService, MaintenanceWindowService, NotificationService, ObjectiveService, DistributedCurrentStateService, SentryJudgeService, AggregationService, IdentityEvidenceService, RuntimeModelConfigService, IdentityReviewAgentService, RemediationService, KubeIdentityService, ObserverInventoryService, PrometheusContextService, ManagementAuthGuard, JudgmentQueueService, DecisionResultApplyService, StreamingQueueService, StreamingFindingService, SupplyChainService, SecurityAssistantService, PlatformMetricsService, SystemContextService, UnknownLearningRuntimeService, ObservedAssetLifecycleService, ObservedAssetReviewService, InfrastructureAssetSnapshotService, InteractionContentStore, InteractionService, SessionEventAttributionService, LocalRecordTrackingService, { provide: INFRASTRUCTURE_ASSET_SNAPSHOT_PROVIDER, useExisting: InfrastructureAssetSnapshotService }],
 })
 export class SecurityMonitoringModule {}

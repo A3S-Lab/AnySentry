@@ -72,8 +72,9 @@ export interface BuiltinRuntimeSignature {
   variants: Array<Partial<Record<'commExact' | 'exeBasename' | 'argv0Basename' | 'argvPrefix', string[]>>>;
 }
 
-export const BUILTIN_RUNTIME_SIGNATURE_VERSION = 4;
+export const BUILTIN_RUNTIME_SIGNATURE_VERSION = 5;
 export const BUILTIN_RUNTIME_SIGNATURES: BuiltinRuntimeSignature[] = [
+  { id: 'opencode', displayName: 'OpenCode', variants: [{ commExact: ['opencode'] }, { exeBasename: ['opencode'] }, { argv0Basename: ['opencode'] }] },
   { id: 'codex', displayName: 'Codex', variants: [{ commExact: ['codex'] }, { argv0Basename: ['codex'] }] },
   { id: 'pi', displayName: 'Pi', variants: [{ commExact: ['pi'] }, { argv0Basename: ['pi'] }] },
   {
@@ -102,7 +103,11 @@ export const BUILTIN_RUNTIME_SIGNATURES: BuiltinRuntimeSignature[] = [
   },
   {
     id: 'a3s-code', agentScopeId: 'a3s code', displayName: 'A3S Code',
-    variants: [{ commExact: ['a3s', 'a3s-code', 'a3s code'] }, { argvPrefix: ['a3s code', 'a3s-code'] }],
+    variants: [
+      { commExact: ['a3s-code', 'a3s code'] },
+      { commExact: ['tokio-rt-worker'], exeBasename: ['a3s'] },
+      { argvPrefix: ['a3s code', 'a3s-code'] },
+    ],
   },
   {
     id: 'claude-code', agentScopeId: 'Claude Code', displayName: 'Claude Code',
@@ -114,7 +119,11 @@ export const BUILTIN_RUNTIME_SIGNATURES: BuiltinRuntimeSignature[] = [
   },
   {
     id: 'kimi-cli', displayName: 'Kimi Code CLI',
-    variants: [{ commExact: ['Kimi Code'] }, { argv0Basename: ['kimi', 'kimi-cli'] }],
+    variants: [
+      { commExact: ['Kimi Code', 'kimi', 'kimi-cli', 'kimi-code'] },
+      { exeBasename: ['kimi', 'kimi-cli', 'kimi-code'] },
+      { argv0Basename: ['kimi', 'kimi-cli', 'kimi-code'] },
+    ],
   },
 ];
 
