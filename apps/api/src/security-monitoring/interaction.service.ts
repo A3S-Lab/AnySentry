@@ -43,6 +43,7 @@ import {
 } from './interaction.types';
 import {
   extractAssistantResponse,
+  extractToolEvents,
   extractUserInstruction,
   isLlmShapedRow,
   isUosContentInteractionId,
@@ -51,6 +52,7 @@ import {
   uosConversationAnchor,
   uosConversationId,
   uosRowToRecords,
+  type UosToolEvent,
 } from './interaction-uos-plaintext';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { canonicalProcessLifecycleIdentity } from './process-lifecycle';
@@ -671,6 +673,11 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
           .find((text) => Boolean(text));
         if (preview) summary.title = preview;
       }
+      const toolCallKeys = new Set<string>();
+      for (const record of uosRecords) {
+        for (const key of this.uosToolCallKeysFor(record)) toolCallKeys.add(key);
+      }
+      if (toolCallKeys.size > 0) summary.toolCallCount = toolCallKeys.size;
       let inputTokens = 0;
       let outputTokens = 0;
       let totalTokens = 0;
@@ -746,7 +753,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     );
     // UOS plaintext: batch-resolve inline bodies for the merged timeline view. Bounded per
     // conversation; full-fidelity reads remain available through the content endpoint.
-    const uosInlineContentById = new Map<string, { content?: string; rawBody?: string; rawMeta?: Record<string, unknown> }>();
+    const uosInlineContentById = new Map<string, { content?: string; rawBody?: string; rawMeta?: Record<string, unknown>; toolEvents?: UosToolEvent[] }>();
     if (this.uosPlaintextEnabled && this.directViewEnabled()) {
       const uosIds = observations
         .map((record) => record.interactionId)
@@ -761,9 +768,18 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
               : {}),
             ...(view.rawBody ? { rawBody: view.rawBody } : {}),
             ...(view.rawMeta ? { rawMeta: view.rawMeta as Record<string, unknown> } : {}),
+            ...(view.toolEvents?.length ? { toolEvents: view.toolEvents } : {}),
           });
         }
       }));
+      // A response that was never captured (capture window spent on a giant request) leaves
+      // the :out view null. Keep the tool timeline on the :in entry in that case; when both
+      // views exist the :out copy wins and the :in duplicate is dropped here.
+      for (const [interactionId, view] of uosInlineContentById) {
+        if (!interactionId.endsWith(':in') || !view.toolEvents) continue;
+        const outView = uosInlineContentById.get(`${uosBaseInteractionId(interactionId)}:out`);
+        if (outView?.toolEvents) delete view.toolEvents;
+      }
     }
     return {
       schemaVersion: 'anysentry.interaction-conversation-detail.v1',
@@ -1057,7 +1073,15 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     records: InteractionRecord[];
     previewIn?: string;
     previewOut?: string;
+    toolCallKeys?: string[];
   }>();
+
+  /** Tool-call dedupe keys for a projected record's interaction (list-level counts mirror
+   *  the Trace timeline: same callId dedupe, request-context + response sources). */
+  private uosToolCallKeysFor(record: InteractionRecord): string[] {
+    const entry = this.uosParsedCache.get(uosBaseInteractionId(record.interactionId));
+    return entry?.toolCallKeys ?? [];
+  }
 
   /** Title preview for a projected record. Reads the parsed-cache entry directly: the separate
    *  inline cache used to be wholesale-cleared at 4000 entries while parsed entries survived,
@@ -1169,6 +1193,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
             let records: InteractionRecord[] = [];
             let previewIn: string | undefined;
             let previewOut: string | undefined;
+            let toolCallKeys: string[] = [];
             if (llm) {
               previewIn = extractUserInstruction(parsed.request?.body).replace(/\s+/gu, ' ').trim().slice(0, 80);
               previewOut = extractAssistantResponse(parsed.response?.body).replace(/\s+/gu, ' ').trim().slice(0, 80);
@@ -1176,6 +1201,9 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
               if (!parsed.agentInstanceId && row.agentInstanceId) parsed.agentInstanceId = row.agentInstanceId;
               if (!parsed.at && row.at) parsed.at = row.at;
               records = uosRowToRecords(parsed);
+              toolCallKeys = extractToolEvents(parsed.request?.body, parsed.response?.body)
+                .filter((event) => event.kind === 'call')
+                .map((event) => event.toolCallId ?? `${event.name}:${event.detail.slice(0, 64)}`);
             }
             entry = {
               llm,
@@ -1184,6 +1212,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
               records,
               ...(previewIn ? { previewIn } : {}),
               ...(previewOut ? { previewOut } : {}),
+              ...(toolCallKeys.length > 0 ? { toolCallKeys } : {}),
             };
           }
           if (cacheKey) {
@@ -1225,6 +1254,9 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     }
     const rawBodyText = (isInput ? parsed.request?.body : parsed.response?.body) ?? '';
     if (!content && !rawBodyText) return null;
+    // Template-shaped tool timeline (OpenAI messages / Anthropic blocks); consumed by the
+    // merged conversation view as structured tool_call/tool_result timeline entries.
+    const toolEvents = extractToolEvents(parsed.request?.body, parsed.response?.body);
     const rawMeta = {
       endpoint: parsed.endpoint ?? '',
       method: parsed.method ?? '',
@@ -1238,6 +1270,12 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       agentInstanceId: parsed.agentInstanceId ?? '',
       collectorId: parsed.collectorId ?? '',
       workspacePath: parsed.workspacePath ?? '',
+      interactionId: baseId,
+      connectionId: parsed.connectionId ?? '',
+      ...(parsed.traceId ? { traceId: parsed.traceId } : {}),
+      ...(parsed.runId ? { runId: parsed.runId } : {}),
+      routeShape: parsed.routeShape ?? '',
+      wireTemplateId: parsed.wireTemplateId ?? '',
       startedAtUnixNs: parsed.startedAtUnixNs ?? '',
       durationNs: parsed.durationNs ?? '',
       capturedBytes: isInput ? parsed.request?.capturedBytes ?? 0 : parsed.response?.capturedBytes ?? 0,
@@ -1259,6 +1297,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       presentationState: 'raw_authorized' as const,
       rawBody: rawBodyText.length > 20_000 ? `${rawBodyText.slice(0, 20_000)}…` : rawBodyText,
       rawMeta,
+      ...(toolEvents.length > 0 ? { toolEvents } : {}),
     };
   }
 

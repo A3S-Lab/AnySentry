@@ -245,6 +245,14 @@ export interface InteractionInstructionRecord
   rawBody?: string;
   /** UOS plaintext: captured transport/collection metadata for the raw view. */
   rawMeta?: Record<string, unknown>;
+  /** UOS plaintext: template-shaped tool-call timeline for the merged view. */
+  toolEvents?: Array<{
+    kind: 'call' | 'result';
+    name: string;
+    detail: string;
+    toolCallId?: string;
+    source: 'request_context' | 'response';
+  }>;
   userInstruction: InteractionInstructionMetadataIngest['userInstruction'] & {
     contentRef: string;
   };
@@ -304,6 +312,14 @@ export interface InteractionResponseRecord
   rawBody?: string;
   /** UOS plaintext: captured transport/collection metadata for the raw view. */
   rawMeta?: Record<string, unknown>;
+  /** UOS plaintext: template-shaped tool-call timeline for the merged view. */
+  toolEvents?: Array<{
+    kind: 'call' | 'result';
+    name: string;
+    detail: string;
+    toolCallId?: string;
+    source: 'request_context' | 'response';
+  }>;
   assistantResponse: InteractionResponseMetadataIngest['assistantResponse'] & {
     contentRef: string;
   };
@@ -360,6 +376,8 @@ export interface InteractionConversationSummary {
   title?: string;
   /** UOS plaintext enrichment: summed token usage across the conversation's model calls. */
   tokenUsage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+  /** UOS plaintext enrichment: deduped tool-call count (mirrors the Trace timeline count). */
+  toolCallCount?: number;
 }
 
 export interface InteractionConversationList {

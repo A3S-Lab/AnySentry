@@ -23,6 +23,8 @@ import {
   type PlatformComponentMetric,
   type PlatformMetricStatus,
   type PlatformMetricsOverview,
+  type PlatformPipelineCollectorView,
+  type PlatformPipelineHistoryPoint,
   securityCenterApi,
 } from "@/lib/api/security-center";
 import { formatSecurityDateTime } from "@/lib/date-time";
@@ -196,6 +198,15 @@ export default function PlatformMonitoringPage() {
       refreshOnWindowFocus: true,
     },
   );
+  const { data: pipeline, refresh: refreshPipeline } = useRequest(
+    () => securityCenterApi.platformPipeline(),
+    {
+      refreshDeps: [refreshVersion],
+      pollingInterval: 15000,
+      pollingWhenHidden: false,
+      refreshOnWindowFocus: true,
+    },
+  );
   const chartSpec = useMemo(() => utilizationSpec(data), [data]);
   const middlewareCharts = useMemo(
     () => (data?.middleware?.series ?? []).filter((item) => item.points.length > 0),
@@ -236,7 +247,10 @@ export default function PlatformMonitoringPage() {
                 type="button"
                 variant="secondary"
                 size="sm"
-                onClick={refresh}
+                onClick={() => {
+                  refresh();
+                  refreshPipeline();
+                }}
                 className="h-8 border border-white/10 bg-white/5 text-xs text-zinc-200 hover:bg-white/10"
               >
                 {loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
@@ -394,6 +408,35 @@ export default function PlatformMonitoringPage() {
           <section className="rounded-[8px] border border-[#232a37] bg-[#0f131a]">
             <div className="flex h-11 items-center justify-between border-b border-[#232a37] px-3">
               <div className="flex items-center gap-2">
+                <Network className="size-4 text-sky-300" />
+                <h2 className="text-sm font-semibold text-zinc-100">采集管线与积压</h2>
+              </div>
+              <span className="text-[10px] text-zinc-600">
+                Observer 心跳上报 · 洪峰熔断累计丢弃 {pipeline ? pipeline.apiFloodDroppedTotal.toLocaleString("zh-CN") : "--"}
+              </span>
+            </div>
+            {pipeline && pipeline.collectors.length > 0 ? (
+              <div>
+                {pipeline.collectors.map((collector) => (
+                  <PipelineCollectorCard
+                    key={collector.collectorId}
+                    item={collector}
+                    history={pipeline.history.filter((point) => point.collectorId === collector.collectorId)}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="flex min-h-24 flex-col items-center justify-center text-center">
+                <Network className="size-5 text-zinc-700" />
+                <p className="mt-2 text-xs text-zinc-500">尚无采集器心跳上报</p>
+                <p className="mt-1 text-[10px] text-zinc-700">采集器启动并完成首轮心跳后展示各阶段计数与积压</p>
+              </div>
+            )}
+          </section>
+
+          <section className="rounded-[8px] border border-[#232a37] bg-[#0f131a]">
+            <div className="flex h-11 items-center justify-between border-b border-[#232a37] px-3">
+              <div className="flex items-center gap-2">
                 <Network className="size-4 text-teal-300" />
                 <h2 className="text-sm font-semibold text-zinc-100">组件运行状态</h2>
               </div>
@@ -422,4 +465,132 @@ function statusFor(value?: number): PlatformMetricStatus {
   if (value >= 95) return "critical";
   if (value >= 85) return "warning";
   return "healthy";
+}
+
+function formatAge(ms: number) {
+  if (ms < 1_000) return "刚刚";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds} 秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.floor(hours / 24)} 天前`;
+}
+
+const PIPELINE_THROUGHPUT_SERIES = [
+  { key: "received", label: "采集接收", color: "#38bdf8" },
+  { key: "apiRetained", label: "API 留存", color: "#2dd4bf" },
+  { key: "apiDiscarded", label: "API 丢弃", color: "#a1a1aa" },
+  { key: "apiRetryable", label: "等待重试", color: "#fbbf24" },
+] as const;
+
+const PIPELINE_BACKLOG_SERIES = [
+  { key: "outstandingEvents", label: "内存积压", color: "#fbbf24" },
+  { key: "spoolRecords", label: "磁盘积压", color: "#f472b6" },
+] as const;
+
+function pipelineTrendSpec(
+  points: readonly PlatformPipelineHistoryPoint[],
+  series: readonly { key: string; label: string; color: string }[],
+): VChartSpec {
+  const chartData = points.flatMap((point) =>
+    series.map((def) => ({
+      time: point.at,
+      value: Number(point[def.key as keyof PlatformPipelineHistoryPoint]) || 0,
+      metric: def.label,
+    })),
+  );
+  return {
+    type: "line",
+    data: [{ id: "pipeline", values: chartData }],
+    xField: "time",
+    yField: "value",
+    seriesField: "metric",
+    height: 176,
+    padding: { top: 8, right: 12, bottom: 20, left: 52 },
+    point: { visible: false },
+    line: { style: { lineWidth: 1.5 } },
+    color: series.map((def) => def.color),
+    axes: [
+      { orient: "left", min: 0, tick: { tickCount: 4 } },
+      { orient: "bottom", type: "time", layers: [{ timeFormat: "%H:%M", timeFormatMode: "local" }] },
+    ],
+    legends: { visible: true, orient: "top", position: "end" },
+    tooltip: { visible: true },
+  } as VChartSpec;
+}
+
+function PipelineCollectorCard({ item, history }: { item: PlatformPipelineCollectorView; history: PlatformPipelineHistoryPoint[] }) {
+  const latest = item.stages.length > 0 ? new Map(item.stages.map((stage) => [stage.stage, stage])) : undefined;
+  const currentOf = (stage: string) => latest?.get(stage)?.count ?? 0;
+  const spoolWarning = item.spool.atCapacity || item.spool.walPutAtCapacity || item.spool.records > 0;
+  const currentStats = [
+    { label: "API 留存（当前窗口）", value: `${currentOf("api_retained").toLocaleString("zh-CN")} 条` },
+    { label: "等待重试", value: `${currentOf("api_retryable").toLocaleString("zh-CN")} 条` },
+    { label: "内存积压", value: `${item.outstandingEvents.toLocaleString("zh-CN")} 条 · ${formatBytes(item.outstandingBytes)}` },
+    { label: "重试队列", value: `${(item.backlog?.retryEvents ?? item.retry.queued).toLocaleString("zh-CN")} 条 · 耗尽 ${item.retry.exhausted.toLocaleString("zh-CN")}` },
+    { label: "磁盘积压（spool）", value: `${item.spool.records.toLocaleString("zh-CN")} 条 · ${formatBytes(item.spool.walBytes)}` },
+    {
+      label: "spool 容量",
+      value: item.spool.atCapacity || item.spool.walPutAtCapacity
+        ? `已满 · 拒绝 ${item.spool.capacityRejects.toLocaleString("zh-CN")} 次`
+        : "正常",
+    },
+  ];
+  return (
+    <div className="border-t border-[#232a37]">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+        <div className="flex items-center gap-2">
+          <span className={cn(
+            "size-1.5 rounded-full",
+            item.status === "healthy" ? "bg-teal-400" : item.status === "degraded" ? "bg-amber-300" : "bg-rose-400",
+          )} />
+          <span className="truncate text-xs font-medium text-zinc-200" title={item.collectorId}>{item.collectorId}</span>
+          <span className="text-[10px] text-zinc-600">心跳 {formatAge(item.ageMs)}</span>
+        </div>
+        <span className="text-[10px] text-zinc-600">统计窗口 {item.windowSeconds ?? "--"}s（增量计数）</span>
+      </div>
+      <div className="grid gap-3 p-3 md:grid-cols-2">
+        <div className="rounded-md border border-[#232a37] bg-[#0c1016]">
+          <div className="flex items-baseline justify-between gap-2 px-3 pt-2">
+            <span className="text-[11px] text-zinc-400">阶段吞吐</span>
+            <span className="text-[10px] text-zinc-700">每 {item.windowSeconds ?? 30}s 窗口</span>
+          </div>
+          <div className="h-[184px]">
+            {history.length > 1 ? (
+              <VChartView spec={pipelineTrendSpec(history, PIPELINE_THROUGHPUT_SERIES)} height={176} />
+            ) : (
+              <div className="flex h-full items-center justify-center text-[10px] text-zinc-700">积累两个以上心跳后出图</div>
+            )}
+          </div>
+        </div>
+        <div className="rounded-md border border-[#232a37] bg-[#0c1016]">
+          <div className="flex items-baseline justify-between gap-2 px-3 pt-2">
+            <span className="text-[11px] text-zinc-400">积压趋势</span>
+            <span className={cn("text-[10px]", spoolWarning ? "text-amber-300" : "text-zinc-700")}>
+              {spoolWarning ? "存在积压" : "无积压"}
+            </span>
+          </div>
+          <div className="h-[184px]">
+            {history.length > 1 ? (
+              <VChartView spec={pipelineTrendSpec(history, PIPELINE_BACKLOG_SERIES)} height={176} />
+            ) : (
+              <div className="flex h-full items-center justify-center text-[10px] text-zinc-700">积累两个以上心跳后出图</div>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-[#232a37] px-3 py-2">
+        {currentStats.map((stat) => (
+          <span key={stat.label} className="text-[10px] text-zinc-600">
+            {stat.label}
+            <span className={cn("ml-1.5 font-mono tabular-nums", stat.value.includes("已满") ? "text-rose-200" : "text-zinc-300")}>
+              {stat.value}
+            </span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }

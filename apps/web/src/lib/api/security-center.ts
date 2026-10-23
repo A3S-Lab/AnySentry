@@ -392,13 +392,82 @@ export interface PlatformMetricAnomaly {
   message: string;
 }
 
+export interface PlatformPipelineStageView {
+  stage: string;
+  count: number;
+  reasons: Record<string, number>;
+}
+
+export interface PlatformPipelineCollectorView {
+  collectorId: string;
+  status: string;
+  lastHeartbeatAt: number;
+  ageMs: number;
+  windowSeconds?: number;
+  stages: PlatformPipelineStageView[];
+  backlog?: {
+    queueEvents: number;
+    queueBytes: number;
+    inflightEvents: number;
+    inflightBytes: number;
+    retryEvents: number;
+    retryBytes: number;
+    outstandingEvents: number;
+    outstandingBytes: number;
+  };
+  retry: {
+    queued: number;
+    attempts: number;
+    recovered: number;
+    exhausted: number;
+    parked: number;
+  };
+  spool: {
+    records: number;
+    activeRecords: number;
+    parkedRecords: number;
+    walBytes: number;
+    oldestAgeMs: number;
+    atCapacity: boolean;
+    walPutAtCapacity: boolean;
+    capacityRejects: number;
+  };
+  outstandingEvents: number;
+  outstandingBytes: number;
+  queueDepth: number;
+}
+
+export interface PlatformPipelineOverview {
+  schemaVersion: "anysentry.platform_pipeline.v1";
+  status: "ready" | "partial";
+  collectors: PlatformPipelineCollectorView[];
+  history: PlatformPipelineHistoryPoint[];
+  apiFloodDroppedTotal: number;
+  updateTime: string;
+}
+
+export interface PlatformPipelineHistoryPoint {
+  at: number;
+  collectorId: string;
+  received: number;
+  filtered: number;
+  queueAdmitted: number;
+  queueDropped: number;
+  apiRetained: number;
+  apiDiscarded: number;
+  apiRetryable: number;
+  outstandingEvents: number;
+  retryEvents: number;
+  spoolRecords: number;
+  spoolWalBytes: number;
+}
+
 export interface PlatformMetricsOverview {
   schemaVersion: "anysentry.platform_metrics.v1";
   status: "ready" | "partial" | "unavailable";
   source: PlatformMetricSource;
   from: string;
-  to: string;
-  stepSeconds: number;
+  to: string;  stepSeconds: number;
   updatedAt: string;
   summary: {
     nodeReady?: number;
@@ -4559,6 +4628,7 @@ export interface InteractionConversationSummary {
   contentAvailable: boolean;
   title?: string;
   tokenUsage?: { inputTokens: number; outputTokens: number; totalTokens: number };
+  toolCallCount?: number;
 }
 
 export interface InteractionConversationList {
@@ -4624,6 +4694,14 @@ export interface InteractionRuntimeObservation {
   modelProvider?: string;
 }
 
+export interface InteractionToolEvent {
+  kind: "call" | "result";
+  name: string;
+  detail: string;
+  toolCallId?: string;
+  source: "request_context" | "response";
+}
+
 export interface InteractionInstructionObservation {
   schemaVersion: "anysentry.interaction-instruction.v1";
   eventType: "AgentInputObserved";
@@ -4638,6 +4716,7 @@ export interface InteractionInstructionObservation {
   content?: string;
   rawBody?: string;
   rawMeta?: Record<string, unknown>;
+  toolEvents?: InteractionToolEvent[];
   processInstanceId: string;
   agentInstanceId?: string;
   workspacePath?: string;
@@ -4693,6 +4772,7 @@ export interface InteractionResponseObservation {
   content?: string;
   rawBody?: string;
   rawMeta?: Record<string, unknown>;
+  toolEvents?: InteractionToolEvent[];
   processInstanceId: string;
   agentInstanceId?: string;
   workspacePath?: string;
@@ -5109,6 +5189,8 @@ export const securityCenterApi = {
     apiClient.get<PlatformHealth>("/security-center/healthz", { signal }),
   platformMetrics: (range: SecurityTimeType = "last_1h") =>
     apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
+  platformPipeline: () =>
+    apiClient.get<PlatformPipelineOverview>("/security-center/platform/pipeline"),
   interactionStatus: () =>
     apiClient.get<InteractionStatus>("/security-center/interactions/status"),
   interactionConversations: (query: {

@@ -1338,6 +1338,70 @@ export interface PlatformComponentMetric {
   message?: string;
 }
 
+/** Platform pipeline funnel + backlog view, derived from the newest collector heartbeat. */
+export interface PlatformPipelineStageView {
+  stage: string;
+  count: number;
+  reasons: Record<string, number>;
+}
+
+export interface PlatformPipelineCollectorView {
+  collectorId: string;
+  status: string;
+  lastHeartbeatAt: number;
+  ageMs: number;
+  windowSeconds?: number;
+  stages: PlatformPipelineStageView[];
+  backlog?: CollectorPipelineBacklog;
+  retry: {
+    queued: number;
+    attempts: number;
+    recovered: number;
+    exhausted: number;
+    parked: number;
+  };
+  spool: {
+    records: number;
+    activeRecords: number;
+    parkedRecords: number;
+    walBytes: number;
+    oldestAgeMs: number;
+    atCapacity: boolean;
+    walPutAtCapacity: boolean;
+    capacityRejects: number;
+  };
+  outstandingEvents: number;
+  outstandingBytes: number;
+  queueDepth: number;
+}
+
+export interface PlatformPipelineHistoryPoint {
+  at: number;
+  collectorId: string;
+  received: number;
+  filtered: number;
+  queueAdmitted: number;
+  queueDropped: number;
+  apiRetained: number;
+  apiDiscarded: number;
+  apiRetryable: number;
+  outstandingEvents: number;
+  retryEvents: number;
+  spoolRecords: number;
+  spoolWalBytes: number;
+}
+
+export interface PlatformPipelineOverview {
+  schemaVersion: 'anysentry.platform_pipeline.v1';
+  status: 'ready' | 'partial';
+  collectors: PlatformPipelineCollectorView[];
+  /** 30-minute per-heartbeat history for trend charts; gauges are point-in-time values. */
+  history: PlatformPipelineHistoryPoint[];
+  /** API-side flood-fuse discard counter (洪峰熔断), process lifetime. */
+  apiFloodDroppedTotal: number;
+  updateTime: string;
+}
+
 export interface PlatformMetricAnomaly {
   id: string;
   severity: 'warning' | 'critical';

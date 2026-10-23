@@ -7,6 +7,7 @@
 import {
   securityCenterApi,
   type InteractionConversationDetail,
+  type InteractionToolEvent,
   type InteractionConversationList,
   type InteractionConversationSummary,
   type LocalObservedLlmRequest,
@@ -52,7 +53,7 @@ function toRecordSummary(item: InteractionConversationSummary): LocalRecordSumma
     userMessageCount: item.instructionObservations,
     assistantMessageCount: item.responseObservations,
     completeTurnCount: item.completeTurns,
-    toolCallCount: 0,
+    toolCallCount: item.toolCallCount ?? 0,
     toolFailureCount: 0,
     tokenUsage: item.tokenUsage
       ? { ...emptyTokenUsage(), ...item.tokenUsage }
@@ -101,7 +102,7 @@ export async function conversationRecordList(query: { limit?: number } = {}): Pr
       recentRecords: count((item) => item.activityStatus === "recent"),
       totalBytes: items.reduce((sum, item) => sum + item.fileBytes, 0),
       observedTokens: items.reduce((sum, item) => sum + item.tokenUsage.totalTokens, 0),
-      observedToolCalls: 0,
+      observedToolCalls: items.reduce((sum, item) => sum + item.toolCallCount, 0),
     },
     updateTime: list.updateTime,
   };
@@ -109,9 +110,31 @@ export async function conversationRecordList(query: { limit?: number } = {}): Pr
 
 type InteractionObservation = InteractionConversationDetail["observations"][number];
 
-function toTimelineEvent(observation: InteractionObservation, index: number): LocalRecordTimelineEvent | null {
+function toToolTimelineEvent(
+  tool: InteractionToolEvent,
+  observation: InteractionObservation,
+  index: number,
+  order: number,
+): LocalRecordTimelineEvent {
+  return {
+    eventId: `${observation.interactionId}:tool:${order}`,
+    kind: tool.kind === "call" ? "tool_call" : "tool_result",
+    timestamp: observation.observedAt,
+    role: "assistant",
+    title: tool.kind === "call"
+      ? `工具调用 · ${tool.name || "unnamed"}`
+      : `工具返回 · ${tool.name || "unnamed"}`,
+    content: tool.detail,
+    toolName: tool.name || undefined,
+    callId: tool.toolCallId,
+    status: "observed",
+    sourceOffset: index,
+  };
+}
+
+function toTimelineEvents(observation: InteractionObservation, index: number): LocalRecordTimelineEvent[] {
   if (observation.eventType === "AgentInputObserved") {
-    return {
+    const events: LocalRecordTimelineEvent[] = [{
       eventId: observation.interactionId,
       kind: "user_message",
       timestamp: observation.observedAt,
@@ -122,14 +145,32 @@ function toTimelineEvent(observation: InteractionObservation, index: number): Lo
       ...(observation.rawBody ? { rawBody: observation.rawBody } : {}),
       ...(observation.rawMeta ? { rawMeta: observation.rawMeta } : {}),
       sourceOffset: index,
-    };
+    }];
+    // The tool timeline normally rides the response observation; it lands here only when
+    // the response was never captured, so render it right after the instruction bubble.
+    let order = 0;
+    for (const tool of observation.toolEvents ?? []) {
+      events.push(toToolTimelineEvent(tool, observation, index, order));
+      order += 1;
+    }
+    return events;
   }
   if (observation.eventType === "AgentOutputObserved") {
     const output = observation.output;
     const model = output.protocol !== "native_stdio" && output.protocol !== "codex_app_server"
       ? output.model
       : undefined;
-    return {
+    const tools = observation.toolEvents ?? [];
+    const events: LocalRecordTimelineEvent[] = [];
+    // The in-progress chain recovered from the request context precedes the reply bubble;
+    // the calls this response itself made follow it.
+    let order = 0;
+    for (const tool of tools) {
+      if (tool.source !== "request_context") continue;
+      events.push(toToolTimelineEvent(tool, observation, index, order));
+      order += 1;
+    }
+    events.push({
       eventId: observation.interactionId,
       kind: "assistant_message",
       timestamp: observation.observedAt,
@@ -140,9 +181,28 @@ function toTimelineEvent(observation: InteractionObservation, index: number): Lo
       ...(observation.rawBody ? { rawBody: observation.rawBody } : {}),
       ...(observation.rawMeta ? { rawMeta: observation.rawMeta } : {}),
       sourceOffset: index,
-    };
+    });
+    for (const tool of tools) {
+      if (tool.source !== "response") continue;
+      events.push(toToolTimelineEvent(tool, observation, index, order));
+      order += 1;
+    }
+    return events;
   }
-  return null;
+  return [];
+}
+
+/** A tool call reappears in the next request's message history; keep the first sighting
+ *  (by call id when present) so multi-turn chains render each call exactly once. */
+function dedupeToolEvents(events: LocalRecordTimelineEvent[]): LocalRecordTimelineEvent[] {
+  const seen = new Set<string>();
+  return events.filter((event) => {
+    if (event.kind !== "tool_call" && event.kind !== "tool_result") return true;
+    const key = `${event.kind}:${event.callId ?? `${event.toolName ?? ""}:${(event.content ?? "").slice(0, 64)}`}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function toObservedLlmRequest(observation: InteractionObservation): LocalObservedLlmRequest | null {
@@ -183,9 +243,8 @@ export async function conversationRecordDetail(
     .catch(() => null);
   if (!detail) return null;
   const record = toRecordSummary(detail.conversation);
-  const events = detail.observations
-    .map((observation, index) => toTimelineEvent(observation, index))
-    .filter((event): event is LocalRecordTimelineEvent => Boolean(event));
+  const events = dedupeToolEvents(detail.observations
+    .flatMap((observation, index) => toTimelineEvents(observation, index)));
   const observedLlmRequests = detail.observations
     .map(toObservedLlmRequest)
     .filter((request): request is LocalObservedLlmRequest => Boolean(request));
@@ -198,8 +257,8 @@ export async function conversationRecordDetail(
     assistantMessageCount: record.assistantMessageCount,
     turnCount: record.completeTurnCount,
     completeTurnCount: record.completeTurnCount,
-    toolCallCount: 0,
-    toolResultCount: 0,
+    toolCallCount: events.filter((event) => event.kind === "tool_call").length,
+    toolResultCount: events.filter((event) => event.kind === "tool_result").length,
     toolFailureCount: 0,
     completedDurationMs: Math.max(0, detail.conversation.lastObservedAt - detail.conversation.firstObservedAt),
     tokenUsage: record.tokenUsage,

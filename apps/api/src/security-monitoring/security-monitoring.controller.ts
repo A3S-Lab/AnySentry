@@ -14299,6 +14299,92 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return this.platformMetrics.prometheusText();
   }
 
+  /** Pipeline stage funnel + backlog gauges from the newest heartbeat per collector.
+   *  Stage counts are forwarder delta counters for the heartbeat window (30s); backlog and
+   *  spool values are point-in-time gauges and must never be summed across heartbeats. */
+  @Get('platform/pipeline')
+  async platformPipeline(): Promise<T.PlatformPipelineOverview> {
+    const now = Date.now();
+    const heartbeats = this.judge.latestCollectorHeartbeats(now);
+    const collectors: T.PlatformPipelineCollectorView[] = heartbeats.map((hb) => {
+      const accounting = hb.pipelineAccounting;
+      const fm = hb.filterMetrics;
+      const windowSeconds = accounting?.window
+        ? Math.max(1, Math.round((accounting.window.endedAtUnixMs - accounting.window.startedAtUnixMs) / 1000))
+        : undefined;
+      const stages = (accounting?.stages ?? [])
+        .filter((stage) => stage.count > 0)
+        .map((stage) => ({
+          stage: stage.stage,
+          count: stage.count,
+          reasons: Object.fromEntries(
+            (stage.reasons ?? [])
+              .filter((reason) => reason.count > 0)
+              .map((reason) => [reason.reason, reason.count]),
+          ),
+        }));
+      return {
+        collectorId: hb.collectorId,
+        status: hb.status,
+        lastHeartbeatAt: hb.at,
+        ageMs: Math.max(0, now - hb.at),
+        ...(windowSeconds !== undefined ? { windowSeconds } : {}),
+        stages,
+        ...(accounting?.backlog ? { backlog: accounting.backlog } : {}),
+        retry: {
+          queued: fm?.retryQueued ?? 0,
+          attempts: fm?.retryAttempts ?? 0,
+          recovered: fm?.retryRecovered ?? 0,
+          exhausted: fm?.retryExhausted ?? 0,
+          parked: fm?.retryParked ?? 0,
+        },
+        spool: {
+          records: fm?.spoolRecords ?? 0,
+          activeRecords: fm?.spoolActiveRecords ?? 0,
+          parkedRecords: fm?.spoolParkedRecords ?? 0,
+          walBytes: fm?.spoolWalBytes ?? 0,
+          oldestAgeMs: fm?.spoolOldestAgeMs ?? 0,
+          atCapacity: fm?.spoolAtCapacity === true,
+          walPutAtCapacity: fm?.spoolWalPutAtCapacity === true,
+          capacityRejects: fm?.spoolWalCapacityRejects ?? 0,
+        },
+        outstandingEvents: fm?.outstandingEvents ?? 0,
+        outstandingBytes: fm?.outstandingBytes ?? 0,
+        queueDepth: hb.queueDepth ?? 0,
+      };
+    });
+    // 30-minute per-heartbeat history for the trend charts. Stage counts are per-window deltas;
+    // backlog gauges are point-in-time readings at each heartbeat.
+    const historyRows = (await this.judge.storedCollectorHeartbeats(now - 30 * 60_000, now)) ?? [];
+    const stageCountOf = (hb: T.CollectorHeartbeatRecord, stage: string): number =>
+      hb.pipelineAccounting?.stages?.find((entry) => entry.stage === stage)?.count ?? 0;
+    const history: T.PlatformPipelineHistoryPoint[] = historyRows
+      .filter((hb) => hb.pipelineAccounting)
+      .map((hb) => ({
+        at: hb.at,
+        collectorId: hb.collectorId,
+        received: stageCountOf(hb, 'received'),
+        filtered: stageCountOf(hb, 'filtered'),
+        queueAdmitted: stageCountOf(hb, 'queue_admitted'),
+        queueDropped: stageCountOf(hb, 'queue_dropped'),
+        apiRetained: stageCountOf(hb, 'api_retained'),
+        apiDiscarded: stageCountOf(hb, 'api_discarded'),
+        apiRetryable: stageCountOf(hb, 'api_retryable'),
+        outstandingEvents: hb.pipelineAccounting?.backlog?.outstandingEvents ?? hb.filterMetrics?.outstandingEvents ?? 0,
+        retryEvents: hb.pipelineAccounting?.backlog?.retryEvents ?? 0,
+        spoolRecords: hb.filterMetrics?.spoolRecords ?? 0,
+        spoolWalBytes: hb.filterMetrics?.spoolWalBytes ?? 0,
+      }));
+    return {
+      schemaVersion: 'anysentry.platform_pipeline.v1',
+      status: collectors.length > 0 ? 'ready' : 'partial',
+      collectors,
+      history,
+      apiFloodDroppedTotal: ingestFloodState.droppedTotal,
+      updateTime: new Date().toISOString(),
+    };
+  }
+
   /** Versioned, node-filtered workload identity data for observation-only forwarders. */
   @Get('identity/snapshot')
   @SkipWrap()
