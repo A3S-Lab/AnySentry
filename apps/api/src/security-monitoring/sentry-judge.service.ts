@@ -3029,6 +3029,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
         }
       : undefined;
     const pipelineAccounting = normalizePipelineAccounting(input.pipelineAccounting);
+    const perfLostByMap = input.perfLostByMap && typeof input.perfLostByMap === 'object'
+      ? Object.fromEntries(Object.entries(input.perfLostByMap)
+          .slice(0, 16)
+          .map(([key, value]) => [key.slice(0, 64), clamp(value)]))
+      : undefined;
     const legacyCounterTemporality = input.legacyCounterTemporality === 'delta' || input.legacyCounterTemporality === 'cumulative'
       ? input.legacyCounterTemporality
       : undefined;
@@ -3061,6 +3066,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       ...(legacyCounterTemporality ? { legacyCounterTemporality } : {}),
       observedAgents: clamp(input.observedAgents),
       ...(pipelineAccounting ? { pipelineAccounting } : {}),
+      ...(perfLostByMap ? { perfLostByMap } : {}),
       execEvidence,
       filterMetrics,
       fileFilterMetrics,

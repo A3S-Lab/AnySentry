@@ -3417,6 +3417,14 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
     const interactionReassembly = parseCollectorInteractionReassembly(
       hb.interactionReassembly ?? hb.interaction_reassembly,
     );
+    const perfLostRaw = obj(hb.perfLostByMap) ?? obj(hb.perf_lost_by_map);
+    const perfLostByMap: Record<string, number> = {};
+    if (perfLostRaw) {
+      for (const [key, value] of Object.entries(perfLostRaw)) {
+        const count = Number(value);
+        if (Number.isFinite(count) && count >= 0) perfLostByMap[key.slice(0, 64)] = Math.round(count);
+      }
+    }
     return {
       collectorId: canonicalCollectorId(strField(hb, 'collectorId', 'collector_id')),
       nodeName: strField(hb, 'nodeName', 'node_name'),
@@ -3437,6 +3445,7 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
         ? legacyCounterTemporality
         : undefined,
       pipelineAccounting: normalizePipelineAccounting(hb.pipelineAccounting ?? hb.pipeline_accounting),
+      ...(Object.keys(perfLostByMap).length > 0 ? { perfLostByMap } : {}),
       captureProfileMetrics,
       interactionReassembly,
       execEvidence: reportsExecEvidence ? {

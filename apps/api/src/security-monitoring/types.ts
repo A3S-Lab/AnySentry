@@ -3674,6 +3674,8 @@ export interface CollectorHeartbeatRequest {
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents?: number;
   pipelineAccounting?: CollectorPipelineAccounting;
+  /** Raw collector perf-buffer losses split by map (additive; absent on older collectors). */
+  perfLostByMap?: Record<string, number>;
   filterMetrics?: CollectorFilterMetrics;
   fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
@@ -4180,6 +4182,8 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHear
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents: number;
   pipelineAccounting?: CollectorPipelineAccounting;
+  /** Raw collector perf-buffer losses split by map (additive; absent on older collectors). */
+  perfLostByMap?: Record<string, number>;
   /** Present only when this record originated from a raw CollectorHeartbeat with quality fields. */
   execEvidence?: CollectorExecEvidenceReport;
   filterMetrics: CollectorFilterMetrics;
