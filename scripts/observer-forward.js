@@ -1896,9 +1896,23 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
 }
 
 let identitySnapshotRefreshInFlight = false;
+// Same stuck-flag protection as the infrastructure-policy lane; the identity snapshot feeds
+// workload attribution, so a frozen refresh silently degrades identity quality too.
+let identitySnapshotRefreshStartedAt = 0;
 function refreshIdentitySnapshot() {
-  if (identitySnapshotRefreshInFlight) return;
+  if (identitySnapshotRefreshInFlight) {
+    if (
+      identitySnapshotRefreshStartedAt > 0
+      && Date.now() - identitySnapshotRefreshStartedAt > IDENTITY_SNAPSHOT_SECS * 3000
+    ) {
+      console.error('[observer-forward] identity snapshot refresh watchdog reset a stuck in-flight request');
+      identitySnapshotRefreshInFlight = false;
+    } else {
+      return;
+    }
+  }
   identitySnapshotRefreshInFlight = true;
+  identitySnapshotRefreshStartedAt = Date.now();
   getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
     identitySnapshotRefreshInFlight = false;
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
@@ -1946,10 +1960,26 @@ function synchronizeInfrastructurePolicyRules() {
 let lastInfrastructurePolicyError = '';
 let lastLoggedInfrastructurePolicyVersion = -1;
 let infrastructurePolicyRefreshInFlight = false;
+// Absolute deadline of the in-flight infrastructure-policy request. The HTTP call has its
+// own timeout, but any callback-loss path (socket-level hang, agent edge case) would leave
+// the in-flight flag set forever and freeze rule refresh in lkg_degraded until a restart
+// (observed in the field). The watchdog below resets it after 3x the refresh period.
+let infrastructurePolicyRefreshStartedAt = 0;
 function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
-  if (infrastructurePolicyRefreshInFlight) return;
+  if (infrastructurePolicyRefreshInFlight) {
+    if (
+      infrastructurePolicyRefreshStartedAt > 0
+      && Date.now() - infrastructurePolicyRefreshStartedAt > INFRASTRUCTURE_POLICY_SECS * 3000
+    ) {
+      console.error('[observer-forward] infrastructure policy refresh watchdog reset a stuck in-flight request');
+      infrastructurePolicyRefreshInFlight = false;
+    } else {
+      return;
+    }
+  }
   infrastructurePolicyRefreshInFlight = true;
+  infrastructurePolicyRefreshStartedAt = Date.now();
   getJson(
     infrastructurePolicyTarget,
     CONTROL_HTTP_TIMEOUT_MS,
