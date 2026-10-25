@@ -589,9 +589,11 @@ class WorkloadIdentityCache {
     for (const entry of confirmed) {
       const physicalWorkloadId = text(entry.physicalWorkloadId);
       if (physicalWorkloadId) ids.add(physicalWorkloadId);
-      if (entry?.attributionSource === 'manual_review') {
-        for (const pwid of lookupLive(entry)) ids.add(pwid);
-      }
+      // Any confirmed entry may carry a review-time key shape (docker:<container-id>)
+      // that differs from the live discovery shape (docker:<hostId>:<container-id>).
+      // Resolve through the live index so downstream joins (plaintext whitelist) see
+      // the same keys the Docker inventory produces.
+      for (const pwid of lookupLive(entry)) ids.add(pwid);
     }
     for (const pwid of rejectedPwids) ids.delete(pwid);
     return ids;
