@@ -788,6 +788,8 @@ export interface JudgedEvent {
   attributes: Record<string, EventAttributeValue>;
   /** Additive S3 identity/role/capture view. It is never a filtering authority. */
   classificationSemantics?: ClassificationSemanticsV1;
+  /** Original durable events-table key; never recomputed for UOS evidence display. */
+  processInstanceKey?: string;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;
@@ -1338,6 +1340,70 @@ export interface PlatformComponentMetric {
   message?: string;
 }
 
+/** Platform pipeline funnel + backlog view, derived from the newest collector heartbeat. */
+export interface PlatformPipelineStageView {
+  stage: string;
+  count: number;
+  reasons: Record<string, number>;
+}
+
+export interface PlatformPipelineCollectorView {
+  collectorId: string;
+  status: string;
+  lastHeartbeatAt: number;
+  ageMs: number;
+  windowSeconds?: number;
+  stages: PlatformPipelineStageView[];
+  backlog?: CollectorPipelineBacklog;
+  retry: {
+    queued: number;
+    attempts: number;
+    recovered: number;
+    exhausted: number;
+    parked: number;
+  };
+  spool: {
+    records: number;
+    activeRecords: number;
+    parkedRecords: number;
+    walBytes: number;
+    oldestAgeMs: number;
+    atCapacity: boolean;
+    walPutAtCapacity: boolean;
+    capacityRejects: number;
+  };
+  outstandingEvents: number;
+  outstandingBytes: number;
+  queueDepth: number;
+}
+
+export interface PlatformPipelineHistoryPoint {
+  at: number;
+  collectorId: string;
+  received: number;
+  filtered: number;
+  queueAdmitted: number;
+  queueDropped: number;
+  apiRetained: number;
+  apiDiscarded: number;
+  apiRetryable: number;
+  outstandingEvents: number;
+  retryEvents: number;
+  spoolRecords: number;
+  spoolWalBytes: number;
+}
+
+export interface PlatformPipelineOverview {
+  schemaVersion: 'anysentry.platform_pipeline.v1';
+  status: 'ready' | 'partial';
+  collectors: PlatformPipelineCollectorView[];
+  /** 30-minute per-heartbeat history for trend charts; gauges are point-in-time values. */
+  history: PlatformPipelineHistoryPoint[];
+  /** API-side flood-fuse discard counter (洪峰熔断), process lifetime. */
+  apiFloodDroppedTotal: number;
+  updateTime: string;
+}
+
 export interface PlatformMetricAnomaly {
   id: string;
   severity: 'warning' | 'critical';
@@ -1374,6 +1440,15 @@ export interface PlatformMetricsOverview {
   components: PlatformComponentMetric[];
   anomalies: PlatformMetricAnomaly[];
   message?: string;
+  middleware?: {
+    components: Array<Pick<PlatformComponentMetric, 'id' | 'name' | 'status'> & { message: string }>;
+    series: Array<{
+      key: string;
+      label: string;
+      unit: string;
+      points: PlatformMetricPoint[];
+    }>;
+  };
 }
 
 export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
@@ -3601,6 +3676,8 @@ export interface CollectorHeartbeatRequest {
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents?: number;
   pipelineAccounting?: CollectorPipelineAccounting;
+  /** Raw collector perf-buffer losses split by map (additive; absent on older collectors). */
+  perfLostByMap?: Record<string, number>;
   filterMetrics?: CollectorFilterMetrics;
   fileFilterMetrics?: CollectorFileFilterMetrics;
   message?: string;
@@ -4107,6 +4184,8 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHear
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents: number;
   pipelineAccounting?: CollectorPipelineAccounting;
+  /** Raw collector perf-buffer losses split by map (additive; absent on older collectors). */
+  perfLostByMap?: Record<string, number>;
   /** Present only when this record originated from a raw CollectorHeartbeat with quality fields. */
   execEvidence?: CollectorExecEvidenceReport;
   filterMetrics: CollectorFilterMetrics;
@@ -5087,8 +5166,10 @@ export type AuditAction =
   | 'unknown_learning.infrastructure_draft_created'
   | 'unknown_learning.infrastructure_draft_reused'
   | 'unknown_learning.infrastructure_draft_rejected'
-  | 'unknown_learning.config_updated';
-export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user';
+  | 'unknown_learning.config_updated'
+  | 'interaction.content.viewed'
+  | 'interaction.content.deleted';
+export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user' | 'interaction';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;

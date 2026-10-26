@@ -65,3 +65,23 @@
 当前已定位的产品缺口：采集侧已产出大量分块散落明文，缺“按内容/模板拼装成
 前端可展示的结构化对话”这一层。该层开发以开发机真实样本为设计输入，
 成熟后回仿真环境调试适配。
+
+## UOS 明文会话系统证据归属维护说明
+
+- 只读端点为 `GET security-center/conversations/:id/system-evidence`，独立于 CLI
+  Session 文件绑定链。绑定锚点只取明文 interaction 同时观测到的 `/proc` 进程代际：
+  `pid + startTimeTicks`，并在字段存在时同时核对 host、boot、PID namespace 与
+  `processGenerationKey`。`comm/exe`、Workspace 和时间接近都不是归属依据；会话时间窗
+  只用于展示裁剪与限制查询范围。
+- 事件来自既有 `anysentry.events` 的 exec/exit/connect（ToolExec/ProcessExit/Egress）
+  等 kprobe 事实，`processInstanceKey` 保留 events 原值。此功能不新增 BPF 程序、探针符号、
+  内核结构体偏移或内核版本判断，因此聚合层实现与 x86_64/ARM64 及内核版本无关。
+  hybrid cgroup 不影响归属：身份来自 `/proc` 代际，而不是 cgroup id。
+- 一个会话出现多个进程代际、关键代际字段缺失或事件查询不可用时必须 fail closed；
+  不得按最近、频次或名称选择一代。空会话和零事件返回完整 `unavailable` 证据结构。
+  父边只使用事件同时携带的 PPID 与可信 parent generation，不递归扩链，也不凭 PPID
+  单独猜父实例。
+- 维护时保持 interaction 按 session + 时间窗 + limit 读取；事件页和统计查询按精确
+  代际 + 时间窗 + limit 读取。空会话不得继续扫描 events。仿真侧只需核对两表代际字段一致、同代际事件可见、Egress
+  subject/command 保留目标地址、ProcessExit 能切换历史范围，并用错误 startTimeTicks
+  验证不会误归属；无需为此功能新增内核专项适配。

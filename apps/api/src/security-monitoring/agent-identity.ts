@@ -42,11 +42,18 @@ function basename(value?: string): string | undefined {
   return normalized ? path.posix.basename(normalized) : undefined;
 }
 
+function argvTokens(value: unknown): string[] {
+  return (Array.isArray(value) ? value.map(String) : String(value ?? '').split(/\s+/u))
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function canonicalAgentName(value?: string): string | undefined {
   const normalized = text(value)?.toLowerCase();
   if (!normalized) return undefined;
   if (normalized === 'a3s' || normalized === 'a3s-code' || normalized === 'a3s code') return 'a3s code';
   if (normalized === 'claude' || normalized === 'claude-code' || normalized === 'claude code') return 'claude code';
+  if (normalized === 'gemini' || normalized === 'gemini-cli' || normalized === 'gemini cli') return 'gemini cli';
   return normalized;
 }
 
@@ -88,7 +95,12 @@ export function hasDirectAgentRootEvidence(
     canonicalAgentName(basename(event.process?.comm)),
     canonicalAgentName(basename(event.process?.exe)),
   ].filter((value): value is string => Boolean(value)));
-  return executableNames.has(scope);
+  if (executableNames.has(scope)) return true;
+  const argv = argvTokens(event.attributes?.argv)
+    .map((token) => token.toLowerCase().replaceAll('\\', '/'));
+  return scope === 'gemini cli'
+    && (executableNames.has('node') || executableNames.has('nodejs'))
+    && argv.slice(1, 2).some((token) => token.includes('/@google/gemini-cli/'));
 }
 
 export function hasAgentRuntimeLineageEvidence(

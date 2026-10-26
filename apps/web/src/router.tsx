@@ -44,6 +44,7 @@ export const router = createBrowserRouter(
       { path: "/capabilities", lazy: lazyRoute("/capabilities") },
       { path: "/collectors", lazy: lazyRoute("/collectors") },
       { path: "/conversations", lazy: lazyRoute("/conversations") },
+      { path: "/record-tracking", lazy: lazyRoute("/record-tracking") },
       { path: "/coverage", lazy: lazyRoute("/coverage") },
       { path: "/evidence", lazy: lazyRoute("/evidence") },
       { path: "/events", lazy: lazyRoute("/events") },

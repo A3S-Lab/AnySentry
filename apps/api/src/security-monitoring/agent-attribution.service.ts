@@ -22,7 +22,7 @@ const BUILTIN_AGENT_HINTS_ENABLED = !['0', 'false', 'off', 'no', 'disabled'].inc
 );
 const ROOT_NAMES = (
   process.env.ANYSENTRY_AGENT_ROOT_NAMES ??
-  (BUILTIN_AGENT_HINTS_ENABLED ? 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code' : '')
+  (BUILTIN_AGENT_HINTS_ENABLED ? 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code,gemini,gemini-cli,gemini cli' : '')
 )
   .split(',')
   .map((s) => s.trim().toLowerCase())
@@ -56,6 +56,7 @@ function canonicalAgentName(value?: string): string | undefined {
   if (!text) return undefined;
   if (text === 'a3s' || text === 'a3s-code' || text === 'a3s code') return 'a3s code';
   if (text === 'claude' || text === 'claude-code' || text === 'claude code') return 'Claude Code';
+  if (text === 'gemini' || text === 'gemini-cli' || text === 'gemini cli') return 'Gemini CLI';
   return text;
 }
 
@@ -71,7 +72,14 @@ function isInternalAgentHelper(argv?: string): boolean {
 function directRootMatch(comm?: string, exe?: string, argv?: string): string | undefined {
   if (isInternalAgentHelper(argv)) return undefined;
   const names = [basename(comm), basename(exe)].filter(Boolean);
-  return ROOT_NAMES.find((root) => names.some((name) => name === root));
+  return ROOT_NAMES.find((root) => names.some((name) => {
+    if (name !== root) return false;
+    // `a3s` is also the administrative CLI (`a3s info`, `a3s update`, ...). Only its
+    // interactive `code` subcommand is an Agent runtime. A dedicated a3s-code executable
+    // remains an exact root match.
+    if (root === 'a3s') return argvRootMatch(argv) === 'a3s code';
+    return true;
+  }));
 }
 
 function argvRootMatch(argv?: string): string | undefined {
@@ -84,6 +92,11 @@ function argvRootMatch(argv?: string): string | undefined {
   if (command === 'codex') return 'codex';
   if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
   if (command === 'claude' || command === 'claude-code') return 'Claude Code';
+  if (command === 'gemini' || command === 'gemini-cli') return 'Gemini CLI';
+  if (
+    (command === 'node' || command.startsWith('node-'))
+    && (tokens[1] ?? '').replaceAll('\\', '/').includes('/@google/gemini-cli/')
+  ) return 'Gemini CLI';
   return undefined;
 }
 

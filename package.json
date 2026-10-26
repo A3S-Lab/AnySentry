@@ -133,6 +133,7 @@
     "verify:agent-semantic-identity": "pnpm build:api && node scripts/verify-agent-semantic-identity.mjs",
     "verify:agent-actions": "pnpm build:api && node scripts/verify-agent-actions.mjs",
     "verify:agent-interactions": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-agent-interactions.mjs",
+    "verify:uos-system-evidence": "pnpm build:api && node scripts/verify-uos-system-evidence.mjs",
     "verify:agent-interactions:real-forwarder": "pnpm build:api && node scripts/verify-deep-links-local.mjs scripts/verify-real-agent-interaction-forwarder.mjs",
     "verify:agent-interactions:browser": "pnpm build && node scripts/verify-agent-interaction-browser.mjs",
     "verify:conversation-tracking:browser": "pnpm build && node scripts/verify-conversation-tracking-browser.mjs",

@@ -20,9 +20,9 @@ import {
   Severity,
 } from './types';
 import { cleanText } from './redaction';
+import { securityTimeSpanMs } from './time-window';
 
 const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const RETAIN_LIMIT = 2_000;
 // Pending relational writes are coalesced by task ID and kept within the compatibility snapshot
@@ -33,6 +33,14 @@ const OVERDUE_SCAN_BUFFER_MS = 250;
 const RELATIONAL_REFRESH_MS = 15_000;
 const PERSIST_RETRY_INITIAL_MS = 5_000;
 const PERSIST_RETRY_MAX_MS = 60_000;
+// Refresh-driven regeneration shares the same full-window cost as the scheduled scan; collapsing
+// bursts of UI polls keeps the API responsive while still feeling fresh to an operator.
+const REMEDIATION_REFRESH_MIN_INTERVAL_MS = 10_000;
+// A scheduled scan that itself takes seconds must not re-arm on the nominal interval, otherwise
+// dense hosts run the regeneration back-to-back and starve every other request. Space the next
+// scan proportionally to the observed duration.
+const OVERDUE_SCAN_DURATION_BACKOFF_FACTOR = 4;
+const OVERDUE_SCAN_MAX_DELAY_MS = 15 * 60_000;
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const n = Number(process.env[name]);
@@ -173,6 +181,8 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
   private initialized = false;
+  private lastRefreshSyncAt = 0;
+  private lastOverdueScanDurationMs = 0;
 
   constructor(
     private readonly ch: ClickHouseStore,
@@ -263,6 +273,11 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     await this.persist(true);
   }
 
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    await this.persist();
+  }
+
   stateStatus(): {
     recordCount: number;
     postgresqlBacked: boolean;
@@ -277,8 +292,15 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
 
   list(query: RemediationQuery, options: { refresh?: boolean } = {}): RemediationList {
     if (options.refresh !== false) {
-      this.syncGenerated(query);
-      this.syncOverdueAlerts();
+      // A refresh-triggered regeneration walks the full event window; on dense hosts this is
+      // expensive enough to starve the event loop when the UI polls. Reuse the most recent
+      // result for a short grace period instead of recomputing on every request.
+      const nowMs = Date.now();
+      if (nowMs - this.lastRefreshSyncAt >= REMEDIATION_REFRESH_MIN_INTERVAL_MS) {
+        this.lastRefreshSyncAt = nowMs;
+        this.syncGenerated(query);
+        this.syncOverdueAlerts();
+      }
       this.scheduleOverdueScan();
     }
 
@@ -677,8 +699,10 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   }
 
   private runScheduledOverdueScan(): void {
+    const startedAt = Date.now();
     this.syncGenerated({ timeType: 'last_30d', status: 'all', limit: 500 });
     this.syncOverdueAlerts();
+    this.lastOverdueScanDurationMs = Date.now() - startedAt;
     this.scheduleOverdueScan();
   }
 
@@ -689,8 +713,14 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       if (task.dueAt <= at) continue;
       nextDueAt = nextDueAt === undefined ? task.dueAt : Math.min(nextDueAt, task.dueAt);
     }
-    if (nextDueAt !== undefined) return Math.max(OVERDUE_SCAN_BUFFER_MS, Math.min(this.overdueScanIntervalMs, nextDueAt - at + OVERDUE_SCAN_BUFFER_MS));
-    return this.overdueScanIntervalMs;
+    const nominal = nextDueAt !== undefined
+      ? Math.max(OVERDUE_SCAN_BUFFER_MS, Math.min(this.overdueScanIntervalMs, nextDueAt - at + OVERDUE_SCAN_BUFFER_MS))
+      : this.overdueScanIntervalMs;
+    const costFloor = Math.min(
+      this.lastOverdueScanDurationMs * OVERDUE_SCAN_DURATION_BACKOFF_FACTOR,
+      OVERDUE_SCAN_MAX_DELAY_MS,
+    );
+    return Math.max(nominal, costFloor);
   }
 
   private scheduleOverdueScan(delayMs?: number): void {
@@ -728,8 +758,8 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
 
   private since(query: RemediationQuery): number {
     const end = Date.now();
-    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - 3 * HOUR;
-    return end - (WINDOW[query.timeType ?? 'last_3h'] ?? 3 * HOUR);
+    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - securityTimeSpanMs();
+    return end - securityTimeSpanMs(query.timeType);
   }
 
   private persistSoon(): void {

@@ -133,3 +133,12 @@ bash uos20-arm64/build.sh --version 0.4.0-compat34 --component assemble
 
 现场已经遇到的打包和部署要点写在仓库根目录 [UOS20_ARM64_DEPLOYMENT_REVIEW.md](../UOS20_ARM64_DEPLOYMENT_REVIEW.md)。双环境调试铁律（开发机 x86_64 调试场 / 本通道交付基准的边界）见
 [UOS_DUAL_ENV_DEBUGGING.md](../UOS_DUAL_ENV_DEBUGGING.md)。其中包括服务进程不能写 `/opt`、compat 版本与 glibc、ClickHouse 旧表补列、端口占用，以及 Docker 镜像通配模板。
+
+## 新增功能的环境适配边界（2026-10-23）
+
+- R1（ring 容量字节目标自适应）与 R2（per-map 丢失计数 perfLostByMap）为纯 Rust/API 改动，
+  本通道直接生效；64K 页下 ring 默认仍为 8 页/CPU/map，无需改打包参数。
+- R3（截断补读 cursor reread）**当前仅 x86 生效**：BPF 游标代码全部 x86 门控，arm64 对象与
+  冻结基线字节一致。仿真侧启用需先解除门控并通过 4.19 验证器实机加载验证（128K 指令预算），
+  适配步骤与回退标准见《UOS_仿真环境验证清单》第六节。未经验证不得把 x86 构建参数
+  （DST_NARROW/DIAG/显式页数）带入本通道。

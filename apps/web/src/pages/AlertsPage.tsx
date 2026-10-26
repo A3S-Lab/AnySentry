@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   Activity,
   ArrowLeft,
@@ -601,7 +602,7 @@ function AlertDetail({
 export default function AlertsPage() {
   const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [scope, setScope] = useState<AlertScope>(searchParams.get("scope") === "raw" ? "raw" : "agent");
   const [timeMode, setTimeMode] = useState<AlertTimeMode>(searchParams.get("timeMode") === "backlog" ? "backlog" : "window");
   const [status, setStatus] = useState<AlertStatusFilter>(

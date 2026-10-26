@@ -398,6 +398,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
   private closing = false;
   private persistTimer?: NodeJS.Timeout;
   private currentStateTimer?: NodeJS.Timeout;
+  private activityFlushTimer?: NodeJS.Timeout;
+  private readonly pendingSourceActivity = new Map<string, IngestionSourceCurrentActivity>();
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
   private initialized = false;
@@ -493,6 +495,8 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
     if (this.currentStateTimer) clearInterval(this.currentStateTimer);
     if (this.persistenceRetryTimer) clearTimeout(this.persistenceRetryTimer);
     this.persistenceRetryTimer = undefined;
+    if (this.activityFlushTimer) clearTimeout(this.activityFlushTimer);
+    await this.flushSourceActivity();
     await this.persist(true);
   }
 
@@ -721,7 +725,7 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       record.acceptedEvents += 1;
     }
     this.markSourceDirty(record.sourceId);
-    void this.currentState.recordSourceActivity({
+    this.queueSourceActivityFlush({
       sourceId: record.sourceId,
       lastSeenAt: at,
       lastEventAt: kind === 'event' ? at : undefined,
@@ -990,6 +994,31 @@ export class IngestionSourceService implements OnModuleInit, OnModuleDestroy {
       this.persistTimer = undefined;
       void this.persist();
     }, 500);
+  }
+
+  private queueSourceActivityFlush(activity: IngestionSourceCurrentActivity): void {
+    const prior = this.pendingSourceActivity.get(activity.sourceId);
+    this.pendingSourceActivity.set(activity.sourceId, {
+      sourceId: activity.sourceId,
+      lastSeenAt: Math.max(prior?.lastSeenAt ?? 0, activity.lastSeenAt),
+      lastEventAt: activity.lastEventAt ?? prior?.lastEventAt,
+      lastHeartbeatAt: activity.lastHeartbeatAt ?? prior?.lastHeartbeatAt,
+      collectorId: activity.collectorId ?? prior?.collectorId,
+      workspacePath: activity.workspacePath ?? prior?.workspacePath,
+    });
+    if (this.activityFlushTimer) return;
+    this.activityFlushTimer = setTimeout(() => {
+      this.activityFlushTimer = undefined;
+      void this.flushSourceActivity();
+    }, 250);
+    this.activityFlushTimer.unref();
+  }
+
+  private async flushSourceActivity(): Promise<void> {
+    if (this.pendingSourceActivity.size === 0) return;
+    const batch = [...this.pendingSourceActivity.values()];
+    this.pendingSourceActivity.clear();
+    await Promise.all(batch.map((activity) => this.currentState.recordSourceActivity(activity)));
   }
 
   private persist(forceSnapshot = false): Promise<void> {

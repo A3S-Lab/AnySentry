@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   CheckCircle2,
   Clock3,
@@ -296,7 +297,7 @@ function IncidentDetail({
 export default function IncidentsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [scope, setScope] = useState<"agent" | "raw">(searchParams.get("scope") === "raw" ? "raw" : "agent");
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [status, setStatus] = useState<IncidentStatus | "all">((searchParams.get("status") as IncidentStatus) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");
   const [workspacePath, setWorkspacePath] = useState(searchParams.get("workspacePath") ?? "");

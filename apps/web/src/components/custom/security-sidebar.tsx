@@ -3,9 +3,11 @@ import {
   BellRing,
   Bot,
   CalendarClock,
+  ChevronDown,
   EyeOff,
   FileCheck2,
   GitBranch,
+  History,
   KeyRound,
   Layers3,
   LayoutDashboard,
@@ -26,6 +28,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   COLLAPSED_SECURITY_SIDEBAR_WIDTH,
@@ -83,6 +86,7 @@ export const SECURITY_NAVIGATION_GROUPS: Array<{ label: string; icon: LucideIcon
       { label: "Agent 态势", description: "实例活动与研判健康", href: "/?view=agentInstances", icon: Activity, dashboardView: "agentInstances" },
       { label: "Agent 拓扑", description: "Agent 运行时安全关系", href: "/topology", icon: Network },
       { label: "对话追踪", description: "Agent 对话与上下文追踪", href: "/conversations", icon: MessageSquareText },
+      { label: "记录追踪", description: "本地 Agent 会话与工具记录", href: "/record-tracking", icon: History },
       { label: "运行链路", description: "无侵入事件时间线", href: "/?view=events", icon: GitBranch, dashboardView: "events" },
       { label: "复合研判", description: "Flink 连续行为关联", href: "/?view=stream", icon: Sparkles, dashboardView: "stream" },
       { label: "供应链漏洞", description: "OSV 依赖漏洞资产", href: "/?view=supplyChain", icon: ShieldAlert, dashboardView: "supplyChain" },
@@ -97,7 +101,6 @@ export const SECURITY_NAVIGATION_GROUPS: Array<{ label: string; icon: LucideIcon
       { label: "维护窗口", description: "维护窗口与告警抑制", href: "/maintenance", icon: CalendarClock },
       { label: "覆盖盲区", description: "采集与监控盲区", href: "/coverage", icon: EyeOff },
       { label: "监控目标", description: "持续监控目标", href: "/objectives", icon: Target },
-      { label: "过滤规则", description: "F0/F1/F2/F3 统一规则治理", href: "/filter-rules", icon: ListFilter },
       { label: "审计日志", description: "管理操作审计记录", href: "/audit", icon: KeyRound },
     ],
   },
@@ -106,6 +109,7 @@ export const SECURITY_NAVIGATION_GROUPS: Array<{ label: string; icon: LucideIcon
     icon: SlidersHorizontal,
     items: [
       { label: "策略配置", description: "L1 / L2 / L3 研判策略", href: "/admin/policy", icon: SlidersHorizontal },
+      { label: "过滤规则", description: "F0/F1/F2/F3 统一规则治理", href: "/filter-rules", icon: ListFilter },
     ],
   },
 ];
@@ -123,6 +127,26 @@ export function SecuritySidebar() {
   const { pathname, search } = useLocation();
   const { t } = useI18n();
   const { sidebarWidth, sidebarCollapsed } = useSecurityConsole();
+  const activeGroupLabel = SECURITY_NAVIGATION_GROUPS.find((group) =>
+    group.items.some((item) => isSecurityNavigationItemActive(pathname, search, item)),
+  )?.label;
+  const [expandedGroupLabels, setExpandedGroupLabels] = useState<Set<string>>(
+    () => new Set(activeGroupLabel
+      ? [activeGroupLabel]
+      : SECURITY_NAVIGATION_GROUPS[0]?.label
+        ? [SECURITY_NAVIGATION_GROUPS[0].label]
+        : []),
+  );
+
+  useEffect(() => {
+    if (!activeGroupLabel) return;
+    setExpandedGroupLabels((current) => {
+      if (current.has(activeGroupLabel)) return current;
+      const next = new Set(current);
+      next.add(activeGroupLabel);
+      return next;
+    });
+  }, [activeGroupLabel]);
 
   return (
     <aside
@@ -130,65 +154,76 @@ export function SecuritySidebar() {
       style={{ width: sidebarCollapsed ? COLLAPSED_SECURITY_SIDEBAR_WIDTH : sidebarWidth }}
     >
       <div className="flex h-full min-h-0 flex-col">
-        <div className="mr-1 min-h-0 flex-1 overflow-y-auto p-1.5">
-          <nav className="space-y-1" aria-label={t("安全监控模块")}>
+        <div className="mr-1 min-h-0 flex-1 overflow-y-auto px-2 py-2">
+          <nav aria-label={t("安全监控模块")}>
             {SECURITY_NAVIGATION_GROUPS.map((group, groupIndex) => {
               const GroupIcon = group.icon;
+              const expanded = expandedGroupLabels.has(group.label);
+              const panelId = `security-navigation-group-${groupIndex}`;
               return (
-                <div key={group.label}>
-                  <p
+                <div key={group.label} className={cn(groupIndex > 0 && "mt-2")}>
+                  <button
+                    type="button"
+                    aria-expanded={expanded}
+                    aria-controls={panelId}
+                    aria-label={sidebarCollapsed ? t(group.label) : undefined}
+                    onClick={() => setExpandedGroupLabels((current) => {
+                      const next = new Set(current);
+                      if (next.has(group.label)) next.delete(group.label);
+                      else next.add(group.label);
+                      return next;
+                    })}
                     className={cn(
-                      "flex items-center gap-2 px-3 pb-1 text-[10px] font-bold uppercase tracking-[0.1em] text-[#5b6373]",
-                      groupIndex === 0 ? "pt-3" : "mt-3 border-t border-[#232a37] pt-4",
-                      sidebarCollapsed && "justify-center px-0",
+                      "flex w-full items-center rounded-md text-left text-[#d7dee8] transition-colors hover:bg-[#151a23] hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-cyan-400/60",
+                      sidebarCollapsed
+                        ? "h-9 justify-center"
+                        : "h-9 gap-2 px-2 text-[16px] font-medium",
                     )}
                     title={sidebarCollapsed ? t(group.label) : undefined}
                   >
-                    <GroupIcon className="size-3.5" />
-                    {!sidebarCollapsed ? t(group.label) : null}
-                  </p>
-                  {group.items.map((item) => {
-                    const Icon = item.icon;
-                    const active = isSecurityNavigationItemActive(pathname, search, item);
-                    return (
-                      <Link
-                        key={item.href}
-                        to={item.href}
-                        title={sidebarCollapsed ? t(item.label) : undefined}
-                        aria-label={sidebarCollapsed ? t(item.label) : undefined}
-                        aria-current={active ? "page" : undefined}
-                        onMouseEnter={() => prefetchRoute(item.href)}
-                        onFocus={() => prefetchRoute(item.href)}
-                        className={cn(
-                          "flex w-full items-start gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-400/60",
-                          active
-                            ? "border-transparent bg-[radial-gradient(circle_at_100%_50%,rgba(37,99,235,0.72),transparent_24%),linear-gradient(90deg,rgba(6,28,54,0.96),rgba(15,43,98,0.92))] text-[#f4f8ff] shadow-[inset_2px_0_0_#22d3ee,inset_0_0_22px_rgba(37,99,235,0.18)]"
-                            : "border-transparent text-[#b6bdcc] hover:bg-[#151a23] hover:text-[#e8ecf3]",
-                          sidebarCollapsed && "justify-center px-0",
-                        )}
-                      >
-                        <span className={cn(
-                          "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center",
-                          active ? "text-[#22d3ee]" : "text-[#818a9c]",
-                        )}>
-                          <Icon className="size-3.5" />
-                        </span>
-                        {!sidebarCollapsed ? (
-                          <span className="min-w-0">
-                            <span className="block text-xs font-semibold leading-[1.45]">{t(item.label)}</span>
-                            {item.description ? (
-                              <span className={cn(
-                                "mt-0.5 block text-[10.5px] leading-4",
-                                active ? "text-[#9eb3d2]" : "text-[#5b6373]",
-                              )}>
-                                {t(item.description)}
-                              </span>
-                            ) : null}
-                          </span>
-                        ) : null}
-                      </Link>
-                    );
-                  })}
+                    <GroupIcon className="size-4 shrink-0 text-[#9aa3b5]" aria-hidden="true" />
+                    {!sidebarCollapsed ? (
+                      <>
+                        <span className="min-w-0 flex-1 truncate">{t(group.label)}</span>
+                        <ChevronDown
+                          className={cn("size-3.5 shrink-0 text-[#7d8698] transition-transform", expanded && "rotate-180")}
+                          aria-hidden="true"
+                        />
+                      </>
+                    ) : null}
+                  </button>
+                  {expanded ? (
+                    <div id={panelId} className="mt-0.5 space-y-0.5">
+                      {group.items.map((item) => {
+                        const Icon = item.icon;
+                        const active = isSecurityNavigationItemActive(pathname, search, item);
+                        return (
+                          <Link
+                            key={item.href}
+                            to={item.href}
+                            title={item.description ? `${t(item.label)} · ${t(item.description)}` : t(item.label)}
+                            aria-label={sidebarCollapsed ? t(item.label) : undefined}
+                            aria-current={active ? "page" : undefined}
+                            onMouseEnter={() => prefetchRoute(item.href)}
+                            onFocus={() => prefetchRoute(item.href)}
+                            className={cn(
+                              "flex h-9 w-full items-center rounded-md text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-400/60",
+                              sidebarCollapsed ? "justify-center px-0" : "pl-8 pr-2",
+                              active
+                                ? "bg-[radial-gradient(circle_at_100%_50%,rgba(37,99,235,0.72),transparent_24%),linear-gradient(90deg,rgba(6,28,54,0.96),rgba(15,43,98,0.92))] text-[#f4f8ff] shadow-[inset_2px_0_0_#22d3ee,inset_0_0_22px_rgba(37,99,235,0.18)]"
+                                : "text-[#c5ccd6] hover:bg-[#151a23] hover:text-white",
+                            )}
+                          >
+                            {sidebarCollapsed ? (
+                              <Icon className={cn("size-4 shrink-0", active ? "text-[#7dd3fc]" : "text-[#8b93a3]")} aria-hidden="true" />
+                            ) : (
+                              <span className="min-w-0 truncate text-[15px] font-medium leading-none">{t(item.label)}</span>
+                            )}
+                          </Link>
+                        );
+                      })}
+                    </div>
+                  ) : null}
                 </div>
               );
             })}

@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   AlertTriangle,
   BellRing,
@@ -243,7 +244,7 @@ function operatorRouteParams({
   endTime?: string;
 }) {
   const next = new URLSearchParams();
-  if (timeType !== "last_3h" || selectedActionId || snapshotAsOf) next.set("timeType", timeType);
+  if (timeType !== DEFAULT_SECURITY_TIME_TYPE || selectedActionId || snapshotAsOf) next.set("timeType", timeType);
   if (snapshotAsOf) next.set("snapshotAsOf", snapshotAsOf);
   if (timeType === "custom" && startTime && endTime) {
     next.set("startTime", startTime);
@@ -682,7 +683,7 @@ function ActionDetail({
 
 export default function OperatorPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [status, setStatus] = useState<RemediationStatus | "all">((searchParams.get("status") as RemediationStatus) || "all");
   const [sourceType, setSourceType] = useState<RemediationSourceType | "all">((searchParams.get("sourceType") as RemediationSourceType) || "all");
   const [severity, setSeverity] = useState<SecuritySeverity | "all">((searchParams.get("severity") as SecuritySeverity) || "all");

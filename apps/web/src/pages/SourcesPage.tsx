@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   BellRing,
   CalendarClock,
@@ -664,28 +665,28 @@ function buildOtelMixedSnippet(selected: IngestionSourceItem, draft: Draft, toke
 }
 
 function sourceEventsHref(source: IngestionSourceItem) {
-  const params = new URLSearchParams({ timeType: "last_3h", sourceId: source.sourceId });
+  const params = new URLSearchParams({ timeType: DEFAULT_SECURITY_TIME_TYPE, sourceId: source.sourceId });
   if (source.collectorId) params.set("collectorId", source.collectorId);
   if (source.workspacePath) params.set("workspacePath", source.workspacePath);
   return `/events?${params.toString()}`;
 }
 
 function sourceEvidenceHref(source: IngestionSourceItem) {
-  const params = new URLSearchParams({ timeType: "last_3h", sourceId: source.sourceId });
+  const params = new URLSearchParams({ timeType: DEFAULT_SECURITY_TIME_TYPE, sourceId: source.sourceId });
   if (source.collectorId) params.set("collectorId", source.collectorId);
   if (source.workspacePath) params.set("workspacePath", source.workspacePath);
   return `/evidence?${params.toString()}`;
 }
 
 function sourceIncidentsHref(source: IngestionSourceItem) {
-  const params = new URLSearchParams({ timeType: "last_3h", status: "open", sourceId: source.sourceId });
+  const params = new URLSearchParams({ timeType: DEFAULT_SECURITY_TIME_TYPE, status: "open", sourceId: source.sourceId });
   if (source.collectorId) params.set("collectorId", source.collectorId);
   if (source.workspacePath) params.set("workspacePath", source.workspacePath);
   return `/incidents?${params.toString()}`;
 }
 
 function sourceAlertsHref(source: IngestionSourceItem) {
-  const params = new URLSearchParams({ timeType: "last_3h", status: "all", kind: "source", sourceId: source.sourceId });
+  const params = new URLSearchParams({ timeType: DEFAULT_SECURITY_TIME_TYPE, status: "all", kind: "source", sourceId: source.sourceId });
   if (source.collectorId) params.set("collectorId", source.collectorId);
   if (source.workspacePath) params.set("workspacePath", source.workspacePath);
   return `/alerts?${params.toString()}`;
