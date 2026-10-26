@@ -46,6 +46,8 @@ SERVICES=(
   anysentry-composite-judge.service
   anysentry-supply-chain.service
   anysentry-observer.service
+  anysentry-prometheus.service
+  anysentry-node-exporter.service
 )
 START_SERVICES=(
   anysentry-clickhouse.service
@@ -62,8 +64,12 @@ START_SERVICES=(
   anysentry-composite-judge.service
   anysentry-supply-chain.service
   anysentry-observer.service
+  anysentry-prometheus.service
+  anysentry-node-exporter.service
 )
 STOP_SERVICES=(
+  anysentry-node-exporter.service
+  anysentry-prometheus.service
   anysentry-observer.service
   anysentry-supply-chain.service
   anysentry-composite-judge.service
@@ -503,6 +509,10 @@ preflight() {
   validate_redis_runtime
   collector_version=$("$PACKAGE_ROOT/observer/bin/a3s-observer-collector" --version 2>&1) ||
     fail "bundled Observer cannot execute: $collector_version"
+  prometheus_version=$("$PACKAGE_ROOT/prometheus/bin/prometheus" --version 2>&1) ||
+    fail "bundled Prometheus cannot execute: $prometheus_version"
+  node_exporter_version=$("$PACKAGE_ROOT/prometheus/bin/node_exporter" --version 2>&1) ||
+    fail "bundled node_exporter cannot execute: $node_exporter_version"
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
   [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')

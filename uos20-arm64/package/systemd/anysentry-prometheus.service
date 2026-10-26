@@ -1,0 +1,20 @@
+[Unit]
+Description=AnySentry bundled Prometheus (loopback platform metrics)
+After=network.target
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+ExecStart=/opt/anysentry/prometheus/bin/prometheus --config.file=/opt/anysentry/prometheus/conf/prometheus.yml --storage.tsdb.path=/var/lib/anysentry/prometheus --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle
+WorkingDirectory=/var/lib/anysentry/prometheus
+StateDirectory=anysentry/prometheus
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/anysentry/prometheus
+
+[Install]
+WantedBy=multi-user.target

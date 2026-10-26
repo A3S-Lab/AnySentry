@@ -1,0 +1,17 @@
+[Unit]
+Description=AnySentry bundled node_exporter (loopback host metrics)
+After=network.target
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+ExecStart=/opt/anysentry/prometheus/bin/node_exporter --web.listen-address=127.0.0.1:9100
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

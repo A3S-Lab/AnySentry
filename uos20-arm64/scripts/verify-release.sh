@@ -13,6 +13,7 @@ required=(
   java/bin/java kafka/bin/kafka-server-start.sh
   flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar
   observer/bin/a3s-observer-collector observer/observer-forward.js
+  prometheus/bin/prometheus prometheus/bin/node_exporter prometheus/conf/prometheus.yml
   observer/observer-agent-attribution.js observer/observer-agent-runtime-signatures.js
   observer/observer-agent-templates.js observer/observer-attribution-merge.js
   observer/observer-behavior-discovery.js observer/observer-capture-profile-control.js

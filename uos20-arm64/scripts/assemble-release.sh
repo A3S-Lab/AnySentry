@@ -3,13 +3,14 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-for dir in app runtime native clickhouse redis observer l3 java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+for dir in app runtime native clickhouse redis observer l3 prometheus java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
 for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-config.xml" "$STAGE_DIR/clickhouse/etc/config.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-users.xml" "$STAGE_DIR/clickhouse/etc/users.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/redis.conf" "$STAGE_DIR/redis/etc/redis.conf"
+install -m 0644 "$CHANNEL_DIR/package/config/prometheus.yml" "$STAGE_DIR/prometheus/conf/prometheus.yml"
 install -d -m 0755 "$STAGE_DIR/kafka/config"
 install -m 0644 "$CHANNEL_DIR/package/config/kafka-log4j2.yaml" "$STAGE_DIR/kafka/config/log4j2.yaml"
 install -m 0644 "$CHANNEL_DIR/package/config/kafka-tools-log4j2.yaml" "$STAGE_DIR/kafka/config/tools-log4j2.yaml"
@@ -28,7 +29,9 @@ for file in \
   systemd/anysentry-stream-worker.service \
   systemd/anysentry-composite-judge.service \
   systemd/anysentry-supply-chain.service \
-  systemd/anysentry-observer.service
+  systemd/anysentry-observer.service \
+  systemd/anysentry-prometheus.service \
+  systemd/anysentry-node-exporter.service
 do
   install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
 done
