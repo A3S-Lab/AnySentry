@@ -70,6 +70,19 @@ function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorklo
         .map((value) => text(value))
         .filter(Boolean),
     );
+  // Key shapes differ across producers (review-time docker:<id>, discovery
+  // docker:<hostId>:<id>, future hostId changes). Fall back to matching the
+  // trailing hex container-id segment, which is stable across all shapes.
+  const confirmedTails = new Set();
+  for (const key of confirmed) {
+    const tail = String(key ?? '').split(':').at(-1);
+    if (tail && /^[a-f0-9]{12,64}$/i.test(tail)) confirmedTails.add(tail.toLowerCase());
+  }
+  const confirmedHas = (workloadId) => {
+    if (confirmed.has(workloadId)) return true;
+    const tail = String(workloadId ?? '').split(':').at(-1);
+    return Boolean(tail) && confirmedTails.has(tail.toLowerCase());
+  };
   const promotedCgroupIds = new Set();
   const ownedCgroupIds = new Set();
   const entries = (Array.isArray(dockerEntries) ? dockerEntries : []).map((entry) => {
@@ -85,7 +98,7 @@ function promoteConfirmedDockerTlsEntries(dockerEntries, confirmedPhysicalWorklo
       ownedCgroupIds.add(id);
       return entry;
     }
-    if (!confirmed.has(physicalWorkloadId)) {
+    if (!confirmedHas(physicalWorkloadId)) {
       return entry;
     }
     promotedCgroupIds.add(id);
