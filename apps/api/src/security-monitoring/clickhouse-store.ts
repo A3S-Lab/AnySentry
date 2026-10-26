@@ -2484,6 +2484,7 @@ function fromRow(r: Record<string, unknown>): JudgedEvent {
     latencyMs: num(r.latencyMs),
     attributes,
     ...(classificationSemantics ? { classificationSemantics } : {}),
+    processInstanceKey: str(r.processInstanceKey) || undefined,
     process: visibleProcessContext(parseObject<ProcessContext>(r.process)),
     attribution,
     judgment: parseObject<NonNullable<JudgedEvent["judgment"]>>(r.judgment),
@@ -5861,6 +5862,78 @@ export class ClickHouseStore {
         (error as Error).message,
       );
       return undefined;
+    }
+  }
+
+  /** Narrow UOS generation statistics. The display count and post-conversation exit probe share
+   * one bounded scan; no payload columns or unbounded process-family walk are involved. */
+  async readUosProcessGenerationEventStats(input: {
+    processPid: number;
+    processStartTimeTicks: string;
+    processHostId?: string;
+    processBootId?: string;
+    processPidNamespace?: string;
+    sinceMs: number;
+    displayUntilMs: number;
+    untilMs: number;
+  }): Promise<{ totalEvents: number; exitedAt?: number } | null> {
+    if (!this.client || !this.ready) return null;
+    const conditions = [
+      "processPid = {processPid:UInt64}",
+      "processStartTimeTicks = {processStartTimeTicks:String}",
+    ];
+    const queryParams: Record<string, unknown> = {
+      processPid: input.processPid,
+      processStartTimeTicks: input.processStartTimeTicks,
+      sinceMs: Math.max(0, Math.trunc(input.sinceMs)),
+      displayUntilMs: Math.max(0, Math.trunc(input.displayUntilMs)),
+      untilMs: Math.max(0, Math.trunc(input.untilMs)),
+    };
+    for (const [key, column] of [
+      ["processHostId", "processHostId"],
+      ["processBootId", "processBootId"],
+      ["processPidNamespace", "processPidNamespace"],
+    ] as const) {
+      const value = input[key]?.trim();
+      if (!value) continue;
+      conditions.push(column + " = {" + key + ":String}");
+      queryParams[key] = value;
+    }
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT
+            uniqExactIf(eventId, at <= {displayUntilMs:UInt64}) AS totalEvents,
+            maxIf(at, eventKind = 'ProcessExit') AS exitedAt
+          FROM ${TABLE}
+          PREWHERE at >= {sinceMs:UInt64} AND at <= {untilMs:UInt64}
+          WHERE ${conditions.join(" AND ")}
+          LIMIT 1`,
+        query_params: queryParams,
+        clickhouse_settings: {
+          ...BOUNDED_DASHBOARD_DETAIL_READ_SETTINGS,
+          max_result_rows: "1",
+          result_overflow_mode: "break",
+        },
+        format: "JSONEachRow",
+      });
+      const rows = (await result.json()) as Array<{
+        totalEvents?: number | string;
+        exitedAt?: number | string;
+      }>;
+      const totalEvents = Number(rows[0]?.totalEvents ?? 0);
+      const exitedAt = Number(rows[0]?.exitedAt ?? 0);
+      if (!Number.isSafeInteger(totalEvents) || totalEvents < 0) return null;
+      return {
+        totalEvents,
+        ...(Number.isSafeInteger(exitedAt) && exitedAt > 0 ? { exitedAt } : {}),
+      };
+    } catch (error) {
+      console.error(
+        "[clickhouse] UOS process-generation stats query failed:",
+        (error as Error).message,
+      );
+      return null;
     }
   }
 

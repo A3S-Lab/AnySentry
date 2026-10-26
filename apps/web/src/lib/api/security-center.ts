@@ -5208,6 +5208,13 @@ export const securityCenterApi = {
     apiClient.get<InteractionConversationDetail>(
       `/security-center/conversations/${encodeURIComponent(conversationId)}`,
     ),
+  interactionConversationSystemEvidence: (
+    conversationId: string,
+    query: { evidenceLimit?: number } = {},
+  ) =>
+    apiClient.get<NonNullable<LocalRecordDetail["systemEvidence"]>>(
+      `/security-center/conversations/${encodeURIComponent(conversationId)}/system-evidence${querySuffix(query)}`,
+    ),
   localRecordStatus: () =>
     apiClient.get<LocalRecordTrackingStatus>("/security-center/local-records/status"),
   localRecords: (query: {

@@ -18,6 +18,7 @@ import {
 import { AuditService } from './audit.service';
 import { IngestionSourceService } from './ingestion-source.service';
 import { InteractionService } from './interaction.service';
+import { UosSystemEvidenceService } from './uos-system-evidence.service';
 import {
   AllowUnsafeLocalInteractionDirectView,
   managementAuthConfigured,
@@ -146,6 +147,7 @@ function protectedInteractionSource(
 export class InteractionController {
   constructor(
     private readonly interactions: InteractionService,
+    private readonly uosSystemEvidence: UosSystemEvidenceService,
     private readonly sources: IngestionSourceService,
     private readonly audit: AuditService,
   ) {}
@@ -236,6 +238,20 @@ export class InteractionController {
       since: numberQuery(since),
       until: numberQuery(until),
     });
+  }
+
+  @Get('conversations/:conversationId/system-evidence')
+  @RequireManagementAuth()
+  @AllowUnsafeLocalInteractionDirectView()
+  conversationSystemEvidence(
+    @Param('conversationId') conversationId: string,
+    @Query('evidenceLimit') evidenceLimitValue?: string,
+  ) {
+    const evidenceLimit = numberQuery(evidenceLimitValue);
+    if (evidenceLimit !== undefined && (evidenceLimit < 1 || evidenceLimit > 5_000)) {
+      throw new BadRequestException('evidenceLimit must be between 1 and 5000');
+    }
+    return this.uosSystemEvidence.evidence(conversationId, evidenceLimit);
   }
 
   @Get('conversations/:conversationId')

@@ -788,6 +788,8 @@ export interface JudgedEvent {
   attributes: Record<string, EventAttributeValue>;
   /** Additive S3 identity/role/capture view. It is never a filtering authority. */
   classificationSemantics?: ClassificationSemanticsV1;
+  /** Original durable events-table key; never recomputed for UOS evidence display. */
+  processInstanceKey?: string;
   process?: ProcessContext;
   attribution?: AgentAttribution;
   judgment?: EventJudgmentMetadata;

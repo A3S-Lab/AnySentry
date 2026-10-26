@@ -17,6 +17,7 @@ import {
   type InteractionInstructionRecord,
   type InteractionResponseRecord,
 } from './interaction.types';
+import type { ProcessContext } from './types';
 
 export const UOS_CONVERSATION_PREFIX = 'uosconv:';
 export const UOS_CONTENT_SUFFIX = /:(?:in|out)$/u;
@@ -32,6 +33,7 @@ export interface UosInteractionRow {
   collectorId?: string;
   agentInstanceId?: string;
   agentProduct?: string;
+  process?: ProcessContext;
   environmentId?: string;
   sessionId?: string;
   canonicalSessionId?: string;
@@ -97,6 +99,15 @@ export function parseUosPayload(payload: string): UosInteractionRow | undefined 
       const collapsed = escaped.replace(/\\\\/g, '\\');
       return JSON.parse(`"${collapsed}"`) as string;
     };
+    const processSpan = (): ProcessContext | undefined => {
+      const anchor = '"process":';
+      const start = payload.indexOf(anchor);
+      if (start < 0) return undefined;
+      const from = payload.indexOf('{', start + anchor.length);
+      const end = from < 0 ? -1 : payload.indexOf('}', from);
+      if (from < 0 || end < 0) return undefined;
+      return JSON.parse(payload.slice(from, end + 1)) as ProcessContext;
+    };
     const row: UosInteractionRow = {
       schemaVersion: head('schemaVersion'),
       interactionId: head('interactionId'),
@@ -106,6 +117,7 @@ export function parseUosPayload(payload: string): UosInteractionRow | undefined 
       collectorId: head('collectorId'),
       agentInstanceId: head('agentInstanceId'),
       agentProduct: head('agentProduct'),
+      process: processSpan(),
       sessionId: head('sessionId'),
       canonicalSessionId: head('canonicalSessionId'),
       endpoint: head('endpoint'),

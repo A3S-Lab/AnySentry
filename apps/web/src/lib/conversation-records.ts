@@ -293,10 +293,19 @@ export async function conversationRecordDetail(
   } as unknown as LocalRecordDetail;
 }
 
-/** System evidence is wired to the kernel-event lane in phase 2; empty for now. */
+/** Load the UOS /proc-generation attribution without involving the CLI session-file lane. */
 export async function conversationRecordSystemEvidence(
   recordId: string,
   options: Record<string, unknown> = {},
 ): Promise<LocalRecordDetail | null> {
-  return conversationRecordDetail(recordId, options);
+  const evidenceLimit = typeof options.evidenceLimit === "number"
+    ? options.evidenceLimit
+    : undefined;
+  const [detail, systemEvidence] = await Promise.all([
+    conversationRecordDetail(recordId, options),
+    securityCenterApi.interactionConversationSystemEvidence(recordId, { evidenceLimit })
+      .catch(() => null),
+  ]);
+  if (!detail) return null;
+  return systemEvidence ? { ...detail, systemEvidence } : detail;
 }
