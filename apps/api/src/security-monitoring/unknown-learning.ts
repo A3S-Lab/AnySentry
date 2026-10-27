@@ -242,7 +242,9 @@ function stableProcessScope(event: JudgedEvent): string | undefined {
   const boot = text(process?.bootId, 512);
   const startTicks = text(process?.startTimeTicks, 512);
   const startNs = text(process?.startTimeNs, 512);
-  const start = startTicks ? `ticks:${startTicks}` : startNs ? `ns:${startNs}` : undefined;
+  const start = process?.startTimeSource === 'kernel_start_boottime' && startNs
+    ? `ns:${startNs}`
+    : startTicks ? `ticks:${startTicks}` : startNs ? `ns:${startNs}` : undefined;
   return host && boot && Number.isSafeInteger(process?.pid) && Number(process?.pid) > 0 && start
     ? `process:${sha256([host, boot, process!.pid, start].join('\0')).slice(0, 32)}`
     : undefined;

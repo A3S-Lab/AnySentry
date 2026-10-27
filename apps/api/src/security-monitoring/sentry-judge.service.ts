@@ -402,9 +402,10 @@ function strongRuntimeRootKey(
 }
 
 function trustedProcessStartTime(processContext: ProcessContext | undefined): string | undefined {
-  const ticks = typeof processContext?.startTimeTicks === 'string' ? processContext.startTimeTicks.trim() : '';
-  if (ticks) return `ticks:${ticks}`;
   const ns = typeof processContext?.startTimeNs === 'string' ? processContext.startTimeNs.trim() : '';
+  const ticks = typeof processContext?.startTimeTicks === 'string' ? processContext.startTimeTicks.trim() : '';
+  if (processContext?.startTimeSource === 'kernel_start_boottime' && ns) return `ns:${ns}`;
+  if (ticks) return `ticks:${ticks}`;
   return ns ? `ns:${ns}` : undefined;
 }
 
@@ -2163,6 +2164,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     const clamp = (n: unknown) => Math.max(0, Number.isFinite(Number(n)) ? Math.round(Number(n)) : 0);
     const eventKindCounts: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
+    const droppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(input.droppedByKind ?? {})) droppedByKind[key.slice(0, 64)] = clamp(value);
     // Raw Rust and enriched Forwarder heartbeats share an ID. The Forwarder exclusively owns
     // identity/filter delivery metrics; the raw collector exclusively owns ring-before file-filter
     // counters below. Provenance prevents either stream from refreshing the other's state.
@@ -2370,6 +2373,11 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       outstandingOldestAgeMs: clamp(rawFilter.outstandingOldestAgeMs),
       outstandingEventLimit: clamp(rawFilter.outstandingEventLimit),
       outstandingByteLimit: clamp(rawFilter.outstandingByteLimit),
+      durableRecords: clamp(rawFilter.durableRecords),
+      durableBytes: clamp(rawFilter.durableBytes),
+      durableWalBytes: clamp(rawFilter.durableWalBytes),
+      durableOldestAgeMs: clamp(rawFilter.durableOldestAgeMs),
+      durableReplayPending: clamp(rawFilter.durableReplayPending),
       protectedReserveEvents: clamp(rawFilter.protectedReserveEvents),
       protectedReserveBytes: clamp(rawFilter.protectedReserveBytes),
       identitySnapshotReady: rawFilter.identitySnapshotReady === true,
@@ -2532,6 +2540,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       enabledFeatures: (input.enabledFeatures ?? []).map((v) => String(v).slice(0, 80)).slice(0, 32),
       intervalSecs: clamp(input.intervalSecs),
       eventKindCounts,
+      droppedByKind,
       queueDepth: clamp(input.queueDepth),
       droppedEvents: clamp(input.droppedEvents),
       outputDropped: clamp(input.outputDropped),

@@ -139,6 +139,16 @@ function sameOsProcessGeneration(
     && (!leftNamespace || !rightNamespace || leftNamespace === rightNamespace);
 }
 
+function sameProcessStartTime(left: string, right: string, userHz = 100): boolean {
+  if (left === right) return true;
+  const a = /^(ticks|ns):([1-9][0-9]*)$/u.exec(left);
+  const b = /^(ticks|ns):([1-9][0-9]*)$/u.exec(right);
+  if (!a || !b || a[1] === b[1] || !Number.isSafeInteger(userHz) || userHz <= 0) return false;
+  const ticks = a[1] === 'ticks' ? BigInt(a[2]) : BigInt(b[2]);
+  const ns = a[1] === 'ns' ? BigInt(a[2]) : BigInt(b[2]);
+  return ns * BigInt(userHz) / 1_000_000_000n === ticks;
+}
+
 function bindingContains(binding: SessionProcessBinding, at: number): boolean {
   return at >= binding.validFrom && (binding.validTo === undefined || at <= binding.validTo);
 }
@@ -511,7 +521,7 @@ export class SessionEventAttributionService {
     );
     const exactFacts = (facts ?? []).filter((fact) =>
       fact.pid === candidate.matchedPid
-      && fact.startTime === candidate.matchedStartTime,
+      && sameProcessStartTime(fact.startTime, candidate.matchedStartTime),
     );
     const exactIdentities = new Map(
       exactFacts.map((fact) => [fact.processInstanceKey, fact]),
@@ -720,7 +730,11 @@ export class SessionEventAttributionService {
         ? { runtimeProcessInstanceId: candidate.runtimeProcessInstanceId }
         : {}),
       matchedPid: candidate.matchedPid,
-      matchedStartTime: candidate.matchedStartTime,
+      matchedStartTime: fact
+        && fact.pid === candidate.matchedPid
+        && sameProcessStartTime(fact.startTime, candidate.matchedStartTime)
+        ? fact.startTime
+        : candidate.matchedStartTime,
       ...(launcherFact ? {
         launcherProcessInstanceKey: launcherFact.processInstanceKey,
         launcherPid: launcherFact.pid,

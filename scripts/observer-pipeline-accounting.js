@@ -24,6 +24,8 @@ const STAGE_REASONS = Object.freeze({
     'discovery_budget',
     'e2e_scope',
     'agent_allowlist',
+    'unresolved_exit_disabled',
+    'unresolved_exit_capacity',
     'file_path_scope',
   ]),
   aggregated: Object.freeze(['file_access_coalesced']),

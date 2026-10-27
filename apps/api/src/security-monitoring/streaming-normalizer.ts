@@ -536,8 +536,11 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
   const bootId = event.process?.bootId ?? text(event.attributes.bootId);
   const startTimeTicks = event.process?.startTimeTicks;
   const startTimeNs = event.process?.startTimeNs;
-  const stableStartTime = startTimeTicks ?? startTimeNs;
-  const stableStartTimeKind = startTimeTicks ? 'ticks' : startTimeNs ? 'ns' : undefined;
+  const preferNs = event.process?.startTimeSource === 'kernel_start_boottime';
+  const stableStartTime = preferNs ? startTimeNs ?? startTimeTicks : startTimeTicks ?? startTimeNs;
+  const stableStartTimeKind = preferNs
+    ? startTimeNs ? 'ns' : startTimeTicks ? 'ticks' : undefined
+    : startTimeTicks ? 'ticks' : startTimeNs ? 'ns' : undefined;
   const mountNamespace = event.process?.mountNamespace
     ?? (Number.isFinite(Number(event.attributes.mountNamespace))
       ? Number(event.attributes.mountNamespace)
@@ -569,6 +572,7 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
       pid: event.process?.pid,
       startTimeTicks,
       startTimeNs,
+      startTimeSource: event.process?.startTimeSource,
     }),
     identityConfidence: processIdentityConfidence,
   };
@@ -623,8 +627,8 @@ export function canonicalizeEvent(event: JudgedEvent, observerLine: string, rece
         processIdentity.hostId,
         processIdentity.containerId,
         processIdentity.pid,
-        processIdentity.startTimeTicks ? 'ticks' : processIdentity.startTimeNs ? 'ns' : undefined,
-        processIdentity.startTimeTicks ?? processIdentity.startTimeNs,
+        stableStartTimeKind,
+        stableStartTime,
       );
   return {
     schemaVersion: 'anysentry.canonical_event.v1',

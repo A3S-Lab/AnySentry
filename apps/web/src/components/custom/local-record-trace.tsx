@@ -116,6 +116,16 @@ export function LocalRecordTrace({ detail, events, hasMore, olderLoading, onLoad
       <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900"><ListTree aria-hidden="true" className="size-4 text-teal-600" />Trace</h3>
       <div className="flex flex-wrap gap-2 text-[10px] text-slate-600">
         <span className="rounded-md bg-slate-50 px-2 py-1">{rows.length} 行 · 当前窗口</span>
+        <button
+          type="button"
+          data-trace-system-only
+          title="查看当前已加载的全部系统事件，不受全局看板时间范围影响"
+          disabled={!typeCounts.get("SYSTEM")}
+          onClick={() => { setTypes(["SYSTEM"]); setPage(0); }}
+          className="rounded-md bg-amber-50 px-2 py-1 text-amber-800 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          系统事件 {typeCounts.get("SYSTEM")}
+        </button>
         <span className="rounded-md bg-sky-50 px-2 py-1 text-sky-800">{typeCounts.get("MODEL")} 条 Observer 请求</span>
       </div>
     </header>

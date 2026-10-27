@@ -562,6 +562,58 @@ assert.equal(await a3sFileService.resolveBindingFromSessionFile({
 }, { since: now - 1_000, until: now + 10_000 }), undefined,
 'multiple A3S Session writer generations must remain unbound');
 
+const mixedUnitRoot = {
+  ...rootFact,
+  processInstanceKey: 'pri_mixed_unit_root',
+  startTime: 'ns:10000000000',
+};
+const mixedUnitStores = stores([mixedUnitRoot, childFact]);
+mixedUnitStores.clickhouse.readSessionFileWriteEvents = async () => [{
+  ...judgedEvent('event-kimi-session-write', 100, now + 20, 'FileAccess'),
+  agentId: 'kimi-cli',
+  collectorId: 'collector-a',
+  process: {
+    pid: 100,
+    ppid: 1,
+    hostId: 'host-a',
+    bootId: 'boot-a',
+    startTimeTicks: '1000',
+  },
+  attribution: { agentScopeId: 'kimi-cli', agentInstanceId: 'agent-a' },
+  attributes: {
+    path: '/logs/agent/.kimi-code/sessions/wd_app/session-kimi/agents/main/wire.jsonl',
+    write: true,
+    accessMode: 'write_only',
+  },
+}];
+const mixedUnitService = new SessionEventAttributionService(
+  mixedUnitStores.clickhouse,
+  mixedUnitStores.relational,
+);
+const mixedUnitBinding = await mixedUnitService.resolveBindingFromSessionFile({
+  runtimeType: 'kimi_cli',
+  nativeSessionId: 'session-kimi',
+  sessionPaths: [],
+  pathMarkers: ['/session-kimi/'],
+  validFrom: now,
+}, { since: now - 1_000, until: now + 10_000 });
+assert.ok(mixedUnitBinding, 'Session ticks must match the same lifecycle generation in ns');
+assert.equal(mixedUnitBinding.matchedStartTime, mixedUnitRoot.startTime);
+assert.equal(mixedUnitBinding.matchedOsProcessInstanceKey, mixedUnitRoot.processInstanceKey);
+assert.equal(await mixedUnitService.resolveBinding({
+  runtimeType: 'kimi_cli',
+  nativeSessionId: 'session-kimi',
+  matchedPid: 100,
+  matchedStartTime: 'ticks:1002',
+  validFrom: now,
+  observedIdentity: {
+    processInstanceKey: 'pri_wrong_generation',
+    hostId: 'host-a',
+    bootId: 'boot-a',
+  },
+}, { since: now - 1_000, until: now + 10_000 }), undefined,
+'a different tick generation must not be merged by unit compatibility');
+
 const revisionStores = stores([rootFact, childFact]);
 revisionStores.relational.loadLatestSessionProcessBinding = async () => binding;
 const revisionService = new SessionEventAttributionService(
@@ -1476,7 +1528,6 @@ const pageSource = await readFile(
   'utf8',
 );
 assert.match(pageSource, /Session 系统证据树/u);
-assert.match(pageSource, /不代表已归因到具体 Turn、Tool Call 或用户指令/u);
 
 console.log(JSON.stringify({
   ok: true,

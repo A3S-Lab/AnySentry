@@ -1422,22 +1422,24 @@ export default function LocalRecordTrackingPage() {
   const allItems = listRequest.data?.items ?? [];
   const filteredItems = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    return allItems.filter((item) => {
-      if (adapterFilter !== "all" && item.adapter !== adapterFilter) return false;
-      if (activityFilter !== "all" && item.activityStatus !== activityFilter) return false;
-      if (processFilter !== "all" && item.processStatus !== processFilter) return false;
-      if (!query) return true;
-      return [
-        item.title,
-        item.cwd,
-        item.model,
-        item.sessionId,
-        item.originator,
-        adapterLabel(item.adapter),
-      ]
-        .filter((value): value is string => Boolean(value))
-        .some((value) => value.toLocaleLowerCase().includes(query));
-    });
+    return allItems
+      .filter((item) => {
+        if (adapterFilter !== "all" && item.adapter !== adapterFilter) return false;
+        if (activityFilter !== "all" && item.activityStatus !== activityFilter) return false;
+        if (processFilter !== "all" && item.processStatus !== processFilter) return false;
+        if (!query) return true;
+        return [
+          item.title,
+          item.cwd,
+          item.model,
+          item.sessionId,
+          item.originator,
+          adapterLabel(item.adapter),
+        ]
+          .filter((value): value is string => Boolean(value))
+          .some((value) => value.toLocaleLowerCase().includes(query));
+      })
+      .sort((left, right) => right.updatedAt - left.updatedAt || left.recordId.localeCompare(right.recordId));
   }, [activityFilter, adapterFilter, allItems, processFilter, search]);
 
   function openRecord(recordId: string) {
@@ -1569,7 +1571,7 @@ export default function LocalRecordTrackingPage() {
             </span>
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold text-slate-950">记录追踪</h1>
+                <h1 className="text-lg font-semibold text-slate-950">Agent Trace</h1>
                 <span className="rounded-full border border-teal-200 bg-teal-50 px-2 py-0.5 text-[10px] text-teal-700">
                   本地只读
                 </span>

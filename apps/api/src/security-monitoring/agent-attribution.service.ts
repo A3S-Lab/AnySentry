@@ -157,7 +157,9 @@ export class AgentAttributionService {
     const exe = process?.exe ?? attrString(attributes, 'exe');
     const argv = attrString(attributes, 'argv');
     const cwd = process?.cwd ?? attrString(attributes, 'cwd') ?? meta.workspacePath;
-    const startTime = process?.startTimeTicks ?? process?.startTimeNs;
+    const startTime = process?.startTimeSource === 'kernel_start_boottime'
+      ? process.startTimeNs ?? process.startTimeTicks
+      : process?.startTimeTicks ?? process?.startTimeNs;
     if (!pid) return this.notAgent('not_evaluated');
 
     const existing = this.procs.get(pid);

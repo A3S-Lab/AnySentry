@@ -485,8 +485,25 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     hostId: stringLikeField('hostId', 'host_id'),
     bootId: stringLikeField('bootId', 'boot_id'),
     eventTimeNs: stringLikeField('eventTimeNs', 'event_time_ns'),
-    startTimeNs: stringLikeField('startTimeNs', 'start_time_ns'),
+    startTimeNs: stringLikeField('startTimeNs', 'startBoottimeNs', 'start_boottime_ns', 'start_time_ns'),
     startTimeTicks: stringLikeField('startTimeTicks', 'start_time_ticks'),
+    startTimeSource: stringLikeField('startTimeSource', 'start_time_source')
+      ?? (stringLikeField('startBoottimeNs', 'start_boottime_ns') ? 'kernel_start_boottime' : undefined),
+    userHz: numberField('userHz') ?? numberField('user_hz'),
+    creationPpid: numberField('creationPpid') ?? numberField('creation_ppid'),
+    creationParentStartBoottimeNs: stringLikeField(
+      'creationParentStartBoottimeNs',
+      'creation_parent_start_boottime_ns',
+    ),
+    observedPpid: numberField('observedPpid') ?? numberField('observed_ppid'),
+    observedParentStartBoottimeNs: stringLikeField(
+      'observedParentStartBoottimeNs',
+      'observed_parent_start_boottime_ns',
+    ),
+    parentRelationSource: stringLikeField('parentRelationSource', 'parent_relation_source'),
+    lineageComplete: typeof (p.lineageComplete ?? p.lineage_complete) === 'boolean'
+      ? (p.lineageComplete ?? p.lineage_complete) as boolean
+      : undefined,
     mountNamespace: numberField('mountNamespace') ?? numberField('mount_namespace'),
     lifecycleSource: parseProcessLifecycleSource(stringLikeField('lifecycleSource', 'lifecycle_source')),
     lifecycleReason: parseUnknownReason(stringLikeField('lifecycleReason', 'lifecycle_reason')),
@@ -737,6 +754,16 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
         if (Number.isFinite(count)) eventKindCounts[key] = count;
       }
     }
+    const droppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(obj(hb.droppedByKind) ?? obj(hb.dropped_by_kind) ?? {})) {
+      const count = Number(value);
+      if (Number.isFinite(count)) droppedByKind[key] = count;
+    }
+    const outputDroppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(obj(hb.outputDroppedByKind) ?? obj(hb.output_dropped_by_kind) ?? {})) {
+      const count = Number(value);
+      if (Number.isFinite(count)) outputDroppedByKind[key] = count;
+    }
     const exec = nonNegativeSafeIntegerField(hb, 'exec');
     const execTruncated = nonNegativeSafeIntegerField(hb, 'execTruncated', 'exec_truncated');
     const execIncomplete = nonNegativeSafeIntegerField(hb, 'execIncomplete', 'exec_incomplete');
@@ -786,8 +813,10 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
       enabledFeatures: strArrayField(hb, 'enabledFeatures', 'enabled_features'),
       intervalSecs: numField(hb, 'intervalSecs', 'interval_secs'),
       eventKindCounts,
+      droppedByKind,
       droppedEvents: numField(hb, 'droppedEvents', 'dropped'),
       outputDropped: numField(hb, 'outputDropped', 'output_dropped'),
+      outputDroppedByKind,
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
       errorCount: numField(hb, 'errorCount', 'error_count'),
       legacyCounterTemporality: legacyCounterTemporality === 'delta' || legacyCounterTemporality === 'cumulative'

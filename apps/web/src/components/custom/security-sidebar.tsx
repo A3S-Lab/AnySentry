@@ -81,12 +81,11 @@ export const SECURITY_NAVIGATION_GROUPS: Array<{ label: string; icon: LucideIcon
     label: "Agent 观测",
     icon: Bot,
     items: [
+      { label: "Agent Trace", description: "本地 Agent 会话与工具记录", href: "/record-tracking", icon: History },
       { label: "Agent 列表", description: "Agent 清单与运行状态", href: "/?view=agentAssets", icon: Bot, dashboardView: "agentAssets" },
       { label: "资产与身份", description: "Agent、服务与待识别对象", href: "/assets", icon: ShieldCheck },
       { label: "Agent 态势", description: "实例活动与研判健康", href: "/?view=agentInstances", icon: Activity, dashboardView: "agentInstances" },
       { label: "Agent 拓扑", description: "Agent 运行时安全关系", href: "/topology", icon: Network },
-      { label: "对话追踪", description: "Agent 对话与上下文追踪", href: "/conversations", icon: MessageSquareText },
-      { label: "记录追踪", description: "本地 Agent 会话与工具记录", href: "/record-tracking", icon: History },
       { label: "运行链路", description: "无侵入事件时间线", href: "/?view=events", icon: GitBranch, dashboardView: "events" },
       { label: "复合研判", description: "Flink 连续行为关联", href: "/?view=stream", icon: Sparkles, dashboardView: "stream" },
       { label: "供应链漏洞", description: "OSV 依赖漏洞资产", href: "/?view=supplyChain", icon: ShieldAlert, dashboardView: "supplyChain" },
@@ -217,7 +216,7 @@ export function SecuritySidebar() {
                             {sidebarCollapsed ? (
                               <Icon className={cn("size-4 shrink-0", active ? "text-[#7dd3fc]" : "text-[#8b93a3]")} aria-hidden="true" />
                             ) : (
-                              <span className="min-w-0 truncate text-[15px] font-medium leading-none">{t(item.label)}</span>
+                              <span className="min-w-0 truncate text-[15px] font-medium leading-snug">{t(item.label)}</span>
                             )}
                           </Link>
                         );

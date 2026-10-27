@@ -48,6 +48,7 @@ const { FilterRulePublisher } = require('./observer-filter-rules');
 const { CaptureProfileReporter } = require('./observer-capture-profile-reporter');
 const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
+const { PipelineDiagnostics } = require('./observer-pipeline-diagnostics');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
@@ -280,6 +281,47 @@ function agentAllowlistMatch(allowlist, observerEvent, classification) {
   return candidates.some((candidate) => allowlist.has(canonicalAgentSelector(candidate)));
 }
 
+const EVALUATION_LIFECYCLE_CGROUPS = new Set(
+  text(process.env.ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS)
+    .split(/[\s,]+/u)
+    .filter(Boolean),
+);
+
+function evaluationLifecycleMatch(observerEvent, classification) {
+  if (
+    EVALUATION_LIFECYCLE_CGROUPS.size === 0
+    || !['unknown', 'non_agent'].includes(classification?.state)
+  ) return false;
+  const kind = eventKind(observerEvent);
+  if (kind !== 'ToolExec' && kind !== 'ProcessExit') return false;
+  const process = observerEvent?.process ?? {};
+  const cgroupId = text(process.cgroupId || process.cgroup_id);
+  return EVALUATION_LIFECYCLE_CGROUPS.has(cgroupId);
+}
+
+const UNRESOLVED_EXIT_LIMIT = Math.max(0, Number(process.env.ANYSENTRY_UNRESOLVED_EXIT_LIMIT) || 0);
+let unresolvedExitRetained = 0;
+
+function unresolvedExitCapacity() {
+  return UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitRetained >= UNRESOLVED_EXIT_LIMIT;
+}
+
+function unresolvedExitIdentityMatch(observerEvent, classification) {
+  if (eventKind(observerEvent) !== 'ProcessExit' || classification?.state !== 'unknown') return false;
+  const process = observerEvent?.process ?? {};
+  const hostId = text(process.hostId || process.host_id);
+  const bootId = text(process.bootId || process.boot_id);
+  const startTime = text(
+    process.startBoottimeNs || process.start_boottime_ns || process.startTimeNs || process.start_time_ns,
+  );
+  return Boolean(hostId && bootId && Number(process.pid) > 0 && startTime);
+}
+
+function unresolvedExitMatch(observerEvent, classification) {
+  if (UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitCapacity()) return false;
+  return unresolvedExitIdentityMatch(observerEvent, classification);
+}
+
 const rawE2eIngestMarkerPrefix = process.env.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
 const e2eIngestMarkerPrefixMatch = rawE2eIngestMarkerPrefix?.match(
   /^asel-marker-([a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?)-(host|docker|k8s)-(shadow|enforce)-$/,
@@ -397,6 +439,12 @@ const WRITER_ID = stableWriterId([
 ]);
 const SPOOL_PATH = process.env.FORWARD_SPOOL_PATH ||
   path.join(os.tmpdir(), 'anysentry-forwarder', safeId(WRITER_ID), 'spool.wal');
+const pipelineDiagnostics = new PipelineDiagnostics({
+  filePath: process.env.ANYSENTRY_PIPELINE_DIAGNOSTICS_PATH
+    || path.join(path.dirname(SPOOL_PATH), 'pipeline-diagnostics.json'),
+  maxRecords: Math.min(100_000, Math.max(1000,
+    Number(process.env.ANYSENTRY_PIPELINE_DIAGNOSTICS_MAX_RECORDS) || 1000)),
+});
 const spool = new DurableSpool({
   writerId: WRITER_ID,
   filePath: SPOOL_PATH,
@@ -760,11 +808,15 @@ function durableRecordMatchesAgentAllowlist(body) {
     const kind = eventKind(observerEvent);
     // These are bounded collector control-plane records rather than host workload evidence.
     if (kind === 'CollectorHeartbeat' || kind === 'CaptureAggregate') return true;
-    return agentAllowlistMatch(
-      FORWARD_AGENT_ALLOWLIST,
-      observerEvent,
-      { attribution: body?.attribution },
-    );
+    const classification = {
+      state: text(body?.attribution?.classification) || 'unknown',
+      attribution: body?.attribution,
+    };
+    if (agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, observerEvent, classification)) return true;
+    if (evaluationLifecycleMatch(observerEvent, classification)) return true;
+    return UNRESOLVED_EXIT_LIMIT > 0
+      && text(observerEvent.process?.lifecycleReason) === 'ancestry_incomplete'
+      && unresolvedExitIdentityMatch(observerEvent, classification);
   } catch {
     // A durable record without a valid Observer envelope cannot prove that it belongs to the
     // selected Agent. Fail closed while an explicit benchmark allowlist is active.
@@ -1908,7 +1960,13 @@ function eventQueueMetrics(now = Date.now()) {
     if (item.retryOwned) retryOldestAt = Math.min(retryOldestAt, item.retryStartedAt || now);
     if (item.inflightSince) inflightOldestAt = Math.min(inflightOldestAt, item.inflightSince);
   }
+  const durable = spool.status();
   return {
+    durableRecords: durable.records,
+    durableBytes: durable.logicalBytes,
+    durableWalBytes: durable.walBytes,
+    durableOldestAgeMs: durable.oldestMs,
+    durableReplayPending: durableReplayNotBefore.size,
     queueDepth: pending.length,
     queueBytes: pending.totalWeight,
     inflightEvents,
@@ -2176,6 +2234,11 @@ function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false
         outstandingOldestAgeMs: eventQueues.outstandingOldestAgeMs,
         outstandingEventLimit: eventQueues.outstandingEventLimit,
         outstandingByteLimit: eventQueues.outstandingByteLimit,
+        durableRecords: eventQueues.durableRecords,
+        durableBytes: eventQueues.durableBytes,
+        durableWalBytes: eventQueues.durableWalBytes,
+        durableOldestAgeMs: eventQueues.durableOldestAgeMs,
+        durableReplayPending: eventQueues.durableReplayPending,
         protectedReserveEvents: eventQueues.protectedReserveEvents,
         protectedReserveBytes: eventQueues.protectedReserveBytes,
         identitySnapshotReady: workload.ready,
@@ -2287,6 +2350,7 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
+  pipelineDiagnostics.close();
   spool.close();
   interactionForwarder.close();
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
@@ -2391,6 +2455,7 @@ function recordRetryExhausted(items, operationalError = true, reason = 'retry_ex
   attributionCounts.retryExhausted += count;
   outputDropped += count;
   pipelineAccounting.record('queue_dropped', reason, count);
+  for (const item of items) pipelineDiagnostics.record(item.body, 'queue_dropped', reason);
   if (operationalError) errorCount++;
   scheduleDurableReplayWakeup();
 }
@@ -2466,6 +2531,15 @@ function finishBatch(batch, outcome, retryDelivery) {
   const terminalItems = batch.filter((item) => !retrySet.has(item));
   const acceptedItems = outcome.acceptedItems ?? [];
   const rejectedItems = outcome.rejectedItems ?? [];
+  for (const item of retryItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_retry', outcome.reason || 'retry_scheduled');
+  }
+  for (const item of acceptedItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_accepted', outcome.reason || 'accepted');
+  }
+  for (const item of rejectedItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_rejected', outcome.reason || 'rejected');
+  }
   if (acceptedItems.length) {
     spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
   }
@@ -2484,6 +2558,9 @@ function finishBatch(batch, outcome, retryDelivery) {
   }
   const durablySettled = new Set([...acceptedItems, ...rejectedItems]);
   const unresolvedTerminalItems = terminalItems.filter((item) => !durablySettled.has(item));
+  for (const item of unresolvedTerminalItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_unresolved', outcome.reason || 'unresolved');
+  }
   if (unresolvedTerminalItems.length) deferDurableReplay(unresolvedTerminalItems);
   if (retryDelivery) {
     const exhausted = Math.min(terminalItems.length, outcome.dropped);
@@ -2637,7 +2714,7 @@ function flushPending() {
   pumpEventWork();
 }
 
-function recordQueueDrop(kind, priority, reason) {
+function recordQueueDrop(kind, priority, reason, body) {
   outputDropped++;
   attributionCounts.queueDropped++;
   const dropClass = queueDropClass(kind, priority);
@@ -2645,6 +2722,7 @@ function recordQueueDrop(kind, priority, reason) {
     (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
   if (priority >= PROTECTED_PRIORITY) attributionCounts.protectedQueueDropped++;
   pipelineAccounting.record('queue_dropped', reason);
+  if (body) pipelineDiagnostics.record(body, 'queue_dropped', reason);
 }
 
 function dropQueuedItem(item, reason = 'priority_evicted') {
@@ -2653,7 +2731,7 @@ function dropQueuedItem(item, reason = 'priority_evicted') {
   // The event is still present in the durable WAL. Delay its re-admission so a protected event
   // can actually use the ownership slot it just reclaimed instead of racing an immediate replay.
   deferDurableReplay([item]);
-  recordQueueDrop(item.kind, item.priority, reason);
+  recordQueueDrop(item.kind, item.priority, reason, item.body);
 }
 
 function makeQueueRoom(bytes, priority) {
@@ -2768,6 +2846,7 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
     'queue_admitted',
     countForwarded ? 'event' : 'collector_heartbeat',
   );
+  pipelineDiagnostics.record(durableBody, 'queue_admitted', kind);
   if (countForwarded) attributionCounts.forwarded++;
   if (pending.length >= BATCH_SIZE) flushPending();
   else scheduleBatch();
@@ -2948,6 +3027,7 @@ function handleLine(raw) {
     return;
   }
   const kind = eventKind(o);
+  const diagnosticBody = () => ({ ...o, sourceEventId: sourceEventId(line), eventKind: kind });
   if (kind === 'CollectorHeartbeat') {
     // Collector health is control-plane telemetry, not Agent activity. It must reach the raw
     // heartbeat ingest seam even when Enforce suppresses unknown workloads, and it must not
@@ -3031,13 +3111,14 @@ function handleLine(raw) {
     }, 0, true, kind);
     return;
   }
+  const processClassification = attributor.classify(o);
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
     pipelineAccounting.record('filtered', 'deduplicated');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'deduplicated');
     return;
   }
-  const processClassification = attributor.classify(o);
   if (processClassification.processContext) {
     const recovered = processClassification.processContext;
     const process = { ...o.process };
@@ -3049,12 +3130,37 @@ function handleLine(raw) {
   }
   if (!fileInConfiguredScope(o)) {
     pipelineAccounting.record('filtered', 'file_path_scope');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'file_path_scope');
     return;
   }
-  if (!agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification)) {
+  const allowlistMatched = agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification);
+  const evaluationLifecycle = !allowlistMatched && evaluationLifecycleMatch(o, processClassification);
+  const unresolvedExit = !allowlistMatched && !evaluationLifecycle && unresolvedExitMatch(o, processClassification);
+  const unresolvedExitLimited = !allowlistMatched && !evaluationLifecycle && !unresolvedExit
+    && eventKind(o) === 'ProcessExit' && processClassification.state === 'unknown' && unresolvedExitCapacity();
+  const unresolvedExitDisabled = unresolvedExitLimited && UNRESOLVED_EXIT_LIMIT <= 0;
+  if (!allowlistMatched && !evaluationLifecycle && !unresolvedExit) {
     attributionCounts.agentAllowlistScopedOut++;
-    pipelineAccounting.record('filtered', 'agent_allowlist');
+    const reason = unresolvedExitDisabled
+      ? 'unresolved_exit_disabled'
+      : unresolvedExitLimited ? 'unresolved_exit_capacity' : 'agent_allowlist';
+    pipelineAccounting.record('filtered', reason);
+    pipelineDiagnostics.record(
+      { ...diagnosticBody(), classification: processClassification.state },
+      'filtered',
+      reason,
+    );
     return;
+  }
+  if (unresolvedExit) unresolvedExitRetained++;
+  if (evaluationLifecycle || unresolvedExit) {
+    o.process = { ...o.process, lifecycleReason: 'ancestry_incomplete' };
+    line = JSON.stringify(o);
+    pipelineDiagnostics.record(
+      diagnosticBody(),
+      evaluationLifecycle ? 'evaluation_lifecycle_retained' : 'unresolved_exit_retained',
+      'ancestry_incomplete',
+    );
   }
   const workloadClassification = workloadCache.classify(o);
   const activity = classifyEventActivity(o, processClassification, workloadClassification);
@@ -3233,12 +3339,14 @@ function handleLine(raw) {
         attributionCounts.filteredNoise++;
       }
       pipelineAccounting.record('filtered', filterReason);
+      pipelineDiagnostics.record(diagnosticBody(), 'filtered', filterReason);
       return;
     }
   }
   if (!matchesE2eIngestMarkerScope(o)) {
     attributionCounts.e2eMarkerScopedOut++;
     pipelineAccounting.record('filtered', 'e2e_scope');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'e2e_scope');
     return;
   }
   const record = {

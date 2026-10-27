@@ -62,6 +62,9 @@ const targets = {
   'observer-kimi-tls': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-openssl-tls-20261013'],
   'observer-kimi-response': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-response-20261014'],
   'observer-kimi-keepalive': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-keepalive-20261015'],
+  'observer-kimi-oversize': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-oversize-20261020'],
+  'observer-kimi-fragment': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-fragment-20261020'],
+  'observer-kimi-fragment-fix': ['anysentry-observer-1', 'anysentry-observer-wrapper:kimi-fragment-fix-20261020'],
   'api-kimi-tls-session': ['anysentry-anysentry-1', 'anysentry-api:kimi-tls-session-20261013'],
   'api-kimi-tls-session-v2': ['anysentry-anysentry-1', 'anysentry-api:kimi-tls-session-v2-20261013'],
   'api-kimi-response': ['anysentry-anysentry-1', 'anysentry-api:kimi-response-20261014'],
@@ -97,7 +100,7 @@ const setEnv = (updates) => {
   config.Env = [...env].map(([key, value]) => `${key}=${value}`);
 };
 const openCodeData = '/home/zhongyule/code/anysentry-e2e-work/opencode-20260917/data/opencode';
-if (['observer-kimi-tls', 'observer-kimi-response', 'observer-kimi-keepalive'].includes(process.argv[2])) {
+if (['observer-kimi-tls', 'observer-kimi-response', 'observer-kimi-keepalive', 'observer-kimi-oversize', 'observer-kimi-fragment', 'observer-kimi-fragment-fix'].includes(process.argv[2])) {
   // kimi managed-OAuth and API-key providers terminate on these hosts; suffix-matched.
   const env = Object.fromEntries(config.Env.map(value => { const i = value.indexOf('='); return [value.slice(0, i), value.slice(i + 1)]; }));
   setEnv({ A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS: [...new Set([...(env.A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS || '').split(','),

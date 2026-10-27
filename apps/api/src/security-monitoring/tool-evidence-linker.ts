@@ -130,7 +130,9 @@ function processTuple(process: ProcessContext | undefined): StrongProcessTuple |
   const pid = process?.pid;
   const startTicks = text(process?.startTimeTicks, 512);
   const startNs = text(process?.startTimeNs, 512);
-  const start = startTicks ? `ticks:${startTicks}` : startNs ? `ns:${startNs}` : undefined;
+  const start = process?.startTimeSource === 'kernel_start_boottime' && startNs
+    ? `ns:${startNs}`
+    : startTicks ? `ticks:${startTicks}` : startNs ? `ns:${startNs}` : undefined;
   const pidNamespace = text(process?.pidNamespace, 512);
   const namespacePid = process?.namespacePid;
   const namespacePpid = process?.namespacePpid;

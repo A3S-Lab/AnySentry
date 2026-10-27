@@ -43,7 +43,6 @@ export const router = createBrowserRouter(
       { path: "/audit", lazy: lazyRoute("/audit") },
       { path: "/capabilities", lazy: lazyRoute("/capabilities") },
       { path: "/collectors", lazy: lazyRoute("/collectors") },
-      { path: "/conversations", lazy: lazyRoute("/conversations") },
       { path: "/record-tracking", lazy: lazyRoute("/record-tracking") },
       { path: "/coverage", lazy: lazyRoute("/coverage") },
       { path: "/evidence", lazy: lazyRoute("/evidence") },

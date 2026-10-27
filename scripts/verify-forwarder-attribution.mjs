@@ -1476,6 +1476,15 @@ function attributor(procEntries = []) {
   const otherArgv = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo two'] });
   assert.equal(deduper.isDuplicate(otherArgv), false);
 
+  const incomplete = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo one'] });
+  incomplete.event.ToolExec.exec_confirmed = true;
+  incomplete.event.ToolExec.argv_incomplete = true;
+  const complete = structuredClone(incomplete);
+  complete.event.ToolExec.argv_incomplete = false;
+  assert.equal(deduper.isDuplicate(incomplete), false);
+  assert.equal(deduper.isDuplicate(complete), false);
+  assert.equal(deduper.isDuplicate(incomplete), true);
+
   now += 5001;
   assert.equal(deduper.isDuplicate(event), false);
 }

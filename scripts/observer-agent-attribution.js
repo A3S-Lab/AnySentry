@@ -182,6 +182,31 @@ function processKey(info, defaults = {}) {
   ]);
 }
 
+function startTimeTicksFromNs(value, userHz) {
+  const ns = text(value);
+  const hz = positiveInt(userHz);
+  if (!ns || !hz) return undefined;
+  try {
+    const divisor = 1_000_000_000n / BigInt(hz);
+    return divisor > 0n ? (BigInt(ns) / divisor).toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameProcessGeneration(left, right) {
+  const leftNs = text(left?.startTimeNs);
+  const rightNs = text(right?.startTimeNs);
+  if (leftNs && rightNs) return leftNs === rightNs;
+  const leftTicks = text(left?.startTimeTicks);
+  const rightTicks = text(right?.startTimeTicks);
+  if (leftTicks && rightTicks) return leftTicks === rightTicks;
+  const hz = positiveInt(left?.userHz) || positiveInt(right?.userHz);
+  const convertedLeft = leftTicks || startTimeTicksFromNs(leftNs, hz);
+  const convertedRight = rightTicks || startTimeTicksFromNs(rightNs, hz);
+  return Boolean(convertedLeft && convertedRight && convertedLeft === convertedRight);
+}
+
 function readProcStartTime(pid, procRoot = '/proc') {
   try {
     const stat = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf8');
@@ -231,8 +256,15 @@ class ProcessRecordStore {
   getFor(info, allowPidFallback = false) {
     const normalized = this.normalize(info);
     const key = processKey(normalized, this.defaults);
-    if (key) return this.records.get(key);
-    return allowPidFallback ? this.get(normalized.pid, normalized.hostId, normalized.bootId) : undefined;
+    if (key) {
+      const exact = this.records.get(key);
+      if (exact) return exact;
+    }
+    const candidate = this.get(normalized.pid, normalized.hostId, normalized.bootId);
+    if (candidate && ((!key && allowPidFallback) || sameProcessGeneration(normalized, candidate))) {
+      return candidate;
+    }
+    return undefined;
   }
 
   getByKey(key) {
@@ -981,13 +1013,32 @@ class AgentAttributor {
       pid,
       tgid: positiveInt(processInfo.tgid),
       ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
+      creationPpid: positiveInt(processInfo.creationPpid) || positiveInt(processInfo.creation_ppid),
+      observedPpid: positiveInt(processInfo.observedPpid) || positiveInt(processInfo.observed_ppid),
+      creationParentStartTimeNs:
+        text(processInfo.creationParentStartBoottimeNs) ||
+        text(processInfo.creation_parent_start_boottime_ns),
+      observedParentStartTimeNs:
+        text(processInfo.observedParentStartBoottimeNs) ||
+        text(processInfo.observed_parent_start_boottime_ns),
+      parentRelationSource:
+        text(processInfo.parentRelationSource) || text(processInfo.parent_relation_source),
+      lineageComplete:
+        (processInfo.lineageComplete ?? processInfo.lineage_complete) === false ? false : undefined,
+      userHz: positiveInt(processInfo.userHz) || positiveInt(processInfo.user_hz),
       startTime:
+        text(processInfo.startBoottimeNs) ||
+        text(processInfo.start_boottime_ns) ||
+        text(processInfo.startTimeNs) ||
+        text(processInfo.start_time_ns) ||
         text(processInfo.startTimeTicks) ||
-        text(processInfo.start_time_ticks) ||
+        text(processInfo.start_time_ticks),
+      startTimeTicks: text(processInfo.startTimeTicks) || text(processInfo.start_time_ticks),
+      startTimeNs:
+        text(processInfo.startBoottimeNs) ||
+        text(processInfo.start_boottime_ns) ||
         text(processInfo.startTimeNs) ||
         text(processInfo.start_time_ns),
-      startTimeTicks: text(processInfo.startTimeTicks) || text(processInfo.start_time_ticks),
-      startTimeNs: text(processInfo.startTimeNs) || text(processInfo.start_time_ns),
       pidNamespace: text(processInfo.pidNamespace) || text(processInfo.pid_namespace),
       namespacePid: positiveInt(processInfo.namespacePid) || positiveInt(processInfo.namespace_pid),
       namespacePpid: positiveInt(processInfo.namespacePpid) || positiveInt(processInfo.namespace_ppid),
@@ -1009,6 +1060,7 @@ class AgentAttributor {
       cached &&
       (
         (observed.startTime && cached.startTime === observed.startTime) ||
+        sameProcessGeneration(observed, cached) ||
         (!observed.startTime &&
           observed.cgroupId &&
           cached.cgroupId &&
@@ -1019,6 +1071,18 @@ class AgentAttributor {
       ...(sameCachedProcess ? cached : {}),
       ...observed,
       ppid: observed.ppid || (sameCachedProcess ? cached.ppid : undefined),
+      creationPpid: observed.creationPpid || (sameCachedProcess ? cached.creationPpid : undefined),
+      observedPpid: observed.observedPpid || (sameCachedProcess ? cached.observedPpid : undefined),
+      creationParentStartTimeNs:
+        observed.creationParentStartTimeNs ||
+        (sameCachedProcess ? cached.creationParentStartTimeNs : undefined),
+      observedParentStartTimeNs:
+        observed.observedParentStartTimeNs ||
+        (sameCachedProcess ? cached.observedParentStartTimeNs : undefined),
+      parentRelationSource:
+        observed.parentRelationSource || (sameCachedProcess ? cached.parentRelationSource : undefined),
+      lineageComplete: observed.lineageComplete ?? (sameCachedProcess ? cached.lineageComplete : undefined),
+      userHz: observed.userHz || (sameCachedProcess ? cached.userHz : undefined),
       startTime: observed.startTime || (sameCachedProcess ? cached.startTime : undefined),
       startTimeTicks: observed.startTimeTicks || (sameCachedProcess ? cached.startTimeTicks : undefined),
       startTimeNs: observed.startTimeNs || (sameCachedProcess ? cached.startTimeNs : undefined),
@@ -1136,7 +1200,12 @@ class AgentAttributor {
     // labels and same-scope implementation wrappers from fragmenting one Agent lifecycle. A
     // different, registry-verified executable remains a real nested Agent boundary (for example
     // Pi launched by Codex), so it may establish an independent root below the owner.
-    const ancestry = this.resolveAncestry(current.ppid, now);
+    const ancestry = this.resolveAncestry(
+      current.ppid,
+      now,
+      current.creationParentStartTimeNs,
+      current.userHz,
+    );
     if (ancestry.state === 'agent') {
       if (directAgent && text(directAgent.agentId) !== text(ancestry.agentId)) {
         return this.finish(
@@ -1294,8 +1363,10 @@ class AgentAttributor {
     }
   }
 
-  resolveAncestry(initialPpid, now) {
+  resolveAncestry(initialPpid, now, initialParentStartNs, initialUserHz) {
     let pid = positiveInt(initialPpid);
+    let expectedStartNs = text(initialParentStartNs);
+    let userHz = positiveInt(initialUserHz);
     if (!pid) return { state: 'unknown' };
     const visited = new Set();
 
@@ -1303,7 +1374,10 @@ class AgentAttributor {
       if (visited.has(pid)) return { state: 'unknown' };
       visited.add(pid);
 
-      const cached = this.procs.get(pid);
+      const cached = this.procs.getFor(
+        { pid, startTimeNs: expectedStartNs, userHz },
+        !expectedStartNs,
+      );
       if (cached?.state === 'agent') {
         const scope = this.agentScope(cached);
         if (scope.state === 'agent') return scope;
@@ -1314,16 +1388,38 @@ class AgentAttributor {
       }
       if (pid === 1) return { state: 'non_agent' };
 
-      // A recent unknown entry still contains useful parent/start facts. Follow that cached
-      // parent without re-reading /proc; once the negative TTL expires, refresh it normally.
-      if (cached?.state === 'unknown' && cached.nextResolveAt > now) {
+      // A generation-matched unknown parent is durable evidence, not a liveness claim. Follow its
+      // cached ancestry after exit instead of requiring /proc to remain available.
+      if (cached?.state === 'unknown' && cached.startTime) {
+        const cachedAgent = this.matchAgent(cached);
+        if (cachedAgent) {
+          const ancestor = this.resolveSameScopeAncestor(cached.ppid, cachedAgent);
+          this.rememberAgent(
+            cached,
+            ancestor || cachedAgent,
+            ancestor?.rootPid || pid,
+            ancestor ? 'process_lineage' : 'hint_only',
+            ancestor ? 'process_graph' : 'process_signature',
+            ancestor?.workspacePath,
+          );
+          const scope = this.agentScope(this.procs.getFor(cached));
+          if (scope.state === 'agent') return scope;
+        }
         pid = positiveInt(cached.ppid);
+        expectedStartNs = text(cached.creationParentStartTimeNs);
+        userHz = positiveInt(cached.userHz);
         if (!pid) return { state: 'unknown' };
         continue;
       }
 
       const live = this.readProcess(pid, 'ancestry');
       if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
+      if (expectedStartNs && !sameProcessGeneration(
+        { startTimeNs: expectedStartNs, userHz },
+        { startTimeTicks: live.startTime, userHz },
+      )) {
+        return { state: 'unknown' };
+      }
       this.discardReusedPid(live);
 
       const containerScope = this.matchInfrastructure(live);
@@ -1416,6 +1512,8 @@ class AgentAttributor {
 
       this.remember({ ...live, state: 'unknown', lastSeen: now });
       pid = positiveInt(live.ppid);
+      expectedStartNs = '';
+      userHz = undefined;
       if (!pid) return { state: 'unknown' };
     }
     return { state: 'unknown' };

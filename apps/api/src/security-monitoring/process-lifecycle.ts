@@ -84,9 +84,12 @@ function sha256(value: unknown): string {
 }
 
 function trustedStart(process: ProcessContext): string | undefined {
-  const ticks = text(process.startTimeTicks, 160);
-  if (ticks && /^[1-9][0-9]*$/u.test(ticks)) return `ticks:${ticks}`;
   const ns = text(process.startTimeNs, 160);
+  const ticks = text(process.startTimeTicks, 160);
+  if (process.startTimeSource === 'kernel_start_boottime' && ns && /^[1-9][0-9]*$/u.test(ns)) {
+    return `ns:${ns}`;
+  }
+  if (ticks && /^[1-9][0-9]*$/u.test(ticks)) return `ticks:${ticks}`;
   if (ns && /^[1-9][0-9]*$/u.test(ns)) return `ns:${ns}`;
   return undefined;
 }

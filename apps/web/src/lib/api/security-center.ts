@@ -4128,21 +4128,6 @@ export const securityCenterApi = {
     apiClient.get<PlatformMetricsOverview>(`/security-center/platform/metrics${querySuffix({ range })}`),
   interactionStatus: () =>
     apiClient.get<InteractionStatus>("/security-center/interactions/status"),
-  interactionConversations: (query: {
-    limit?: number;
-    collectorId?: string;
-    agentInstanceId?: string;
-    workspacePath?: string;
-    since?: number;
-    until?: number;
-  } = {}) =>
-    apiClient.get<InteractionConversationList>(
-      `/security-center/conversations${querySuffix(query)}`,
-    ),
-  interactionConversation: (conversationId: string) =>
-    apiClient.get<InteractionConversationDetail>(
-      `/security-center/conversations/${encodeURIComponent(conversationId)}`,
-    ),
   localRecordStatus: () =>
     apiClient.get<LocalRecordTrackingStatus>("/security-center/local-records/status"),
   localRecords: (query: {
