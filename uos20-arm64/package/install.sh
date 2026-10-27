@@ -517,7 +517,7 @@ preflight() {
     fail "bundled Prometheus cannot execute: $prometheus_version"
   node_exporter_version=$("$PACKAGE_ROOT/prometheus/bin/node_exporter" --version 2>&1) ||
     fail "bundled node_exporter cannot execute: $node_exporter_version"
-  "$PACKAGE_ROOT/postgresql/bin/postgres" --version >/dev/null 2>&1 ||
+  LD_LIBRARY_PATH="$PACKAGE_ROOT/postgresql/lib" "$PACKAGE_ROOT/postgresql/bin/postgres" --version >/dev/null 2>&1 ||
     fail "bundled PostgreSQL cannot execute"
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
