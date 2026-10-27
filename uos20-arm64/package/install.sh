@@ -534,6 +534,14 @@ stop_services() {
 }
 
 start_available_services() {
+  # Bundled PostgreSQL bootstrap: idempotent initdb + database + env wiring.
+  if [[ -x $INSTALL_ROOT/init-postgresql.sh ]]; then
+    bash $INSTALL_ROOT/init-postgresql.sh >>"$INSTALL_LOG_ROOT/postgresql-bootstrap.txt" 2>&1 || true
+    if grep -q '^ANYSENTRY_DATABASE_URL=' "$ENV_FILE" 2>/dev/null; then
+      systemctl restart anysentry.service
+      echo 'PostgreSQL bootstrap: relational lane enabled, API restarted'
+    fi
+  fi
   local unit
   for unit in "${START_SERVICES[@]}"; do
     [[ -f $SYSTEMD_DIR/$unit ]] || continue
