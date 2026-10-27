@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-for dir in app runtime native clickhouse redis observer l3 prometheus java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+for dir in app runtime native clickhouse redis observer l3 prometheus postgresql java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
 for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
@@ -31,7 +31,8 @@ for file in \
   systemd/anysentry-supply-chain.service \
   systemd/anysentry-observer.service \
   systemd/anysentry-prometheus.service \
-  systemd/anysentry-node-exporter.service
+  systemd/anysentry-node-exporter.service \
+  systemd/anysentry-postgresql.service
 do
   install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
 done

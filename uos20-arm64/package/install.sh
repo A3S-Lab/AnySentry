@@ -48,6 +48,7 @@ SERVICES=(
   anysentry-observer.service
   anysentry-prometheus.service
   anysentry-node-exporter.service
+  anysentry-postgresql.service
 )
 START_SERVICES=(
   anysentry-clickhouse.service
@@ -66,8 +67,11 @@ START_SERVICES=(
   anysentry-observer.service
   anysentry-prometheus.service
   anysentry-node-exporter.service
+  anysentry-postgresql.service
 )
 STOP_SERVICES=(
+  anysentry.service
+  anysentry-postgresql.service
   anysentry-node-exporter.service
   anysentry-prometheus.service
   anysentry-observer.service
@@ -513,6 +517,8 @@ preflight() {
     fail "bundled Prometheus cannot execute: $prometheus_version"
   node_exporter_version=$("$PACKAGE_ROOT/prometheus/bin/node_exporter" --version 2>&1) ||
     fail "bundled node_exporter cannot execute: $node_exporter_version"
+  "$PACKAGE_ROOT/postgresql/bin/postgres" --version >/dev/null 2>&1 ||
+    fail "bundled PostgreSQL cannot execute"
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
   [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
@@ -857,7 +863,7 @@ main() {
     "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
     "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" \
     "$STATE_DIR/a3s-memory" "$STATE_DIR/a3s-l2-workspace" \
-    "$STATE_DIR/prometheus" "$STATE_DIR/forwarder" "$LOG_DIR"
+    "$STATE_DIR/prometheus" "$STATE_DIR/forwarder" "$STATE_DIR/postgresql" "$LOG_DIR"
   set_stage normalize-configuration
   install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"
   set_stage persist-resource-configuration
