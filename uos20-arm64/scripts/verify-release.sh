@@ -46,7 +46,7 @@ elf_count=0
 bpf_count=0
 while IFS= read -r -d '' file; do
   if LANG=C readelf -h "$file" >/dev/null 2>&1; then
-    machine=$(LANG=C readelf -h "$file" | awk -F: '/Machine:/ {sub(/^[[:space:]]+/, "", $2); print $2}')
+    machine=$(LANG=C readelf -h "$file" | awk -F: '/Machine:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')
     case "$machine" in
       AArch64)
         "$SCRIPT_DIR/check-elf.sh" "$file" >/dev/null
