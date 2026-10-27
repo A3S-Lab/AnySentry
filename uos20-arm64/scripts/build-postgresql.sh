@@ -21,7 +21,11 @@ docker create --platform linux/arm64 --name "$container" --entrypoint /bin/true 
 libtmp=$(mktemp -d "$BUILD_DIR/pglib.XXXXXX")
 docker cp "$container:/usr/local/lib/." "$libtmp/" 2>/dev/null || true
 docker rm "$container" >/dev/null
-if [[ -d "$libtmp" ]]; then cp -a "$libtmp/." "$STAGE_DIR/postgresql/lib/"; fi
+if [[ -d "$libtmp" ]]; then
+  # Ship only the shared objects postgres links against; the image also carries static
+  # archives (.a) that have no PT_LOAD segments and would fail the release ELF scan.
+  find "$libtmp" -maxdepth 1 -name '*.so*' -exec cp -a {} "$STAGE_DIR/postgresql/lib/" \;
+fi
 rm -rf "$tmp" "$libtmp"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$STAGE_DIR/postgresql/bin/postgres"
 printf '%s\n' "$POSTGRES_VERSION" >"$STAGE_DIR/postgresql/POSTGRES_VERSION"
