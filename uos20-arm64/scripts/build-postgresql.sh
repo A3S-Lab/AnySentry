@@ -25,9 +25,10 @@ done
 mkdir -p "$tmp/pluglib"
 docker cp "$container:/usr/lib/postgresql/13/lib/." "$tmp/pluglib/" 2>/dev/null || true
 
-# share data — REQUIRED by initdb (postgres.bki, timezone, extension SQL)
+# share data — REQUIRED by initdb (postgres.bki, timezone, extension SQL).
+# docker cp chokes on the relative sample symlinks; stream via export+tar instead.
 mkdir -p "$tmp/share"
-docker cp "$container:/usr/share/postgresql/13/." "$tmp/share/"
+docker export "$container" | tar -C "$tmp/share" --strip-components=4 -xf - usr/share/postgresql/13
 [[ -f "$tmp/share/postgres.bki" ]] || die "postgres.bki missing — initdb would fail"
 
 docker rm "$container" >/dev/null
