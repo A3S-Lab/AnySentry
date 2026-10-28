@@ -4,7 +4,7 @@ After=network.target
 Before=anysentry.service
 
 [Service]
-Type=notify
+Type=simple
 User=anysentry
 Group=anysentry
 Environment=PGDATA=/var/lib/anysentry/postgresql
