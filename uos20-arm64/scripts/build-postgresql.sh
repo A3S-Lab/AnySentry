@@ -22,10 +22,12 @@ done
 [[ -f "$tmp/syslib/libpq.so.5.13" ]] || die "libpq.so.5 missing from image"
 
 # plugin libs (extensions)
+mkdir -p "$tmp/pluglib"
 docker cp "$container:/usr/lib/postgresql/13/lib/." "$tmp/pluglib/" 2>/dev/null || true
 
 # share data — REQUIRED by initdb (postgres.bki, timezone, extension SQL)
-docker cp "$container:/usr/share/postgresql/13" "$tmp/share"
+mkdir -p "$tmp/share"
+docker cp "$container:/usr/share/postgresql/13/." "$tmp/share/"
 [[ -f "$tmp/share/postgres.bki" ]] || die "postgres.bki missing — initdb would fail"
 
 docker rm "$container" >/dev/null
