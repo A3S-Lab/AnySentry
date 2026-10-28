@@ -669,6 +669,38 @@ wait_for_flink() {
   wait_for_url http://127.0.0.1:8081/overview
 }
 
+wire_postgresql_paths() {
+  # Debian-built postgres resolves share/ and lib/ from compiled-in absolute paths
+  # (/usr/share/postgresql/13, /usr/lib/postgresql/13/lib). Point them at the bundled
+  # tree; a system PostgreSQL already occupying those paths aborts the install.
+  install -d -m 0755 /usr/share/postgresql /usr/lib/postgresql/13
+  local pair link target missing=()
+  for pair in "/usr/share/postgresql/13:$INSTALL_ROOT/postgresql/share" \
+              "/usr/lib/postgresql/13/lib:$INSTALL_ROOT/postgresql/lib"; do
+    link=${pair%%:*}
+    target=${pair#*:}
+    if [[ -e $link && ! -L $link ]]; then
+      fail "$link exists and is not a symlink (system PostgreSQL conflict?)"
+    fi
+    ln -sfn "$target" "$link"
+  done
+  [[ -f $INSTALL_ROOT/postgresql/share/postgres.bki ]] || missing+=('postgres.bki')
+  [[ -d $INSTALL_ROOT/postgresql/share/timezonesets ]] || missing+=('timezonesets/')
+  [[ -d $INSTALL_ROOT/postgresql/share/timezone ]] || missing+=('timezone/')
+  ((${#missing[@]} == 0)) || fail "bundled PostgreSQL share incomplete: ${missing[*]}"
+  [[ -e /usr/share/postgresql/13/timezonesets ]] || fail "share symlink not effective"
+}
+
+wait_for_postgresql() {
+  local i
+  for i in $(seq 1 60); do
+    LD_LIBRARY_PATH=$INSTALL_ROOT/postgresql/lib \
+      "$INSTALL_ROOT/postgresql/bin/pg_isready" -h 127.0.0.1 -p 5432 -q 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
 record_unit_startup_log() {
   local unit=$1 name=$2 dest errors
   dest=$INSTALL_LOG_ROOT/startup-$name.log
@@ -773,6 +805,27 @@ activate_release() {
   done
   systemctl daemon-reload
   : >"$INSTALL_LOG_ROOT/startup-failures.txt"
+  set_stage wire-postgresql-paths
+  wire_postgresql_paths
+  set_stage start-postgresql
+  if [[ -x /init-postgresql.sh ]]; then
+    # Pre-start pass: initdb on a fresh PGDATA (script exits 0 after initdb —
+    # DB creation and env wiring happen post-start). Without this, postgres
+    # starts against an empty cluster directory and crash-loops.
+    bash "/init-postgresql.sh" >>"/postgresql-bootstrap.txt" 2>&1 ||
+      remember_start_failure "PostgreSQL initdb pass failed"
+  fi
+  start_unit anysentry-postgresql.service postgresql
+  if systemctl is-active --quiet anysentry-postgresql.service; then
+    wait_for_postgresql || remember_start_failure "PostgreSQL readiness timeout"
+  fi
+  if [[ -x $INSTALL_ROOT/init-postgresql.sh ]]; then
+    # Fresh installs need the post-start pass: CREATE DATABASE + DATABASE_URL wiring.
+    bash "$INSTALL_ROOT/init-postgresql.sh" >>"$INSTALL_LOG_ROOT/postgresql-bootstrap.txt" 2>&1 ||
+      remember_start_failure "PostgreSQL bootstrap failed"
+    grep -q '^ANYSENTRY_DATABASE_URL=' "$ENV_FILE" 2>/dev/null &&
+      echo 'PostgreSQL bootstrap: relational lane wired (ANYSENTRY_DATABASE_URL present)'
+  fi
   set_stage start-clickhouse
   start_unit anysentry-clickhouse.service clickhouse
   if systemctl is-active --quiet anysentry-clickhouse.service; then
@@ -827,6 +880,9 @@ activate_release() {
   start_unit anysentry-stream-worker.service stream-worker
   start_unit anysentry-composite-judge.service composite-judge
   start_unit anysentry-supply-chain.service supply-chain
+  set_stage start-monitoring
+  start_unit anysentry-prometheus.service prometheus
+  start_unit anysentry-node-exporter.service node-exporter
   capture_diagnostics activation
   finish_if_start_failures
   set_stage verify-activation
@@ -884,6 +940,8 @@ main() {
   [[ ! -f $ROLLBACK_ENV ]] || rm -f "$ROLLBACK_ENV"
   set_stage completed
   echo "AnySentry installation or upgrade completed. Dashboard: http://<host>:$(env_value PORT "$ENV_FILE")/"
+  [[ -f $INSTALL_ROOT/VERSION ]] &&
+    echo "Installed release: $(sed -n 's/^RELEASE_VERSION=//p' "$INSTALL_ROOT/VERSION")"
   [[ $HAD_PREVIOUS -eq 0 ]] || echo "Previous program retained for rollback: $ROLLBACK_ROOT"
 }
 

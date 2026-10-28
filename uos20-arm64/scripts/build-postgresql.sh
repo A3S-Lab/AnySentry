@@ -27,10 +27,13 @@ docker cp "$container:/usr/lib/postgresql/13/lib/." "$tmp/pluglib/" 2>/dev/null 
 
 # share data — REQUIRED by initdb (postgres.bki, timezone, extension SQL).
 # docker cp chokes on the relative sample symlinks; stream via export+tar instead.
-mkdir -p "$tmp/share"
-mkdir -p "$tmp/pghome"
+mkdir -p "$tmp/share" "$tmp/pghome" "$tmp/zoneinfo"
 docker export "$container" | tar -C "$tmp/pghome" --strip-components=3 -xf - usr/share/postgresql
 [[ -f "$tmp/pghome/13/postgres.bki" ]] || die "postgres.bki missing — initdb would fail"
+# The image ships share/timezone as a dangling ../../zoneinfo symlink; pull the real
+# system tzdata subtree so the staged share is self-contained.
+docker export "$container" | tar -C "$tmp/zoneinfo" --strip-components=3 -xf - usr/share/zoneinfo
+[[ -f "$tmp/zoneinfo/Asia/Shanghai" ]] || die "zoneinfo subtree missing from image"
 
 docker rm "$container" >/dev/null
 
@@ -48,7 +51,15 @@ ln -sf libicudata.so.63.1 libicudata.so.63
 cd - >/dev/null
 cp -a "$tmp/syslib/"* "$STAGE_DIR/postgresql/lib/"
 if compgen -G "$tmp/pluglib/*.so" >/dev/null; then cp -a "$tmp/pluglib/"*.so "$STAGE_DIR/postgresql/lib/"; fi
+# Drop dangling symlinks first (-aL dereference would abort on them), then copy.
+find "$tmp/pghome/13" -xtype l -delete 2>/dev/null || true
 cp -aL "$tmp/pghome/13/." "$STAGE_DIR/postgresql/share/"
+rm -rf "$STAGE_DIR/postgresql/share/timezone"
+cp -a "$tmp/zoneinfo" "$STAGE_DIR/postgresql/share/timezone"
+find "$STAGE_DIR/postgresql/share/timezone" -xtype l -delete 2>/dev/null || true
+for required in postgres.bki timezonesets timezone; do
+  [[ -e "$STAGE_DIR/postgresql/share/$required" ]] || die "staged share incomplete: $required"
+done
 rm -rf "$tmp"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$STAGE_DIR/postgresql/bin/postgres"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$STAGE_DIR/postgresql/bin/initdb"

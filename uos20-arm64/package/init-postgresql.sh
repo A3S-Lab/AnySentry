@@ -7,9 +7,13 @@ PGDATA=${ANYSENTRY_PGDATA:-/var/lib/anysentry/postgresql}
 ENV_FILE=${ANYSENTRY_ENV_FILE:-/etc/anysentry/anysentry.env}
 PGBIN=$PG_HOME/bin
 
+# Socket dir for the Debian-built postmaster (unit RuntimeDirectory owns this on
+# start; this line covers manual/bootstrap invocations outside systemd).
+install -d -o anysentry -g anysentry -m 0755 /run/postgresql 2>/dev/null || true
+
 if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
   echo 'Initializing PostgreSQL data directory...'
-  install -d -o anysentry -g anysentry -m 0700 "$PGDATA"
+  install -d -o anysentry -g anysentry -m 0750 "$PGDATA"
   runuser -u anysentry -- "$PGBIN/initdb" -D "$PGDATA" -U anysentry --auth=trust -E UTF8 -L "$PG_HOME/share"
   { echo "listen_addresses = '127.0.0.1'"; echo port = 5432; } >>"$PGDATA/postgresql.conf"
   chown anysentry:anysentry "$PGDATA/postgresql.conf"
