@@ -28,8 +28,9 @@ docker cp "$container:/usr/lib/postgresql/13/lib/." "$tmp/pluglib/" 2>/dev/null 
 # share data — REQUIRED by initdb (postgres.bki, timezone, extension SQL).
 # docker cp chokes on the relative sample symlinks; stream via export+tar instead.
 mkdir -p "$tmp/share"
-docker export "$container" | tar -C "$tmp/share" --strip-components=4 -xf - usr/share/postgresql/13
-[[ -f "$tmp/share/postgres.bki" ]] || die "postgres.bki missing — initdb would fail"
+mkdir -p "$tmp/pghome"
+docker export "$container" | tar -C "$tmp/pghome" --strip-components=3 -xf - usr/share/postgresql
+[[ -f "$tmp/pghome/13/postgres.bki" ]] || die "postgres.bki missing — initdb would fail"
 
 docker rm "$container" >/dev/null
 
@@ -47,7 +48,7 @@ ln -sf libicudata.so.63.1 libicudata.so.63
 cd - >/dev/null
 cp -a "$tmp/syslib/"* "$STAGE_DIR/postgresql/lib/"
 if compgen -G "$tmp/pluglib/*.so" >/dev/null; then cp -a "$tmp/pluglib/"*.so "$STAGE_DIR/postgresql/lib/"; fi
-cp -a "$tmp/share/." "$STAGE_DIR/postgresql/share/"
+cp -aL "$tmp/pghome/13/." "$STAGE_DIR/postgresql/share/"
 rm -rf "$tmp"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$STAGE_DIR/postgresql/bin/postgres"
 "$CHANNEL_DIR/scripts/check-elf.sh" "$STAGE_DIR/postgresql/bin/initdb"
