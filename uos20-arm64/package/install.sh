@@ -51,6 +51,7 @@ SERVICES=(
   anysentry-postgresql.service
 )
 START_SERVICES=(
+  anysentry-postgresql.service
   anysentry-clickhouse.service
   anysentry-redis.service
   anysentry-kafka.service
