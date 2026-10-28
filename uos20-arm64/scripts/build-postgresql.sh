@@ -45,7 +45,7 @@ ln -sf libicui18n.so.63.1 libicui18n.so.63
 ln -sf libicuuc.so.63.1 libicuuc.so.63
 ln -sf libicudata.so.63.1 libicudata.so.63
 cd - >/dev/null
-cp -a "$tmp/syslib/."* "$STAGE_DIR/postgresql/lib/"
+cp -a "$tmp/syslib/"* "$STAGE_DIR/postgresql/lib/"
 if compgen -G "$tmp/pluglib/*.so" >/dev/null; then cp -a "$tmp/pluglib/"*.so "$STAGE_DIR/postgresql/lib/"; fi
 cp -a "$tmp/share/." "$STAGE_DIR/postgresql/share/"
 rm -rf "$tmp"
