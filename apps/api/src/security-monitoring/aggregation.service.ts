@@ -3931,9 +3931,11 @@ export class AggregationService implements OnModuleDestroy {
     const records = resolvedConversationId
       ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
-    const segments = resolvedConversationId && this.conversationBindings
-      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
-      : [];
+    // Read-path support: PG-authoritative segments + technical activities with
+    // on-read derivation fallback — the hot maps are restart-volatile.
+    const segments = (resolvedConversationId && this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(resolvedConversationId, records)
+      : { segments: [] }).segments;
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
@@ -4038,17 +4040,18 @@ export class AggregationService implements OnModuleDestroy {
     const records = resolvedConversationId
       ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
-    const segments = resolvedConversationId && this.conversationBindings
-      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
-      : [];
+    // Read-path support: PG-authoritative segments + technical activities with
+    // on-read derivation fallback — the hot maps are restart-volatile.
+    const timelineSupport = resolvedConversationId && this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(resolvedConversationId, records)
+      : { segments: [], technicalActivities: [] };
+    const segments = timelineSupport.segments;
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
     const instanceIds = new Set(segments.map((segment) => segment.agentInstanceId));
-    const technicalActivitySummaries = this.conversationBindings
-      ? this.conversationBindings.listTechnicalActivities()
-        .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId))
-      : [];
+    const technicalActivitySummaries = timelineSupport.technicalActivities
+      .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId));
     const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
     const requestKey = createHash('sha256').update([
       resolvedConversationId ?? requestedConversationId ?? '',
@@ -4128,8 +4131,12 @@ export class AggregationService implements OnModuleDestroy {
     return this.conversationBindings?.currentResolutionRevision() ?? 0;
   }
 
-  agentRunTechnicalActivities(agentInstanceId?: string): T.AgentRunTechnicalActivitySummary[] {
-    return this.conversationBindings?.listTechnicalActivities(agentInstanceId) ?? [];
+  async agentRunTechnicalActivities(
+    agentInstanceId?: string,
+  ): Promise<T.AgentRunTechnicalActivitySummary[]> {
+    if (!this.conversationBindings) return [];
+    if (!agentInstanceId) return this.conversationBindings.listTechnicalActivities();
+    return this.conversationBindings.technicalActivitiesForInstance(agentInstanceId);
   }
 
   async agentSemanticEvidence(
@@ -4143,7 +4150,9 @@ export class AggregationService implements OnModuleDestroy {
     const conversationId = canonicalConversationId ?? query.conversationId;
     const thread = projection.summaries.find((item) => item.conversationId === conversationId);
     const records = projection.interactionsByConversation.get(conversationId) ?? [];
-    const segments = this.conversationBindings?.segmentsForConversation(conversationId) ?? [];
+    const segments = (this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(conversationId, records)
+      : { segments: [] }).segments;
     if (!thread?.hasContent || records.length === 0) return undefined;
     const turns = projectSemanticConversationTimeline(thread, records, segments);
     const events = turns.flatMap((turn) => turn.events);

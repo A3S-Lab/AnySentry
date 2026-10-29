@@ -8887,7 +8887,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     @Headers() headers: HeaderBag,
   ): Promise<T.AgentConversationDirectoryListV3> {
     const legacy = await this.agentConversationDirectoryV2(f, headers);
-    const technical = this.agg.agentRunTechnicalActivities();
+    const technical = await this.agg.agentRunTechnicalActivities();
     return {
       ...legacy,
       apiVersion: 3,
