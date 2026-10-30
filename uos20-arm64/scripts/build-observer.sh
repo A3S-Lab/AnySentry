@@ -11,7 +11,7 @@ zigbuild=$TOOLS/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION/bin/cargo-zigbuild
 observer=$SOURCE_DIR/observer
 bpf=$BUILD_DIR/observer-bpf/probes-legacy.o
 install -d -m 0755 "$(dirname "$bpf")"
-bpf_cflags=(-mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables
+bpf_cflags=(-mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables -D A3S_BPF_LEGACY_CURSOR
   -mllvm -enable-tail-merge=0 -mllvm -disable-branch-fold -mllvm -disable-block-placement)
 if [[ ${A3S_BPF_LOCAL_CLANG:-} == zig ]]; then
   # Fallback for a wedged Docker daemon: zig cc embeds the same LLVM BPF backend.
