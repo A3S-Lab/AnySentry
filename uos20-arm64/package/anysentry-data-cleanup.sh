@@ -114,6 +114,18 @@ else note "PG 未就绪，跳过 PG 段"; fi
 
 [[ $MODE == report ]] && { echo; note "只读报告结束。删除用法见: bash $0 --help"; exit 0; }
 
+# 断线自持久（v3）：清理模式 + 交互终端时自动转后台，SSH 断线不杀脚本。
+# 重 I/O 阶段机器可能忙到 SSH 无响应（现场两次断线的根因），后台化后断线无害。
+if [[ -z ${CLEANUP_DAEMON:-} && -t 1 ]]; then
+  export CLEANUP_DAEMON=1
+  LOGF=/var/log/anysentry/cleanup-run.log
+  mkdir -p /var/log/anysentry
+  setsid nohup bash "$0" "$@" >>"$LOGF" 2>&1 < /dev/null &
+  echo "已转入后台运行（SSH 断线安全）"
+  echo "  日志: $LOGF    跟踪: tail -f $LOGF"
+  exit 0
+fi
+
 # =========================================================================
 step "6. 计算删除边界（--keep-days N = 保留最近 N 天，含今天）"
 if [[ $MODE == keep ]]; then
@@ -167,6 +179,19 @@ if [[ $ASSUME_YES -ne 1 ]]; then
 fi
 
 step "8. ClickHouse 删除（mutation 异步，等待完成）"
+# v3: 先等上一轮遗留 mutation（断线重启场景），避免叠加重写
+pre=$(chq "SELECT count() FROM system.mutations WHERE database='anysentry'
+           AND table IN ($TABLE_LIST) AND is_done=0 AND command LIKE '%DELETE%'")
+if [[ ${pre:-0} != 0 ]]; then
+  note "上轮遗留 ${pre} 个未完成 mutation，先等它们结束（不叠加新重写）..."
+  while :; do
+    p=$(chq "SELECT count() FROM system.mutations WHERE database='anysentry'
+             AND table IN ($TABLE_LIST) AND is_done=0 AND command LIKE '%DELETE%'")
+    [[ ${p:-0} == 0 ]] && break
+    sleep 10
+  done
+  note "遗留 mutation 已完成"
+fi
 for i in "${!TABLES[@]}"; do
   if chq "ALTER TABLE anysentry.${TABLES[$i]} DELETE WHERE ${TSEXPR[$i]} < '$CUTOFF'" >/dev/null; then
     note "已提交: ${TABLES[$i]}"
@@ -177,9 +202,15 @@ while :; do
   pending=$(chq "SELECT count() FROM system.mutations WHERE database='anysentry'
                  AND table IN ($TABLE_LIST) AND is_done=0 AND command LIKE '%DELETE%'")
   [[ ${pending:-0} == 0 ]] && break
-  (( $(date +%s) > deadline )) && { note "等待超时（20 分钟），mutation 后台继续，稍后重跑报告核对"; break; }
+  (( $(date +%s) > deadline )) && { note "等待超时（20 分钟）"; break; }
   sleep 5
 done
+# v3: mutation 未完成时绝不进入 PG VACUUM FULL——两场全表重写叠加曾把机器压到 SSH 无响应
+if [[ ${pending:-0} != 0 ]]; then
+  echo "!! CH mutation 仍在重写（${pending} 个）。为避免与 PG VACUUM FULL 叠加压垮磁盘，本次到此为止。" >&2
+  echo "!! 等 mutation 完成后重跑本脚本（幂等，会跳过已删数据直奔 PG 段）。" >&2
+  exit 1
+fi
 
 step "9. PostgreSQL 删除 + 空间回收"
 if [[ $PG_READY == 1 ]]; then
@@ -198,10 +229,21 @@ if [[ $PG_READY == 1 ]]; then
   done
   pgq "VACUUM ANALYZE" >/dev/null 2>&1
   if [[ $VAC_FULL == 1 ]]; then
-    note "VACUUM FULL 还磁盘空间（每表短暂锁，API loopback 专用，影响为秒级停顿）..."
-    for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1; do
-      pgq "VACUUM FULL $t" >/dev/null 2>&1 && note "VACUUM FULL $t 完成"
-    done
+    # v3: 磁盘余量守卫（VACUUM FULL 需约等于表大小的临时空间）+ checkpoint 降压
+    FREE_KB=$(df -P --output=avail /var/lib/anysentry/postgresql 2>/dev/null | tail -1 | tr -d ' ')
+    BIG_KB=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc \
+      "SELECT greatest(pg_total_relation_size('anysentry_raw_observations_v1'),
+                        pg_total_relation_size('anysentry_kernel_facts_v1'))/1024" 2>/dev/null || echo 0)
+    note "VACUUM FULL 前检查: 余量 ${FREE_KB:-?}KB vs 最大表 ${BIG_KB:-?}KB"
+    if [[ -n ${FREE_KB:-} && -n ${BIG_KB:-} && ${BIG_KB:-0} -gt 0 && $FREE_KB -lt $((BIG_KB*2)) ]]; then
+      note "!! 余量不足（需约 2×最大表），跳过 VACUUM FULL——空间已可复用，下次余量充足时再跑"
+    else
+      note "VACUUM FULL 还磁盘空间（每表短暂锁，API loopback 专用，影响为秒级停顿）..."
+      for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1; do
+        pgq "CHECKPOINT" >/dev/null 2>&1
+        pgq "VACUUM FULL $t" >/dev/null 2>&1 && note "VACUUM FULL $t 完成"
+      done
+    fi
   else note "已跳过 VACUUM FULL（--skip-vacuum-full）：空间仅标记复用，不返还磁盘"
   fi
   note "PG 现占用: $(du -sh /var/lib/anysentry/postgresql 2>/dev/null | cut -f1)"
