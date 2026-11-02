@@ -39,6 +39,7 @@ chq() { "${CH[@]}" "$CH_URL" --data-binary "$1" 2>/dev/null; }
 pgq() { "$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -v ON_ERROR_STOP=0 -q "$1" 2>&1; }
 
 MODE=report; KEEP_DAYS=""; OLDEST_DAYS=""; ASSUME_YES=0; PURGE_RB=0; VAC_FULL=1
+ORIG_ARGS=("$@")   # 解析循环会 shift 掉参数；后台重执行前必须先留存原参
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-days)          KEEP_DAYS=${2:-}; MODE=keep; shift 2 ;;
@@ -120,7 +121,7 @@ if [[ -z ${CLEANUP_DAEMON:-} && -t 1 ]]; then
   export CLEANUP_DAEMON=1
   LOGF=/var/log/anysentry/cleanup-run.log
   mkdir -p /var/log/anysentry
-  setsid nohup bash "$0" "$@" >>"$LOGF" 2>&1 < /dev/null &
+  setsid nohup bash "$0" "${ORIG_ARGS[@]}" >>"$LOGF" 2>&1 < /dev/null &
   echo "已转入后台运行（SSH 断线安全）"
   echo "  日志: $LOGF    跟踪: tail -f $LOGF"
   exit 0
