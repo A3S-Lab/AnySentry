@@ -7,7 +7,6 @@ import {
   EyeOff,
   FileCheck2,
   GitBranch,
-  History,
   KeyRound,
   Layers3,
   LayoutDashboard,
