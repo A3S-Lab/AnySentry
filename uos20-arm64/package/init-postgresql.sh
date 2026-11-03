@@ -15,7 +15,7 @@ if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
   echo 'Initializing PostgreSQL data directory...'
   install -d -o anysentry -g anysentry -m 0750 "$PGDATA"
   runuser -u anysentry -- "$PGBIN/initdb" -D "$PGDATA" -U anysentry --auth=trust -E UTF8 -L "$PG_HOME/share"
-  { echo "listen_addresses = '127.0.0.1'"; echo port = 5432; } >>"$PGDATA/postgresql.conf"
+  { echo "listen_addresses = '127.0.0.1'"; echo port = 5432; echo "jit = off"; } >>"$PGDATA/postgresql.conf"
   chown anysentry:anysentry "$PGDATA/postgresql.conf"
   echo "initdb completed"
 fi

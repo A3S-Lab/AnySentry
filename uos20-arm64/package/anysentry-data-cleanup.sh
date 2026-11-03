@@ -36,7 +36,10 @@ PG_FAMILY_TABLES=(anysentry_agent_conversation_threads_v1 anysentry_agent_conver
 step() { echo; echo "########## $* ##########"; }
 note() { echo "  $*"; }
 chq() { "${CH[@]}" "$CH_URL" --data-binary "$1" 2>/dev/null; }
-pgq() { "$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -v ON_ERROR_STOP=0 -q "$1" 2>&1; }
+pgq() { "$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -v ON_ERROR_STOP=1 "$@" 2>&1; }
+# v4: 打包缺 llvmjit*.bc，触发 JIT 的大表查询整条报错（2026-11-03 现场根因）——清理前确保关闭
+pgq -c "ALTER SYSTEM SET jit='off'" >/dev/null 2>&1 || true
+pgq -c "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
 
 MODE=report; KEEP_DAYS=""; OLDEST_DAYS=""; ASSUME_YES=0; PURGE_RB=0; VAC_FULL=1
 ORIG_ARGS=("$@")   # 解析循环会 shift 掉参数；后台重执行前必须先留存原参
@@ -217,14 +220,14 @@ step "9. PostgreSQL 删除 + 空间回收"
 if [[ $PG_READY == 1 ]]; then
   for te in "${PG_NS_TABLES[@]}"; do
     t=${te%%:*}; col=${te##*:}
-    r=$(pgq "DELETE FROM $t WHERE $col < $CUTOFF_NS")
-    note "DELETE $t: $(echo "$r" | grep -oE 'DELETE [0-9]+' || echo '0/失败')"
+    r=$(pgq -c "DELETE FROM $t WHERE $col < $CUTOFF_NS")
+    note "DELETE $t: $(echo "$r" | grep -oE 'DELETE [0-9]+' || echo "失败:$(echo "$r" | head -c 120)")"
   done
   for t in "${PG_FAMILY_TABLES[@]}"; do
     has=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc \
       "SELECT 1 FROM information_schema.columns WHERE table_name='$t' AND column_name='created_at'" 2>/dev/null)
     [[ $has == 1 ]] || continue
-    r=$(pgq "DELETE FROM $t WHERE created_at < '$CUTOFF'")
+    r=$(pgq -c "DELETE FROM $t WHERE created_at < '$CUTOFF'")
     n=$(echo "$r" | grep -oE 'DELETE [0-9]+' | grep -oE '[0-9]+' || echo 0)
     [[ ${n:-0} -gt 0 ]] && note "DELETE $t: $n"
   done
@@ -240,9 +243,13 @@ if [[ $PG_READY == 1 ]]; then
       note "!! 余量不足（需约 2×最大表），跳过 VACUUM FULL——空间已可复用，下次余量充足时再跑"
     else
       note "VACUUM FULL 还磁盘空间（每表短暂锁，API loopback 专用，影响为秒级停顿）..."
-      for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1; do
-        pgq "CHECKPOINT" >/dev/null 2>&1
-        pgq "VACUUM FULL $t" >/dev/null 2>&1 && note "VACUUM FULL $t 完成"
+      for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1 anysentry_coverage_gaps_v1 anysentry_agent_conversation_memberships_v2; do
+        pgq -c "CHECKPOINT" >/dev/null 2>&1
+        b=$(pgq -tAc "SELECT pg_size_pretty(pg_total_relation_size('$t'))" 2>/dev/null)
+        out=$(pgq -c "VACUUM FULL $t" 2>&1)
+        a=$(pgq -tAc "SELECT pg_size_pretty(pg_total_relation_size('$t'))" 2>/dev/null)
+        if echo "$out" | grep -q VACUUM; then note "VACUUM FULL $t: $b -> $a"
+        else note "!! VACUUM FULL $t 失败: $(echo "$out" | head -c 120)"; fi
       done
     fi
   else note "已跳过 VACUUM FULL（--skip-vacuum-full）：空间仅标记复用，不返还磁盘"
