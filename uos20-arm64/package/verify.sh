@@ -217,7 +217,9 @@ before_rejected=$(printf '%s' "$before" | json_value data.items.0.rejectedEvents
 /bin/ls /etc >/dev/null
 
 after=$before
-for _ in $(seq 1 30); do
+# compat19: 90s window - the forwarder may still be in ECONNRESET backoff right
+# after the API reboot; 30s cut it fine in the field (2026-11-05).
+for _ in $(seq 1 90); do
   sleep 1
   after=$(post_json sources/list "$source_body") || continue
   after_accepted=$(printf '%s' "$after" | json_value data.items.0.acceptedEvents)

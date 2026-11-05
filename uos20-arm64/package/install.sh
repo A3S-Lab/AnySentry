@@ -852,8 +852,18 @@ activate_release() {
   start_unit anysentry-flink-job.service flink-job
   set_stage start-api-and-observer
   systemctl enable anysentry.service anysentry-observer.service
-  if ! systemctl start anysentry.service anysentry-observer.service; then
+  # compat19: start the API alone and wait for healthz BEFORE starting the observer.
+  # Starting both at once raced the forwarder into the API reboot window (field
+  # 2026-11-05: ECONNRESET x N, verify's smoke event missed its retry budget).
+  if ! systemctl start anysentry.service; then
     systemctl start --job-mode=ignore-dependencies anysentry.service || true
+  fi
+  api_port=$(env_value PORT "$ENV_FILE")
+  [[ -n $api_port ]] || api_port=29653
+  if ! wait_for_url "http://127.0.0.1:$api_port/security-center/healthz"; then
+    remember_start_failure "API did not become healthy before observer start"
+  fi
+  if ! systemctl start anysentry-observer.service; then
     systemctl start --job-mode=ignore-dependencies anysentry-observer.service || true
   fi
   sleep 2

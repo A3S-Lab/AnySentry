@@ -11,6 +11,8 @@ NODE=/opt/anysentry/runtime/node/bin/node
 FWD=/opt/anysentry/observer/observer-forward.js
 
 mkdir -p "$DIR"
+# compat19: die together - a bare pkill of this script must not orphan the children
+trap 'kill "$cp" "$fp" 2>/dev/null; exit 0' TERM INT
 echo "run-observer: supervisor started (fifo=$FIFO)"
 while :; do
   rm -f "$FIFO"
