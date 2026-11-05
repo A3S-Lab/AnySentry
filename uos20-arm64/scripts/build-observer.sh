@@ -66,6 +66,7 @@ do
   install -m 0644 "$SOURCE_DIR/anysentry/scripts/$module" "$STAGE_DIR/observer/$module"
 done
 install -m 0644 "$bpf" "$STAGE_DIR/observer/probes-legacy.o"
+install -m 0755 "$CHANNEL_DIR/package/observer-run.sh" "$STAGE_DIR/observer/run-observer.sh"
 printf '%s\n' 'perf-kprobe-legacy' > "$STAGE_DIR/observer/BACKEND"
 printf '%s\n' "$UOS_BPF_KERNEL_VERSION" > "$STAGE_DIR/observer/KERNEL_VERSION"
 printf '%s\n' "$UOS_BPF_KERNEL_VERSION_CODE" > "$STAGE_DIR/observer/KERNEL_VERSION_CODE"

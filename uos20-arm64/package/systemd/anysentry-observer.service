@@ -27,32 +27,6 @@ Environment=ANYSENTRY_FILTER_RULES_FILE=/run/anysentry-filter/filter-rules.json
 Environment=NODE_OPTIONS=--max-old-space-size=1024
 Environment=FORWARD_HTTP_TIMEOUT_MS=20000
 Environment="FORWARD_DROP_PATHS=/sys/,/proc/,/run/,/dev/,/var/lib/anysentry/clickhouse/,/var/lib/anysentry/redis/,/var/log/anysentry/"
-# Supervisor pattern (compat17): the old `collector | forwarder` pipeline kept the unit
-# "active" when EITHER half died silently (field-observed 2026-11-05: forwarder node died
-# ~4h before detection, unit active, zero events reaching CH). wait -n makes any child
-# exit kill the sibling and fail the unit so Restart=on-failure heals the whole pipeline.
-ExecStart=/bin/bash -c '/opt/anysentry/observer/bin/a3s-observer-collector & c=$$!; /opt/anysentry/runtime/node/bin/node /opt/anysentry/observer/observer-forward.js & f=$$!; wait -n; kill $$c $$f 2>/dev/null; wait 2>/dev/null; exit 1'
-Restart=on-failure
-RestartSec=5s
-TimeoutStartSec=60s
-TimeoutStopSec=30s
-KillMode=control-group
-LimitMEMLOCK=infinity
-LimitNOFILE=65536
-MemoryHigh=2G
-MemoryMax=3G
-# CAP_SYS_PTRACE：uprobe 采集需要读白名单进程的 /proc/pid/maps（libssl 发现）与
-# /proc/pid/root（容器内库路径解析）；无此权限时 uprobe 静默不挂接（kprobe 兜底不受影响）。
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-
-[Install]
-WantedBy=multi-user.target
+# compat18: dedicated supervisor keeps the collector|forwarder FIFO data path
+# AND fails fast on either member's death (self-restarting loop inside the script).
+ExecStart=/opt/anysentry/observer/run-observer.sh
