@@ -20,10 +20,14 @@ echo "run-observer: memlock=$(ulimit -l)"
 # double unit start) competes for the BPF map budget and adds a second
 # collector_heartbeats writer, so drop counters alternate between writers and
 # acceptance sampling reads whichever landed last (field 2026-11-06).
-exec 9>/var/lock/anysentry-observer.lock
-if ! flock -n 9; then
-  echo "run-observer: another supervisor holds the lock; exiting" >&2
-  exit 0
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/var/lock/anysentry-observer.lock
+  if ! flock -n 9; then
+    echo "run-observer: another supervisor holds the lock; exiting" >&2
+    exit 0
+  fi
+else
+  echo "run-observer: flock unavailable; running without the single-instance guard" >&2
 fi
 
 # compat19: die together - a bare pkill of this script must not orphan the children
