@@ -10,11 +10,18 @@ C=/opt/anysentry/observer/bin/a3s-observer-collector
 NODE=/opt/anysentry/runtime/node/bin/node
 FWD=/opt/anysentry/observer/observer-forward.js
 
+# compat21: BPF map creation EPERMs under the inherited 64KiB memlock (field
+# 2026-11-06: collector died at map EVENTS on every supervised start while the
+# old pipeline unit's children ran unlimited). Declare the budget explicitly.
+ulimit -l unlimited 2>/dev/null || true
 mkdir -p "$DIR"
+echo "run-observer: memlock=$(ulimit -l)"
 # compat19: die together - a bare pkill of this script must not orphan the children
 trap 'kill "$cp" "$fp" 2>/dev/null; exit 0' TERM INT
 echo "run-observer: supervisor started (fifo=$FIFO)"
+FAILS=0
 while :; do
+  _cycle_start=$(date +%s)
   rm -f "$FIFO"
   mkfifo "$FIFO" || { echo "run-observer: mkfifo failed" >&2; sleep 5; continue; }
   "$C" >"$FIFO" 2>&2 &
@@ -25,9 +32,15 @@ while :; do
   while kill -0 "$cp" 2>/dev/null && kill -0 "$fp" 2>/dev/null; do
     sleep 2
   done
+  [ $(( $(date +%s) - _cycle_start )) -ge 30 ] && FAILS=0
   echo "run-observer: pipeline member exited (collector pid=$cp alive=$(kill -0 $cp 2>/dev/null && echo y || echo n), forwarder pid=$fp alive=$(kill -0 $fp 2>/dev/null && echo y || echo n)); restarting both" >&2
   kill "$cp" "$fp" 2>/dev/null
   wait "$cp" 2>/dev/null
   wait "$fp" 2>/dev/null
-  sleep 2
+  FAILS=$((FAILS + 1))
+  if [ "$FAILS" -ge 5 ]; then
+    echo "run-observer: 5 consecutive failed cycles; exiting for systemd restart pacing" >&2
+    exit 1
+  fi
+  sleep $((FAILS * 2))
 done

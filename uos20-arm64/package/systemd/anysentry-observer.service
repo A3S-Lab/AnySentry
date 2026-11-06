@@ -30,3 +30,4 @@ Environment="FORWARD_DROP_PATHS=/sys/,/proc/,/run/,/dev/,/var/lib/anysentry/clic
 # compat18: dedicated supervisor keeps the collector|forwarder FIFO data path
 # AND fails fast on either member's death (self-restarting loop inside the script).
 ExecStart=/opt/anysentry/observer/run-observer.sh
+LimitMEMLOCK=infinity
