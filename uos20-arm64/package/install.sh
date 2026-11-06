@@ -705,7 +705,7 @@ record_unit_startup_log() {
   local unit=$1 name=$2 dest errors
   dest=$INSTALL_LOG_ROOT/startup-$name.log
   errors=$INSTALL_LOG_ROOT/startup-$name.errors.txt
-  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 200 \
+  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 2000 \
     >"$dest" 2>&1 || true
   echo "----- $name ($unit) startup journal: $dest -----"
   if grep -E -i 'error|fail|exception|cannot find module|libzvec|GLIBC_|@a3s-lab/code' \
@@ -895,6 +895,30 @@ activate_release() {
   start_unit anysentry-node-exporter.service node-exporter
   capture_diagnostics activation
   finish_if_start_failures
+  set_stage wait-observer-delivery
+  # compat20: after a full-stack restart the forwarder's first delivery lands
+  # 90-120s in (field: hb bursts at +2min across installs) while verify's own
+  # window starts immediately and misses it. Poll until the observer source's
+  # acceptedEvents actually moves, then let verify take its baseline.
+  admin_token=$(env_value ANYSENTRY_ADMIN_TOKEN "$ENV_FILE")
+  api_port=$(env_value PORT "$ENV_FILE")
+  [[ -n $api_port ]] || api_port=29653
+  obs_sid=$(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE")
+  if [[ -n $admin_token && -n $obs_sid ]]; then
+    _poll_body="{\"sourceId\":\"$obs_sid\",\"limit\":5}"
+    _acc_of() { curl -sS -m 8 -X POST "http://127.0.0.1:$api_port/security-center/sources/list"       -H 'Content-Type: application/json' -H "Authorization: Bearer $admin_token"       --data "$_poll_body" 2>/dev/null | grep -o '"acceptedEvents":[0-9]*' | head -1 | cut -d: -f2; }
+    _base=$(_acc_of); _prev=${_base:-0}
+    for _ in $(seq 1 60); do
+      sleep 3
+      _now=$(_acc_of); _now=${_now:-0}
+      if [[ $_now =~ ^[0-9]+$ && $_prev =~ ^[0-9]+$ && $_now -gt $_prev ]]; then
+        echo "observer delivery confirmed (acceptedEvents $_prev -> $_now)"
+        break
+      fi
+      _prev=$_now
+    done
+  fi
+
   set_stage verify-activation
   "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log" ||
     fail "activation verification failed"
