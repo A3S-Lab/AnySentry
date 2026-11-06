@@ -1402,13 +1402,22 @@ async function runClickHouseBootstrap(
     // (tenantId, environmentId, agentAssetId, at, interactionId) primary key, so every list /
     // timeline read decompressed the whole payload column for the range — GB-scale scans that
     // stacked behind max_execution_time and stalled the API event loop while parsing tens of MiB
-    // of JSON. A projection ordered by interactionId turns those reads into point lookups.
-    await schema.command({
-      query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
-        ADD PROJECTION IF NOT EXISTS ${INTERACTION_PAYLOAD_PROJECTION}
-        (SELECT interactionId, revision, payload, routeShape ORDER BY (interactionId, revision))`,
-    });
+    // of JSON. A projection ordered by interactionId turns those reads into point lookups
+    // (verified on ClickHouse 24.8.14: the planner picks it for the id-point-lookup shape).
+    // The whole block degrades gracefully: without it reads stay correct on the base table.
     try {
+      // ReplacingMergeTree refuses ADD PROJECTION unless merges are told how to maintain it
+      // (Code 344: "Use 'drop' or 'rebuild' option of deduplicate_merge_projection_mode").
+      // 'rebuild' keeps projection parts materialized across background merges.
+      await schema.command({
+        query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
+          MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'`,
+      });
+      await schema.command({
+        query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
+          ADD PROJECTION IF NOT EXISTS ${INTERACTION_PAYLOAD_PROJECTION}
+          (SELECT interactionId, revision, payload, routeShape ORDER BY (interactionId, revision))`,
+      });
       const projectionResult = await schema.query({
         query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
         query_params: { key: INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY },
