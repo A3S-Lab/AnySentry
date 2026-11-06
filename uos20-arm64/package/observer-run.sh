@@ -16,6 +16,16 @@ FWD=/opt/anysentry/observer/observer-forward.js
 ulimit -l unlimited 2>/dev/null || true
 mkdir -p "$DIR"
 echo "run-observer: memlock=$(ulimit -l)"
+# compat22: one supervisor per host. A second instance (stale manual pipeline or a
+# double unit start) competes for the BPF map budget and adds a second
+# collector_heartbeats writer, so drop counters alternate between writers and
+# acceptance sampling reads whichever landed last (field 2026-11-06).
+exec 9>/var/lock/anysentry-observer.lock
+if ! flock -n 9; then
+  echo "run-observer: another supervisor holds the lock; exiting" >&2
+  exit 0
+fi
+
 # compat19: die together - a bare pkill of this script must not orphan the children
 trap 'kill "$cp" "$fp" 2>/dev/null; exit 0' TERM INT
 echo "run-observer: supervisor started (fifo=$FIFO)"

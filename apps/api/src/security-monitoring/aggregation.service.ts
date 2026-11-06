@@ -968,6 +968,23 @@ function semanticResultForCall(
     .at(0);
 }
 
+async function boundedAbortableRelationRead<T>(
+  factory: (signal: AbortSignal) => Promise<T>,
+  fallback: T,
+  timeoutMs = 1_500,
+): Promise<{ value: T; failed: boolean }> {
+  const controller = new AbortController();
+  try {
+    return await boundedRelationRead(factory(controller.signal), fallback, timeoutMs);
+  } finally {
+    // An abandoned read must also stop the server work: the bare-promise variant kept the
+    // ClickHouse response downloading and JSON-parsing on the event loop long after the caller
+    // had fallen back to the hot ring (UOS 2026-11-06: tens of MiB per conversations call).
+    // Aborting after a settled read is a no-op.
+    controller.abort();
+  }
+}
+
 async function boundedRelationRead<T>(
   operation: Promise<T>,
   fallback: T,
@@ -3242,8 +3259,8 @@ export class AggregationService implements OnModuleDestroy {
     // An empty membership selection is still an exact query, never a request for all history.
     const persisted = exactMembershipRead && exactInteractionIds.size === 0
       ? (options.membershipDurable === true ? [] : null)
-      : (await boundedRelationRead(
-          this.judge.storedAgentInteractions(query),
+      : (await boundedAbortableRelationRead(
+          (signal) => this.judge.storedAgentInteractions(query, signal),
           null,
           AGENT_INTERACTION_QUERY_TIMEOUT_MS,
         )).value;
@@ -3841,15 +3858,20 @@ export class AggregationService implements OnModuleDestroy {
       if (pageRecords.length) {
         // Kernel search must stay hop/conversation-scoped. A page-wide load over last_1h
         // truncates later Egress rows, so LLM aliases (run_python) cannot fold onto execute.
-        for (const item of items) {
-          const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
-          if (!records.length) continue;
-          const toolItems = await this.toolEvidenceItemsForInteractions(records);
-          item.coverageLayers = observabilityCoverageLayers(
-            records,
-            toolItems,
-            item.coverage,
-          );
+        // Page items resolve in bounded concurrent chunks — the former serial per-conversation
+        // await multiplied the kernel-read latency by the conversation count on every call.
+        const CONVERSATION_EVIDENCE_CHUNK = 8;
+        for (let start = 0; start < items.length; start += CONVERSATION_EVIDENCE_CHUNK) {
+          await Promise.all(items.slice(start, start + CONVERSATION_EVIDENCE_CHUNK).map(async (item) => {
+            const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
+            if (!records.length) return;
+            const toolItems = await this.toolEvidenceItemsForInteractions(records);
+            item.coverageLayers = observabilityCoverageLayers(
+              records,
+              toolItems,
+              item.coverage,
+            );
+          }));
         }
       }
     }

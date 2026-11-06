@@ -563,6 +563,8 @@ const EVENT_EVIDENCE_INDEX_NAMES = [
   'idx_evidence_command_hash',
 ] as const;
 const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v4';
+const INTERACTION_PAYLOAD_PROJECTION = 'interaction_payload_by_id';
+const INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY = 'schema.agent_interactions.payload_projection.v1';
 
 const COLLECTOR_HEARTBEAT_TABLE = "collector_heartbeats";
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
@@ -1396,6 +1398,53 @@ async function runClickHouseBootstrap(
         MODIFY COLUMN producerRunId String DEFAULT JSONExtractString(payload, 'producerRunId'),
         MODIFY COLUMN traceId String DEFAULT JSONExtractString(payload, 'traceId')`,
     });
+    // UOS field 2026-11-06: `WHERE interactionId IN (...) argMax(payload, revision)` cannot use the
+    // (tenantId, environmentId, agentAssetId, at, interactionId) primary key, so every list /
+    // timeline read decompressed the whole payload column for the range — GB-scale scans that
+    // stacked behind max_execution_time and stalled the API event loop while parsing tens of MiB
+    // of JSON. A projection ordered by interactionId turns those reads into point lookups.
+    await schema.command({
+      query: `ALTER TABLE ${AGENT_INTERACTION_TABLE}
+        ADD PROJECTION IF NOT EXISTS ${INTERACTION_PAYLOAD_PROJECTION}
+        (SELECT interactionId, revision, payload, routeShape ORDER BY (interactionId, revision))`,
+    });
+    try {
+      const projectionResult = await schema.query({
+        query: `SELECT value FROM ${CONFIG_TABLE} FINAL WHERE key = {key:String} LIMIT 1`,
+        query_params: { key: INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY },
+        clickhouse_settings: BOUNDED_BOOTSTRAP_PROGRESS_READ_SETTINGS,
+        format: "JSONEachRow",
+      });
+      const projectionRows = (await projectionResult.json()) as Array<{
+        value?: string;
+      }>;
+      if (!["scheduled", "complete"].includes(projectionRows[0]?.value ?? "")) {
+        await schema.command({
+          query: `ALTER TABLE ${AGENT_INTERACTION_TABLE} MATERIALIZE PROJECTION ${INTERACTION_PAYLOAD_PROJECTION}`,
+          // Backfilling existing parts is a server-side mutation; reads stay correct on the
+          // un-projected parts while it runs (same contract as the evidence index backfill).
+          clickhouse_settings: { mutations_sync: "0" },
+        });
+        await schema.insert({
+          table: CONFIG_TABLE,
+          values: [
+            {
+              key: INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY,
+              value: "scheduled",
+              updated_at: Date.now(),
+            },
+          ],
+          format: "JSONEachRow",
+        });
+      }
+    } catch (error) {
+      // Existing data remains queryable without the materialized projection. Do not claim the
+      // migration complete; a later healthy bootstrap retries it.
+      console.warn(
+        "[clickhouse] interaction payload projection backfill deferred:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     await schema.command({
       query: `ALTER TABLE ${TABLE} MODIFY SETTING non_replicated_deduplication_window = ${EVENT_DEDUPLICATION_WINDOW}`,
     });
@@ -9497,6 +9546,7 @@ export class ClickHouseStore {
       fairPerAgentLimit?: number;
       interactionIds?: readonly string[];
     },
+    signal?: AbortSignal,
   ): Promise<AgentInteractionRecord[] | null> {
     if (!this.client || !this.ready) return null;
     const interactionIds = [
@@ -9507,9 +9557,6 @@ export class ClickHouseStore {
       ),
     ].slice(0, 5_000);
     const exactMembershipRead = interactionIds.length > 0;
-    const correlationPointRead = Boolean(
-      input.sessionId || input.runId || input.traceId || input.invocationId,
-    );
     const fairPerAgentLimit =
       exactMembershipRead || input.fairPerAgentLimit === undefined
         ? undefined
@@ -9597,65 +9644,43 @@ export class ClickHouseStore {
       result_overflow_mode: "break" as const,
     };
     try {
-      let rows: Array<{ payload?: string; routeShape?: string }>;
-      if (fairPerAgentLimit || correlationPointRead) {
-        // Keep large request/response payloads out of the LIMIT BY sort. Resolve a bounded set of
-        // lightweight IDs first, then fetch only those payloads in a second query.
-        const indexResult = await this.client.query({
-          query: `
-            SELECT interactionId, latestAt, latestAgentAssetId
-            FROM (
-              SELECT interactionId,
-                max(at) AS latestAt,
-                argMax(agentAssetId, revision) AS latestAgentAssetId
-              FROM ${AGENT_INTERACTION_TABLE}
-              WHERE ${conditions.join(" AND ")}
-              GROUP BY interactionId
-            )
-            ORDER BY latestAt DESC, interactionId DESC
-            ${fairPerAgentLimit ? 'LIMIT {fairPerAgentLimit:UInt32} BY latestAgentAssetId' : ''}
-            LIMIT {limit:UInt32}`,
-          query_params: queryParams,
-          clickhouse_settings: settings,
-          format: "JSONEachRow",
-        });
-        const indexRows = (await indexResult.json()) as Array<{
-          interactionId?: string;
-        }>;
-        const interactionIds = indexRows
-          .map((row) => row.interactionId)
-          .filter((value): value is string => Boolean(value));
-        if (interactionIds.length === 0) return [];
-        const payloadResult = await this.client.query({
-          query: `
-            SELECT interactionId, argMax(payload, revision) AS payload, argMax(routeShape, revision) AS routeShape
-            FROM ${AGENT_INTERACTION_TABLE}
-            WHERE interactionId IN {interactionIds:Array(String)}
-            GROUP BY interactionId
-            LIMIT {limit:UInt32}`,
-          query_params: { interactionIds, limit },
-          clickhouse_settings: settings,
-          format: "JSONEachRow",
-        });
-        rows = (await payloadResult.json()) as Array<{ payload?: string }>;
-      } else {
-        const result = await this.client.query({
-          query: `
-            SELECT interactionId, argMax(payload, revision) AS payload, argMax(routeShape, revision) AS routeShape, max(at) AS latestAt
+      if (signal?.aborted) return null;
+      // Stage 1 never touches the heavy payload column: resolve the bounded id set from scalar
+      // columns first (GROUP BY interactionId, fair LIMIT BY latestAgentAssetId when requested).
+      // The plain window branch shares this shape so every list read pays the same two-stage cost.
+      const indexResult = await this.client.query({
+        query: `
+          SELECT interactionId
+          FROM (
+            SELECT interactionId,
+              max(at) AS latestAt,
+              argMax(agentAssetId, revision) AS latestAgentAssetId
             FROM ${AGENT_INTERACTION_TABLE}
             WHERE ${conditions.join(" AND ")}
             GROUP BY interactionId
-            ORDER BY latestAt DESC, interactionId DESC
-            LIMIT {limit:UInt32}`,
-          query_params: queryParams,
-          clickhouse_settings: settings,
-          format: "JSONEachRow",
-        });
-        rows = (await result.json()) as Array<{ payload?: string }>;
-      }
-      return rows.flatMap((row) => {
+          )
+          ORDER BY latestAt DESC, interactionId DESC
+          ${fairPerAgentLimit ? 'LIMIT {fairPerAgentLimit:UInt32} BY latestAgentAssetId' : ''}
+          LIMIT {limit:UInt32}`,
+        query_params: queryParams,
+        clickhouse_settings: settings,
+        ...(signal ? { abort_signal: signal } : {}),
+        format: "JSONEachRow",
+      });
+      const indexRows = (await indexResult.json()) as Array<{
+        interactionId?: string;
+      }>;
+      const targetIds = indexRows
+        .map((row) => row.interactionId)
+        .filter((value): value is string => Boolean(value));
+      if (targetIds.length === 0) return [];
+      // Stage 2 fetches payloads only for the resolved ids as a point lookup (see
+      // fetchInteractionPayloadRows). The former argMax GROUP BY decompressed the whole payload
+      // column per read and stalled the API event loop for tens of seconds on UOS (2026-11-06).
+      const payloadRows = await this.fetchInteractionPayloadRows(targetIds, signal);
+      if (payloadRows === null) return null;
+      return payloadRows.flatMap((row) => {
         try {
-          if (!row.payload) return [];
           const parsed = JSON.parse(row.payload) as AgentInteractionRecord;
           return parsed.schemaVersion === "anysentry.agent_interaction.v1"
             ? [{ ...parsed, ...(parsed.routeShape || !row.routeShape ? {} : { routeShape: row.routeShape }) }]
@@ -9665,8 +9690,55 @@ export class ClickHouseStore {
         }
       });
     } catch (error) {
+      if (signal?.aborted) return null;
       console.error(
         "[clickhouse] agent interaction query failed:",
+        (error as Error).message,
+      );
+      return null;
+    }
+  }
+
+  /** Latest-revision payload rows for explicit interaction ids. Ordered (interactionId, revision)
+   *  in the interaction_payload_by_id projection this is a primary-key point lookup instead of an
+   *  argMax GROUP BY full scan; picking the winning revision client-side also keeps payload and
+   *  routeShape row-consistent. */
+  private async fetchInteractionPayloadRows(
+    interactionIds: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<Array<{ interactionId: string; payload: string; routeShape?: string }> | null> {
+    if (!this.client || !this.ready || interactionIds.length === 0) return null;
+    try {
+      const result = await this.client.query({
+        query: `
+          SELECT interactionId, revision, payload, routeShape
+          FROM ${AGENT_INTERACTION_TABLE}
+          WHERE interactionId IN {interactionIds:Array(String)}
+          ORDER BY interactionId, revision`,
+        query_params: { interactionIds: [...interactionIds] },
+        clickhouse_settings: { max_execution_time: 10 },
+        ...(signal ? { abort_signal: signal } : {}),
+        format: "JSONEachRow",
+      });
+      const rows = (await result.json()) as Array<{
+        interactionId?: string;
+        payload?: string;
+        routeShape?: string;
+      }>;
+      const latest = new Map<string, { interactionId: string; payload: string; routeShape?: string }>();
+      for (const row of rows) {
+        if (!row.interactionId || !row.payload) continue;
+        latest.set(row.interactionId, {
+          interactionId: row.interactionId,
+          payload: row.payload,
+          routeShape: row.routeShape || undefined,
+        });
+      }
+      return [...latest.values()];
+    } catch (error) {
+      if (signal?.aborted) return null;
+      console.error(
+        "[clickhouse] interaction payload lookup failed:",
         (error as Error).message,
       );
       return null;
@@ -9738,24 +9810,10 @@ export class ClickHouseStore {
         .map((row) => row.interactionId)
         .filter((value): value is string => Boolean(value));
       if (ids.length === 0) return [];
-      const payloadResult = await this.client.query({
-        query: `
-          SELECT interactionId, argMax(payload, revision) AS payload
-          FROM ${AGENT_INTERACTION_TABLE}
-          WHERE interactionId IN {interactionIds:Array(String)}
-          GROUP BY interactionId`,
-        query_params: { interactionIds: ids },
-        clickhouse_settings: { max_execution_time: 10 },
-        format: "JSONEachRow",
-      });
-      const payloadRows = (await payloadResult.json()) as Array<{
-        interactionId?: string;
-        payload?: string;
-      }>;
+      const payloadRows = await this.fetchInteractionPayloadRows(ids);
+      if (payloadRows === null) return null;
       const payloadById = new Map(
-        payloadRows
-          .filter((row) => row.interactionId && row.payload)
-          .map((row) => [row.interactionId as string, row.payload as string]),
+        payloadRows.map((row) => [row.interactionId, row.payload]),
       );
       const rows = indexRows.map((row) => ({
         interactionId: row.interactionId,
@@ -9862,25 +9920,9 @@ export class ClickHouseStore {
     const ids = [...new Set(interactionIds.map((id) => id.trim()).filter(Boolean))].slice(0, 2_000);
     if (ids.length === 0) return new Map();
     try {
-      const payloadResult = await this.client.query({
-        query: `
-          SELECT interactionId, argMax(payload, revision) AS payload
-          FROM ${AGENT_INTERACTION_TABLE}
-          WHERE interactionId IN {interactionIds:Array(String)}
-          GROUP BY interactionId`,
-        query_params: { interactionIds: ids },
-        clickhouse_settings: { max_execution_time: 10 },
-        format: "JSONEachRow",
-      });
-      const payloadRows = (await payloadResult.json()) as Array<{
-        interactionId?: string;
-        payload?: string;
-      }>;
-      return new Map(
-        payloadRows
-          .filter((row) => row.interactionId && row.payload)
-          .map((row) => [row.interactionId as string, row.payload as string]),
-      );
+      const payloadRows = await this.fetchInteractionPayloadRows(ids);
+      if (payloadRows === null) return null;
+      return new Map(payloadRows.map((row) => [row.interactionId, row.payload]));
     } catch (error) {
       console.error(
         "[clickhouse] agent interaction payload-by-id query failed:",

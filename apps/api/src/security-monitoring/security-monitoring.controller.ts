@@ -7367,6 +7367,10 @@ function otlpMetricsToUniversal(
 @UseGuards(ManagementAuthGuard)
 @Controller('security-center')
 export class SecurityMonitoringController implements OnModuleDestroy {
+  // healthz serves a short-TTL snapshot so probes and dashboards never rebuild ~40 subsystem
+  // status objects per request (UOS 2026-11-06: healthz queued 4-10s behind conversations reads).
+  private static readonly HEALTHZ_SNAPSHOT_TTL_MS = 5_000;
+  private healthzSnapshot?: { at: number; body: Record<string, unknown> };
   private readonly canonicalDirectoryCache = new Map<string, CanonicalDirectoryCacheEntry>();
   private readonly canonicalDirectoryInFlight = new Map<
     string,
@@ -14235,6 +14239,23 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
   @Get('healthz')
   healthz() {
+    const nowMs = Date.now();
+    if (
+      !this.healthzSnapshot
+      || nowMs - this.healthzSnapshot.at > SecurityMonitoringController.HEALTHZ_SNAPSHOT_TTL_MS
+    ) {
+      this.healthzSnapshot = { at: nowMs, body: this.buildHealthzBody() };
+    }
+    // uptime is process state, not observability state — keep it fresh on every probe. The rest
+    // of the contract is unchanged for readers; values may lag the clock by up to the TTL.
+    return {
+      ...this.healthzSnapshot.body,
+      uptimeSeconds: Math.round(process.uptime()),
+      snapshotAgeSeconds: Math.round((nowMs - this.healthzSnapshot.at) / 1000),
+    };
+  }
+
+  private buildHealthzBody(): Record<string, unknown> {
     const stats = this.judge.healthStats();
     const policy = this.judge.getPolicy();
     return {

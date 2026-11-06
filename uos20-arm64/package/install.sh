@@ -852,6 +852,20 @@ activate_release() {
   start_unit anysentry-flink-job.service flink-job
   set_stage start-api-and-observer
   systemctl enable anysentry.service anysentry-observer.service
+  # compat22: a pre-install manual pipeline (collector + forwarder left from field
+  # debugging) survives installs and runs beside the systemd supervisor: two collectors
+  # compete for the BPF map budget and both write collector_heartbeats (field
+  # 2026-11-06: drop counter alternated 0 <-> 41.6M across the acceptance window). Kill
+  # anything not owned by the units we are about to start.
+  for _pid in $(pgrep -f 'a3s-observer-collector' 2>/dev/null; pgrep -f 'observer-forward' 2>/dev/null); do
+    echo "stopping stray observer process pid=$_pid before observer start"
+    kill "$_pid" 2>/dev/null || true
+  done
+  sleep 2
+  for _pid in $(pgrep -f 'a3s-observer-collector' 2>/dev/null; pgrep -f 'observer-forward' 2>/dev/null); do
+    echo "force-killing stray observer process pid=$_pid"
+    kill -9 "$_pid" 2>/dev/null || true
+  done
   # compat19: start the API alone and wait for healthz BEFORE starting the observer.
   # Starting both at once raced the forwarder into the API reboot window (field
   # 2026-11-05: ECONNRESET x N, verify's smoke event missed its retry budget).
@@ -917,6 +931,19 @@ activate_release() {
       fi
       _prev=$_now
     done
+  fi
+  # compat22: the delivery gate must end with exactly one collector heartbeating. Two
+  # writers mean a stray pipeline survived the cleanup and is stealing BPF budget.
+  _ch_user=$(env_value CLICKHOUSE_USER "$ENV_FILE")
+  _ch_pass=$(env_value CLICKHOUSE_PASSWORD "$ENV_FILE")
+  if [[ -n $_ch_user && -n $_ch_pass ]]; then
+    _writers=$(curl -sS -m 8 --data-binary \
+      "SELECT uniqExact(JSONExtractString(payload,'collectorId')) FROM collector_heartbeats WHERE at >= (now() - 300) * 1000" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" 2>/dev/null | tr -d '[:space:]')
+    if [[ $_writers =~ ^[0-9]+$ && $_writers -gt 1 ]]; then
+      echo "observer heartbeat writers in last 5m: $_writers (expected 1)"
+      remember_start_failure "multiple collector heartbeat writers detected"
+    fi
   fi
 
   set_stage verify-activation
