@@ -565,6 +565,13 @@ const EVENT_EVIDENCE_INDEX_NAMES = [
 const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v4';
 const INTERACTION_PAYLOAD_PROJECTION = 'interaction_payload_by_id';
 const INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY = 'schema.agent_interactions.payload_projection.v1';
+// UOS field 2026-11-08: scheduling the projection MATERIALIZE from bootstrap made the 9.7 GB
+// agent_interactions_v1 rewrite compete with the install's activation window on a loaded box
+// (ClickHouse mutation threads, WAL fsync on the same disk, slow ingest ACKs -> collector
+// delivery degraded -> verify failed). The DDL stays at bootstrap; the backfill is scheduled
+// only once the process has been up long enough that this is a steady-state restart rather
+// than an install, and install.sh schedules it explicitly after verify passes.
+const INTERACTION_PAYLOAD_MATERIALIZE_MIN_UPTIME_MS = 10 * 60_000;
 
 const COLLECTOR_HEARTBEAT_TABLE = "collector_heartbeats";
 const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEAT_TABLE} (
@@ -1427,7 +1434,10 @@ async function runClickHouseBootstrap(
       const projectionRows = (await projectionResult.json()) as Array<{
         value?: string;
       }>;
-      if (!["scheduled", "complete"].includes(projectionRows[0]?.value ?? "")) {
+      if (
+        !["scheduled", "complete"].includes(projectionRows[0]?.value ?? "")
+        && process.uptime() >= INTERACTION_PAYLOAD_MATERIALIZE_MIN_UPTIME_MS
+      ) {
         await schema.command({
           query: `ALTER TABLE ${AGENT_INTERACTION_TABLE} MATERIALIZE PROJECTION ${INTERACTION_PAYLOAD_PROJECTION}`,
           // Backfilling existing parts is a server-side mutation; reads stay correct on the

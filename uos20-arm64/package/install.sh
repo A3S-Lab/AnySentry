@@ -950,6 +950,31 @@ activate_release() {
   "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log" ||
     fail "activation verification failed"
   ACTIVATED=0
+
+  # compat23: backfill the interaction payload projection only after verify passed. Scheduling
+  # it from API bootstrap made the 9.7 GB part rewrite compete with the activation window on a
+  # loaded box and helped push collector delivery past its SLO (field 2026-11-08). The API also
+  # self-heals this after 10 minutes of uptime when the migration key is still unrecorded.
+  _ch_user=$(env_value CLICKHOUSE_USER "$ENV_FILE")
+  _ch_pass=$(env_value CLICKHOUSE_PASSWORD "$ENV_FILE")
+  if [[ -n $_ch_user && -n $_ch_pass ]]; then
+    _mat_done=$(curl -sS -m 15 --data-binary \
+      "SELECT count() FROM system.mutations WHERE table = 'agent_interactions_v1' AND NOT is_done AND command LIKE '%interaction_payload_by_id%'" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n $_mat_done && $_mat_done != "0" ]]; then
+      echo "interaction payload projection materialize already in progress"
+    else
+      curl -sS -m 20 --data-binary \
+        "ALTER TABLE anysentry.agent_interactions_v1 MATERIALIZE PROJECTION interaction_payload_by_id SETTINGS mutations_sync = 0" \
+        "http://127.0.0.1:8123/" -u "$_ch_user:$_ch_pass" >/dev/null 2>&1 \
+        && echo "interaction payload projection materialize scheduled (post-verify)" \
+        || echo "WARN: projection materialize scheduling failed; API self-heals after 10m uptime"
+    fi
+    _now_ms=$(( $(date +%s) * 1000 ))
+    curl -sS -m 10 --data-binary \
+      "INSERT INTO anysentry.config (key, value, updated_at) FORMAT JSONEachRow {"key":"schema.agent_interactions.payload_projection.v1","value":"scheduled","updated_at":$_now_ms}" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" >/dev/null 2>&1 || true
+  fi
 }
 
 main() {
