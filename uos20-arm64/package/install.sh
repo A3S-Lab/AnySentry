@@ -932,6 +932,17 @@ activate_release() {
       _prev=$_now
     done
   fi
+  # compat23: the kernel-side unknown-file drop policy must actually reach the collector
+  # process (field 2026-11-08: fileFilterMetrics reported enabled=false/epoch=0 with no
+  # snapshot-load line in the journal, so the storm valve was silently absent).
+  _cpid=$(pgrep -f 'a3s-observer-collector' | head -1)
+  if [[ -n $_cpid ]]; then
+    _pol=$(tr '\0' '\n' < "/proc/$_cpid/environ" 2>/dev/null | sed -n 's/^A3S_OBSERVER_FILE_UNKNOWN_POLICY=//p' | head -1)
+    echo "collector unknown-file policy: ${_pol:-unset} (expect drop)"
+    if [[ ${_pol:-} != drop ]]; then
+      echo "WARN: unknown-file policy did not reach the collector; file-event storms can saturate the pipeline"
+    fi
+  fi
   # compat22: the delivery gate must end with exactly one collector heartbeating. Two
   # writers mean a stray pipeline survived the cleanup and is stealing BPF budget.
   _ch_user=$(env_value CLICKHOUSE_USER "$ENV_FILE")
