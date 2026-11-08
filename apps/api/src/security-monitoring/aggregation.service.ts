@@ -309,7 +309,12 @@ export function deliveryEvaluation(
   }
   if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
   if (metrics.spoolAtCapacity || metrics.spoolWalAtCapacity) hard.push('spool_at_capacity');
-  if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
+  // A real delivery backlog is a growing live set, not a handful of stranded records: collector
+  // restarts can park one or two exhausted records in the durable spool that never age out
+  // (field 2026-11-08: single stuck records aged 53 minutes kept this channel hard-degraded for
+  // hours while the pipeline itself had fully drained). Parked records stay visible through the
+  // soft spool_backlog reason below; the hard SLO now requires an actual live backlog.
+  if ((metrics.spoolRecords ?? 0) >= 16 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
     hard.push('spool_backlog_over_slo');
   }
   if ((metrics.queueParked ?? 0) > 0) soft.push('queue_parked');

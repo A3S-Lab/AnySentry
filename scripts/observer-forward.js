@@ -987,6 +987,7 @@ let e2eFilterReceipts = [];
 let attributionCounts = emptyAttributionCounts();
 let closing = false;
 let heartbeatTimer;
+let strandedSweepTimer;
 let heartbeatDeliveryInFlight = false;
 let pendingHeartbeatDelivery;
 let identitySnapshotTimer;
@@ -3512,6 +3513,28 @@ function recordQueueDrop(kind, priority, reason, durablyParked = false) {
   pipelineAccounting.record('queue_dropped', reason);
 }
 
+// compat24: an admitted item whose batch can never settle (a completion lost across a restart,
+// or an edge case that leaves it neither inflight nor retry-scheduled) pins its durable record
+// in activeSpoolIds forever, parking the delivery channel past its SLO with no self-healing.
+// Items that are neither inflight nor retry-pending and have outlived four retry budgets are
+// settled as retry-exhausted; their spool records are deferred like any other exhaustion.
+let strandedSweepRunning = false;
+function sweepStrandedOutstanding(now = Date.now()) {
+  if (strandedSweepRunning || closing) return;
+  strandedSweepRunning = true;
+  try {
+    const stranded = [];
+    for (const item of outstandingItems) {
+      if (item.settled || item.inflightSince || item.retryOwned) continue;
+      const deadline = (item.retryDeadlineAt || item.createdAt || now) + RETRY_MAX_AGE_MS * 4;
+      if (now >= deadline) stranded.push(item);
+    }
+    if (stranded.length) recordRetryExhausted(stranded, true, 'stranded_outstanding_sweep');
+  } finally {
+    strandedSweepRunning = false;
+  }
+}
+
 function dropQueuedItem(item, reason = 'priority_evicted') {
   if (!item) return;
   settleOutstanding([item]);
@@ -4610,6 +4633,8 @@ async function start() {
     heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
     heartbeatTimer.unref();
   }
+  strandedSweepTimer = setInterval(sweepStrandedOutstanding, 30_000);
+  strandedSweepTimer.unref();
   if (IDENTITY_SNAPSHOT_SECS > 0) {
     refreshIdentitySnapshot();
     identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);
