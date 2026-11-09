@@ -938,9 +938,17 @@ activate_release() {
   _cpid=$(pgrep -f 'a3s-observer-collector' | head -1)
   if [[ -n $_cpid ]]; then
     _pol=$(tr '\0' '\n' < "/proc/$_cpid/environ" 2>/dev/null | sed -n 's/^A3S_OBSERVER_FILE_UNKNOWN_POLICY=//p' | head -1)
-    echo "collector unknown-file policy: ${_pol:-unset} (expect drop)"
-    if [[ ${_pol:-} != drop ]]; then
-      echo "WARN: unknown-file policy did not reach the collector; file-event storms can saturate the pipeline"
+    _backend=$(cat "$INSTALL_ROOT/observer/BACKEND" 2>/dev/null || true)
+    if [[ $_backend == perf-kprobe-legacy ]]; then
+      # compat24 postmortem: kernel-side file filtering is a modern-backend feature; the 4.19
+      # legacy backend does not consume this variable (userspace aggregation + delivery SLO
+      # backstop the pipeline). Keep the plumbing check, do not imply kernel enforcement.
+      echo "collector unknown-file policy: ${_pol:-unset} (plumbed; kernel-side enforcement requires the modern backend - legacy relies on userspace aggregation + delivery SLO)"
+    else
+      echo "collector unknown-file policy: ${_pol:-unset} (expect drop)"
+      if [[ ${_pol:-} != drop ]]; then
+        echo "WARN: unknown-file policy did not reach the collector; file-event storms can saturate the pipeline"
+      fi
     fi
   fi
   # compat22: the delivery gate must end with exactly one collector heartbeating. Two

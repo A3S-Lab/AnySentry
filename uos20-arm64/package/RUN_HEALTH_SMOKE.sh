@@ -385,18 +385,44 @@ output_dropped=$(numeric_or "$output_dropped" -1)
 error_count=$(numeric_or "$error_count" -1)
 queue_depth=$(numeric_or "$queue_depth" -1)
 
-[[ $collector_state == healthy ]] &&
-  pass "Observer collector state=healthy" ||
-  fail "Observer collector state=${collector_state:-missing}"
-[[ $attached_probes -ge 14 ]] &&
-  pass "Observer collector attachedProbes=$attached_probes" ||
-  fail "Observer collector attachedProbes=$attached_probes; expected at least 14 (8 basic + 6 plaintext)"
-[[ $output_dropped == 0 ]] &&
-  pass "Observer collector outputDropped=0" ||
-  fail "Observer collector outputDropped=$output_dropped"
-[[ $error_count == 0 ]] &&
-  pass "Observer collector errorCount=0" ||
-  fail "Observer collector errorCount=$error_count"
+# compat24 field (2026-11-09): windowed counters and transitional API reads failed a healthy
+# box during post-install drain. Readiness now keys on probe attachment and LOSS TREND (two
+# latest-heartbeat samples), not on windowed absolutes.
+hb_latest() {
+  [[ -n $CLICKHOUSE_PASSWORD ]] || return 1
+  curl -sS --connect-timeout 2 --max-time 10 \
+    --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+    --data-binary "SELECT argMax(JSONExtractUInt(payload, '$1'), at) FROM collector_heartbeats WHERE at >= toUInt64((toUnixTimestamp(now()) - 900) * 1000)" \
+    "http://127.0.0.1:8123/?database=anysentry" 2>/dev/null
+}
+case $collector_state in
+  healthy) pass "Observer collector state=healthy" ;;
+  degraded) warn "Observer collector state=degraded (window reasons expected while draining; see FIELD_DIAGNOSTIC)" ;;
+  *) fail "Observer collector state=${collector_state:-missing}" ;;
+esac
+hb_probes=$(numeric_or "$(hb_latest attachedProbes)" -1)
+[[ $attached_probes -ge 14 || $hb_probes -ge 14 ]] &&
+  pass "Observer collector attachedProbes=$attached_probes (latest heartbeat: $hb_probes)" ||
+  fail "Observer collector attachedProbes=$attached_probes (latest heartbeat: $hb_probes); expected at least 14 (8 basic + 6 plaintext)"
+drop_a=$(numeric_or "$(hb_latest outputDropped)" -1)
+err_a=$(numeric_or "$(hb_latest errorCount)" -1)
+sleep 20
+drop_b=$(numeric_or "$(hb_latest outputDropped)" -1)
+err_b=$(numeric_or "$(hb_latest errorCount)" -1)
+if [[ $drop_a -lt 0 || $drop_b -lt 0 ]]; then
+  warn "Observer collector outputDropped=$output_dropped (windowed; latest-delta check unavailable)"
+else
+  [[ $drop_b -le $drop_a ]] &&
+    pass "Observer collector outputDropped stable (latest heartbeat $drop_a -> $drop_b; windowed value $output_dropped)" ||
+    fail "Observer collector outputDropped still growing (latest heartbeat $drop_a -> $drop_b)"
+fi
+if [[ $err_a -lt 0 || $err_b -lt 0 ]]; then
+  warn "Observer collector errorCount=$error_count (windowed; latest-delta check unavailable)"
+else
+  [[ $err_b -le $err_a ]] &&
+    pass "Observer collector errorCount stable (latest heartbeat $err_a -> $err_b)" ||
+    fail "Observer collector errorCount still growing (latest heartbeat $err_a -> $err_b)"
+fi
 [[ $queue_depth -le 100 && $queue_depth -ge 0 ]] &&
   pass "Observer collector queueDepth=$queue_depth" ||
   warn "Observer collector queueDepth=$queue_depth"

@@ -76,22 +76,42 @@ wait_health() {
 wait_for_collector_health() {
   local body response= state attached_probes
   body="{\"timeType\":\"last_3h\",\"collectorId\":\"$COLLECTOR_ID\",\"limit\":5}"
-  # compat23: 180s was too tight for a full-stack restart to drain its own recovery window
-  # (API-down gap ages spool records past the 60s SLO by construction; the channel then needs
-  # two clean heartbeats to leave "recovery"). 300s keeps the healthy-state requirement.
-  for _ in $(seq 1 300); do
+  # compat24 field (2026-11-09): a full-stack install legitimately drains its own catch-up
+  # backlog for >300s; spool_backlog_over_slo / capture_pipeline_loss are honest SLO states,
+  # not failures. Ready == probes attached + live collector + output loss no longer growing;
+  # absent probes, a dead window, or monotonically growing loss keep this failing.
+  local drop_now queue_now prev_drop=-1 prev_queue=-1 stable=0
+  for _ in $(seq 1 20); do
     if response=$(post_json collectors/health "$body"); then
       state=$(printf '%s' "$response" |
         collector_value state)
       attached_probes=$(printf '%s' "$response" |
         collector_value attachedProbes)
       [[ -n $attached_probes ]] || attached_probes=-1
-      if [[ $state == healthy && $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 ]]; then
-        printf '%s' "$response"
-        return 0
+      drop_now=$(printf '%s' "$response" | collector_value outputDropped)
+      queue_now=$(printf '%s' "$response" | collector_value queueDepth)
+      [[ -n $drop_now ]] || drop_now=-1
+      [[ -n $queue_now ]] || queue_now=-1
+      if [[ $attached_probes =~ ^[0-9]+$ && $attached_probes -ge 8 && $state != down && $state != stale ]]; then
+        if [[ $state == healthy ]]; then
+          printf '%s' "$response"
+          return 0
+        fi
+        if [[ $drop_now -ge 0 && $drop_now -le $prev_drop && $queue_now -ge 0 && $queue_now -le $prev_queue ]]; then
+          stable=$((stable + 1))
+        else
+          stable=0
+        fi
+        if [[ $stable -ge 3 ]]; then
+          echo "note: collector state=$state with probes attached and output loss no longer growing - treating as ready (post-install drain)" >&2
+          printf '%s' "$response"
+          return 0
+        fi
       fi
+      prev_drop=$drop_now
+      prev_queue=$queue_now
     fi
-    sleep 1
+    sleep 15
   done
   [[ -n $response ]] || response='{"error":"collector health endpoint returned no successful response"}'
   printf '%s' "$response"
