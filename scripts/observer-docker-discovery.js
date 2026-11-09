@@ -120,6 +120,24 @@ function dockerRuntimeIdentity(inspect, options = {}) {
     const cgroupPath = relative ? `${unifiedRoot}/${relative}` : unifiedRoot;
     const stat = fs.statSync(cgroupPath, { bigint: true });
     const cgroupId = stat.ino > 0n ? stat.ino.toString() : '';
+    // compat27: on hybrid kernels bpf_get_current_cgroup_id may key by a v1 hierarchy inode
+    // rather than the unified one (field 2026-11-09: unified-only rules never hit). Collect
+    // every stat-able hierarchy id for this container so rules can cover them all.
+    const cgroupIds = [];
+    if (cgroupId) cgroupIds.push(cgroupId);
+    for (const line of membership.split('\n')) {
+      const match = line.match(/^([0-9,]+):([^:]*):\/(.+)$/u);
+      if (!match || match[1] === '0' || match[1].includes(',')) continue;
+      const controller = match[2].split(',')[0];
+      if (!controller) continue;
+      try {
+        const v1Stat = fs.statSync(`${cgroupRoot}/${controller}/${match[3]}`, { bigint: true });
+        const id = v1Stat.ino > 0n ? v1Stat.ino.toString() : '';
+        if (id && !cgroupIds.includes(id)) cgroupIds.push(id);
+      } catch {
+        // Not every controller is mounted at the canonical path; skip.
+      }
+    }
     const statLine = fs.readFileSync(`${procRoot}/${hostPid}/stat`, 'utf8').trim();
     const close = statLine.lastIndexOf(')');
     const fields = close >= 0 ? statLine.slice(close + 1).trim().split(/\s+/u) : [];
@@ -139,6 +157,7 @@ function dockerRuntimeIdentity(inspect, options = {}) {
       hostPid,
       cgroupPath: unifiedPath,
       ...(cgroupId ? { cgroupId } : {}),
+      ...(cgroupIds.length > 1 ? { cgroupIds } : {}),
       ...(rootStartTimeTicks ? { rootStartTimeTicks } : {}),
       ...(processComm ? { processComm } : {}),
       ...(processExeBasename ? { processExeBasename } : {}),

@@ -1950,6 +1950,29 @@ function synchronizeInfrastructurePolicyRules() {
     const captureDecision = infrastructurePolicy.materializeCaptureProfile(facts);
     if (captureDecision) decisions.push(captureDecision);
   }
+  // compat27: hybrid kernels may key bpf_get_current_cgroup_id by a v1 hierarchy inode
+  // instead of the unified one (field 2026-11-09: unified-only rules never hit). Emit one
+  // decision per known cgroup id of the same workload so every hierarchy id matches.
+  const altIdsByPrimary = new Map();
+  for (const entry of (Array.isArray(latestDockerIdentitySnapshot?.entries)
+    ? latestDockerIdentitySnapshot.entries : [])) {
+    const primary = text(entry?.cgroupId);
+    const ids = Array.isArray(entry?.cgroupIds)
+      ? entry.cgroupIds.map((id) => text(id)).filter(Boolean) : [];
+    if (primary && ids.length > 1) altIdsByPrimary.set(primary, ids.filter((id) => id !== primary));
+  }
+  if (altIdsByPrimary.size) {
+    const expanded = [];
+    for (const decision of decisions) {
+      expanded.push(decision);
+      const primary = text(decision?.cgroupId);
+      for (const alt of (altIdsByPrimary.get(primary) || [])) {
+        expanded.push({ ...decision, cgroupId: alt, scopeKey: `cgroup:${alt}` });
+      }
+    }
+    decisions.length = 0;
+    decisions.push(...expanded);
+  }
   const synchronized = filterRulePublisher.synchronizePolicyDecisions(
     decisions,
     policyMetrics.policyVersion,
