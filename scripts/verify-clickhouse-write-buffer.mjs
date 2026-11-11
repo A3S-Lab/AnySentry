@@ -248,11 +248,18 @@ function batchController(options = {}) {
       async enqueueCanonical() { return true; },
       async enqueueCanonicalBatch() { return 0; },
     },
-    supplyChain: { async observeRuntimeInstall() {} },
+    supplyChain: {
+      async observeRuntimeInstall(...args) {
+        await options.observeInstall?.(...args);
+      },
+    },
     workspaceDirectory: { observeEvent() {} },
     identityReview: { considerCandidate() {} },
     unknownLearning: { observeMany() {} },
     agg: { invalidateWindowCache() {} },
+    supplyChainInstallQueue: [],
+    supplyChainInstallActive: 0,
+    supplyChainInstallDropped: 0,
     observedAssets: {
       bindIngestMeta: (meta) => meta,
       materializeCommittedIngest: (meta) => options.materialize?.(meta),
@@ -1252,7 +1259,7 @@ await withoutExpectedErrorLogs(async () => {
     materialize() { materialized += 1; },
   });
   const ack = await controller.ingestBatch({ events: [{ line: 'memory-only-retained' }] }, {});
-  assert.equal(ack.retainedEvents, 1, 'memory-only compatibility mode may still retain in the hot ring');
+  assert.equal(ack.retainedEvents, 1, `memory-only compatibility mode may still retain in the hot ring: ${JSON.stringify(ack)}`);
   assert.equal(materialized, 0,
     'memory-only batch retention must not publish a durable Observed Asset lifecycle state');
 }
@@ -1613,5 +1620,28 @@ await withoutExpectedErrorLogs(async () => {
   await within(judge.onApplicationShutdown(), 'final shared-store close did not complete');
   assert.equal(closeCalls, 1, 'ClickHouse close must flush the additive heartbeat side buffer');
 }
+
+await (async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let started = 0;
+  let finished = 0;
+  const controller = batchController({
+    async observeInstall() {
+      started += 1;
+      await gate;
+      finished += 1;
+    },
+  });
+  const ack = await controller.ingestBatch({ events: [{ line: 'slow-supply-chain-side-path' }] }, {});
+  assert.equal(ack.acceptedEvents, 1, 'event acknowledgement must not wait for optional supply-chain analysis');
+  assert.equal(started, 1);
+  assert.equal(finished, 0, 'optional analysis remains pending when the durable ACK is returned');
+  release();
+  for (let attempt = 0; attempt < 10 && finished === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(finished, 1, 'queued analysis must still complete after ACK');
+})();
 
 console.log('ClickHouse write-buffer verification passed');

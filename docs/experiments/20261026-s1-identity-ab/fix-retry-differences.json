@@ -1,0 +1,52 @@
+{
+  "alignment": "Per-task PID/count comparison inside archived short execution windows; not a generation-safe universal matcher.",
+  "tasks": [
+    {
+      "task": "fix-git",
+      "generation": {
+        "missing_start_boottime_ns": [],
+        "missing_process_instance_key": [],
+        "process_instance_key_conflicts": [],
+        "creation_parent_mismatches": []
+      },
+      "exec": {
+        "AnySentry": 62,
+        "AgentSight": 64,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 2,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 478776,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 478837,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 52,
+        "AgentSight": 53,
+        "shared_pid_count": 52,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 478776,
+            "comm": "sleep",
+            "at_ms": 1792991390442,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          }
+        ]
+      }
+    }
+  ]
+}

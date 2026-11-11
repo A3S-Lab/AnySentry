@@ -1,0 +1,139 @@
+{
+  "started_at_ms": 1792745754008,
+  "runs": [
+    {
+      "task": "fix-git",
+      "job": "kimi-s1r2-fix-git-20261023-165554",
+      "port": 7441,
+      "state_before_stop": {
+        "Status": "running",
+        "Running": true,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.561933221Z",
+        "FinishedAt": "0001-01-01T00:00:00Z",
+        "Error": ""
+      },
+      "state_after_stop": {
+        "Status": "exited",
+        "Running": false,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.561933221Z",
+        "FinishedAt": "2026-10-23T09:05:53.2441397Z",
+        "Error": ""
+      },
+      "deployment_state": "completed",
+      "host_pid": 3681250,
+      "released_at_ms": 1792745786583
+    },
+    {
+      "task": "db-wal-recovery",
+      "job": "kimi-s1r2-db-wal-recovery-20261023-165554",
+      "port": 7442,
+      "state_before_stop": {
+        "Status": "running",
+        "Running": true,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.557884668Z",
+        "FinishedAt": "0001-01-01T00:00:00Z",
+        "Error": ""
+      },
+      "state_after_stop": {
+        "Status": "exited",
+        "Running": false,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.557884668Z",
+        "FinishedAt": "2026-10-23T09:05:57.254022862Z",
+        "Error": ""
+      },
+      "deployment_state": "completed",
+      "host_pid": 3681148,
+      "released_at_ms": 1792745786944
+    },
+    {
+      "task": "polyglot-c-py",
+      "job": "kimi-s1r2-polyglot-c-py-20261023-165554",
+      "port": 7443,
+      "state_before_stop": {
+        "Status": "running",
+        "Running": true,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.562981022Z",
+        "FinishedAt": "0001-01-01T00:00:00Z",
+        "Error": ""
+      },
+      "state_after_stop": {
+        "Status": "exited",
+        "Running": false,
+        "OOMKilled": false,
+        "ExitCode": 0,
+        "StartedAt": "2026-10-23T08:56:22.562981022Z",
+        "FinishedAt": "2026-10-23T09:05:59.69072857Z",
+        "Error": ""
+      },
+      "deployment_state": "completed",
+      "host_pid": 3681144,
+      "released_at_ms": 1792745786887
+    }
+  ],
+  "design": "S1 rerun: three original tasks, independent Docker jobs with overlapping agent windows; dual native observation. No independent oracle probe.",
+  "recorder_limits": {
+    "cpus": 2,
+    "memory_gib": 2
+  },
+  "observer_restarted": false,
+  "kimi_version": "2.2.0",
+  "requested_model": "kimi-code/k3-256k",
+  "source_versions": {
+    "AnySentry": {
+      "HEAD": "bbc03817222460b3b7ff1b1a395e332b8a2ec46f",
+      "tracked_diff_sha256": "d9aecc3b0269a8614ef301dc433fe5df41398a902ae03d83a0937d54aa727c92"
+    },
+    "Observer": {
+      "HEAD": "98484b45f8f13e9ebfa6467d7d831c1fc2615e40",
+      "tracked_diff_sha256": "ce9a626211e8f880e8b8b36b45ccec46f3a942ed50a305f9d1abf78c5b2900d5"
+    },
+    "agentsight": {
+      "HEAD": "85bdb152653999bb5bf24a5b13c863bf8c949581",
+      "tracked_diff_sha256": "b339a82773f0c340e5edb3cd4035a644e4f35eaa989f1418e682a17f9b93c139"
+    },
+    "terminal-bench": {
+      "HEAD": "83c7a6172d629c6575b785ab12c8db787bb2e323",
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "terminal-bench-2-1": {
+      "HEAD": "7131e4375048a0e408a8fb404b5f499d726b695b",
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "task_files": {
+    "fix-git": {
+      "task.toml": "f59d711003b974e4ef8ed63556614e2ea9ea7d0e394af13b2071225e3fda7805",
+      "instruction.md": "f98174e47ba5ce040f6fad22ef3cbca4dd27b3192868ea5d082077222c3ec4e8"
+    },
+    "db-wal-recovery": {
+      "task.toml": "1cdc2c615e259bc10265efbe71b518332070c1c002e226566399e9788f18d0aa",
+      "instruction.md": "5a20375162921b8911c67035d1905df7fd335d1bed03044271e608b2c3c93b26"
+    },
+    "polyglot-c-py": {
+      "task.toml": "d31b9f60c47eed0d79e10d3be8fd56a23e50b3986606e3f2546863d44ac9a9ea",
+      "instruction.md": "a57c0c0e1232113113cd29a154ea7e0ac9ea45e4aedc16958fbc6bc753a4ef96"
+    }
+  },
+  "images": {
+    "anysentry-observer-1": "anysentry-observer-wrapper:kimi-fragment-fix-20261020 sha256:71d8353a4ef24681a1ba1b6f64d6eb5c5ca82a106d39fcd6c8131f87b0b543a6",
+    "anysentry-anysentry-1": "anysentry-api:kimi-response-20261014 sha256:74eafbf591f3ff0e4f77d75e22c9b12198695825a5b8dcd01cfe60e5ea3592d3",
+    "recorder": "sha256:de9ee9f0c73333e8af57e5ae5f2de4876756176c860ced0ccc8b70f2c3300dfb"
+  },
+  "orchestrator_exit": 0,
+  "finished_at_ms": 1792746352880,
+  "limitations": [
+    "Observer runtime provider_hosts exclude api.kimi.com: AnySentry Kimi TLS interactions unavailable in this rerun.",
+    "No independent kernel oracle; raw family event counts are not recall or attribution accuracy.",
+    "Six AgentSight exec events are startup gate sleep processes."
+  ]
+}

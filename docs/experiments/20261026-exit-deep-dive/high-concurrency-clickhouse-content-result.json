@@ -1,0 +1,8 @@
+{
+  "schema": "a3s.clickhouse-exit-tree-content-validation.v1",
+  "run_id": "exit-tree-0f41f54cf7fc",
+  "truth_count": 1500,
+  "rows": 1500,
+  "exit_code_mismatches": [],
+  "missing_process_instance_keys": []
+}

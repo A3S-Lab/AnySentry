@@ -1,0 +1,675 @@
+{
+  "schema": "s1-native-evidence/v1",
+  "sources": {
+    "fix-git": {
+      "session_id": "session_2de33eaa-f8d2-4e61-ad32-947405b91636",
+      "wire_path": "/home/zhongyule/.kimi-code/sessions/wd_personal-site_be35bdff3600/session_2de33eaa-f8d2-4e61-ad32-947405b91636/agents/main/wire.jsonl",
+      "wire_sha256": "5c2fd370c869209f50170bc3adb7f24a5dffe8b51d76336def9f5db3634fc457"
+    },
+    "db-wal-recovery": {
+      "session_id": "session_d6b510a1-2854-44d1-a82a-04bf3ff66f62",
+      "wire_path": "/home/zhongyule/.kimi-code/sessions/wd_app_f53b52ad6d21/session_d6b510a1-2854-44d1-a82a-04bf3ff66f62/agents/main/wire.jsonl",
+      "wire_sha256": "835bda84de42e394f45e662e79e94285d0efa1e9df447821db5b5b2dca36db35"
+    },
+    "polyglot-c-py": {
+      "session_id": "session_d11e0f37-797b-491b-a046-31bafbefaea6",
+      "wire_path": "/home/zhongyule/.kimi-code/sessions/wd_app_f53b52ad6d21/session_d11e0f37-797b-491b-a046-31bafbefaea6/agents/main/wire.jsonl",
+      "wire_sha256": "2e165fc80b353b18065842bff4a52cf393e91ff52b290c3f4a1ff77156af88e6"
+    }
+  },
+  "claims": [
+    {
+      "id": "fix-git-K1",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "读取 reflog 定位丢失提交",
+      "basis": [
+        {
+          "call_id": "tool_9PbX8GMbFJsQJ4BnD9UZM2yM",
+          "step": 1,
+          "call_line": 20,
+          "result_line": 22,
+          "tool": "Bash",
+          "application_evidence": "git reflog --date=iso | head -50",
+          "result_excerpt": "d7d3e4b HEAD@{2026-04-03 07:47:18 +0000}: checkout: moving from c499730ae050deb27e5d22972ea28daf778060f2 to master\nc499730 HEAD@{2026-04-03 07:47:18 +0000}: commit: Move to Stanford\nc4e38a1 HEAD@{2026-04-03 07:47:18 +0000}: checkout: moving from master to HEAD~1\nd7d3e4b HEAD@{2026-04-03 07:47:18 +0000}: reset: moving to d7d3e4b\n19b5d10 HEAD@{2026-04-03 07:47:17 +0000}: clone: from https://github.com/TheMikeMerrill/personal-site.git\n"
+        }
+      ],
+      "expected_kernel_behavior": "git 程序执行并读取仓库 reflog；管道输出交给 head。",
+      "target_objects": [
+        "/app/personal-site/.git/logs/HEAD",
+        "git reflog"
+      ],
+      "verification_acceptance": "独立记录确认 git reflog 的执行，以及该进程家族对本仓库 reflog 的成功读取；仅观察到命令文本不足。",
+      "allowed_variance": "允许不同 Git 可执行路径、文件读取或映射；head 不是任务必要证据。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "fix-git-K2",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "合并产生冲突与待合并状态",
+      "basis": [
+        {
+          "call_id": "tool_lOAWqkNjUkKfSCRbTVVFAHjn",
+          "step": 5,
+          "call_line": 55,
+          "result_line": 56,
+          "tool": "Bash",
+          "application_evidence": "git merge c499730 --no-edit; echo \"EXIT: $?\"; git status --short",
+          "result_excerpt": "Auto-merging _includes/about.md\nCONFLICT (content): Merge conflict in _includes/about.md\nAutomatic merge failed; fix conflicts and then commit the result.\nEXIT: 1\nUU _includes/about.md\nM  _layouts/default.html\n"
+        }
+      ],
+      "expected_kernel_behavior": "git merge 读取提交/树/索引，在工作区产生冲突内容并更新合并状态。",
+      "target_objects": [
+        ".git/objects/",
+        ".git/index",
+        ".git/MERGE_HEAD",
+        "_includes/about.md",
+        "_layouts/default.html"
+      ],
+      "verification_acceptance": "确认 git merge 执行、about.md 的成功修改与冲突标记，以及提交前待合并状态。参考路径中 git merge 返回非零；不可用整个复合 Shell 的最终退出码替代。",
+      "allowed_variance": "对象可来自 loose object 或 pack；写入允许临时文件加 rename。若重跑改用另一正确恢复方案，记路径不适用而非系统漏采。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "fix-git-K3",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "内置 Read 读取冲突文件",
+      "basis": [
+        {
+          "call_id": "tool_ghEDKOTFCFUQPojEyxtg16S2",
+          "step": 6,
+          "call_line": 63,
+          "result_line": 64,
+          "tool": "Read",
+          "application_evidence": {
+            "path": "_includes/about.md",
+            "operation": "Read"
+          },
+          "result_excerpt": "1\t<<<<<<< HEAD\n2\tI am a sixth PhD candidate at the [Paul G. Allen School of Computer Science & Engineering](https://www.cs.washington.edu/) at The University of Washington, where I am advised by [Tim Althoff](http://www.timalthoff.com/). I am affiliated with [UW NLP](https://twitter.com/uwnlp).\n3\t\n4\t Previously, I was a Student Researcher at [Google Research](https://research.google/), an ML Research Intern at [Apple Health AI](https://machinelearning.apple.com/work-with-us) and a data scientist and the second full-time employee at [HealthRhyth"
+        }
+      ],
+      "expected_kernel_behavior": "Kimi 本体、工作线程或工具辅助进程读取 about.md 内容。",
+      "target_objects": [
+        "/app/personal-site/_includes/about.md"
+      ],
+      "verification_acceptance": "独立事件确认目标文件成功读取；关联打开/FD/读取或映射，不要求启动 cat。",
+      "allowed_variance": "允许同进程直接读、辅助进程读或映射。若实现从既有应用缓存返回，单次调用内文件读取命题可能不成立，需另记而非硬补证据。",
+      "uncertainty": "不能从 Read 工具名推断存在 cat 子进程；文件缓存实现可能改变本次调用的 I/O。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "fix-git-K4",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "Edit 修改 about.md",
+      "basis": [
+        {
+          "call_id": "tool_U5wSDEL5EFw9Mwc3D6pTkg73",
+          "step": 7,
+          "call_line": 72,
+          "result_line": 73,
+          "tool": "Edit",
+          "application_evidence": {
+            "path": "_includes/about.md",
+            "operation": "Edit"
+          },
+          "result_excerpt": "Replaced 1 occurrence in _includes/about.md"
+        }
+      ],
+      "expected_kernel_behavior": "编辑逻辑将目标内容替换，产生目标 inode 的成功写入，或写临时文件后成功替换目标路径。",
+      "target_objects": [
+        "/app/personal-site/_includes/about.md"
+      ],
+      "verification_acceptance": "核验成功写入或原子替换链，并在终态断言新内容与冲突标记消失；可写打开本身不足以证明写入成功。",
+      "allowed_variance": "直接覆盖、截断后写、临时文件+rename 均可；不预设额外 Shell 进程。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "fix-git-K5",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "暂存并提交恢复内容",
+      "basis": [
+        {
+          "call_id": "tool_V5o04dNQVCb2Oe2fwN5AJori",
+          "step": 8,
+          "call_line": 80,
+          "result_line": 81,
+          "tool": "Bash",
+          "application_evidence": "git add _includes/about.md && git commit --no-edit && git log --oneline --graph -4 && git status",
+          "result_excerpt": "[master 1ebaf60] Merge commit 'c499730'\n*   1ebaf60 Merge commit 'c499730'\n|\\  \n| * c499730 Move to Stanford\n* | d7d3e4b off the job market woo\n|/  \n* c4e38a1 Add code link for BLADE\nOn branch master\nnothing to commit, working tree clean\n"
+        }
+      ],
+      "expected_kernel_behavior": "git add 读取修复文件并更新索引；git commit 生成提交/对象，更新 master 或其引用存储。",
+      "target_objects": [
+        "_includes/about.md",
+        ".git/index",
+        ".git/objects/",
+        ".git/refs/heads/master",
+        ".git/packed-refs"
+      ],
+      "verification_acceptance": "分别确认 add/commit 执行、仓库写操作与终态 master 包含恢复提交；引用可按存储格式变更，不要求每个候选路径都被写。",
+      "allowed_variance": "锁文件+rename、不同 Git 对象/引用存储均接受；不锁死历史新提交哈希。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "fix-git-K6",
+      "task": "fix-git",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "回读检查冲突标记",
+      "basis": [
+        {
+          "call_id": "tool_4tuJAvsJPx2S4Sq1jFWVzrng",
+          "step": 9,
+          "call_line": 88,
+          "result_line": 89,
+          "tool": "Bash",
+          "application_evidence": "grep -rn '<<<<<<<\\|>>>>>>>' --include='*.md' --include='*.html' . || echo \"No conflict markers remain\"",
+          "result_excerpt": "No conflict markers remain\n"
+        }
+      ],
+      "expected_kernel_behavior": "grep 遍历任务目录并读取匹配扩展名的文件，向管道或 stdout 输出结果。",
+      "target_objects": [
+        "/app/personal-site/**/*.md",
+        "/app/personal-site/**/*.html"
+      ],
+      "verification_acceptance": "独立记录确认任务目录内候选文件读取，并用只读内容断言确认冲突标记已消失；grep 无匹配返回 1 不应自动判任务失败。",
+      "allowed_variance": "grep 检查是参考路径；其他等价验证可替代，不要求精确读取次数。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K1",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "读取原 WAL 并在内存分析",
+      "basis": [
+        {
+          "call_id": "tool_W7Dpew7wcLAgpaTAbRuO5c5H",
+          "step": 2,
+          "call_line": 28,
+          "result_line": 29,
+          "tool": "Bash",
+          "application_evidence": "xxd /app/main.db-wal | head -40",
+          "result_excerpt": "00000000: 753d 44c0 426f a05a 4242 5242 4242 4242  u=D.Bo.ZBBRBBBBB\n00000010: d2da 2e57 4cd1 a443 a811 d9e1 e660 4414  ...WL..C.....`D.\n00000020: 4242 4243 4242 4242 d2da 2e57 4cd1 a443  BBBCBBBB...WL..C\n00000030: 2d88 6eaf c648 0d21 1113 0e2b 3627 6224  -.n..H.!...+6'b$\n00000040: 2d30 2f23 3662 7142 5242 4040 4202 6262  -0/#6bqBRB@@B.bb\n00000050: 4242 4240 4242 4240 4242 4242 4242 4242  BBB@BBB@BBBBBBBB\n00000060: 4242 4243 4242 4246 4242 4242 4242 4242  BBBCBBBFBBBBBBBB\n00000070: 4242 4243 4242 4242 4242 4242 4242 4242  BBBCBBBBBBBBBBBB\n000000"
+        },
+        {
+          "call_id": "tool_sqQrpFasHQTMhSGxRDORpQXb",
+          "step": 3,
+          "call_line": 37,
+          "result_line": 38,
+          "tool": "Bash",
+          "application_evidence": "cd /app && python3 -c \"\ndata = open('main.db-wal','rb').read()\ndec = bytes(b ^ 0x42 for b in data)\nprint('magic:', dec[:4].hex())\nimport struct\nmagic, ver, pgsz, ckpt, s1, s2, c1, c2 = struct.unpack('>8I', dec[:32])\nprint(f'version={ver} pagesize={pgsz} ckpt={ckpt} salt1={s1:#x} salt2={s2:#x}')\n# frame header at offset 32: pgno, commit_size, salt1, salt2, c1, c2\nfh = struct.unpack('>6I', dec[32:56])\nprint('frame1 header:', [hex(x) for x in fh])\nprint('WAL size:', len(dec), 'frames:', (len(dec)-32)/(pgsz+24))\n\"",
+          "result_excerpt": "magic: 377f0682\nversion=3007000 pagesize=4096 ckpt=0 salt1=0x90986c15 salt2=0xe93e601\nframe1 header: ['0x1', '0x0', '0x90986c15', '0xe93e601', '0x6fca2ced', '0x840a4f63']\nWAL size: 16512 frames: 4.0\n"
+        },
+        {
+          "call_id": "tool_Y7qKRLgjCmcTp1oPc3pGnYft",
+          "step": 4,
+          "call_line": 46,
+          "result_line": 47,
+          "tool": "Bash",
+          "application_evidence": "cd /app && python3 -c \"\nimport struct\ndata = bytes(b ^ 0x42 for b in open('main.db-wal','rb').read())\n\ndef wal_cksum(data, s0=0, s1_=0, native_le=False):\n    # magic 0x377f0682 => little-endian checksum, 0x377f0683 => big-endian\n    fmt = '<I' if native_le else '>I'\n    for i in range(0, len(data), 8):\n        x0 = struct.unpack(fmt, data[i:i+4])[0]\n        x1 = struct.unpack(fmt, data[i+4:i+8])[0]\n        s0 = (s0 + x0 + s1_) & 0xffffffff\n        s1_ = (s1_ + x1 + s0) & 0xffffffff\n    return s0, s1_\n\nmagic = struct.unpack('>I', data[:4])[0]\nle = (magic & 1) == 0  # 0x...82 -> little endian words\nh0, h1 = wal_cksum(data[:24], native_le=le)\nc0, c1 = struct.unpack('>2I', data[24:32])\nprint('header cksum ok:', (h0, h1) == (c0, c1))\n\npgsz = struct.unpack('>I', data[8:12])[0]\noff = 32\ns0, s1_ = h0, h1\nwhile off + 24 + pgsz <= len(data):\n    pgno, commit, fs0, fs1, fc0, fc1 = struct.unpack('>6I', data[off:off+24])\n    s0, s1_ = wal_cksum(data[off:off+8], s0, s1_, native_le=le)\n    s0, s1_ = wal_cksum(data[off+24:off+24+pgsz], s0, s1_, native_le=le)\n    ok = (s0, s1_) == (fc0, fc1)\n    print(f'frame pgno={pgno} commit={commit} salts_match={fs0==struct.unpack(\\\">I\\\",data[16:20])[0]} cksum_ok={ok}')\n    off += 24 + pgsz\n\"",
+          "result_excerpt": "header cksum ok: True\nframe pgno=1 commit=0 salts_match=True cksum_ok=True\nframe pgno=2 commit=2 salts_match=True cksum_ok=True\nframe pgno=2 commit=2 salts_match=True cksum_ok=True\nframe pgno=2 commit=2 salts_match=True cksum_ok=True\n"
+        }
+      ],
+      "expected_kernel_behavior": "xxd/Python 读取 main.db-wal 原始字节；Python 的 XOR 与校验计算在用户态内存中执行。",
+      "target_objects": [
+        "/app/main.db-wal"
+      ],
+      "verification_acceptance": "确认成功读取 WAL；解码值由应用返回/离线计算佐证，不能要求内核产生 XOR/校验专属事件。",
+      "allowed_variance": "允许不同读取/映射方式；不要求特定 read 次数或管道切片。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K2",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "备份主库与 WAL",
+      "basis": [
+        {
+          "call_id": "tool_iTiv0OvdNhVm7douzRFf9Nwt",
+          "step": 5,
+          "call_line": 55,
+          "result_line": 56,
+          "tool": "Bash",
+          "application_evidence": "cd /app && cp main.db main.db.orig && cp main.db-wal main.db-wal.orig && python3 -c \"\ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n\" && sqlite3 main.db \"PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;\"",
+          "result_excerpt": "ok\n1\n"
+        }
+      ],
+      "expected_kernel_behavior": "cp 读取原文件并创建 main.db.orig、main.db-wal.orig；复制可能用 read/write、copy_file_range 或其他文件复制机制。",
+      "target_objects": [
+        "/app/main.db",
+        "/app/main.db.orig",
+        "/app/main.db-wal",
+        "/app/main.db-wal.orig"
+      ],
+      "verification_acceptance": "核验两个备份的文件创建/复制成功及原始内容一致，读取证据可结合复制 syscall；此备份为参考实现步骤。",
+      "allowed_variance": "允许不同复制机制；重跑选择不备份或改名时，本条记实现差异而非漏采。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K3",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "Python 将解码 WAL 写回",
+      "basis": [
+        {
+          "call_id": "tool_iTiv0OvdNhVm7douzRFf9Nwt",
+          "step": 5,
+          "call_line": 55,
+          "result_line": 56,
+          "tool": "Bash",
+          "application_evidence": "cd /app && cp main.db main.db.orig && cp main.db-wal main.db-wal.orig && python3 -c \"\ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n\" && sqlite3 main.db \"PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;\"",
+          "result_excerpt": "ok\n1\n"
+        }
+      ],
+      "expected_kernel_behavior": "Python 读取 main.db-wal.orig，经内存 XOR 0x42 解码，使用 wb 截断/写入 main.db-wal。",
+      "target_objects": [
+        "/app/main.db-wal.orig",
+        "/app/main.db-wal"
+      ],
+      "verification_acceptance": "同一执行链确认备份 WAL 读取与目标 WAL 成功写入；在 SQLite 后续操作前检查文件头/解码内容。",
+      "allowed_variance": "目标可被 SQLite 后续 checkpoint、删除，不能仅在最终时刻检查 WAL 是否仍存在。",
+      "uncertainty": "源码给出 wb 与 XOR；内核能见文件 I/O，不能直接证明 XOR 算法或明文字节语义。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K4",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "SQLite 读取恢复结果",
+      "basis": [
+        {
+          "call_id": "tool_iTiv0OvdNhVm7douzRFf9Nwt",
+          "step": 5,
+          "call_line": 55,
+          "result_line": 56,
+          "tool": "Bash",
+          "application_evidence": "cd /app && cp main.db main.db.orig && cp main.db-wal main.db-wal.orig && python3 -c \"\ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n\" && sqlite3 main.db \"PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;\"",
+          "result_excerpt": "ok\n1\n"
+        },
+        {
+          "call_id": "tool_j6vciAV7yq8m7856t5DPdVDG",
+          "step": 6,
+          "call_line": 64,
+          "result_line": 65,
+          "tool": "Bash",
+          "application_evidence": "cd /app && sqlite3 main.db \"SELECT * FROM sqlite_master; SELECT * FROM items ORDER BY id;\"",
+          "result_excerpt": "table|items|items|2|CREATE TABLE items (\n        id INTEGER PRIMARY KEY,\n        name TEXT,\n        value INTEGER\n    )\n1|apple|150\n2|banana|250\n3|cherry|300\n4|date|400\n5|elderberry|500\n6|fig|600\n7|grape|700\n8|honeydew|800\n9|kiwi|900\n10|lemon|1000\n11|mango|1100\n"
+        }
+      ],
+      "expected_kernel_behavior": "sqlite3 执行并访问 main.db；为应用 WAL 可读取 WAL/共享内存并可能 checkpoint 更新主库。",
+      "target_objects": [
+        "/app/main.db",
+        "/app/main.db-wal",
+        "/app/main.db-shm"
+      ],
+      "verification_acceptance": "确认 SQLite 执行与数据库成功读取，外部查询验证 11 条记录；WAL/shm 的具体访问、锁、checkpoint 和删除作为待探索分支。",
+      "allowed_variance": "不把 main.db-wal、main.db-shm 每次都必须出现列为硬条件；checkpoint 后可能仅读主库。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K5",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "Python 查询数据库并导出 JSON",
+      "basis": [
+        {
+          "call_id": "tool_ZfTYeIGqcIHbU1T5eYFlT4WU",
+          "step": 7,
+          "call_line": 73,
+          "result_line": 74,
+          "tool": "Bash",
+          "application_evidence": "cd /app && python3 -c \"\nimport sqlite3, json\ncon = sqlite3.connect('main.db')\nrows = con.execute('SELECT id, name, value FROM items ORDER BY id').fetchall()\ncon.close()\ndata = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in rows]\nwith open('recovered.json', 'w') as f:\n    json.dump(data, f)\nprint(open('recovered.json').read())\n\"",
+          "result_excerpt": "[{\"id\": 1, \"name\": \"apple\", \"value\": 150}, {\"id\": 2, \"name\": \"banana\", \"value\": 250}, {\"id\": 3, \"name\": \"cherry\", \"value\": 300}, {\"id\": 4, \"name\": \"date\", \"value\": 400}, {\"id\": 5, \"name\": \"elderberry\", \"value\": 500}, {\"id\": 6, \"name\": \"fig\", \"value\": 600}, {\"id\": 7, \"name\": \"grape\", \"value\": 700}, {\"id\": 8, \"name\": \"honeydew\", \"value\": 800}, {\"id\": 9, \"name\": \"kiwi\", \"value\": 900}, {\"id\": 10, \"name\": \"lemon\", \"value\": 1000}, {\"id\": 11, \"name\": \"mango\", \"value\": 1100}]\n"
+        }
+      ],
+      "expected_kernel_behavior": "python3 进程内的 sqlite3 库访问 main.db，json.dump 写 recovered.json，随后 Python 回读该 JSON。",
+      "target_objects": [
+        "/app/main.db",
+        "/app/recovered.json"
+      ],
+      "verification_acceptance": "确认 Python 执行、数据库读取、JSON 成功写入与回读；外部断言 JSON 有按 id 排序的 11 条记录。",
+      "allowed_variance": "嵌入式 sqlite3 不要求启动 sqlite3 CLI 子进程；直接写入及等价原子替换可接受。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "db-wal-recovery-K6",
+      "task": "db-wal-recovery",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "独立回读核对输出",
+      "basis": [
+        {
+          "call_id": "tool_N7hVRN4RdQzVRLc4K6mKFPcz",
+          "step": 8,
+          "call_line": 82,
+          "result_line": 83,
+          "tool": "Bash",
+          "application_evidence": "cd /app && ls -la && python3 -c \"\nimport json\nd = json.load(open('recovered.json'))\nassert len(d) == 11 and [r['id'] for r in d] == list(range(1,12)), 'validation failed'\nassert all(set(r) == {'id','name','value'} for r in d)\nprint('recovered.json: 11 records, sorted by id — OK')\n\" && sqlite3 main.db \"SELECT count(*) FROM items;\"",
+          "result_excerpt": "total 52\ndrwxr-xr-x 1 root root  4096 Oct 19 07:33 .\ndrwxr-xr-x 1 root root  4096 Oct 19 07:32 ..\n-rw-r--r-- 1 root root  8192 Oct 19 07:33 main.db\n-rw-r--r-- 1 root root 16512 Oct 19 07:33 main.db-wal.orig\n-rw-r--r-- 1 root root  8192 Oct 19 07:33 main.db.orig\n-rw-r--r-- 1 root root   472 Oct 19 07:33 recovered.json\nrecovered.json: 11 records, sorted by id — OK\n11\n"
+        }
+      ],
+      "expected_kernel_behavior": "另一次 Python 执行读取 recovered.json；sqlite3 CLI 再次读取主库进行计数。",
+      "target_objects": [
+        "/app/recovered.json",
+        "/app/main.db"
+      ],
+      "verification_acceptance": "确认导出后的回读和查询执行；终态检查 id=1..11、字段集合正确。",
+      "allowed_variance": "允许等价检查；验证通过的应用输出不替代文件读取与进程的独立证据。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K1",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "生成并修订双语言源文件",
+      "basis": [
+        {
+          "call_id": "tool_mYDETKUZB2vSybvQrlMtiMU6",
+          "step": 1,
+          "call_line": 20,
+          "result_line": 21,
+          "tool": "Write",
+          "application_evidence": {
+            "path": "/app/polyglot/main.py.c",
+            "operation": "Write"
+          },
+          "result_excerpt": "Wrote 906 bytes to /app/polyglot/main.py.c"
+        },
+        {
+          "call_id": "tool_JfVPPZSLCz0WaC2WWB0QvDix",
+          "step": 5,
+          "call_line": 56,
+          "result_line": 57,
+          "tool": "Edit",
+          "application_evidence": {
+            "path": "/app/polyglot/main.py.c",
+            "operation": "Edit"
+          },
+          "result_excerpt": "Replaced 1 occurrence in /app/polyglot/main.py.c"
+        },
+        {
+          "call_id": "tool_i7Ykcj8D8IEjG4XTXDyGdGga",
+          "step": 7,
+          "call_line": 72,
+          "result_line": 73,
+          "tool": "Edit",
+          "application_evidence": {
+            "path": "/app/polyglot/main.py.c",
+            "operation": "Edit"
+          },
+          "result_excerpt": "Replaced 1 occurrence in /app/polyglot/main.py.c"
+        }
+      ],
+      "expected_kernel_behavior": "Kimi 工具逻辑创建 main.py.c 并完成两次修订，可能同进程文件 I/O 或原子替换。",
+      "target_objects": [
+        "/app/polyglot/main.py.c"
+      ],
+      "verification_acceptance": "确认文件创建/成功写入或替换；以轨迹中的 Write 内容顺序应用两次 Edit，得到参考源文件用于终态比对。",
+      "allowed_variance": "不要求每次 Edit 产生新进程；不同实现允许一次性写对，不强制重演修订。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K2",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "编译读取源文件并生成二进制",
+      "basis": [
+        {
+          "call_id": "tool_Y5tPDpFBxdqgRnNkSMBpTinN",
+          "step": 2,
+          "call_line": 29,
+          "result_line": 30,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc -Wall -Wextra main.py.c -o cmain\nfor n in 0 1 2 7 10 20 50 90; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$([ \"$py\" = \"$c\" ] && echo OK || echo MISMATCH)\"\ndone",
+          "result_excerpt": "main.py.c:2:4: warning: missing terminating \" character\n    2 | r\"\"\"\n      |    ^\nmain.py.c:33:3: warning: missing terminating \" character\n   33 | \"\"\"\n      |   ^\n/bin/bash: line 5: python3: command not found\nCommand failed with exit code: 127."
+        },
+        {
+          "call_id": "tool_RL3R2TCjGzv7U3MDFUUeePJE",
+          "step": 8,
+          "call_line": 81,
+          "result_line": 83,
+          "tool": "Bash",
+          "application_evidence": "cd /app/polyglot && gcc -Wall -Wextra main.py.c -o cmain && echo BUILD_OK && ./cmain 10 && ./cmain 0 && ./cmain 90",
+          "result_excerpt": "BUILD_OK\n55\n0\n2880067194370816120\n"
+        },
+        {
+          "call_id": "tool_MrPRS8FiJcH0s18Nrqa44cio",
+          "step": 10,
+          "call_line": 104,
+          "result_line": 105,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc main.py.c -o cmain\nfail=0\nfor n in 0 1 2 3 7 10 20 50 90 93; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  if [ \"$py\" = \"$c\" ]; then s=OK; else s=MISMATCH; fail=1; fi\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$s\"\ndone\nexit $fail",
+          "result_excerpt": "N=0   python=0                      c=0                      OK\nN=1   python=1                      c=1                      OK\nN=2   python=1                      c=1                      OK\nN=3   python=2                      c=2                      OK\nN=7   python=13                     c=13                     OK\nN=10  python=55                     c=55                     OK\nN=20  python=6765                   c=6765                   OK\nN=50  python=12586269025            c=12586269025            OK\nN=90  python=2880067194370816120    c="
+        }
+      ],
+      "expected_kernel_behavior": "gcc 执行并读取 main.py.c，编译/汇编/链接链创建或替换 cmain；可能产生 cc1、as、collect2、ld 等后代。",
+      "target_objects": [
+        "/app/polyglot/main.py.c",
+        "/app/polyglot/cmain"
+      ],
+      "verification_acceptance": "确认 gcc 及其家族的源文件读取、输出二进制成功落盘；后续能执行 cmain。",
+      "allowed_variance": "编译器子程序名、临时文件位置、具体数量因工具链不同而变，不列为全部必需。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K3",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "diagnostic_only",
+      "title": "Python 未安装时执行失败",
+      "basis": [
+        {
+          "call_id": "tool_Y5tPDpFBxdqgRnNkSMBpTinN",
+          "step": 2,
+          "call_line": 29,
+          "result_line": 30,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc -Wall -Wextra main.py.c -o cmain\nfor n in 0 1 2 7 10 20 50 90; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$([ \"$py\" = \"$c\" ] && echo OK || echo MISMATCH)\"\ndone",
+          "result_excerpt": "main.py.c:2:4: warning: missing terminating \" character\n    2 | r\"\"\"\n      |    ^\nmain.py.c:33:3: warning: missing terminating \" character\n   33 | \"\"\"\n      |   ^\n/bin/bash: line 5: python3: command not found\nCommand failed with exit code: 127."
+        },
+        {
+          "call_id": "tool_hD5D1Ipw2LIFqkm6HacA6RH5",
+          "step": 3,
+          "call_line": 38,
+          "result_line": 39,
+          "tool": "Bash",
+          "application_evidence": "command -v python3 python python3.12 2>/dev/null; ls -l /usr/bin/python* /usr/local/bin/python* 2>/dev/null; echo \"PATH=$PATH\"",
+          "result_excerpt": "PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+        }
+      ],
+      "expected_kernel_behavior": "首次 Shell 报 python3 command not found；可能执行路径查找/stat/access，可能尝试失败的 exec。",
+      "target_objects": [
+        "PATH 中的 python3 候选路径"
+      ],
+      "verification_acceptance": "记录为诊断命题：用独立事件辨认查找失败方式；应用返回127只证明 Shell 结果，不等同内核 execve 必然返回 ENOENT。",
+      "allowed_variance": "可能没有任何 python3 execve，也可能有失败尝试；不得要求出现成功 python3 exec。",
+      "uncertainty": "该失败属于本轮弯路，不是成功任务必须重演的关键行为。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K4",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "后台安装 Python 产生系统文件变更",
+      "basis": [
+        {
+          "call_id": "tool_09tqnYdpmxlt3QYSY54weI4i",
+          "step": 8,
+          "call_line": 82,
+          "result_line": 85,
+          "tool": "Bash",
+          "application_evidence": "apt-get update -qq && apt-get install -y -qq python3 2>&1 | tail -3; command -v python3 && python3 --version",
+          "result_excerpt": "task_id: bash-xqfq3svr\npid: 121\ndescription: Install python3 via apt\nstatus: running\nautomatic_notification: true\nnext_step: The completion arrives automatically in a later turn — do NOT wait, poll, or call TaskOutput on it; continue with your current work.\nnext_step: Use TaskStop only if the task must be cancelled.\nhuman_shell_hint: The task is visible in the background-task panel."
+        },
+        {
+          "call_id": "tool_qbZNgbExzSvS6eu5QQUAQViC",
+          "step": 9,
+          "call_line": 93,
+          "result_line": 96,
+          "tool": "WaitFor",
+          "application_evidence": {
+            "path": null,
+            "operation": "WaitFor"
+          },
+          "result_excerpt": "wait_status: completed\ntask_id: bash-xqfq3svr\nwaited_ms: 37489\ntimeout_ms: 90000\n\n[finished]\nWall time: 42.418 seconds\ntask_id: bash-xqfq3svr\ndescription: Install python3 via apt\nstatus: completed\ndetached: true\ntimeout_ms: 600000\nkind: process\ncommand: apt-get update -qq && apt-get install -y -qq python3 2>&1 | tail -3; command -v python3 && python3 --version\npid: 121\nexit_code: 0\nparent_tool_call_id: tool_09tqnYdpmxlt3QYSY54weI4i\noutput_path: /logs/agent/.kimi-code/sessions/wd_app_f53b52ad6d21/session_d11e0f37-797b-491b-a046-31bafbefaea6/agen"
+        }
+      ],
+      "expected_kernel_behavior": "apt-get 启动并可能派生包管理辅助进程，访问软件包索引、缓存与安装数据库，安装 Python 程序和库文件。",
+      "target_objects": [
+        "/var/lib/apt/",
+        "/var/cache/apt/",
+        "/var/lib/dpkg/",
+        "/usr/bin/python3",
+        "Python 库路径"
+      ],
+      "verification_acceptance": "确认包管理执行链及安装相关成功文件变更、Python 可用；作用域必须延长到后台任务完成，不能在初次 Bash 返回 running 时截止。",
+      "allowed_variance": "重跑镜像已安装 Python 时本条不适用；日志 pid=121 是容器命名空间 PID，不能直接当宿主 PID。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K5",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "conditional",
+      "title": "包更新可能产生网络访问",
+      "basis": [
+        {
+          "call_id": "tool_09tqnYdpmxlt3QYSY54weI4i",
+          "step": 8,
+          "call_line": 82,
+          "result_line": 85,
+          "tool": "Bash",
+          "application_evidence": "apt-get update -qq && apt-get install -y -qq python3 2>&1 | tail -3; command -v python3 && python3 --version",
+          "result_excerpt": "task_id: bash-xqfq3svr\npid: 121\ndescription: Install python3 via apt\nstatus: running\nautomatic_notification: true\nnext_step: The completion arrives automatically in a later turn — do NOT wait, poll, or call TaskOutput on it; continue with your current work.\nnext_step: Use TaskStop only if the task must be cancelled.\nhuman_shell_hint: The task is visible in the background-task panel."
+        }
+      ],
+      "expected_kernel_behavior": "若 apt update/安装确实获取远端索引或软件包，apt 或其方法进程建立网络连接并接收数据。",
+      "target_objects": [
+        "由重跑 APT 配置决定的镜像站/代理"
+      ],
+      "verification_acceptance": "先确认本轮是否需要远端获取；若需要，用成功连接及数据传输核验。缓存、预装、本地 file 源等分支记不适用。",
+      "allowed_variance": "不预设域名、IP、端口、TLS 或精确连接数；不能从 apt-get 字符串直接断言访问公网。",
+      "uncertainty": "参考命令包含 apt-get update，但轨迹不足以确定真实网络目标或下载字节数。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K6",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "Python 解释执行同一份源文件",
+      "basis": [
+        {
+          "call_id": "tool_MrPRS8FiJcH0s18Nrqa44cio",
+          "step": 10,
+          "call_line": 104,
+          "result_line": 105,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc main.py.c -o cmain\nfail=0\nfor n in 0 1 2 3 7 10 20 50 90 93; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  if [ \"$py\" = \"$c\" ]; then s=OK; else s=MISMATCH; fail=1; fi\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$s\"\ndone\nexit $fail",
+          "result_excerpt": "N=0   python=0                      c=0                      OK\nN=1   python=1                      c=1                      OK\nN=2   python=1                      c=1                      OK\nN=3   python=2                      c=2                      OK\nN=7   python=13                     c=13                     OK\nN=10  python=55                     c=55                     OK\nN=20  python=6765                   c=6765                   OK\nN=50  python=12586269025            c=12586269025            OK\nN=90  python=2880067194370816120    c="
+        }
+      ],
+      "expected_kernel_behavior": "Shell 循环启动 python3 main.py.c N；Python 读取源文件，在用户态计算 Fibonacci，通过 stdout 输出。",
+      "target_objects": [
+        "/app/polyglot/main.py.c",
+        "stdout 对应管道/终端"
+      ],
+      "verification_acceptance": "独立确认 Python 成功执行、读取同一源文件及输出；对参考完整循环可探索 10 个 N 的执行实例，但主核验不锁死进程总数。",
+      "allowed_variance": "不要求启动另外的计算程序；Fibonacci 运算本身没有专属内核事件。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K7",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "required_for_reference_path",
+      "title": "执行编译后的 C 程序",
+      "basis": [
+        {
+          "call_id": "tool_RL3R2TCjGzv7U3MDFUUeePJE",
+          "step": 8,
+          "call_line": 81,
+          "result_line": 83,
+          "tool": "Bash",
+          "application_evidence": "cd /app/polyglot && gcc -Wall -Wextra main.py.c -o cmain && echo BUILD_OK && ./cmain 10 && ./cmain 0 && ./cmain 90",
+          "result_excerpt": "BUILD_OK\n55\n0\n2880067194370816120\n"
+        },
+        {
+          "call_id": "tool_MrPRS8FiJcH0s18Nrqa44cio",
+          "step": 10,
+          "call_line": 104,
+          "result_line": 105,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc main.py.c -o cmain\nfail=0\nfor n in 0 1 2 3 7 10 20 50 90 93; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  if [ \"$py\" = \"$c\" ]; then s=OK; else s=MISMATCH; fail=1; fi\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$s\"\ndone\nexit $fail",
+          "result_excerpt": "N=0   python=0                      c=0                      OK\nN=1   python=1                      c=1                      OK\nN=2   python=1                      c=1                      OK\nN=3   python=2                      c=2                      OK\nN=7   python=13                     c=13                     OK\nN=10  python=55                     c=55                     OK\nN=20  python=6765                   c=6765                   OK\nN=50  python=12586269025            c=12586269025            OK\nN=90  python=2880067194370816120    c="
+        }
+      ],
+      "expected_kernel_behavior": "执行 /app/polyglot/cmain N，通过加载/映射二进制运行并向 stdout 输出结果。",
+      "target_objects": [
+        "/app/polyglot/cmain",
+        "stdout 对应管道/终端"
+      ],
+      "verification_acceptance": "独立记录 cmain 成功 exec、退出及输出；外部结果比较与 Python 一致。",
+      "allowed_variance": "二进制加载不一定表现为普通 read；仅出现 gcc 编译命令不足以证明 cmain 被执行。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    },
+    {
+      "id": "polyglot-c-py-K8",
+      "task": "polyglot-c-py",
+      "status": "unverified",
+      "priority": "implementation_detail",
+      "title": "Shell 用管道收集两路输出并比较",
+      "basis": [
+        {
+          "call_id": "tool_MrPRS8FiJcH0s18Nrqa44cio",
+          "step": 10,
+          "call_line": 104,
+          "result_line": 105,
+          "tool": "Bash",
+          "application_evidence": "set -e\ncd /app/polyglot\ngcc main.py.c -o cmain\nfail=0\nfor n in 0 1 2 3 7 10 20 50 90 93; do\n  py=$(python3 main.py.c \"$n\")\n  c=$(./cmain \"$n\")\n  if [ \"$py\" = \"$c\" ]; then s=OK; else s=MISMATCH; fail=1; fi\n  printf 'N=%-3s python=%-22s c=%-22s %s\\n' \"$n\" \"$py\" \"$c\" \"$s\"\ndone\nexit $fail",
+          "result_excerpt": "N=0   python=0                      c=0                      OK\nN=1   python=1                      c=1                      OK\nN=2   python=1                      c=1                      OK\nN=3   python=2                      c=2                      OK\nN=7   python=13                     c=13                     OK\nN=10  python=55                     c=55                     OK\nN=20  python=6765                   c=6765                   OK\nN=50  python=12586269025            c=12586269025            OK\nN=90  python=2880067194370816120    c="
+        }
+      ],
+      "expected_kernel_behavior": "命令替换捕获 Python/C stdout，Shell 比较值并输出 OK；可能有 pipe/dup/close 和 fork/clone。",
+      "target_objects": [
+        "Shell 与 Python/C 的 stdout 管道"
+      ],
+      "verification_acceptance": "核验子程序输出被成功传回并完成对比；若核验此实现细节，需跟踪 FD 流向，而非只比较日志字符串。",
+      "allowed_variance": "具体 fork/clone、pipe/pipe2、write/writev 次数取决于 Shell/运行时；Shell 内置比较无需独立 test/echo 进程。",
+      "uncertainty": "具体 syscall、PID、次数和进程边界需实测。",
+      "process_scope": "重跑目标容器中的 Kimi 进程及其子孙；内置工具允许由同进程或工作线程完成。PID 与时间窗仅为核验范围，不构成确定级 call 绑定。"
+    }
+  ]
+}

@@ -1,0 +1,2075 @@
+{
+  "scope": "S3 short mixed run 20261028-213330; raw Collector vs AgentSight, not production AnySentry. Post-hoc task-related program selection, not independent complete kernel ground truth.",
+  "definition": "Direct dependency installation commands, task object construction/configuration, core programs and their task subprocesses, validation and output-location programs. Exclude sleep/gate/hook/shell initialization, generic shell/runuser wrappers, and package-manager internals. Include task failure/retry with actual exec, not only successful commands.",
+  "web_setup_pids": [
+    958725,
+    958733,
+    958723,
+    959059,
+    959060,
+    960043,
+    960044,
+    960046,
+    960047,
+    962135,
+    962136
+  ],
+  "other_selectors": {
+    "web": "apt-get, git/git-upload-pack/git-receive-pack/post-receive, nginx, ss/grep :8080, curl",
+    "crack": "apt-get; actual perl running 7z2john (two attempts); john; /usr/lib/7zip/7z; rg PID971540 with cwd /app/extracted",
+    "polyglot": "gcc/cc1/as/collect2/ld and /app/polyglot/cmain"
+  },
+  "notes": [
+    "Interpreter/env wrappers normalized to the actual selected program; not counted twice.",
+    "Read/Edit/Write within the Kimi process need not create exec. Native tool logs are not kernel file I/O proof.",
+    "Selected web PIDs implement explicit task user/directory/permission checks plus temporary validation workspace creation and permission preparation.",
+    "The full raw family archive includes one additional pre-window root gate exec per task. It is excluded from key selection; existing total columns retain the original window counts.",
+    "No new workload or runtime modification.",
+    "Recount excludes temporary directory cleanup, Git maintenance and automatic gc from task-critical counts; these remain in total event counts."
+  ],
+  "source_sha256": "68b7d438246e47eff6291c17a90a0e715bceb6602239a27544c5ec796588b8ff",
+  "tasks": [
+    {
+      "task": "configure-git-webserver",
+      "counts": {
+        "raw": {
+          "exec": 35,
+          "exit": 35
+        },
+        "AS": {
+          "exec": 34,
+          "exit": 32
+        }
+      },
+      "events": {
+        "raw": {
+          "exec": [
+            {
+              "pid": 953620,
+              "role": "依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "update"
+              ],
+              "source_id": "raw-line:13147"
+            },
+            {
+              "pid": 953614,
+              "role": "依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "install",
+                "-y",
+                "git",
+                "nginx"
+              ],
+              "source_id": "raw-line:15492"
+            },
+            {
+              "pid": 958725,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "useradd",
+                "--create-home",
+                "--shell",
+                "/bin/bash",
+                "user"
+              ],
+              "source_id": "raw-line:20271"
+            },
+            {
+              "pid": 958733,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mkdir",
+                "-p",
+                "/git",
+                "/var/www/html"
+              ],
+              "source_id": "raw-line:20280"
+            },
+            {
+              "pid": 958735,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "init",
+                "--bare",
+                "--initial-branch=master",
+                "/git/server"
+              ],
+              "source_id": "raw-line:20283"
+            },
+            {
+              "pid": 958723,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "-R",
+                "user:user",
+                "/var/www/html"
+              ],
+              "source_id": "raw-line:20284"
+            },
+            {
+              "pid": 959059,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mkdir",
+                "-p",
+                "/git/server"
+              ],
+              "source_id": "raw-line:20732"
+            },
+            {
+              "pid": 959060,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/git/server"
+              ],
+              "source_id": "raw-line:20733"
+            },
+            {
+              "pid": 959061,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "init",
+                "--bare",
+                "--initial-branch=master",
+                "/git/server"
+              ],
+              "source_id": "raw-line:20737"
+            },
+            {
+              "pid": 960043,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "raw-line:22167"
+            },
+            {
+              "pid": 960044,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chmod",
+                "755",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "raw-line:22169"
+            },
+            {
+              "pid": 960046,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "test",
+                "-x",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "raw-line:22172"
+            },
+            {
+              "pid": 960047,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "test",
+                "-w",
+                "/var/www/html"
+              ],
+              "source_id": "raw-line:22176"
+            },
+            {
+              "pid": 960793,
+              "role": "服务配置校验与启动",
+              "argv": [
+                "nginx",
+                "-t"
+              ],
+              "source_id": "raw-line:23132"
+            },
+            {
+              "pid": 960976,
+              "role": "服务配置校验与启动",
+              "argv": [
+                "nginx"
+              ],
+              "source_id": "raw-line:23324"
+            },
+            {
+              "pid": 961035,
+              "role": "端口验证",
+              "argv": [
+                "ss",
+                "-ltnp"
+              ],
+              "source_id": "raw-line:23355"
+            },
+            {
+              "pid": 961036,
+              "role": "端口验证",
+              "argv": [
+                "grep",
+                ":8080"
+              ],
+              "source_id": "raw-line:23356"
+            },
+            {
+              "pid": 962135,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mktemp",
+                "-d",
+                "/tmp/git-web-test.XXXXXX"
+              ],
+              "source_id": "raw-line:24921"
+            },
+            {
+              "pid": 962136,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/tmp/git-web-test.tmi23Q"
+              ],
+              "source_id": "raw-line:24923"
+            },
+            {
+              "pid": 962143,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "clone",
+                "/git/server",
+                "/tmp/git-web-test.tmi23Q/server"
+              ],
+              "source_id": "raw-line:24931"
+            },
+            {
+              "pid": 962145,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git-upload-pack",
+                "/git/server"
+              ],
+              "source_id": "raw-line:24933"
+            },
+            {
+              "pid": 962147,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "-C",
+                "/tmp/git-web-test.tmi23Q/server",
+                "config",
+                "user.name",
+                "Test User"
+              ],
+              "source_id": "raw-line:24939"
+            },
+            {
+              "pid": 962149,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "-C",
+                "/tmp/git-web-test.tmi23Q/server",
+                "config",
+                "user.email",
+                "user@server"
+              ],
+              "source_id": "raw-line:24943"
+            },
+            {
+              "pid": 962154,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "add",
+                "hello.html"
+              ],
+              "source_id": "raw-line:24952"
+            },
+            {
+              "pid": 962155,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "commit",
+                "-m",
+                "add hello.html"
+              ],
+              "source_id": "raw-line:24953"
+            },
+            {
+              "pid": 962152,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "master"
+              ],
+              "source_id": "raw-line:24959"
+            },
+            {
+              "pid": 962159,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git-receive-pack",
+                "/git/server"
+              ],
+              "source_id": "raw-line:24962"
+            },
+            {
+              "pid": 962161,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "pack-objects",
+                "--all-progress-implied",
+                "--revs",
+                "--stdout",
+                "--thin",
+                "--delta-base-offset",
+                "-q"
+              ],
+              "source_id": "raw-line:24963"
+            },
+            {
+              "pid": 962163,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "unpack-objects",
+                "--pack_header=2,3",
+                "-q"
+              ],
+              "source_id": "raw-line:24964"
+            },
+            {
+              "pid": 962165,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "rev-list",
+                "--objects",
+                "--stdin",
+                "--not",
+                "--exclude-hidden=receive",
+                "--all",
+                "--quiet",
+                "--alternate-refs"
+              ],
+              "source_id": "raw-line:24967"
+            },
+            {
+              "pid": 962166,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "--git-dir=/git/server",
+                "for-each-ref",
+                "--format=%(objectname)"
+              ],
+              "source_id": "raw-line:24968"
+            },
+            {
+              "pid": 962168,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "hooks/post-receive"
+              ],
+              "source_id": "raw-line:24971"
+            },
+            {
+              "pid": 962169,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "--work-tree=/var/www/html",
+                "--git-dir=/git/server",
+                "checkout",
+                "-f",
+                "master"
+              ],
+              "source_id": "raw-line:24972"
+            },
+            {
+              "pid": 962171,
+              "role": "HTTP结果验证",
+              "argv": [
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "http://localhost:8080/hello.html"
+              ],
+              "source_id": "raw-line:24981"
+            },
+            {
+              "pid": 962178,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "--git-dir=/git/server",
+                "show",
+                "master:hello.html"
+              ],
+              "source_id": "raw-line:24992"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 953620,
+              "code": 0,
+              "source_id": "raw-line:15491"
+            },
+            {
+              "pid": 953614,
+              "code": 0,
+              "source_id": "raw-line:19196"
+            },
+            {
+              "pid": 958725,
+              "code": 0,
+              "source_id": "raw-line:20279"
+            },
+            {
+              "pid": 958733,
+              "code": 0,
+              "source_id": "raw-line:20281"
+            },
+            {
+              "pid": 958735,
+              "code": 128,
+              "source_id": "raw-line:20285"
+            },
+            {
+              "pid": 958723,
+              "code": 0,
+              "source_id": "raw-line:20287"
+            },
+            {
+              "pid": 959059,
+              "code": 0,
+              "source_id": "raw-line:20734"
+            },
+            {
+              "pid": 959060,
+              "code": 0,
+              "source_id": "raw-line:20736"
+            },
+            {
+              "pid": 959061,
+              "code": 0,
+              "source_id": "raw-line:20741"
+            },
+            {
+              "pid": 960043,
+              "code": 0,
+              "source_id": "raw-line:22168"
+            },
+            {
+              "pid": 960044,
+              "code": 0,
+              "source_id": "raw-line:22171"
+            },
+            {
+              "pid": 960046,
+              "code": 0,
+              "source_id": "raw-line:22173"
+            },
+            {
+              "pid": 960047,
+              "code": 0,
+              "source_id": "raw-line:22177"
+            },
+            {
+              "pid": 960793,
+              "code": 0,
+              "source_id": "raw-line:23320"
+            },
+            {
+              "pid": 960976,
+              "code": 0,
+              "source_id": "raw-line:23354"
+            },
+            {
+              "pid": 961035,
+              "code": 0,
+              "source_id": "raw-line:23359"
+            },
+            {
+              "pid": 961036,
+              "code": 0,
+              "source_id": "raw-line:23360"
+            },
+            {
+              "pid": 962135,
+              "code": 0,
+              "source_id": "raw-line:24922"
+            },
+            {
+              "pid": 962136,
+              "code": 0,
+              "source_id": "raw-line:24924"
+            },
+            {
+              "pid": 962145,
+              "code": 0,
+              "source_id": "raw-line:24934"
+            },
+            {
+              "pid": 962143,
+              "code": 0,
+              "source_id": "raw-line:24936"
+            },
+            {
+              "pid": 962147,
+              "code": 0,
+              "source_id": "raw-line:24940"
+            },
+            {
+              "pid": 962149,
+              "code": 0,
+              "source_id": "raw-line:24944"
+            },
+            {
+              "pid": 962154,
+              "code": 0,
+              "source_id": "raw-line:24954"
+            },
+            {
+              "pid": 962155,
+              "code": 0,
+              "source_id": "raw-line:24957"
+            },
+            {
+              "pid": 962161,
+              "code": 0,
+              "source_id": "raw-line:24965"
+            },
+            {
+              "pid": 962163,
+              "code": 0,
+              "source_id": "raw-line:24966"
+            },
+            {
+              "pid": 962166,
+              "code": 0,
+              "source_id": "raw-line:24969"
+            },
+            {
+              "pid": 962165,
+              "code": 0,
+              "source_id": "raw-line:24970"
+            },
+            {
+              "pid": 962169,
+              "code": 0,
+              "source_id": "raw-line:24973"
+            },
+            {
+              "pid": 962168,
+              "code": 0,
+              "source_id": "raw-line:24974"
+            },
+            {
+              "pid": 962159,
+              "code": 0,
+              "source_id": "raw-line:24977"
+            },
+            {
+              "pid": 962152,
+              "code": 0,
+              "source_id": "raw-line:24979"
+            },
+            {
+              "pid": 962171,
+              "code": 0,
+              "source_id": "raw-line:24985"
+            },
+            {
+              "pid": 962178,
+              "code": 0,
+              "source_id": "raw-line:24993"
+            }
+          ]
+        },
+        "AS": {
+          "exec": [
+            {
+              "pid": 953620,
+              "role": "依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "update"
+              ],
+              "source_id": "audit-canon-event-1793194493253-process-953620-678"
+            },
+            {
+              "pid": 953614,
+              "role": "依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "install",
+                "-y",
+                "git",
+                "nginx"
+              ],
+              "source_id": "audit-canon-event-1793194509775-process-953614-1225"
+            },
+            {
+              "pid": 958725,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "useradd",
+                "--create-home",
+                "--shell",
+                "/bin/bash",
+                "user"
+              ],
+              "source_id": "audit-canon-event-1793194546821-process-958725-5687"
+            },
+            {
+              "pid": 958733,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mkdir",
+                "-p",
+                "/git",
+                "/var/www/html"
+              ],
+              "source_id": "audit-canon-event-1793194546860-process-958733-5741"
+            },
+            {
+              "pid": 958735,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "init",
+                "--bare",
+                "--initial-branch=master",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194546873-process-958735-5783"
+            },
+            {
+              "pid": 958723,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "-R",
+                "user:user",
+                "/var/www/html"
+              ],
+              "source_id": "audit-canon-event-1793194546876-process-958723-5794"
+            },
+            {
+              "pid": 959059,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mkdir",
+                "-p",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194552036-process-959059-5869"
+            },
+            {
+              "pid": 959060,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194552045-process-959060-5878"
+            },
+            {
+              "pid": 959061,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "init",
+                "--bare",
+                "--initial-branch=master",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194552059-process-959061-5923"
+            },
+            {
+              "pid": 960043,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "audit-canon-event-1793194562074-process-960043-6126"
+            },
+            {
+              "pid": 960044,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chmod",
+                "755",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "audit-canon-event-1793194562077-process-960044-6135"
+            },
+            {
+              "pid": 960046,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "test",
+                "-x",
+                "/git/server/hooks/post-receive"
+              ],
+              "source_id": "audit-canon-event-1793194562088-process-960046-6175"
+            },
+            {
+              "pid": 960047,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "test",
+                "-w",
+                "/var/www/html"
+              ],
+              "source_id": "audit-canon-event-1793194562104-process-960047-6218"
+            },
+            {
+              "pid": 960793,
+              "role": "服务配置校验与启动",
+              "argv": [
+                "nginx",
+                "-t"
+              ],
+              "source_id": "audit-canon-event-1793194575503-process-960793-6380"
+            },
+            {
+              "pid": 961035,
+              "role": "端口验证",
+              "argv": [
+                "ss",
+                "-ltnp"
+              ],
+              "source_id": "audit-canon-event-1793194577429-process-961035-6418"
+            },
+            {
+              "pid": 961036,
+              "role": "端口验证",
+              "argv": [
+                "grep",
+                ":8080"
+              ],
+              "source_id": "audit-canon-event-1793194577430-process-961036-6425"
+            },
+            {
+              "pid": 962135,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "mktemp",
+                "-d",
+                "/tmp/git-web-test.XXXXXX"
+              ],
+              "source_id": "audit-canon-event-1793194594979-process-962135-6644"
+            },
+            {
+              "pid": 962136,
+              "role": "账户/目录/权限与验证准备",
+              "argv": [
+                "chown",
+                "user:user",
+                "/tmp/git-web-test.tmi23Q"
+              ],
+              "source_id": "audit-canon-event-1793194594981-process-962136-6649"
+            },
+            {
+              "pid": 962143,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "clone",
+                "/git/server",
+                "/tmp/git-web-test.tmi23Q/server"
+              ],
+              "source_id": "audit-canon-event-1793194595013-process-962143-6692"
+            },
+            {
+              "pid": 962145,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git-upload-pack",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194595026-process-962145-6748"
+            },
+            {
+              "pid": 962147,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "-C",
+                "/tmp/git-web-test.tmi23Q/server",
+                "config",
+                "user.name",
+                "Test",
+                "User"
+              ],
+              "source_id": "audit-canon-event-1793194595068-process-962147-6802"
+            },
+            {
+              "pid": 962149,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "-C",
+                "/tmp/git-web-test.tmi23Q/server",
+                "config",
+                "user.email",
+                "user@server"
+              ],
+              "source_id": "audit-canon-event-1793194595085-process-962149-6848"
+            },
+            {
+              "pid": 962154,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "add",
+                "hello.html"
+              ],
+              "source_id": "audit-canon-event-1793194595128-process-962154-6899"
+            },
+            {
+              "pid": 962155,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "commit",
+                "-m",
+                "add",
+                "hello.html"
+              ],
+              "source_id": "audit-canon-event-1793194595131-process-962155-6911"
+            },
+            {
+              "pid": 962152,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "push",
+                "origin",
+                "master"
+              ],
+              "source_id": "audit-canon-event-1793194595145-process-962152-6945"
+            },
+            {
+              "pid": 962159,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git-receive-pack",
+                "/git/server"
+              ],
+              "source_id": "audit-canon-event-1793194595149-process-962159-6956"
+            },
+            {
+              "pid": 962161,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "pack-objects",
+                "--all-progress-implied",
+                "--revs",
+                "--stdout",
+                "--thin",
+                "--delta-base-offset",
+                "-q"
+              ],
+              "source_id": "audit-canon-event-1793194595154-process-962161-6963"
+            },
+            {
+              "pid": 962163,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "unpack-objects",
+                "--pack_header=2,3",
+                "-q"
+              ],
+              "source_id": "audit-canon-event-1793194595171-process-962163-6975"
+            },
+            {
+              "pid": 962165,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "rev-list",
+                "--objects",
+                "--stdin",
+                "--not",
+                "--exclude-hidden=receive",
+                "--all",
+                "--quiet",
+                "--alternate-refs"
+              ],
+              "source_id": "audit-canon-event-1793194595177-process-962165-6986"
+            },
+            {
+              "pid": 962166,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/usr/lib/git-core/git",
+                "--git-dir=/git/server",
+                "for-each-ref",
+                "--format=%(objectname)"
+              ],
+              "source_id": "audit-canon-event-1793194595188-process-962166-6994"
+            },
+            {
+              "pid": 962168,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "/bin/sh",
+                "hooks/post-receive"
+              ],
+              "source_id": "audit-canon-event-1793194595205-process-962168-7007"
+            },
+            {
+              "pid": 962169,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "--work-tree=/var/www/html",
+                "--git-dir=/git/server",
+                "checkout",
+                "-f",
+                "master"
+              ],
+              "source_id": "audit-canon-event-1793194595206-process-962169-7011"
+            },
+            {
+              "pid": 962171,
+              "role": "HTTP结果验证",
+              "argv": [
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "http://localhost:8080/hello.html"
+              ],
+              "source_id": "audit-canon-event-1793194595224-process-962171-7054"
+            },
+            {
+              "pid": 962178,
+              "role": "仓库/提交/推送/部署与Git校验",
+              "argv": [
+                "git",
+                "--git-dir=/git/server",
+                "show",
+                "master:hello.html"
+              ],
+              "source_id": "audit-canon-event-1793194595249-process-962178-7129"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 953620,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194509773-process-953620-1222"
+            },
+            {
+              "pid": 953614,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194536169-process-953614-5517"
+            },
+            {
+              "pid": 958725,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194546859-process-958725-5739"
+            },
+            {
+              "pid": 958733,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194546861-process-958733-5747"
+            },
+            {
+              "pid": 958735,
+              "code": 128,
+              "source_id": "audit-canon-event-1793194546874-process-958735-5789"
+            },
+            {
+              "pid": 958723,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194546880-process-958723-5800"
+            },
+            {
+              "pid": 959059,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194552044-process-959059-5877"
+            },
+            {
+              "pid": 959060,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194552048-process-959060-5884"
+            },
+            {
+              "pid": 959061,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194552084-process-959061-5969"
+            },
+            {
+              "pid": 960043,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194562075-process-960043-6133"
+            },
+            {
+              "pid": 960044,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194562078-process-960044-6139"
+            },
+            {
+              "pid": 960046,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194562089-process-960046-6178"
+            },
+            {
+              "pid": 960047,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194562105-process-960047-6221"
+            },
+            {
+              "pid": 960793,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194577311-process-960793-6407"
+            },
+            {
+              "pid": 961035,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194577472-process-961035-6457"
+            },
+            {
+              "pid": 961036,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194577472-process-961036-6459"
+            },
+            {
+              "pid": 962135,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194594980-process-962135-6648"
+            },
+            {
+              "pid": 962136,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194594984-process-962136-6655"
+            },
+            {
+              "pid": 962147,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595072-process-962147-6810"
+            },
+            {
+              "pid": 962149,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595088-process-962149-6856"
+            },
+            {
+              "pid": 962154,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595130-process-962154-6910"
+            },
+            {
+              "pid": 962155,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595141-process-962155-6942"
+            },
+            {
+              "pid": 962161,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595170-process-962161-6974"
+            },
+            {
+              "pid": 962163,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595174-process-962163-6985"
+            },
+            {
+              "pid": 962166,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595196-process-962166-7001"
+            },
+            {
+              "pid": 962165,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595197-process-962165-7003"
+            },
+            {
+              "pid": 962169,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595212-process-962169-7034"
+            },
+            {
+              "pid": 962168,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595212-process-962168-7037"
+            },
+            {
+              "pid": 962159,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595216-process-962159-7046"
+            },
+            {
+              "pid": 962152,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595221-process-962152-7051"
+            },
+            {
+              "pid": 962171,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595241-process-962171-7091"
+            },
+            {
+              "pid": 962178,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194595252-process-962178-7140"
+            }
+          ]
+        }
+      },
+      "groups": {
+        "raw": {
+          "依赖安装主命令": 2,
+          "账户/目录/权限与验证准备": 11,
+          "仓库/提交/推送/部署与Git校验": 17,
+          "服务配置校验与启动": 2,
+          "端口验证": 2,
+          "HTTP结果验证": 1
+        },
+        "AS": {
+          "依赖安装主命令": 2,
+          "账户/目录/权限与验证准备": 11,
+          "仓库/提交/推送/部署与Git校验": 17,
+          "服务配置校验与启动": 1,
+          "端口验证": 2,
+          "HTTP结果验证": 1
+        }
+      },
+      "excluded_auxiliary": {
+        "962179": "临时验证目录清理，不属于完成任务的必要关键程序",
+        "962156": "git 自动 maintenance，单列为辅助行为",
+        "962170": "git 自动 gc，单列为辅助行为"
+      }
+    },
+    {
+      "task": "crack-7z-hash",
+      "counts": {
+        "raw": {
+          "exec": 7,
+          "exit": 7
+        },
+        "AS": {
+          "exec": 7,
+          "exit": 7
+        }
+      },
+      "events": {
+        "raw": {
+          "exec": [
+            {
+              "pid": 952359,
+              "role": "哈希提取（含失败后重试）",
+              "argv": [
+                "perl",
+                "/app/john/run/7z2john.pl",
+                "/app/secrets.7z"
+              ],
+              "source_id": "raw-line:11305"
+            },
+            {
+              "pid": 952710,
+              "role": "必要依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "update"
+              ],
+              "source_id": "raw-line:11758"
+            },
+            {
+              "pid": 952709,
+              "role": "必要依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "install",
+                "-y",
+                "p7zip-full",
+                "libcompress-raw-lzma-perl"
+              ],
+              "source_id": "raw-line:13571"
+            },
+            {
+              "pid": 956021,
+              "role": "哈希提取（含失败后重试）",
+              "argv": [
+                "perl",
+                "/app/john/run/7z2john.pl",
+                "/app/secrets.7z"
+              ],
+              "source_id": "raw-line:16334"
+            },
+            {
+              "pid": 956020,
+              "role": "密码破解",
+              "argv": [
+                "/app/john/run/john",
+                "--wordlist=/app/john/run/password.lst",
+                "/app/secrets.hash"
+              ],
+              "source_id": "raw-line:16336"
+            },
+            {
+              "pid": 971141,
+              "role": "实际解压程序",
+              "argv": [
+                "/usr/lib/7zip/7z",
+                "x",
+                "-p1998",
+                "-o/app/extracted",
+                "/app/secrets.7z"
+              ],
+              "source_id": "raw-line:37686"
+            },
+            {
+              "pid": 971540,
+              "role": "定位解压结果文件",
+              "argv": [
+                "/logs/agent/.kimi-code/bin/rg",
+                "--files",
+                "--hidden",
+                "--sortr=modified",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!.svn",
+                "--glob",
+                "!.hg",
+                "--glob",
+                "!.bzr",
+                "--glob",
+                "!.jj",
+                "--glob",
+                "!.sl",
+                "--glob",
+                "**/*",
+                "--glob",
+                "!**/.env",
+                "--glob",
+                "!**/id_rsa",
+                "--glob",
+                "!**/id_rsa[-_]*",
+                "--glob",
+                "!**/id_rsa.bak",
+                "--glob",
+                "!**/id_rsa.backup",
+                "--glob",
+                "!**/id_rsa.copy",
+                "--glob",
+                "!**/id_rsa.disabled",
+                "--glob",
+                "!**/id_rsa.key",
+                "--glob",
+                "!**/id_rsa.old",
+                "--glob",
+                "!**/id_rsa.orig",
+                "--glob",
+                "!**/id_rsa.pem",
+                "--glob",
+                "!**/id_rsa.save",
+                "--glob",
+                "!**/id_rsa.tmp",
+                "--glob",
+                "!**/id_ed25519",
+                "--glob",
+                "!**/id_ed25519[-_]*",
+                "--glob",
+                "!**/id_ed25519.bak",
+                "--glob",
+                "!**/id_ed25519.backup",
+                "--glob",
+                "!**/id_ed25519.copy",
+                "--glob",
+                "!**/id_ed25519.disabled",
+                "--glob",
+                "!**/id_ed25519.key",
+                "--glob",
+                "!**/id_ed25519.old",
+                "--glob",
+                "!**/id_ed25519.orig",
+                "--glob",
+                "!**/id_ed25519.pem",
+                "--glob",
+                "!**/id_ed25519.save",
+                "--glob",
+                "!**/id_ed25519.tmp",
+                "--glob",
+                "!**/id_ecdsa",
+                "--glob",
+                "!**/id_ecdsa[-_]*",
+                "--glob",
+                "!**/id_ecdsa.bak",
+                "--glob",
+                "!**/id_ecdsa.backup",
+                "--glob",
+                "!**/id_ecdsa.copy",
+                "--glob",
+                "!**/id_ecdsa.disabled",
+                "--glob",
+                "!**/id_ecdsa.key",
+                "--glob",
+                "!**/id_ecdsa.old",
+                "--glob",
+                "!**/id_ecdsa.orig",
+                "--glob",
+                "!**/id_ecdsa.pem",
+                "--glob",
+                "!**/id_ecdsa.save",
+                "--glob",
+                "!**/id_ecdsa.tmp",
+                "--glob",
+                "!**/.aws/credentials",
+                "--glob",
+                "!**/.aws/credentials/**",
+                "--glob",
+                "!**/.gcp/credentials",
+                "--glob",
+                "!**/.gcp/credentials/**",
+                "."
+              ],
+              "source_id": "raw-line:38227"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 952359,
+              "code": 2,
+              "source_id": "raw-line:11310"
+            },
+            {
+              "pid": 952710,
+              "code": 0,
+              "source_id": "raw-line:13568"
+            },
+            {
+              "pid": 952709,
+              "code": 0,
+              "source_id": "raw-line:15746"
+            },
+            {
+              "pid": 956021,
+              "code": 0,
+              "source_id": "raw-line:16335"
+            },
+            {
+              "pid": 956020,
+              "code": 0,
+              "source_id": "raw-line:36983"
+            },
+            {
+              "pid": 971141,
+              "code": 0,
+              "source_id": "raw-line:37692"
+            },
+            {
+              "pid": 971540,
+              "code": 0,
+              "source_id": "raw-line:38228"
+            }
+          ]
+        },
+        "AS": {
+          "exec": [
+            {
+              "pid": 952359,
+              "role": "哈希提取（含失败后重试）",
+              "argv": [
+                "perl",
+                "/app/john/run/7z2john.pl",
+                "/app/secrets.7z"
+              ],
+              "source_id": "audit-canon-event-1793194478298-process-952359-439"
+            },
+            {
+              "pid": 952710,
+              "role": "必要依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "update"
+              ],
+              "source_id": "audit-canon-event-1793194481417-process-952710-506"
+            },
+            {
+              "pid": 952709,
+              "role": "必要依赖安装主命令",
+              "argv": [
+                "apt-get",
+                "install",
+                "-y",
+                "p7zip-full",
+                "libcompress-raw-lzma-perl"
+              ],
+              "source_id": "audit-canon-event-1793194496751-process-952709-1036"
+            },
+            {
+              "pid": 956021,
+              "role": "哈希提取（含失败后重试）",
+              "argv": [
+                "perl",
+                "/app/john/run/7z2john.pl",
+                "/app/secrets.7z"
+              ],
+              "source_id": "audit-canon-event-1793194515785-process-956021-1869"
+            },
+            {
+              "pid": 956020,
+              "role": "密码破解",
+              "argv": [
+                "/app/john/run/john",
+                "--wordlist=/app/john/run/password.lst",
+                "/app/secrets.hash"
+              ],
+              "source_id": "audit-canon-event-1793194515838-process-956020-1899"
+            },
+            {
+              "pid": 971141,
+              "role": "实际解压程序",
+              "argv": [
+                "/usr/lib/7zip/7z",
+                "x",
+                "-p1998",
+                "-o/app/extracted",
+                "/app/secrets.7z"
+              ],
+              "source_id": "audit-canon-event-1793194681063-process-971141-3585"
+            },
+            {
+              "pid": 971540,
+              "role": "定位解压结果文件",
+              "argv": [
+                "/logs/agent/.kimi-code/bin/rg",
+                "--files",
+                "--hidden",
+                "--sortr=modified",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!.svn",
+                "--glob",
+                "!.hg",
+                "--glob",
+                "!.bzr",
+                "--glob",
+                "!.jj",
+                "--glob",
+                "!.sl",
+                "--glob",
+                "**/*",
+                "--glob",
+                "!**/.env",
+                "--glob",
+                "!**/id_rsa",
+                "--glob",
+                "!**/id_rsa[-_]*",
+                "--glob",
+                "!**/id_rsa.bak",
+                "--glob",
+                "!**/id_rsa.backup"
+              ],
+              "source_id": "audit-canon-event-1793194687788-process-971540-3780"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 952359,
+              "code": 2,
+              "source_id": "audit-canon-event-1793194478319-process-952359-449"
+            },
+            {
+              "pid": 952710,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194496744-process-952710-1032"
+            },
+            {
+              "pid": 952709,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194510837-process-952709-1795"
+            },
+            {
+              "pid": 956021,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194515833-process-956021-1896"
+            },
+            {
+              "pid": 956020,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194677806-process-956020-3535"
+            },
+            {
+              "pid": 971141,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194681113-process-971141-3610"
+            },
+            {
+              "pid": 971540,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194687793-process-971540-3783"
+            }
+          ]
+        }
+      },
+      "groups": {
+        "raw": {
+          "哈希提取（含失败后重试）": 2,
+          "必要依赖安装主命令": 2,
+          "密码破解": 1,
+          "实际解压程序": 1,
+          "定位解压结果文件": 1
+        },
+        "AS": {
+          "哈希提取（含失败后重试）": 2,
+          "必要依赖安装主命令": 2,
+          "密码破解": 1,
+          "实际解压程序": 1,
+          "定位解压结果文件": 1
+        }
+      }
+    },
+    {
+      "task": "polyglot-c-py",
+      "counts": {
+        "raw": {
+          "exec": 12,
+          "exit": 12
+        },
+        "AS": {
+          "exec": 12,
+          "exit": 10
+        }
+      },
+      "events": {
+        "raw": {
+          "exec": [
+            {
+              "pid": 953282,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "gcc",
+                "-Wall",
+                "-Wextra",
+                "-pedantic",
+                "/app/polyglot/main.py.c",
+                "-o",
+                "/app/polyglot/cmain"
+              ],
+              "source_id": "raw-line:12687"
+            },
+            {
+              "pid": 953283,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1",
+                "-quiet",
+                "-imultiarch",
+                "x86_64-linux-gnu",
+                "/app/polyglot/main.py.c",
+                "-quiet",
+                "-dumpdir",
+                "/app/polyglot/cmain-",
+                "-dumpbase",
+                "main.py.c",
+                "-dumpbase-ext",
+                ".c",
+                "-mtune=generic",
+                "-march=x86-64",
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-fasynchronous-unwind-tables",
+                "-fstack-protector-strong",
+                "-Wformat-security",
+                "-fstack-clash-protection",
+                "-fcf-protection",
+                "-o",
+                "/tmp/cc9Flz2u.s"
+              ],
+              "source_id": "raw-line:12688"
+            },
+            {
+              "pid": 953285,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "as",
+                "--64",
+                "-o",
+                "/tmp/ccriYUF4.o",
+                "/tmp/cc9Flz2u.s"
+              ],
+              "source_id": "raw-line:12694"
+            },
+            {
+              "pid": 953286,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/collect2",
+                "-plugin",
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so",
+                "-plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper",
+                "-plugin-opt=-fresolution=/tmp/ccRpE4jP.res",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt=-pass-through=-lgcc_s",
+                "-plugin-opt=-pass-through=-lc",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt=-pass-through=-lgcc_s",
+                "--build-id",
+                "--eh-frame-hdr",
+                "-m",
+                "elf_x86_64",
+                "--hash-style=gnu",
+                "--as-needed",
+                "-dynamic-linker",
+                "/lib64/ld-linux-x86-64.so.2",
+                "-pie",
+                "-z",
+                "now",
+                "-z",
+                "relro",
+                "-o",
+                "/app/polyglot/cmain",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crti.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../../../lib",
+                "-L/lib/x86_64-linux-gnu",
+                "-L/lib/../lib",
+                "-L/usr/lib/x86_64-linux-gnu",
+                "-L/usr/lib/../lib",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../..",
+                "/tmp/ccriYUF4.o",
+                "-lgcc",
+                "--push-state",
+                "--as-needed",
+                "-lgcc_s",
+                "--pop-state",
+                "-lc",
+                "-lgcc",
+                "--push-state",
+                "--as-needed",
+                "-lgcc_s",
+                "--pop-state",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o"
+              ],
+              "source_id": "raw-line:12696"
+            },
+            {
+              "pid": 953287,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/bin/ld",
+                "-plugin",
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so",
+                "-plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper",
+                "-plugin-opt=-fresolution=/tmp/ccRpE4jP.res",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt=-pass-through=-lgcc_s",
+                "-plugin-opt=-pass-through=-lc",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt=-pass-through=-lgcc_s",
+                "--build-id",
+                "--eh-frame-hdr",
+                "-m",
+                "elf_x86_64",
+                "--hash-style=gnu",
+                "--as-needed",
+                "-dynamic-linker",
+                "/lib64/ld-linux-x86-64.so.2",
+                "-pie",
+                "-z",
+                "now",
+                "-z",
+                "relro",
+                "-o",
+                "/app/polyglot/cmain",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crti.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../../../lib",
+                "-L/lib/x86_64-linux-gnu",
+                "-L/lib/../lib",
+                "-L/usr/lib/x86_64-linux-gnu",
+                "-L/usr/lib/../lib",
+                "-L/usr/lib/gcc/x86_64-linux-gnu/13/../../..",
+                "/tmp/ccriYUF4.o",
+                "-lgcc",
+                "--push-state",
+                "--as-needed",
+                "-lgcc_s",
+                "--pop-state",
+                "-lc",
+                "-lgcc",
+                "--push-state",
+                "--as-needed",
+                "-lgcc_s",
+                "--pop-state",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o"
+              ],
+              "source_id": "raw-line:12697"
+            },
+            {
+              "pid": 953824,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "0"
+              ],
+              "source_id": "raw-line:13488"
+            },
+            {
+              "pid": 953825,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "1"
+              ],
+              "source_id": "raw-line:13490"
+            },
+            {
+              "pid": 953827,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "2"
+              ],
+              "source_id": "raw-line:13492"
+            },
+            {
+              "pid": 953828,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "10"
+              ],
+              "source_id": "raw-line:13495"
+            },
+            {
+              "pid": 953829,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "50"
+              ],
+              "source_id": "raw-line:13498"
+            },
+            {
+              "pid": 953830,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "100"
+              ],
+              "source_id": "raw-line:13500"
+            },
+            {
+              "pid": 953831,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "500"
+              ],
+              "source_id": "raw-line:13502"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 953283,
+              "code": 0,
+              "source_id": "raw-line:12693"
+            },
+            {
+              "pid": 953285,
+              "code": 0,
+              "source_id": "raw-line:12695"
+            },
+            {
+              "pid": 953287,
+              "code": 0,
+              "source_id": "raw-line:12703"
+            },
+            {
+              "pid": 953286,
+              "code": 0,
+              "source_id": "raw-line:12704"
+            },
+            {
+              "pid": 953282,
+              "code": 0,
+              "source_id": "raw-line:12705"
+            },
+            {
+              "pid": 953824,
+              "code": 0,
+              "source_id": "raw-line:13489"
+            },
+            {
+              "pid": 953825,
+              "code": 0,
+              "source_id": "raw-line:13491"
+            },
+            {
+              "pid": 953827,
+              "code": 0,
+              "source_id": "raw-line:13493"
+            },
+            {
+              "pid": 953828,
+              "code": 0,
+              "source_id": "raw-line:13497"
+            },
+            {
+              "pid": 953829,
+              "code": 0,
+              "source_id": "raw-line:13499"
+            },
+            {
+              "pid": 953830,
+              "code": 0,
+              "source_id": "raw-line:13501"
+            },
+            {
+              "pid": 953831,
+              "code": 0,
+              "source_id": "raw-line:13503"
+            }
+          ]
+        },
+        "AS": {
+          "exec": [
+            {
+              "pid": 953282,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "gcc",
+                "-Wall",
+                "-Wextra",
+                "-pedantic",
+                "/app/polyglot/main.py.c",
+                "-o",
+                "/app/polyglot/cmain"
+              ],
+              "source_id": "audit-canon-event-1793194488437-process-953282-458"
+            },
+            {
+              "pid": 953283,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1",
+                "-quiet",
+                "-imultiarch",
+                "x86_64-linux-gnu",
+                "/app/polyglot/main.py.c",
+                "-quiet",
+                "-dumpdir",
+                "/app/polyglot/cmain-",
+                "-dumpbase",
+                "main.py.c",
+                "-dumpbase-ext",
+                ".c",
+                "-mtune=generic",
+                "-march=x86-64",
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-fasynchronous-unwind-tabl"
+              ],
+              "source_id": "audit-canon-event-1793194488445-process-953283-464"
+            },
+            {
+              "pid": 953285,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "as",
+                "--64",
+                "-o",
+                "/tmp/ccriYUF4.o",
+                "/tmp/cc9Flz2u.s"
+              ],
+              "source_id": "audit-canon-event-1793194488614-process-953285-547"
+            },
+            {
+              "pid": 953286,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/collect2",
+                "-plugin",
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so",
+                "-plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper",
+                "-plugin-opt=-fresolution=/tmp/ccRpE4jP.res",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt"
+              ],
+              "source_id": "audit-canon-event-1793194488623-process-953286-560"
+            },
+            {
+              "pid": 953287,
+              "role": "编译/汇编/链接",
+              "argv": [
+                "/usr/bin/ld",
+                "-plugin",
+                "/usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so",
+                "-plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper",
+                "-plugin-opt=-fresolution=/tmp/ccRpE4jP.res",
+                "-plugin-opt=-pass-through=-lgcc",
+                "-plugin-opt=-pass-through=-lgcc_s",
+                "-plugin-opt"
+              ],
+              "source_id": "audit-canon-event-1793194488627-process-953287-565"
+            },
+            {
+              "pid": 953824,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "0"
+              ],
+              "source_id": "audit-canon-event-1793194495748-process-953824-690"
+            },
+            {
+              "pid": 953825,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "1"
+              ],
+              "source_id": "audit-canon-event-1793194495750-process-953825-694"
+            },
+            {
+              "pid": 953827,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "2"
+              ],
+              "source_id": "audit-canon-event-1793194495755-process-953827-698"
+            },
+            {
+              "pid": 953828,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "10"
+              ],
+              "source_id": "audit-canon-event-1793194495758-process-953828-706"
+            },
+            {
+              "pid": 953829,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "50"
+              ],
+              "source_id": "audit-canon-event-1793194495760-process-953829-710"
+            },
+            {
+              "pid": 953830,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "100"
+              ],
+              "source_id": "audit-canon-event-1793194495770-process-953830-714"
+            },
+            {
+              "pid": 953831,
+              "role": "答案程序验证",
+              "argv": [
+                "/app/polyglot/cmain",
+                "500"
+              ],
+              "source_id": "audit-canon-event-1793194495773-process-953831-718"
+            }
+          ],
+          "exit": [
+            {
+              "pid": 953283,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194488598-process-953283-545"
+            },
+            {
+              "pid": 953285,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194488621-process-953285-558"
+            },
+            {
+              "pid": 953287,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194488712-process-953287-589"
+            },
+            {
+              "pid": 953824,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495749-process-953824-693"
+            },
+            {
+              "pid": 953825,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495752-process-953825-697"
+            },
+            {
+              "pid": 953827,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495757-process-953827-704"
+            },
+            {
+              "pid": 953828,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495759-process-953828-709"
+            },
+            {
+              "pid": 953829,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495761-process-953829-713"
+            },
+            {
+              "pid": 953830,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495771-process-953830-717"
+            },
+            {
+              "pid": 953831,
+              "code": 0,
+              "source_id": "audit-canon-event-1793194495774-process-953831-721"
+            }
+          ]
+        }
+      },
+      "groups": {
+        "raw": {
+          "编译/汇编/链接": 5,
+          "答案程序验证": 7
+        },
+        "AS": {
+          "编译/汇编/链接": 5,
+          "答案程序验证": 7
+        }
+      }
+    }
+  ]
+}

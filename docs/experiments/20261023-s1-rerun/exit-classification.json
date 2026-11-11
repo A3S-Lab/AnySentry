@@ -1,0 +1,577 @@
+{
+  "scope": "Only AgentSight exit PIDs absent from AnySentry in archived S1 execution windows. Manual semantic classification by command, ancestry and task trajectory; not an independent kernel oracle.",
+  "counts": {
+    "evaluation_preparation": 3,
+    "shell_initialization": 6,
+    "telemetry_hook": 13,
+    "task_execution": 36,
+    "task_automatic_helper": 1
+  },
+  "tasks": [
+    {
+      "task": "fix-git",
+      "counts": {
+        "evaluation_preparation": 1,
+        "shell_initialization": 2,
+        "telemetry_hook": 4,
+        "task_execution": 1,
+        "task_automatic_helper": 1
+      },
+      "events": [
+        {
+          "pid": 3682847,
+          "ppid": 3681250,
+          "comm": "sleep",
+          "command": "sleep 1",
+          "exit_code": 0,
+          "duration_ms": 1000,
+          "category": "evaluation_preparation"
+        },
+        {
+          "pid": 3683716,
+          "ppid": 3683715,
+          "comm": "id",
+          "command": "id -u",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3683715,
+          "ppid": 3681250,
+          "comm": "env",
+          "command": "/usr/bin/env",
+          "exit_code": 0,
+          "duration_ms": 2,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3683839,
+          "ppid": 3681250,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 4,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3690510,
+          "ppid": 3690508,
+          "comm": "git",
+          "command": "git log --oneline -3 master",
+          "exit_code": 0,
+          "duration_ms": 4,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3695752,
+          "ppid": 3681250,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 2,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3696606,
+          "ppid": 3696582,
+          "comm": "git",
+          "command": "/usr/lib/git-core/git maintenance run --auto --no-quiet",
+          "exit_code": 0,
+          "duration_ms": 3,
+          "category": "task_automatic_helper"
+        },
+        {
+          "pid": 3696662,
+          "ppid": 3681250,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 1,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3697671,
+          "ppid": 3681250,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        }
+      ]
+    },
+    {
+      "task": "db-wal-recovery",
+      "counts": {
+        "evaluation_preparation": 1,
+        "shell_initialization": 2,
+        "telemetry_hook": 3,
+        "task_execution": 5
+      },
+      "events": [
+        {
+          "pid": 3682596,
+          "ppid": 3681148,
+          "comm": "sleep",
+          "command": "sleep 1",
+          "exit_code": 0,
+          "duration_ms": 1000,
+          "category": "evaluation_preparation"
+        },
+        {
+          "pid": 3683670,
+          "ppid": 3683660,
+          "comm": "locale-check",
+          "command": "/usr/bin/locale-check C.UTF-8",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3683674,
+          "ppid": 3683660,
+          "comm": "mesg",
+          "command": "mesg n",
+          "exit_code": 2,
+          "duration_ms": 1,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3683823,
+          "ppid": 3681148,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 7,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3684973,
+          "ppid": 3684972,
+          "comm": "xxd",
+          "command": "xxd /app/main.db",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3684974,
+          "ppid": 3684972,
+          "comm": "head",
+          "command": "head -20",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3684976,
+          "ppid": 3681148,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3685763,
+          "ppid": 3685762,
+          "comm": "xxd",
+          "command": "xxd /app/main.db-wal",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3685764,
+          "ppid": 3685762,
+          "comm": "head",
+          "command": "head -60",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3685762,
+          "ppid": 3681148,
+          "comm": "bash",
+          "command": "/bin/bash -c cd '/app' && xxd /app/main.db-wal | head -60",
+          "exit_code": 0,
+          "duration_ms": 3,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3695968,
+          "ppid": 3681148,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 1,
+          "category": "telemetry_hook"
+        }
+      ]
+    },
+    {
+      "task": "polyglot-c-py",
+      "counts": {
+        "evaluation_preparation": 1,
+        "shell_initialization": 2,
+        "task_execution": 30,
+        "telemetry_hook": 6
+      },
+      "events": [
+        {
+          "pid": 3682585,
+          "ppid": 3681144,
+          "comm": "sleep",
+          "command": "sleep 1",
+          "exit_code": 0,
+          "duration_ms": 1000,
+          "category": "evaluation_preparation"
+        },
+        {
+          "pid": 3683648,
+          "ppid": 3683646,
+          "comm": "locale-check",
+          "command": "/usr/bin/locale-check C.UTF-8",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3683653,
+          "ppid": 3683646,
+          "comm": "mesg",
+          "command": "mesg n",
+          "exit_code": 2,
+          "duration_ms": 2,
+          "category": "shell_initialization"
+        },
+        {
+          "pid": 3692780,
+          "ppid": 3692779,
+          "comm": "ld",
+          "command": "/usr/bin/ld -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccgRZ8uy.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt",
+          "exit_code": 0,
+          "duration_ms": 67,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692779,
+          "ppid": 3692727,
+          "comm": "collect2",
+          "command": "/usr/libexec/gcc/x86_64-linux-gnu/13/collect2 -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccgRZ8uy.res -plugin-opt=-pass-through=-lgcc -plugin-opt",
+          "exit_code": 0,
+          "duration_ms": 73,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692782,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 0",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692784,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 1",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692786,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 2",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692788,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 10",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692790,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 50",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3692792,
+          "ppid": 3692726,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 90",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3705022,
+          "ppid": 3705018,
+          "comm": "which",
+          "command": "/bin/sh /usr/bin/which python3 python python3.12",
+          "exit_code": 1,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3705031,
+          "ppid": 3705018,
+          "comm": "ls",
+          "command": "ls /usr/bin /usr/local/bin",
+          "exit_code": 0,
+          "duration_ms": 4,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3705032,
+          "ppid": 3705018,
+          "comm": "grep",
+          "command": "grep -i -E ^python",
+          "exit_code": 1,
+          "duration_ms": 4,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708206,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3708811,
+          "ppid": 3708808,
+          "comm": "as",
+          "command": "as --64 -o /tmp/ccjGElbR.o /tmp/cclBOwVw.s",
+          "exit_code": 0,
+          "duration_ms": 2,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708831,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 0",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708832,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 1",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708833,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 2",
+          "exit_code": 0,
+          "duration_ms": 1,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708834,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 3",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708835,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 10",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708836,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 50",
+          "exit_code": 0,
+          "duration_ms": 3,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708837,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 93",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708838,
+          "ppid": 3708807,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain",
+          "exit_code": 1,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3708839,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3713831,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3715190,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3715797,
+          "ppid": 3715796,
+          "comm": "cc1",
+          "command": "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1 -quiet -imultiarch x86_64-linux-gnu /app/polyglot/main.py.c -quiet -dumpdir /app/polyglot/cmain- -dumpbase main.py.c -dumpbase-ext .c -mtune=generic -march=x86-64 -Wall -fasynchronous-unwind-tables -fstack-protecto",
+          "exit_code": 0,
+          "duration_ms": 44,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715798,
+          "ppid": 3715796,
+          "comm": "as",
+          "command": "as --64 -o /tmp/ccEXtHMa.o /tmp/ccknWwe2.s",
+          "exit_code": 0,
+          "duration_ms": 6,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715800,
+          "ppid": 3715799,
+          "comm": "ld",
+          "command": "/usr/bin/ld -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccBCQmT0.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt",
+          "exit_code": 0,
+          "duration_ms": 57,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715799,
+          "ppid": 3715796,
+          "comm": "collect2",
+          "command": "/usr/libexec/gcc/x86_64-linux-gnu/13/collect2 -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccBCQmT0.res -plugin-opt=-pass-through=-lgcc -plugin-opt",
+          "exit_code": 0,
+          "duration_ms": 60,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715796,
+          "ppid": 3715795,
+          "comm": "gcc",
+          "command": "gcc -Wall /app/polyglot/main.py.c -o /app/polyglot/cmain",
+          "exit_code": 0,
+          "duration_ms": 119,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715801,
+          "ppid": 3715795,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 0",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715804,
+          "ppid": 3715795,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 10",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715805,
+          "ppid": 3715795,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 50",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715806,
+          "ppid": 3715795,
+          "comm": "cmain",
+          "command": "/app/polyglot/cmain 93",
+          "exit_code": 0,
+          "duration_ms": 0,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715795,
+          "ppid": 3681144,
+          "comm": "bash",
+          "command": "/bin/bash -c cd '/app' && gcc -Wall /app/polyglot/main.py.c -o /app/polyglot/cmain && echo \"compiled clean\" && for n in 0 1 2 10 50 93; do printf \"f(%s)=\" $n; /app/polyglot/cmain $n; done",
+          "exit_code": 0,
+          "duration_ms": 153,
+          "category": "task_execution"
+        },
+        {
+          "pid": 3715807,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 0,
+          "category": "telemetry_hook"
+        },
+        {
+          "pid": 3722270,
+          "ppid": 3681144,
+          "comm": "sh",
+          "command": "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs",
+          "exit_code": 127,
+          "duration_ms": 1,
+          "category": "telemetry_hook"
+        }
+      ]
+    }
+  ]
+}

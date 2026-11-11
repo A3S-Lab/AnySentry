@@ -84,7 +84,7 @@ function root(attributor, identity = {}) {
     userHz: 100,
     comm: 'gcc',
     exe: '/usr/bin/gcc',
-  }, ['gcc', 'other.c']).state, 'unknown', 'conflicting parent generation stays unresolved');
+  }, ['gcc', 'other.c']).state, 'non_agent', 'conflicting parent generation remains a definitive non-Agent decision');
   const result = exit(attributor, {
     pid: 10002,
     startBoottimeNs: bashNs,
@@ -212,7 +212,42 @@ function root(attributor, identity = {}) {
     userHz: 100,
     comm: 'bash',
     exe: '/usr/bin/gcc',
-  }, ['gcc', 'other.c']).state, 'unknown', 'signature re-evaluation does not ignore generation mismatch');
+  }, ['gcc', 'other.c']).state, 'non_agent', 'signature re-evaluation does not ignore generation mismatch');
+}
+
+{
+  const attributor = makeAttributor({ rootNames: 'other' });
+  const parent = {
+    pid: 10001,
+    ppid: 1,
+    comm: 'kimi',
+    exe: '/opt/kimi',
+    cwd: '/workspace',
+    startBoottimeNs: rootNs,
+    userHz: 100,
+  };
+  assert.equal(exec(attributor, parent, ['kimi']).state, 'non_agent', 'root is cached as non-Agent before its signature is configured');
+  attributor.signatureRegistry.replace(legacyRootNameDocument('kimi'));
+  assert.equal(exec(attributor, {
+    pid: 10002,
+    ppid: parent.pid,
+    creationPpid: parent.pid,
+    creationParentStartBoottimeNs: rootNs,
+    startBoottimeNs: bashNs,
+    userHz: 100,
+    comm: 'bash',
+    exe: '/usr/bin/readelf',
+  }, ['readelf', '-h', 'a.out']).state, 'agent', 'cached non-Agent parent is re-evaluated when signatures change');
+  assert.equal(exec(attributor, {
+    pid: 10003,
+    ppid: parent.pid,
+    creationPpid: parent.pid,
+    creationParentStartBoottimeNs: '99999999999',
+    startBoottimeNs: '10020000000',
+    userHz: 100,
+    comm: 'bash',
+    exe: '/usr/bin/readelf',
+  }, ['readelf', '-x', '.data']).state, 'non_agent', 'non-Agent promotion still rejects a mismatched parent generation');
 }
 
 console.log('PASS: exact identity, parent generation, ticks compatibility, stable exec, simulated PID reuse, cached signature promotion');

@@ -1,0 +1,69 @@
+{
+  "reviewed_at": "2026-10-30",
+  "single_job": "kimi-fix-c24-check-20261027-205611",
+  "s1_job": "kimi-s1-c24-recheck-fix-git-20261028-110213",
+  "git_selector": "Actual executable basename git, including absolute git-core paths; no shell text matches. Exit matched to selected Git PIDs within each original archived window.",
+  "single_original_window_ms": [
+    1793105788965,
+    1793105902710
+  ],
+  "single_counts": {
+    "independent_raw_collector": {
+      "exec": 23,
+      "exit": 23
+    },
+    "AnySentry_archived": {
+      "exec": 14,
+      "exit": 23
+    },
+    "AgentSight_archived": {
+      "exec": 23,
+      "exit": 22
+    }
+  },
+  "late_exec": [
+    {
+      "pid": 625354,
+      "at_ms": 1793105908495,
+      "command": "git diff --check"
+    },
+    {
+      "pid": 625355,
+      "at_ms": 1793105908493,
+      "command": "git add _includes/about.md"
+    },
+    {
+      "pid": 625356,
+      "at_ms": 1793105908494,
+      "command": "/usr/lib/git-core/git maintenance run --auto --no-quiet"
+    }
+  ],
+  "expanded_query_window_ms": [
+    1793105488965,
+    1793106202710
+  ],
+  "expanded_AnySentry_git_exec": 17,
+  "remaining_exec_pids": [
+    623872,
+    624108,
+    624631,
+    625749,
+    625750,
+    625751
+  ],
+  "s1_original_window_counts": {
+    "AnySentry": {
+      "exec": 22,
+      "exit": 22
+    },
+    "AgentSight": {
+      "exec": 22,
+      "exit": 22
+    }
+  },
+  "limitations": [
+    "Raw Collector is an independent recorder, not a saved pre-filter stream from the production Observer. This does not prove the production kernel probe captured each missing event.",
+    "The two runs do not establish a causal effect of concurrency. Exact historical version/configuration equivalence has not been established.",
+    "The previous 21 AgentSight Git exec omitted two absolute-path git-core commands; previous HTML mixed selectors."
+  ]
+}

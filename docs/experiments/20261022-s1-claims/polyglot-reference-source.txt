@@ -1,0 +1,56 @@
+#if 0
+r""" # "
+#endif
+
+/*
+ * C implementation: prints fib(N) where fib(0)=0, fib(1)=1.
+ * Build: gcc main.py.c -o cmain && ./cmain N
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s N\n", argv[0]);
+        return 1;
+    }
+
+    int n = atoi(argv[1]);
+    unsigned long long a = 0, b = 1;
+
+    for (int i = 0; i < n; i++) {
+        unsigned long long next = a + b;
+        a = b;
+        b = next;
+    }
+
+    printf("%llu\n", a);
+    return 0;
+}
+
+#if 0
+""" # "
+
+# Python implementation: prints fib(N) where fib(0)=0, fib(1)=1.
+# Run: python3 main.py.c N
+import sys
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("usage: %s N\n" % sys.argv[0])
+        sys.exit(1)
+
+    n = int(sys.argv[1])
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+
+    print(a)
+
+
+if __name__ == "__main__":
+    main()
+
+#endif

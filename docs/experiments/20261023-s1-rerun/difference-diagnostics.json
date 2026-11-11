@@ -1,0 +1,141 @@
+{
+  "review_date": "2026-10-26",
+  "mechanism_replay_scope": "Current source, synthetic missing-proc scenario; not per-event historical replay.",
+  "missing_exit_exec_rows": 45,
+  "missing_exit_exec_unique_pids": 44,
+  "all_missing_exit_exec_rows_lack_generation": true,
+  "sample_process_contexts": [
+    {
+      "eventId": "evt_b2186cef2e5e376d",
+      "pid": "3715795",
+      "process": "{\"pid\":3715795,\"ppid\":3681144,\"comm\":\"kimi-code\",\"exe\":\"/bin/bash\",\"cgroupId\":\"208572\",\"hostId\":\"modules-docker-host\",\"bootId\":\"1ea70c7f-df7d-41bc-b61b-655ecc959a63\"}",
+      "subject": "/bin/bash -c cd '/app' && gcc -Wall /app/polyglot/main.py.c -o /app/polyglot/cma"
+    },
+    {
+      "eventId": "evt_3e7fddf0571f988c",
+      "pid": "3685762",
+      "process": "{\"pid\":3685762,\"ppid\":3681148,\"comm\":\"kimi-code\",\"exe\":\"/bin/bash\",\"cgroupId\":\"208486\",\"hostId\":\"modules-docker-host\",\"bootId\":\"1ea70c7f-df7d-41bc-b61b-655ecc959a63\"}",
+      "subject": "/bin/bash -c cd '/app' && xxd /app/main.db-wal | head -60"
+    },
+    {
+      "eventId": "evt_24bf534850e345cc",
+      "pid": "3692782",
+      "process": "{\"pid\":3692782,\"ppid\":3692726,\"comm\":\"bash\",\"exe\":\"/app/polyglot/cmain\",\"cgroupId\":\"208572\",\"hostId\":\"modules-docker-host\",\"bootId\":\"1ea70c7f-df7d-41bc-b61b-655ecc959a63\"}",
+      "subject": "/app/polyglot/cmain 0"
+    },
+    {
+      "eventId": "evt_7d0d29730f96312c",
+      "pid": "3708831",
+      "process": "{\"pid\":3708831,\"ppid\":3708807,\"comm\":\"bash\",\"exe\":\"/app/polyglot/cmain\",\"cgroupId\":\"208572\",\"hostId\":\"modules-docker-host\",\"bootId\":\"1ea70c7f-df7d-41bc-b61b-655ecc959a63\"}",
+      "subject": "/app/polyglot/cmain 0"
+    }
+  ],
+  "forwarder_global_stage_totals": {
+    "received": 138392,
+    "parse_error": 0,
+    "classified": 666,
+    "filtered": 137726,
+    "aggregated": 15,
+    "interaction_handoff": 0,
+    "queue_admitted": 651,
+    "queue_dropped": 0,
+    "api_retained": 651,
+    "api_discarded": 0,
+    "api_rejected": 0,
+    "api_retryable": 0
+  },
+  "collector_stats": [
+    {
+      "at": "2026-10-23T08:56:31.425487Z",
+      "counters": {
+        "exec": "6712",
+        "exec_incomplete": "4324",
+        "exec_reassembly_timeout": "0",
+        "exit": "2827",
+        "dropped": "55154",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T08:57:31.392025Z",
+      "counters": {
+        "exec": "2880",
+        "exec_incomplete": "1088",
+        "exec_reassembly_timeout": "0",
+        "exit": "2141",
+        "dropped": "55154",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T08:58:31.392666Z",
+      "counters": {
+        "exec": "3154",
+        "exec_incomplete": "1267",
+        "exec_reassembly_timeout": "0",
+        "exit": "2266",
+        "dropped": "55154",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T08:59:31.498703Z",
+      "counters": {
+        "exec": "3248",
+        "exec_incomplete": "1237",
+        "exec_reassembly_timeout": "0",
+        "exit": "2496",
+        "dropped": "55154",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T09:00:31.392188Z",
+      "counters": {
+        "exec": "2894",
+        "exec_incomplete": "1134",
+        "exec_reassembly_timeout": "0",
+        "exit": "2194",
+        "dropped": "55154",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T09:01:32.308376Z",
+      "counters": {
+        "exec": "3104",
+        "exec_incomplete": "1234",
+        "exec_reassembly_timeout": "1",
+        "exit": "2285",
+        "dropped": "55830",
+        "output_dropped": "4666"
+      }
+    },
+    {
+      "at": "2026-10-23T09:02:31.457856Z",
+      "counters": {
+        "exec": "3140",
+        "exec_incomplete": "1373",
+        "exec_reassembly_timeout": "0",
+        "exit": "2116",
+        "dropped": "55830",
+        "output_dropped": "4666"
+      }
+    }
+  ],
+  "expanded_query_checks": {
+    "window_ms": [
+      1792745470000,
+      1792746470000
+    ],
+    "missing_exit_pids_found_in_events": 0,
+    "missing_exit_pids_found_in_process_lifecycle_facts": 0
+  },
+  "reviewed_source_sha256": {
+    "scripts/observer-agent-attribution.js": "b8f92440adfd397a15025bc952e5fa3e3cbca9ae5ac988472fa93f8d3452bb33",
+    "scripts/observer-forward.js": "a9f430fc27e54773e562d2345c2741648b4bcf8843cbf975655fc7e05685535c",
+    "../Observer/a3s-observer-collector/src/main.rs": "45809c6b44dea584de335a1098bea58e225c46995093e21b2fadbef9f8606435",
+    "../Observer/a3s-observer-common/src/lib.rs": "33f28d667bc64ab695568d3f7f2b16dcfc7cfd22e9fc8cbd73df5532d103529d",
+    "../agentsight/bpf/process.bpf.c": "622c5ddd248e1e5a243d1dfd7adda6a11658b6206966898542e87d3d4c39f0f1"
+  }
+}

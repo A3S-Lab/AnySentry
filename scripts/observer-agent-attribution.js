@@ -13,7 +13,7 @@ const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claud
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
-const DEFAULT_TOMBSTONE_TTL_MS = 15_000;
+const DEFAULT_TOMBSTONE_TTL_MS = 300_000;
 const DEFAULT_ROOT_TERMINAL_TTL_MS = 60 * 60_000;
 const DEFAULT_LIVENESS_MISSES = 2;
 const DEFAULT_ACTIVITY_IDLE_MS = 60_000;
@@ -546,6 +546,9 @@ class AgentAttributor {
       pid: normalized.pid,
       rootPid: normalized.pid,
       startTime: normalized.startTime,
+      startTimeTicks: normalized.startTimeTicks,
+      startTimeNs: normalized.startTimeNs,
+      userHz: normalized.userHz,
       comm: text(normalized.comm),
       exe: text(normalized.exe),
       cgroup: text(normalized.cgroup),
@@ -670,14 +673,24 @@ class AgentAttributor {
       checked++;
       this.stats.rootLivenessChecks++;
       const observedStart = text(this.readStartTime(root.pid));
+      const sameStart = observedStart && (
+        observedStart === root.startTime || sameProcessGeneration(
+          {
+            startTimeTicks: root.startTimeTicks || (root.startTimeNs ? undefined : root.startTime),
+            startTimeNs: root.startTimeNs,
+            userHz: root.userHz,
+          },
+          { startTimeTicks: observedStart, userHz: root.userHz },
+        )
+      );
       root.lastLivenessCheckAt = checkedAt;
-      if (observedStart && observedStart === root.startTime) {
+      if (sameStart) {
         root.missedLivenessChecks = 0;
         root.lastLivenessAt = checkedAt;
         continue;
       }
       this.stats.rootLivenessMisses++;
-      root.missedLivenessChecks += observedStart && observedStart !== root.startTime
+      root.missedLivenessChecks += observedStart && !sameStart
         ? this.livenessMissThreshold
         : 1;
       if (root.missedLivenessChecks < this.livenessMissThreshold) continue;
@@ -1183,7 +1196,7 @@ class AgentAttributor {
     if (existing?.state === 'infrastructure') {
       return this.finish(pid, this.infrastructureResult(existing), exiting, current);
     }
-    const tombstone = exiting ? this.tombstoneFor(current) : undefined;
+    const tombstone = (exiting || toolExec) ? this.tombstoneFor(current) : undefined;
     if (tombstone?.state === 'agent') {
       return this.finish(pid, this.agentResult(tombstone, true), exiting, current);
     }
@@ -1334,17 +1347,21 @@ class AgentAttributor {
   }
 
   tombstoneFor(info) {
-    this.pruneTombstones();
     const key = this.processKey(info);
     if (!key) return undefined;
     const tombstone = this.tombstones.get(key);
-    if (!tombstone || tombstone.expiresAt <= this.now()) return undefined;
+    if (!tombstone) return undefined;
+    if (tombstone.expiresAt <= this.now()) {
+      this.tombstones.delete(key);
+      return undefined;
+    }
     return tombstone.record;
   }
 
   rememberTombstone(record) {
     const key = record.processKey || this.processKey(record);
     if (!key) return;
+    this.pruneTombstones();
     this.tombstones.set(key, {
       record: { ...record },
       expiresAt: this.now() + this.tombstoneTtlMs,
@@ -1378,13 +1395,44 @@ class AgentAttributor {
         { pid, startTimeNs: expectedStartNs, userHz },
         !expectedStartNs,
       );
+      const cachedGeneration = expectedStartNs ? this.procs.getFor({ pid }, true) : undefined;
+      if (expectedStartNs && cachedGeneration?.startTime && !sameProcessGeneration(
+        { startTimeNs: expectedStartNs, userHz },
+        {
+          startTimeTicks: cachedGeneration.startTimeTicks || cachedGeneration.startTime,
+          startTimeNs: cachedGeneration.startTimeNs,
+          userHz: cachedGeneration.userHz || userHz,
+        },
+      )) {
+        return { state: 'non_agent', reason: 'parent_generation_mismatch' };
+      }
       if (cached?.state === 'agent') {
         const scope = this.agentScope(cached);
         if (scope.state === 'agent') return scope;
       }
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
-      if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
-        return { state: 'non_agent' };
+      if (cached?.state === 'non_agent') {
+        const matcherHash = text(this.signatureRegistry.matcherHash);
+        const signatureChanged = text(cached.signatureMatcherHash) !== matcherHash;
+        if (signatureChanged) {
+          const cachedAgent = this.matchAgent(cached);
+          if (cachedAgent) {
+            const ancestor = this.resolveSameScopeAncestor(cached.ppid, cachedAgent);
+            this.rememberAgent(
+              cached,
+              ancestor || cachedAgent,
+              ancestor?.rootPid || pid,
+              ancestor ? 'process_lineage' : 'hint_only',
+              ancestor ? 'process_graph' : 'process_signature',
+              ancestor?.workspacePath,
+            );
+            const scope = this.agentScope(this.procs.getFor(cached));
+            if (scope.state === 'agent') return scope;
+          }
+          cached.signatureMatcherHash = matcherHash;
+          cached.nextResolveAt = now + this.negativeTtlMs;
+        }
+        if (cached.nextResolveAt > now) return { state: 'non_agent' };
       }
       if (pid === 1) return { state: 'non_agent' };
 
@@ -1418,7 +1466,7 @@ class AgentAttributor {
         { startTimeNs: expectedStartNs, userHz },
         { startTimeTicks: live.startTime, userHz },
       )) {
-        return { state: 'unknown' };
+        return { state: 'non_agent', reason: 'parent_generation_mismatch' };
       }
       this.discardReusedPid(live);
 
@@ -1806,7 +1854,10 @@ class AgentAttributor {
     const hostId = text(info.hostId) || this.hostId;
     const bootId = text(info.bootId) || this.bootId;
     const existing = this.procs.get(info.pid, hostId, bootId);
-    if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) {
+    if (
+      existing?.startTime && info.startTime && existing.startTime !== info.startTime
+      && !sameProcessGeneration(existing, info)
+    ) {
       this.procs.deleteRecord(existing);
     }
   }

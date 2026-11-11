@@ -1,0 +1,40 @@
+{
+  "schema": "anysentry.process-identity-b-validation.v1",
+  "observer_image": "anysentry-observer-wrapper:process-identity-b-20261026",
+  "api_image": "anysentry-api:process-identity-b-20261026",
+  "default_evaluation_cgroups": [],
+  "default_product_scope_changed": false,
+  "checks": {
+    "rust_workspace_tests_88_passed": true,
+    "ebpf_release_build_passed": true,
+    "api_build_passed": true,
+    "observer_ingest_local_passed": true,
+    "bounded_diagnostics_without_argv": true,
+    "evaluation_cgroup_unknown_lifecycle_retained": true,
+    "non_target_cgroup_still_filtered": true,
+    "accepted_receipts_isolated_from_filter_noise": true,
+    "dropped_by_kind_visible_in_api": true
+  },
+  "deployed_evidence": {
+    "target_receipts": {
+      "queue_admitted": 17,
+      "ingest_accepted": 17
+    },
+    "raw_collector_dropped_by_kind_example": {
+      "exec": 0,
+      "exit": 0,
+      "file": 716,
+      "tls": 0,
+      "connect": 0,
+      "dns": 0,
+      "llm": 0,
+      "sec": 0,
+      "ssl": 0
+    }
+  },
+  "notes": [
+    "Ring counts are cumulative and host-wide; they are not per-event loss receipts.",
+    "Diagnostics are bounded recent receipts split into ordinary, accepted-lifecycle and filtered-lifecycle lanes.",
+    "Unknown lifecycle retention requires an explicit ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS allowlist."
+  ]
+}

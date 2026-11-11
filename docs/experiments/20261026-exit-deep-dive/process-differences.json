@@ -1,0 +1,138 @@
+{
+  "alignment": "Per-task PID/count comparison inside archived short execution windows; not a generation-safe universal matcher.",
+  "tasks": [
+    {
+      "task": "fix-git",
+      "generation": {
+        "missing_start_boottime_ns": [],
+        "missing_process_instance_key": [],
+        "process_instance_key_conflicts": [],
+        "creation_parent_mismatches": []
+      },
+      "exec": {
+        "AnySentry": 53,
+        "AgentSight": 56,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 3,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 789404,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 789668,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 797867,
+            "count": 1,
+            "commands": [
+              "git status --short --branch"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 46,
+        "AgentSight": 47,
+        "shared_pid_count": 46,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 789404,
+            "comm": "sleep",
+            "at_ms": 1792997109551,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          }
+        ]
+      }
+    },
+    {
+      "task": "db-wal-recovery",
+      "generation": {
+        "missing_start_boottime_ns": [],
+        "missing_process_instance_key": [],
+        "process_instance_key_conflicts": [],
+        "creation_parent_mismatches": []
+      },
+      "exec": {
+        "AnySentry": 32,
+        "AgentSight": 34,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 2,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 789406,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 789667,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 30,
+        "AgentSight": 31,
+        "shared_pid_count": 30,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 789406,
+            "comm": "sleep",
+            "at_ms": 1792997109551,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          }
+        ]
+      }
+    },
+    {
+      "task": "polyglot-c-py",
+      "generation": {
+        "missing_start_boottime_ns": [],
+        "missing_process_instance_key": [],
+        "process_instance_key_conflicts": [],
+        "creation_parent_mismatches": []
+      },
+      "exec": {
+        "AnySentry": 85,
+        "AgentSight": 86,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 1,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 789648,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 84,
+        "AgentSight": 84,
+        "shared_pid_count": 84,
+        "AnySentry_only": [],
+        "AgentSight_only": []
+      }
+    }
+  ]
+}

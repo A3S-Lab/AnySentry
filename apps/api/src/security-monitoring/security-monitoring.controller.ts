@@ -92,6 +92,8 @@ const EVENT_REVISION_CONFLICT = 'ANYSENTRY_EVENT_REVISION_CONFLICT';
 const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
 const OBSERVER_BATCH_MAX_EVENTS = 256;
 const OBSERVER_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const SUPPLY_CHAIN_INSTALL_MAX_CONCURRENCY = 4;
+const SUPPLY_CHAIN_INSTALL_MAX_QUEUE = 1_024;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
 const OBSERVER_BATCH_ID_DIGEST_CACHE_SIZE = 10_000;
@@ -4405,6 +4407,40 @@ export class SecurityMonitoringController {
     )));
   }
 
+  private readonly supplyChainInstallQueue: Array<() => Promise<void>> = [];
+  private supplyChainInstallActive = 0;
+  private supplyChainInstallDropped = 0;
+
+  private scheduleSupplyChainInstall(event: T.JudgedEvent, observerLine: string): void {
+    if (this.supplyChainInstallQueue.length >= SUPPLY_CHAIN_INSTALL_MAX_QUEUE) {
+      this.supplyChainInstallDropped += 1;
+      if (this.supplyChainInstallDropped % 100 === 1) {
+        console.warn('[supply-chain] runtime install observation queue is full', {
+          dropped: this.supplyChainInstallDropped,
+          queued: this.supplyChainInstallQueue.length,
+        });
+      }
+      return;
+    }
+    this.supplyChainInstallQueue.push(() => this.observeSupplyChainInstall(event, observerLine));
+    this.drainSupplyChainInstallQueue();
+  }
+
+  private drainSupplyChainInstallQueue(): void {
+    while (
+      this.supplyChainInstallActive < SUPPLY_CHAIN_INSTALL_MAX_CONCURRENCY
+      && this.supplyChainInstallQueue.length > 0
+    ) {
+      const job = this.supplyChainInstallQueue.shift();
+      if (!job) break;
+      this.supplyChainInstallActive += 1;
+      void job().finally(() => {
+        this.supplyChainInstallActive -= 1;
+        this.drainSupplyChainInstallQueue();
+      });
+    }
+  }
+
   private async observeSupplyChainInstall(event: T.JudgedEvent, observerLine: string): Promise<void> {
     try {
       await this.supplyChain.observeRuntimeInstall(event, observerLine);
@@ -7882,7 +7918,7 @@ export class SecurityMonitoringController {
     }
     downstreamDeliveredAt = Date.now();
     let retainedCommitted = 0;
-    const supplyChainJobs: Array<Promise<void>> = [];
+    let supplyChainJobs = 0;
     setHttpShutdownPhase(request, 'post-commit');
     for (let index = 0; index < events.length; index += 1) {
       if (deliveryRetryFrom >= 0 && index >= deliveryRetryFrom) break;
@@ -7989,9 +8025,8 @@ export class SecurityMonitoringController {
           collectorId: context.collectorId,
           workspacePath: prepared.event.workspacePath,
         });
-        // Optional supply-chain side path: schedule after ACK-critical sync work and await as a
-        // batch so ProcessExit floods cannot serialize hundreds of Redis RTTs on the ingest path.
-        supplyChainJobs.push(this.observeSupplyChainInstall(prepared.event, context.line));
+        supplyChainJobs += 1;
+        this.scheduleSupplyChainInstall(prepared.event, context.line);
         retainedCommitted += 1;
         items[index] = {
           index,
@@ -8014,11 +8049,6 @@ export class SecurityMonitoringController {
         deliveryRetryFrom = index;
         deliveryError = error instanceof Error ? error.message : String(error);
       }
-    }
-
-    if (supplyChainJobs.length > 0) {
-      setHttpShutdownPhase(request, 'post-commit.supply-chain');
-      await Promise.all(supplyChainJobs);
     }
 
     // Learning is a bounded recommendation plane, not part of the event durability ACK. Evaluate
@@ -8087,7 +8117,7 @@ export class SecurityMonitoringController {
           events: events.length,
           retained: retainedPrepared.length,
           structural: structuralPrepared.length,
-          supplyChainJobs: supplyChainJobs.length,
+          supplyChainJobs,
         });
       }
     }

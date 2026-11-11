@@ -1,0 +1,29 @@
+{
+  "schema": "anysentry.process-identity-deployed-result.v1",
+  "run_id": "a-identity-479240904834",
+  "observer_image": "anysentry-observer-wrapper:process-identity-a-20261026",
+  "api_image": "anysentry-api:process-identity-a-20261026",
+  "scope_pids": 19,
+  "confirmed_exec": 22,
+  "process_exit": 19,
+  "compile_chain": {
+    "gcc": 2,
+    "cc1": 2,
+    "as": 2,
+    "collect2": 2,
+    "ld": 2
+  },
+  "consecutive_exec_comm": ["bash", "bash", "echo"],
+  "missing_exit": [],
+  "missing_start_boottime_ns": [],
+  "process_instance_key_conflicts": [],
+  "checks": {
+    "all_exec_pids_have_exit": true,
+    "all_events_have_start_boottime_ns": true,
+    "start_time_source_is_explicit": true,
+    "same_pid_exec_keeps_one_process_instance_key": true,
+    "two_complete_compile_chains": true
+  },
+  "passed": true,
+  "evidence_boundary": "Real AnySentry Collector -> Forwarder -> API -> ClickHouse path. PID reuse was separately covered only by simulation."
+}

@@ -50,6 +50,19 @@ for (const [pid, classification, cgroupId] of [[1, 'non_agent', 'evaluation-cgro
     },
   });
 }
+replaySpool.put({
+  id: 'replay-exec-93005', priority: 4, queuedAt: Date.now(),
+  body: {
+    line: JSON.stringify({
+      process: {
+        hostId: 'replay-host', bootId: replayBootId, pid: 93005, comm: 'git', cgroupId: 'limit-cgroup',
+        startBoottimeNs: '10000093005', lifecycleReason: 'ancestry_incomplete',
+      },
+      event: { ToolExec: { pid: 93005, argv: ['git', 'status'], exec_confirmed: true } },
+    }),
+    sourceEventId: 'replay-exec-93005', attribution: { classification: 'unknown' },
+  },
+});
 replaySpool.close();
 let child;
 try {
@@ -99,6 +112,7 @@ try {
   const forwarded = received.map(item => JSON.parse(item.line));
   const exits = forwarded.filter(event => event.event.ProcessExit).map(event => event.process.pid);
   assert.deepEqual(new Set(exits), new Set([93001, 93002, 93004, 1]));
+  assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 93005), 'unresolved exec must survive WAL replay');
   const receipts = JSON.parse(await readFile(diagnosticsPath, 'utf8'));
   assert.ok(receipts.some(item => item.pid === 93001 && item.stage === 'unresolved_exit_retained'));
   assert.ok(receipts.some(item => item.pid === 93003 && item.stage === 'filtered' && item.reason === 'unresolved_exit_capacity'));

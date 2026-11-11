@@ -1,0 +1,36 @@
+{
+  "schema": "a3s.process-identity-live-result.v1",
+  "run_id": "a-identity-b3a35ffcbe28",
+  "scope_pids": 19,
+  "confirmed_exec": 22,
+  "process_exit": 19,
+  "compile_chain": {
+    "gcc": 2,
+    "cc1": 2,
+    "as": 2,
+    "collect2": 2,
+    "ld": 2
+  },
+  "consecutive_exec_comm": [
+    "bash",
+    "bash",
+    "echo"
+  ],
+  "missing_exit": [],
+  "missing_ns": [],
+  "bad_parent_generation": [],
+  "bad_ticks": [],
+  "exit_mismatches": [],
+  "checks": {
+    "all_observed_exec_pids_have_final_exit": true,
+    "all_scoped_events_have_start_boottime_ns": true,
+    "creation_parent_generations_match": true,
+    "proc_ticks_match_target_user_hz_conversion": true,
+    "fork_wait_exit_codes_match": true,
+    "consecutive_exec_comm_sequence": true,
+    "consecutive_exec_generation_stable": true,
+    "two_complete_compile_chains": true
+  },
+  "passed": true,
+  "evidence_boundary": "fork/wait plus explicit exec checkpoints; PID reuse is not exercised by this live run"
+}

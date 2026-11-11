@@ -38,6 +38,10 @@ try {
     ANYSENTRY_DOCKER_DISCOVERY: 'off',
     ANYSENTRY_INTERACTIONS: 'off',
     ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS: 'retry-cgroup',
+    ANYSENTRY_ATTRIBUTION_RETRY_DELAY_MS: '10',
+    ANYSENTRY_ATTRIBUTION_RETRY_MAX_ATTEMPTS: '10000',
+    ANYSENTRY_ATTRIBUTION_RETRY_MAX_AGE_MS: '200',
+    ANYSENTRY_UNRESOLVED_EXIT_LIMIT: '1000',
     ANYSENTRY_PIPELINE_DIAGNOSTICS_PATH: diagnosticsPath,
     FORWARD_AGENT_ALLOWLIST: 'kimi-cli',
     FORWARD_FILTER_MODE: 'enforce',
@@ -67,10 +71,47 @@ try {
     process: { ...common, pid: 92001, ppid: 1, startBoottimeNs: '10000000000', comm: 'kimi', exe: '/opt/kimi', cwd: '/workspace' },
     event: { ToolExec: { pid: 92001, ppid: 1, argv: ['kimi'] } },
   };
+  const childExec = {
+    process: { ...childExit.process, cgroupId: 'agent-only-cgroup' },
+    event: { ToolExec: { pid: 92002, ppid: 92001, argv: ['git', 'status'], exec_confirmed: true } },
+  };
+  const wrongGenerationExec = {
+    process: { ...childExec.process, pid: 92003, creationParentStartBoottimeNs: '99999999999' },
+    event: { ToolExec: { pid: 92003, ppid: 92001, argv: ['git', 'diff'], exec_confirmed: true } },
+  };
+  const lateUnresolvedExit = {
+    process: { ...childExit.process, pid: 92004, startBoottimeNs: '10040000000', cgroupId: 'agent-only-cgroup', creationPpid: 99999999, creationParentStartBoottimeNs: '99999999999' },
+    event: { ProcessExit: { pid: 92004, exit_code: 0, signal: 0 } },
+  };
+  const lateUnresolvedExec = {
+    process: lateUnresolvedExit.process,
+    event: { ToolExec: { pid: 92004, ppid: 99999999, argv: ['git', 'show'], exec_confirmed: true } },
+  };
+  const exhaustedUnresolvedExec = {
+    process: { ...lateUnresolvedExit.process, pid: 92005, ppid: 99999999, startBoottimeNs: '10050000000' },
+    event: { ToolExec: { pid: 92005, ppid: 99999999, argv: ['long-running-check'], exec_confirmed: true } },
+  };
+  const delayedRootExec = {
+    process: { ...common, pid: 92007, ppid: 1, startBoottimeNs: '10070000000', comm: 'kimi', exe: '/opt/kimi', cwd: '/workspace' },
+    event: { ToolExec: { pid: 92007, ppid: 1, argv: ['kimi'] } },
+  };
+  const delayedWindowExec = {
+    process: { ...common, pid: 92006, ppid: 92007, creationPpid: 92007,
+      creationParentStartBoottimeNs: '10070000000', startBoottimeNs: '10060000000', comm: 'gcc', cgroupId: 'agent-only-cgroup' },
+    event: { ToolExec: { pid: 92006, ppid: 92007, argv: ['gcc', '-v'], exec_confirmed: true } },
+  };
+  child.stdin.write(`${JSON.stringify(childExec)}\n`);
+  child.stdin.write(`${JSON.stringify(wrongGenerationExec)}\n`);
   child.stdin.write(`${JSON.stringify(childExit)}\n`);
-  await new Promise(resolve => setTimeout(resolve, 50));
+  child.stdin.write(`${JSON.stringify(lateUnresolvedExit)}\n`);
+  child.stdin.write(`${JSON.stringify(lateUnresolvedExec)}\n`);
+  child.stdin.write(`${JSON.stringify(exhaustedUnresolvedExec)}\n`);
+  child.stdin.write(`${JSON.stringify(delayedWindowExec)}\n`);
+  await new Promise(resolve => setTimeout(resolve, 20));
   child.stdin.write(`${JSON.stringify(rootExec)}\n`);
-  await new Promise(resolve => setTimeout(resolve, 200));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  child.stdin.write(`${JSON.stringify(delayedRootExec)}\n`);
+  await new Promise(resolve => setTimeout(resolve, 100));
   child.stdin.end();
   let timer;
   try {
@@ -81,9 +122,20 @@ try {
   const forwarded = received.map(item => JSON.parse(item.line));
   const receipts = JSON.parse(await readFile(diagnosticsPath, 'utf8'));
   assert.ok(forwarded.some(event => event.event.ProcessExit?.pid === 92002), JSON.stringify({ forwarded, receipts }));
+  assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 92002), 'late parent must unblock exact child exec');
+  assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 92006), 'parent inside the bounded age window must unblock child exec');
+  assert.ok(!forwarded.some(event => event.event.ToolExec?.pid === 92006 && event.process.lifecycleReason), 'age-window exec resolved by parent must not stay unresolved');
+  assert.ok(!forwarded.some(event => event.event.ToolExec?.pid === 92003), 'wrong parent generation must stay filtered');
+  assert.ok(!forwarded.some(event => event.event.ToolExec?.pid === 92002 && event.process.lifecycleReason), 'resolved exec must not stay unresolved');
+  assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 92004 && event.process.lifecycleReason === 'ancestry_incomplete'), `unresolved exit must retain its exact-generation late exec: ${JSON.stringify({ forwarded, receipts })}`);
+  assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 92005 && event.process.lifecycleReason === 'ancestry_incomplete'), `retry exhaustion must not silently drop a generation-complete exec: ${JSON.stringify({ forwarded, receipts })}`);
+  assert.ok(forwarded.every(event => event.event.ToolExec?.pid !== 92005 || !['confirmed_agent', 'probable_agent'].includes(event.attribution?.classification)), 'unresolved exec must not gain Agent attribution');
+  assert.ok(receipts.some(item => item.pid === 92005 && item.stage === 'unresolved_exec_retained'));
+  assert.ok(receipts.some(item => item.pid === 92004 && item.stage === 'unresolved_exec_retained'));
+  assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'attribution_deferred'));
   assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'evaluation_lifecycle_retained'));
   assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'ingest_accepted'));
-  console.log('PASS scoped unresolved exit is retained without inventing Agent attribution');
+  console.log('PASS scoped unresolved exit and bounded parent-order exec retry');
 } finally {
   if (child && child.exitCode === null) child.kill('SIGKILL');
   server.closeAllConnections();

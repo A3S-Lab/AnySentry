@@ -1,0 +1,264 @@
+[
+  {
+    "run": "kimi-s1-db-wal-20261019",
+    "root_pid": 870642,
+    "window_ms": [
+      1792395124953,
+      1792395227332
+    ],
+    "family_pids": 22,
+    "AnySentry": {
+      "FileAccess": 71,
+      "ProcessExit": 7,
+      "ToolExec": 21,
+      "Egress": 3
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 21
+    },
+    "AgentSight": {
+      "file": 45,
+      "NET_CONNECT": 10,
+      "NET_BIND": 1,
+      "exec": 30,
+      "exit": 22
+    },
+    "exec_unique_pids": {
+      "AnySentry": 13,
+      "AgentSight": 22,
+      "intersection": 13,
+      "only_any": 0,
+      "only_as": 9
+    }
+  },
+  {
+    "run": "kimi-s1-fix-git-20261019",
+    "root_pid": 870777,
+    "window_ms": [
+      1792395125233,
+      1792395239346
+    ],
+    "family_pids": 33,
+    "AnySentry": {
+      "FileAccess": 108,
+      "ToolExec": 29,
+      "ProcessExit": 14,
+      "Egress": 3
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 29
+    },
+    "AgentSight": {
+      "file": 62,
+      "NET_CONNECT": 5,
+      "NET_BIND": 1,
+      "exec": 36,
+      "exit": 30
+    },
+    "exec_unique_pids": {
+      "AnySentry": 24,
+      "AgentSight": 31,
+      "intersection": 22,
+      "only_any": 2,
+      "only_as": 9
+    }
+  },
+  {
+    "run": "kimi-s1-polyglot-20261019",
+    "root_pid": 870579,
+    "window_ms": [
+      1792395124777,
+      1792395371283
+    ],
+    "family_pids": 411,
+    "AnySentry": {
+      "FileAccess": 2323,
+      "ToolExec": 399,
+      "ProcessExit": 112,
+      "FileDelete": 28,
+      "Egress": 44
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 397,
+      "0": 2
+    },
+    "AgentSight": {
+      "file": 929,
+      "NET_CONNECT": 66,
+      "NET_BIND": 6,
+      "exec": 240,
+      "exit": 218
+    },
+    "exec_unique_pids": {
+      "AnySentry": 390,
+      "AgentSight": 235,
+      "intersection": 214,
+      "only_any": 176,
+      "only_as": 21
+    }
+  },
+  {
+    "run": "kimi-s2-twina-fix-git-20261019",
+    "root_pid": 919636,
+    "window_ms": [
+      1792395863423,
+      1792396002794
+    ],
+    "family_pids": 29,
+    "AnySentry": {
+      "FileAccess": 104,
+      "ToolExec": 32,
+      "ProcessExit": 16,
+      "Egress": 3
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 32
+    },
+    "AgentSight": {
+      "file": 65,
+      "NET_CONNECT": 4,
+      "NET_BIND": 1,
+      "exec": 32,
+      "exit": 25
+    },
+    "exec_unique_pids": {
+      "AnySentry": 24,
+      "AgentSight": 25,
+      "intersection": 20,
+      "only_any": 4,
+      "only_as": 5
+    }
+  },
+  {
+    "run": "kimi-s2-twinb-fix-git-20261019",
+    "root_pid": 919691,
+    "window_ms": [
+      1792395863798,
+      1792395946147
+    ],
+    "family_pids": 29,
+    "AnySentry": {
+      "FileAccess": 98,
+      "ProcessExit": 15,
+      "ToolExec": 38,
+      "Egress": 3
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 38
+    },
+    "AgentSight": {
+      "file": 63,
+      "NET_CONNECT": 4,
+      "NET_BIND": 1,
+      "exec": 40,
+      "exit": 27
+    },
+    "exec_unique_pids": {
+      "AnySentry": 27,
+      "AgentSight": 29,
+      "intersection": 27,
+      "only_any": 0,
+      "only_as": 2
+    }
+  },
+  {
+    "run": "kimi-s3-legacy-utility-20261019",
+    "root_pid": 1605733,
+    "window_ms": [
+      1792409642918,
+      1792413872963
+    ],
+    "family_pids": 964,
+    "AnySentry": {
+      "FileAccess": 1476,
+      "Egress": 865,
+      "ToolExec": 1356,
+      "ProcessExit": 556
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 1302,
+      "0": 54
+    },
+    "AgentSight": {
+      "file": 356,
+      "NET_CONNECT": 338,
+      "NET_BIND": 55,
+      "exec": 418,
+      "exit": 228
+    },
+    "exec_unique_pids": {
+      "AnySentry": 961,
+      "AgentSight": 310,
+      "intersection": 307,
+      "only_any": 654,
+      "only_as": 3
+    }
+  },
+  {
+    "run": "kimi-s3-music-harmony-20261019",
+    "root_pid": 1543004,
+    "window_ms": [
+      1792408910723,
+      1792411797771
+    ],
+    "family_pids": 75,
+    "AnySentry": {
+      "FileAccess": 15448,
+      "ProcessExit": 61,
+      "ToolExec": 88,
+      "Egress": 103,
+      "FileDelete": 97
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 85,
+      "0": 3
+    },
+    "AgentSight": {
+      "file": 98,
+      "NET_CONNECT": 56,
+      "NET_BIND": 19,
+      "exec": 27,
+      "exit": 18
+    },
+    "exec_unique_pids": {
+      "AnySentry": 73,
+      "AgentSight": 25,
+      "intersection": 23,
+      "only_any": 50,
+      "only_as": 2
+    }
+  },
+  {
+    "run": "kimi-s3-shadow-relay-20261019",
+    "root_pid": 1544957,
+    "window_ms": [
+      1792408933684,
+      1792413840272
+    ],
+    "family_pids": 112,
+    "AnySentry": {
+      "ToolExec": 119,
+      "ProcessExit": 75,
+      "FileAccess": 312,
+      "Egress": 39
+    },
+    "AnySentry_exec_confirmed": {
+      "1": 117,
+      "0": 2
+    },
+    "AgentSight": {
+      "file": 29,
+      "NET_CONNECT": 12,
+      "NET_BIND": 5,
+      "exec": 24,
+      "exit": 12
+    },
+    "exec_unique_pids": {
+      "AnySentry": 106,
+      "AgentSight": 21,
+      "intersection": 15,
+      "only_any": 91,
+      "only_as": 6
+    }
+  }
+]

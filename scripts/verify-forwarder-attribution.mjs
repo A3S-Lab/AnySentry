@@ -867,15 +867,47 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(exitEvent).state, 'agent');
   assert.equal(judge.metrics().tombstones, 1);
   const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
-  assert.notEqual(
+  assert.equal(
     judge.classify(late).state,
     'agent',
-    'a root tombstone may deduplicate ProcessExit but must not revive the exited subtree',
+    'an exact-generation tombstone must retain a late ToolExec without reviving the root',
   );
+  assert.equal([...judge.rootsByKey.values()].find((root) => root.pid === 600)?.runtimeState, 'exited');
+  const wrongGeneration = structuredClone(late);
+  wrongGeneration.process.startTimeNs = '61';
+  assert.notEqual(judge.classify(wrongGeneration).state, 'agent');
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
   now += 5_001;
   assert.equal(judge.metrics().tombstones, 0);
+}
+
+{
+  const judge = new AgentAttributor({ readProc: () => undefined, listPids: () => [] });
+  const root = { pid: 610, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '100', argv: ['codex'] };
+  const child = { pid: 611, ppid: 610, comm: 'git', exe: '/usr/lib/git-core/git', startTimeNs: '200', argv: ['git', 'maintenance', 'run'] };
+  assert.equal(judge.classify(observerEvent(root)).state, 'agent');
+  assert.equal(judge.classify(observerEvent(child)).state, 'agent');
+  assert.equal(judge.classify(processExitEvent(child)).state, 'agent');
+  assert.equal(judge.classify(processExitEvent(root)).state, 'agent');
+  const late = judge.classify(observerEvent(child));
+  assert.equal(late.state, 'agent', 'child exec arriving after both exits must retain its exact-generation attribution');
+  assert.equal(late.attribution.rootPid, 610);
+}
+
+{
+  let now = 1_000_000;
+  const judge = new AgentAttributor({ now: () => now, readProc: () => undefined, listPids: () => [] });
+  const root = { pid: 620, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '100', argv: ['codex'] };
+  const child = { pid: 621, ppid: 620, comm: 'git', exe: '/usr/bin/git', startTimeNs: '200', argv: ['git', 'diff', '--check'] };
+  judge.classify(observerEvent(root));
+  judge.classify(observerEvent(child));
+  judge.classify(processExitEvent(child));
+  judge.classify(processExitEvent(root));
+  now += 61_000;
+  assert.equal(judge.classify(observerEvent(child)).state, 'agent', 'a delayed exec must remain attributable beyond the old 15s and 60s tombstone TTLs');
+  now += 239_001;
+  assert.notEqual(judge.classify(observerEvent(child)).state, 'agent', 'the 300s tombstone bound must still expire');
 }
 
 {
@@ -1027,6 +1059,32 @@ function attributor(procEntries = []) {
     )?.runtimeState,
     'running',
   );
+}
+
+{
+  const judge = new AgentAttributor({
+    readProc: () => undefined,
+    readStartTime: () => '575354',
+    livenessMissThreshold: 1,
+    listPids: () => [],
+  });
+  const root = observerEvent({ pid: 2_450, ppid: 1, comm: 'kimi', exe: '/opt/kimi-bin/kimi', startTimeNs: '5753545984160', argv: ['kimi'] });
+  root.process.startTimeTicks = '575354';
+  root.process.userHz = 100;
+  assert.equal(judge.classify(root).state, 'agent');
+  judge.discardReusedPid({
+    pid: 2_450,
+    hostId: judge.hostId,
+    bootId: judge.bootId,
+    startTime: '575354',
+    startTimeTicks: '575354',
+    userHz: 100,
+  });
+  assert.equal(judge.procs.getFor(root.process)?.state, 'agent', 'equivalent identities must not evict the agent cache');
+  judge.discardReusedPid({ pid: 2_450, hostId: judge.hostId, bootId: judge.bootId, startTime: '999', startTimeTicks: '999' });
+  assert.equal(judge.procs.getFor(root.process), undefined, 'a genuinely reused PID must still evict the old generation');
+  assert.equal(judge.checkRootLiveness().lost, 0, 'equivalent tick and nanosecond identities must stay live');
+  assert.equal(judge.runtimeSnapshot().entries[0]?.runtimeState, 'running');
 }
 
 {

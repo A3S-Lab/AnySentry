@@ -1,0 +1,9 @@
+{
+  "schema": "a3s.exec-e2e-comparison.v1",
+  "run_id": "exit-tree-437c475e4ea1",
+  "truth_count": 1500,
+  "clickhouse_missing": [],
+  "clickhouse_bad": [],
+  "clickhouse_exit_bad": [],
+  "missing_process_instance_keys": []
+}

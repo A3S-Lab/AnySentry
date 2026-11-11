@@ -44,6 +44,7 @@ const {
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
 const { InfrastructurePolicyRegistry } = require('./observer-infrastructure-policy');
 const { alwaysKeepEventKind } = require('./observer-infrastructure-rules');
+const { isAgentKeepDecision } = require('./observer-capture-profile-control');
 const { FilterRulePublisher } = require('./observer-filter-rules');
 const { CaptureProfileReporter } = require('./observer-capture-profile-reporter');
 const { FileAccessAggregator } = require('./observer-file-aggregation');
@@ -186,7 +187,7 @@ const RETRY_MAX_DELAY_MS = boundedNumber(
   RETRY_BASE_DELAY_MS,
   2_000,
 );
-const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
+const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 300_000, 100, 300_000);
 const DURABLE_REPLAY_COOLDOWN_MS = boundedNumber(
   process.env.FORWARD_DURABLE_REPLAY_COOLDOWN_MS,
   30_000,
@@ -281,19 +282,41 @@ function agentAllowlistMatch(allowlist, observerEvent, classification) {
   return candidates.some((candidate) => allowlist.has(canonicalAgentSelector(candidate)));
 }
 
+const evaluationLifecycleCgroupPath = text(process.env.ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_PATH)
+  || '/diagnostics/evaluation-cgroups.json';
 const EVALUATION_LIFECYCLE_CGROUPS = new Set(
   text(process.env.ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS)
     .split(/[\s,]+/u)
     .filter(Boolean),
 );
 
+// Evaluation harnesses learn the task container cgroup ids only after the containers start, so
+// the id set must be refreshable at runtime: a JSON array (or comma string) written to a
+// host-mounted file is merged into the env-provided baseline on a short poll.
+function refreshEvaluationLifecycleCgroups() {
+  if (!evaluationLifecycleCgroupPath) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(evaluationLifecycleCgroupPath, 'utf8'));
+    const ids = (Array.isArray(raw) ? raw : text(raw).split(/[\s,]+/u))
+      .map((id) => text(id))
+      .filter(Boolean);
+    EVALUATION_LIFECYCLE_CGROUPS.clear();
+    for (const id of ids.slice(0, 4096)) EVALUATION_LIFECYCLE_CGROUPS.add(id);
+  } catch {
+    // Absent or malformed harness file: keep the last known set (env baseline persists).
+  }
+}
+refreshEvaluationLifecycleCgroups();
+if (evaluationLifecycleCgroupPath) {
+  const evaluationLifecycleTimer = setInterval(refreshEvaluationLifecycleCgroups, 5_000);
+  evaluationLifecycleTimer.unref();
+}
+
 function evaluationLifecycleMatch(observerEvent, classification) {
   if (
     EVALUATION_LIFECYCLE_CGROUPS.size === 0
-    || !['unknown', 'non_agent'].includes(classification?.state)
+    || !['unknown', 'non_agent', 'infrastructure'].includes(classification?.state)
   ) return false;
-  const kind = eventKind(observerEvent);
-  if (kind !== 'ToolExec' && kind !== 'ProcessExit') return false;
   const process = observerEvent?.process ?? {};
   const cgroupId = text(process.cgroupId || process.cgroup_id);
   return EVALUATION_LIFECYCLE_CGROUPS.has(cgroupId);
@@ -301,25 +324,128 @@ function evaluationLifecycleMatch(observerEvent, classification) {
 
 const UNRESOLVED_EXIT_LIMIT = Math.max(0, Number(process.env.ANYSENTRY_UNRESOLVED_EXIT_LIMIT) || 0);
 let unresolvedExitRetained = 0;
+const unresolvedExitGenerations = new Set();
 
 function unresolvedExitCapacity() {
   return UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitRetained >= UNRESOLVED_EXIT_LIMIT;
 }
 
-function unresolvedExitIdentityMatch(observerEvent, classification) {
-  if (eventKind(observerEvent) !== 'ProcessExit' || classification?.state !== 'unknown') return false;
+function unresolvedProcessKey(observerEvent) {
   const process = observerEvent?.process ?? {};
   const hostId = text(process.hostId || process.host_id);
   const bootId = text(process.bootId || process.boot_id);
   const startTime = text(
     process.startBoottimeNs || process.start_boottime_ns || process.startTimeNs || process.start_time_ns,
   );
-  return Boolean(hostId && bootId && Number(process.pid) > 0 && startTime);
+  return hostId && bootId && Number(process.pid) > 0 && startTime
+    ? JSON.stringify([hostId, bootId, Number(process.pid), startTime])
+    : '';
+}
+
+function unresolvedExitIdentityMatch(observerEvent, classification) {
+  if (eventKind(observerEvent) !== 'ProcessExit' || classification?.state !== 'unknown') return false;
+  return Boolean(unresolvedProcessKey(observerEvent));
 }
 
 function unresolvedExitMatch(observerEvent, classification) {
   if (UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitCapacity()) return false;
   return unresolvedExitIdentityMatch(observerEvent, classification);
+}
+
+function unresolvedExecIdentityMatch(observerEvent, classification) {
+  if (
+    eventKind(observerEvent) !== 'ToolExec'
+    || classification?.state !== 'unknown'
+    || observerEvent?.event?.ToolExec?.exec_confirmed !== true
+  ) return false;
+  return Boolean(unresolvedProcessKey(observerEvent));
+}
+
+function unresolvedExecMatch(observerEvent, classification, retryExhausted = false) {
+  if (UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitCapacity()) return false;
+  if (!unresolvedExecIdentityMatch(observerEvent, classification)) return false;
+  const key = unresolvedProcessKey(observerEvent);
+  return retryExhausted || unresolvedExitGenerations.has(key);
+}
+
+const ATTRIBUTION_RETRY_DELAY_MS = Math.max(0, Math.min(1_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_DELAY_MS) || 50));
+// A parent that is going to be observed in the same Collector burst almost always appears within
+// a few seconds; waiting longer only delays delivery (and can push retained execs past consumer
+// windows) without improving attribution. The bound is a wall-clock budget, not an attempt count.
+const MAX_ATTRIBUTION_RETRY_AGE_MS = Math.max(1_000, Math.min(300_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_AGE_MS) || 5_000));
+const MAX_ATTRIBUTION_RETRY_ATTEMPTS = Math.max(1, Math.min(10_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_ATTEMPTS) || 10_000));
+const MAX_ATTRIBUTION_RETRIES = Math.max(1,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_LIMIT) || 16_384);
+const MAX_ATTRIBUTION_RETRY_BYTES = Math.max(1,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_BYTES) || 64 * 1024 * 1024);
+const attributionRetries = new Set();
+let attributionRetryBytes = 0;
+
+function deferAttributionRetry(raw, observerEvent, classification, retryAttempt, retryDeadline = 0) {
+  const process = observerEvent?.process ?? {};
+  const exec = observerEvent?.event?.ToolExec;
+  if (
+    retryAttempt >= MAX_ATTRIBUTION_RETRY_ATTEMPTS
+    || !exec?.exec_confirmed
+    || classification?.state !== 'unknown'
+    || unresolvedExecMatch(observerEvent, classification, retryDeadline > 0 && Date.now() >= retryDeadline)
+    || ATTRIBUTION_RETRY_DELAY_MS <= 0
+  ) return false;
+  const startTime = text(process.startBoottimeNs || process.start_boottime_ns || process.startTimeNs);
+  const parentStart = text(
+    process.creationParentStartBoottimeNs || process.creation_parent_start_boottime_ns,
+  );
+  const parentPid = Number(process.creationPpid || process.creation_ppid);
+  if (
+    !text(process.hostId || process.host_id)
+    || !text(process.bootId || process.boot_id)
+    || Number(process.pid) <= 0
+    || !startTime
+    || parentPid <= 0
+    || !parentStart
+  ) return false;
+  const bytes = Buffer.byteLength(raw);
+  if (
+    attributionRetries.size >= MAX_ATTRIBUTION_RETRIES
+    || attributionRetryBytes + bytes > MAX_ATTRIBUTION_RETRY_BYTES
+  ) {
+    pipelineDiagnostics.record(
+      { ...observerEvent, eventKind: 'ToolExec' },
+      'attribution_retry_capacity',
+      'bounded_pending_attribution',
+    );
+    return false;
+  }
+  const deadline = retryDeadline > 0 ? retryDeadline : Date.now() + MAX_ATTRIBUTION_RETRY_AGE_MS;
+  const retry = { raw, bytes, deadline, timer: undefined };
+  attributionRetries.add(retry);
+  attributionRetryBytes += bytes;
+  if (retryAttempt === 0) {
+    pipelineDiagnostics.record(
+      { ...observerEvent, eventKind: 'ToolExec' },
+      'attribution_deferred',
+      'parent_not_observed',
+    );
+  }
+  retry.timer = setTimeout(() => {
+    attributionRetries.delete(retry);
+    attributionRetryBytes = Math.max(0, attributionRetryBytes - bytes);
+    handleLine(raw, retryAttempt + 1, deadline);
+  }, Math.min(1_000, ATTRIBUTION_RETRY_DELAY_MS * (2 ** Math.min(10, retryAttempt))));
+  return true;
+}
+
+function flushAttributionRetries() {
+  const retries = [...attributionRetries];
+  attributionRetries.clear();
+  attributionRetryBytes = 0;
+  for (const retry of retries) {
+    if (retry.timer) clearTimeout(retry.timer);
+    handleLine(retry.raw, MAX_ATTRIBUTION_RETRY_ATTEMPTS, Date.now() - 1);
+  }
 }
 
 const rawE2eIngestMarkerPrefix = process.env.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
@@ -816,7 +942,10 @@ function durableRecordMatchesAgentAllowlist(body) {
     if (evaluationLifecycleMatch(observerEvent, classification)) return true;
     return UNRESOLVED_EXIT_LIMIT > 0
       && text(observerEvent.process?.lifecycleReason) === 'ancestry_incomplete'
-      && unresolvedExitIdentityMatch(observerEvent, classification);
+      && (
+        unresolvedExitIdentityMatch(observerEvent, classification)
+        || unresolvedExecIdentityMatch(observerEvent, classification)
+      );
   } catch {
     // A durable record without a valid Observer envelope cannot prove that it belongs to the
     // selected Agent. Fail closed while an explicit benchmark allowlist is active.
@@ -962,6 +1091,7 @@ function invalidBatchAck(batchLength, reason) {
     retryItems: [],
     acceptedItems: [],
     rejectedItems: [],
+    invalidAck: true,
     pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batchLength),
     reason,
   };
@@ -1102,7 +1232,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
       ...pipelineCount('api_rejected', 'ack', rejectedItems),
       ...pipelineCount('api_retryable', 'ack', retryItems.length),
     ],
-    reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s)` : '',
+    reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s); reasonCodes=${[...new Set(items.filter((item) => item.disposition === undefined || item.disposition === 'rejected').map((item) => item.reasonCode || item.reason || 'unknown'))].join(',')}` : '',
   };
 }
 
@@ -1193,7 +1323,18 @@ function postEventBatch(batch, timeoutMs, done) {
         }
         responseBody += chunk;
       });
-      res.on('end', () => finish({ statusCode, responseBody }));
+      res.on('end', () => {
+        try {
+          const ack = JSON.parse(responseBody);
+          if (ack.rejectedEvents > 0) {
+            const reasonCodes = [...new Set((ack.items || [])
+              .filter((item) => item.disposition === undefined || item.disposition === 'rejected')
+              .map((item) => item.reasonCode || item.reason || 'unknown'))];
+            console.error(`[observer-forward] batch rejection reason codes: ${reasonCodes.join(',')}`);
+          }
+        } catch {}
+        finish({ statusCode, responseBody });
+      });
       res.on('aborted', () => finish({ error: new Error('batch acknowledgement aborted'), statusCode }));
       res.on('error', (error) => finish({ error, statusCode }));
       res.on('close', () => {
@@ -2558,10 +2699,24 @@ function finishBatch(batch, outcome, retryDelivery) {
   }
   const durablySettled = new Set([...acceptedItems, ...rejectedItems]);
   const unresolvedTerminalItems = terminalItems.filter((item) => !durablySettled.has(item));
-  for (const item of unresolvedTerminalItems) {
-    pipelineDiagnostics.record(item.body, 'ingest_unresolved', outcome.reason || 'unresolved');
+  if (outcome.invalidAck && unresolvedTerminalItems.length) {
+    spool.deadLetter(
+      unresolvedTerminalItems
+        .filter((item) => item.spoolId)
+        .map((item) => ({
+          id: item.spoolId,
+          body: item.body,
+          priority: item.priority,
+          queuedAt: item.createdAt,
+        })),
+      outcome.reason || 'invalid ingest acknowledgement',
+    );
+  } else {
+    for (const item of unresolvedTerminalItems) {
+      pipelineDiagnostics.record(item.body, 'ingest_unresolved', outcome.reason || 'unresolved');
+    }
+    if (unresolvedTerminalItems.length) deferDurableReplay(unresolvedTerminalItems);
   }
-  if (unresolvedTerminalItems.length) deferDurableReplay(unresolvedTerminalItems);
   if (retryDelivery) {
     const exhausted = Math.min(terminalItems.length, outcome.dropped);
     const recovered = Math.max(0, terminalItems.length - exhausted);
@@ -2913,6 +3068,7 @@ function flushAndClose() {
   captureProfileReporter.close();
   fileAccessAggregator.flushAll();
   filterRulePublisher.close();
+  flushAttributionRetries();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
   const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
@@ -2924,7 +3080,14 @@ function flushAndClose() {
     // ownership window. Treat those WAL records as shutdown work as well; otherwise EOF may let
     // the Forwarder exit after delivering only the first window and defer the rest until a future
     // restart. The shutdown deadline remains the bound for a genuinely unavailable API.
-    const durableBacklog = spool.status().records > 0;
+    // Records whose durable-replay cooldown outlives the event drain horizon can never be
+    // replayed before the deadline (retry exhaustion defers them by a full cooldown), so waiting
+    // on them only delays shutdown without delivering anything.
+    let deferredBeyondHorizon = 0;
+    for (const replayAt of durableReplayNotBefore.values()) {
+      if (replayAt > eventDrainDeadline) deferredBeyondHorizon++;
+    }
+    const durableBacklog = spool.status().records > deferredBeyondHorizon;
     const hasEventWork =
       inflight > 0
       || pending.length > 0
@@ -3013,7 +3176,7 @@ function enqueueClassifiedRecord(record) {
   );
 }
 
-function handleLine(raw) {
+function handleLine(raw, retryAttempt = 0, retryDeadline = 0) {
   let line = raw.trim();
   if (!line) return;
   pipelineAccounting.record('received', 'input');
@@ -3112,6 +3275,7 @@ function handleLine(raw) {
     return;
   }
   const processClassification = attributor.classify(o);
+  if (deferAttributionRetry(raw, o, processClassification, retryAttempt, retryDeadline)) return;
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
@@ -3136,29 +3300,23 @@ function handleLine(raw) {
   const allowlistMatched = agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification);
   const evaluationLifecycle = !allowlistMatched && evaluationLifecycleMatch(o, processClassification);
   const unresolvedExit = !allowlistMatched && !evaluationLifecycle && unresolvedExitMatch(o, processClassification);
-  const unresolvedExitLimited = !allowlistMatched && !evaluationLifecycle && !unresolvedExit
+  const retryExpired = retryAttempt >= MAX_ATTRIBUTION_RETRY_ATTEMPTS
+    || (retryDeadline > 0 && Date.now() >= retryDeadline);
+  const unresolvedExec = !allowlistMatched && !evaluationLifecycle && !unresolvedExit
+    && unresolvedExecMatch(o, processClassification, retryExpired);
+  const unresolvedExitLimited = !allowlistMatched && !evaluationLifecycle && !unresolvedExit && !unresolvedExec
     && eventKind(o) === 'ProcessExit' && processClassification.state === 'unknown' && unresolvedExitCapacity();
   const unresolvedExitDisabled = unresolvedExitLimited && UNRESOLVED_EXIT_LIMIT <= 0;
-  if (!allowlistMatched && !evaluationLifecycle && !unresolvedExit) {
-    attributionCounts.agentAllowlistScopedOut++;
-    const reason = unresolvedExitDisabled
-      ? 'unresolved_exit_disabled'
-      : unresolvedExitLimited ? 'unresolved_exit_capacity' : 'agent_allowlist';
-    pipelineAccounting.record('filtered', reason);
-    pipelineDiagnostics.record(
-      { ...diagnosticBody(), classification: processClassification.state },
-      'filtered',
-      reason,
-    );
-    return;
-  }
-  if (unresolvedExit) unresolvedExitRetained++;
-  if (evaluationLifecycle || unresolvedExit) {
+  if (unresolvedExit || unresolvedExec) unresolvedExitRetained++;
+  if (unresolvedExit) unresolvedExitGenerations.add(unresolvedProcessKey(o));
+  if (evaluationLifecycle || unresolvedExit || unresolvedExec) {
     o.process = { ...o.process, lifecycleReason: 'ancestry_incomplete' };
     line = JSON.stringify(o);
     pipelineDiagnostics.record(
       diagnosticBody(),
-      evaluationLifecycle ? 'evaluation_lifecycle_retained' : 'unresolved_exit_retained',
+      evaluationLifecycle
+        ? 'evaluation_lifecycle_retained'
+        : unresolvedExit ? 'unresolved_exit_retained' : 'unresolved_exec_retained',
       'ancestry_incomplete',
     );
   }
@@ -3218,6 +3376,30 @@ function handleLine(raw) {
     classification,
     resolvedCaptureDecision,
   );
+  // The coarse env-based Agent allowlist must not override a specific published keep decision:
+  // evaluation task workloads are frequently classified as infrastructure by the broad inventory
+  // while the filter rules already proved the same cgroup belongs to an Agent family. Without
+  // this exemption the allowlist silently wipes their FileAccess/FileDelete evidence, breaking
+  // file-level task verification even though the same cgroup's exec/exit records are retained.
+  if (
+    !isAgentKeepDecision(decision)
+    && !allowlistMatched
+    && !evaluationLifecycle
+    && !unresolvedExit
+    && !unresolvedExec
+  ) {
+    attributionCounts.agentAllowlistScopedOut++;
+    const reason = unresolvedExitDisabled
+      ? 'unresolved_exit_disabled'
+      : unresolvedExitLimited ? 'unresolved_exit_capacity' : 'agent_allowlist';
+    pipelineAccounting.record('filtered', reason);
+    pipelineDiagnostics.record(
+      { ...diagnosticBody(), classification: processClassification.state },
+      'filtered',
+      reason,
+    );
+    return;
+  }
   // Runtime lifecycle is rooted in ProcessKey, but placement/confirmation can come from Docker,
   // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
   // its process-instance ID with a workload-level ID.

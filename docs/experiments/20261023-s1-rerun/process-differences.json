@@ -1,0 +1,624 @@
+{
+  "alignment": "Per-task PID/count comparison inside archived short execution windows; not a generation-safe universal matcher.",
+  "tasks": [
+    {
+      "task": "fix-git",
+      "exec": {
+        "AnySentry": 38,
+        "AgentSight": 40,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 2,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 3682847,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 3683136,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 25,
+        "AgentSight": 34,
+        "shared_pid_count": 25,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 3682847,
+            "comm": "sleep",
+            "at_ms": 1792745786206,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3683716,
+            "comm": "id",
+            "at_ms": 1792745790189,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3683715,
+            "comm": "env",
+            "at_ms": 1792745790241,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3683839,
+            "comm": "sh",
+            "at_ms": 1792745791206,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3690510,
+            "comm": "git",
+            "at_ms": 1792745852072,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3695752,
+            "comm": "sh",
+            "at_ms": 1792745899572,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3696606,
+            "comm": "git",
+            "at_ms": 1792745903822,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3696662,
+            "comm": "sh",
+            "at_ms": 1792745903961,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3697671,
+            "comm": "sh",
+            "at_ms": 1792745912248,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          }
+        ]
+      }
+    },
+    {
+      "task": "db-wal-recovery",
+      "exec": {
+        "AnySentry": 33,
+        "AgentSight": 37,
+        "AnySentry_only_pid_count_surplus": 0,
+        "AgentSight_only_pid_count_surplus": 4,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 3682596,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 3682902,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 3685763,
+            "count": 1,
+            "commands": [
+              "xxd /app/main.db-wal"
+            ]
+          },
+          {
+            "pid": 3685764,
+            "count": 1,
+            "commands": [
+              "head -60"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 25,
+        "AgentSight": 36,
+        "shared_pid_count": 25,
+        "AnySentry_only": [],
+        "AgentSight_only": [
+          {
+            "pid": 3682596,
+            "comm": "sleep",
+            "at_ms": 1792745785787,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3683670,
+            "comm": "locale-check",
+            "at_ms": 1792745789945,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3683674,
+            "comm": "mesg",
+            "at_ms": 1792745789948,
+            "exit_code": 2,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3683823,
+            "comm": "sh",
+            "at_ms": 1792745791075,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3684973,
+            "comm": "xxd",
+            "at_ms": 1792745801029,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3684974,
+            "comm": "head",
+            "at_ms": 1792745801029,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3684976,
+            "comm": "sh",
+            "at_ms": 1792745801066,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3685763,
+            "comm": "xxd",
+            "at_ms": 1792745809333,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3685764,
+            "comm": "head",
+            "at_ms": 1792745809333,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3685762,
+            "comm": "bash",
+            "at_ms": 1792745809333,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3695968,
+            "comm": "sh",
+            "at_ms": 1792745901238,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          }
+        ]
+      }
+    },
+    {
+      "task": "polyglot-c-py",
+      "exec": {
+        "AnySentry": 52,
+        "AgentSight": 62,
+        "AnySentry_only_pid_count_surplus": 2,
+        "AgentSight_only_pid_count_surplus": 12,
+        "AnySentry_only": [
+          {
+            "pid": 3705037,
+            "count": 1,
+            "commands": [
+              "/bin/sh -c node ~/.kimi-code/hooks/langfuse-trace.mjs"
+            ]
+          },
+          {
+            "pid": 3705033,
+            "count": 1,
+            "commands": [
+              "sort -u"
+            ]
+          }
+        ],
+        "AgentSight_only": [
+          {
+            "pid": 3682585,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 3682897,
+            "count": 1,
+            "commands": [
+              "sleep 1"
+            ]
+          },
+          {
+            "pid": 3692780,
+            "count": 1,
+            "commands": [
+              "/usr/bin/ld -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccgRZ8uy.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt"
+            ]
+          },
+          {
+            "pid": 3715796,
+            "count": 1,
+            "commands": [
+              "gcc -Wall /app/polyglot/main.py.c -o /app/polyglot/cmain"
+            ]
+          },
+          {
+            "pid": 3715797,
+            "count": 1,
+            "commands": [
+              "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1 -quiet -imultiarch x86_64-linux-gnu /app/polyglot/main.py.c -quiet -dumpdir /app/polyglot/cmain- -dumpbase main.py.c -dumpbase-ext .c -mtune=generic -march=x86-64 -Wall -fasynchronous-unwind-tables -fstack-protecto"
+            ]
+          },
+          {
+            "pid": 3715798,
+            "count": 1,
+            "commands": [
+              "as --64 -o /tmp/ccEXtHMa.o /tmp/ccknWwe2.s"
+            ]
+          },
+          {
+            "pid": 3715799,
+            "count": 1,
+            "commands": [
+              "/usr/libexec/gcc/x86_64-linux-gnu/13/collect2 -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccBCQmT0.res -plugin-opt=-pass-through=-lgcc -plugin-opt"
+            ]
+          },
+          {
+            "pid": 3715800,
+            "count": 1,
+            "commands": [
+              "/usr/bin/ld -plugin /usr/libexec/gcc/x86_64-linux-gnu/13/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/x86_64-linux-gnu/13/lto-wrapper -plugin-opt=-fresolution=/tmp/ccBCQmT0.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt"
+            ]
+          },
+          {
+            "pid": 3715801,
+            "count": 1,
+            "commands": [
+              "/app/polyglot/cmain 0"
+            ]
+          },
+          {
+            "pid": 3715804,
+            "count": 1,
+            "commands": [
+              "/app/polyglot/cmain 10"
+            ]
+          },
+          {
+            "pid": 3715805,
+            "count": 1,
+            "commands": [
+              "/app/polyglot/cmain 50"
+            ]
+          },
+          {
+            "pid": 3715806,
+            "count": 1,
+            "commands": [
+              "/app/polyglot/cmain 93"
+            ]
+          }
+        ]
+      },
+      "exit": {
+        "AnySentry": 22,
+        "AgentSight": 60,
+        "shared_pid_count": 21,
+        "AnySentry_only": [
+          {
+            "pid": 3705037,
+            "at_ms": 1792745971266
+          }
+        ],
+        "AgentSight_only": [
+          {
+            "pid": 3682585,
+            "comm": "sleep",
+            "at_ms": 1792745785751,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3683648,
+            "comm": "locale-check",
+            "at_ms": 1792745789860,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3683653,
+            "comm": "mesg",
+            "at_ms": 1792745789866,
+            "exit_code": 2,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692780,
+            "comm": "ld",
+            "at_ms": 1792745872300,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3692779,
+            "comm": "collect2",
+            "at_ms": 1792745872301,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692782,
+            "comm": "cmain",
+            "at_ms": 1792745872307,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692784,
+            "comm": "cmain",
+            "at_ms": 1792745872309,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692786,
+            "comm": "cmain",
+            "at_ms": 1792745872315,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692788,
+            "comm": "cmain",
+            "at_ms": 1792745872317,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692790,
+            "comm": "cmain",
+            "at_ms": 1792745872321,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3692792,
+            "comm": "cmain",
+            "at_ms": 1792745872331,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3705022,
+            "comm": "which",
+            "at_ms": 1792745970898,
+            "exit_code": 1,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3705031,
+            "comm": "ls",
+            "at_ms": 1792745970903,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3705032,
+            "comm": "grep",
+            "at_ms": 1792745970903,
+            "exit_code": 1,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708206,
+            "comm": "sh",
+            "at_ms": 1792745998463,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708811,
+            "comm": "as",
+            "at_ms": 1792746005037,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708831,
+            "comm": "cmain",
+            "at_ms": 1792746005090,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708832,
+            "comm": "cmain",
+            "at_ms": 1792746005094,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708833,
+            "comm": "cmain",
+            "at_ms": 1792746005098,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708834,
+            "comm": "cmain",
+            "at_ms": 1792746005099,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708835,
+            "comm": "cmain",
+            "at_ms": 1792746005102,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708836,
+            "comm": "cmain",
+            "at_ms": 1792746005106,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708837,
+            "comm": "cmain",
+            "at_ms": 1792746005108,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708838,
+            "comm": "cmain",
+            "at_ms": 1792746005109,
+            "exit_code": 1,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3708839,
+            "comm": "sh",
+            "at_ms": 1792746005116,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3713831,
+            "comm": "sh",
+            "at_ms": 1792746045947,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3715190,
+            "comm": "sh",
+            "at_ms": 1792746053603,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3715797,
+            "comm": "cc1",
+            "at_ms": 1792746060250,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715798,
+            "comm": "as",
+            "at_ms": 1792746060260,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715800,
+            "comm": "ld",
+            "at_ms": 1792746060320,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715799,
+            "comm": "collect2",
+            "at_ms": 1792746060322,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715796,
+            "comm": "gcc",
+            "at_ms": 1792746060322,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715801,
+            "comm": "cmain",
+            "at_ms": 1792746060326,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715804,
+            "comm": "cmain",
+            "at_ms": 1792746060346,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715805,
+            "comm": "cmain",
+            "at_ms": 1792746060347,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715806,
+            "comm": "cmain",
+            "at_ms": 1792746060349,
+            "exit_code": 0,
+            "AnySentry_has_exec": false
+          },
+          {
+            "pid": 3715795,
+            "comm": "bash",
+            "at_ms": 1792746060350,
+            "exit_code": 0,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3715807,
+            "comm": "sh",
+            "at_ms": 1792746060370,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          },
+          {
+            "pid": 3722270,
+            "comm": "sh",
+            "at_ms": 1792746118850,
+            "exit_code": 127,
+            "AnySentry_has_exec": true
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,190 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AnySentry 与 AgentSight 实验结果（核对版）</title><style>
+body{font-family:"Noto Sans CJK SC","Microsoft YaHei",Arial,sans-serif;line-height:1.65;color:#1f2937;margin:28px;max-width:1600px}
+h1{font-size:26px}h2{font-size:22px;margin-top:32px}h3{font-size:18px;margin-top:24px}
+table{border-collapse:collapse;width:100%;margin:16px 0 24px;font-size:13px;table-layout:auto}
+th,td{border:1px solid #cbd5e1;padding:8px 10px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{background:#eaf1f8;font-weight:600}tr:nth-child(even) td{background:#f8fafc}
+code{font-family:monospace;background:#f3f4f6;padding:1px 3px}li{margin:5px 0}
+
+small{display:block;color:#475569}td:nth-child(3),td:nth-child(4),td:nth-child(5),td:nth-child(6){white-space:nowrap;text-align:right}th{overflow-wrap:normal}
+
+small{display:block;color:#475569}td:nth-child(3),td:nth-child(4),td:nth-child(5),td:nth-child(6){white-space:nowrap;text-align:right}th{overflow-wrap:normal}
+</style><style id="report-editor-style">
+#report-editor{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 2px 8px #0f172a0d;margin-bottom:20px;font-size:14px}
+#report-editor button{font:inherit;min-height:44px;padding:8px 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;cursor:pointer}
+#report-editor #report-save{background:#155e75;color:white;border-color:#155e75}
+#report-editor button:hover{filter:brightness(.95)}#report-editor button:focus-visible{outline:3px solid #0284c7;outline-offset:2px}#report-editor button:disabled{opacity:.6;cursor:wait}
+#report-editor-status{flex:1;min-width:200px;color:#475569;font-size:13px}
+#report-content[contenteditable=true]:focus{outline:2px solid #7dd3fc;outline-offset:6px}
+#report-content[contenteditable=true] td:focus-within{background:#f0f9ff}
+@media print{#report-editor{display:none!important}#report-content{outline:none!important}body{margin:0;max-width:none}}
+</style>
+</head><body>
+<div id="report-editor" role="region" aria-label="报告编辑工具栏">
+<strong>报告编辑</strong>
+<button type="button" id="report-toggle" aria-pressed="true">退出编辑</button>
+<button type="button" id="report-save">保存 HTML</button>
+<button type="button" id="report-download">导出副本</button>
+<span id="report-editor-status" role="status" aria-live="polite">点击文字或表格即可编辑；Ctrl / ⌘ + S 保存 HTML。</span>
+</div>
+<main id="report-content" contenteditable="true" spellcheck="false" aria-label="可编辑实验报告">
+<h1>AnySentry 与 AgentSight 的 Terminal-Bench 2.1 进程证据对照</h1>
+<p>实验执行：2026-10-27—10-30；数据复核：2026-10-30。单任务 fix-git 已更新为 10 月 30 日最新重跑，其余行保留各自实验轮次；不是当前部署版本的统一成绩。</p>
+<h2>1. 单任务与同题并发：关键程序记录对照</h2>
+<p>单任务、S1、S2 是不同执行轮次，不能将它们的原始数量直接作为并发或修复的因果对照。第 1、3 节使用产品数据库归档记录；第 4 节明确使用独立原始 Collector。两个数据层级不合并排名。</p>
+<h3>1.1 单任务样本</h3>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>单任务 · 10-30 14:58</td><td><code>fix-git</code></td><td>72 / 50</td><td>66 / 52</td><td>20 已确认 + 1 未确认 / 21 exit</td><td>21 / 21</td><td>Git 记录数对齐；exec 确认状态不同</td><td>最新重跑 reward 1.0。AnySentry 和独立原始 Collector 均为 20 条 confirmed + 1 条 unconfirmed Git 记录、21 条 exit；AgentSight 为 21 条 exec、21 条 exit。PID 676583 已在原窗口入库；此前 confirmed-only 将其排除，不是事件未记录或迟到。</td></tr><tr><td>单任务 · 10-27 22:01</td><td><code>db-wal-recovery</code></td><td>47 / 42</td><td>16 / 12</td><td>8 / 8</td><td>2 / 2</td><td>AnySentry 所选关键记录更多</td><td>统一排除 python3/sqlite3 的版本探测；比较实际 WAL 检查、备份、恢复与验证程序。</td></tr><tr><td>单任务 · 10-27 20:51</td><td><code>polyglot-c-py</code></td><td>38 / 36</td><td>32 / 30</td><td>14 / 14</td><td>14 / 14</td><td>所选关键记录持平</td><td>统一统计 gcc/cc1/as/collect2/ld 与实际 cmain，不再只数答案程序。成功 exec 不代表进程退出码必为 0。</td></tr></tbody></table>
+<p><strong>fix-git 最新重跑三方核对：</strong>该轮 Git 记录均已保留。confirmed/unconfirmed 是 AnySentry 的执行确认状态，不能把未确认记录当成缺失，也不能仅凭合计相同声称未确认记录已获得成功 exec 证明。</p>
+<table><thead><tr><th>数据源</th><th>confirmed Git exec</th><th>unconfirmed Git 记录</th><th>Git exec 记录合计</th><th>Git exit</th></tr></thead><tbody>
+<tr><td>独立原始 Collector</td><td>20</td><td>1</td><td>21</td><td>21</td></tr>
+<tr><td>AnySentry</td><td>20</td><td>1</td><td>21</td><td>21</td></tr>
+<tr><td>AgentSight</td><td>21（自身口径）</td><td>不适用</td><td>21</td><td>21</td></tr></tbody></table>
+<p>未确认记录：<code>git status --short --branch</code>，PID <code>676583</code>，事件 <code>evt_a3e9c65251d49c7e</code>，<code>argv_incomplete=true</code>、<code>exec_confirmed=false</code>，位于原窗口内。原始 Collector 的 dropped/output_dropped 均为 0，缺启动时间、代际冲突和创建父代际不匹配均为 0。总 exec 仍报告 AnySentry confirmed 72 条，不将未确认记录静默加进 confirmed。</p>
+<p><a href="experiments/20261030-final-report/fix-single-r2-analysis.json">最新重跑分析原件</a>。10 月 27 日的旧异常样本另保留在<a href="experiments/20261030-single-vs-s1-review/review.json">历史复核</a>中，本次重跑不追溯消除旧轮次问题。</p>
+<h3>1.2 S2-G：fix-git × 2</h3>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>S2-G · 10-27 21:04</td><td><code>fix-git A</code></td><td>101 / 86</td><td>74 / 57</td><td>28 / 28</td><td>27 / 25</td><td>AnySentry 所选关键记录更多</td><td>统计实际 Git 程序（含 git-core 路径）；关键 exit 按双方关键 PID 并集核对。</td></tr><tr><td>S2-G · 10-27 21:04</td><td><code>fix-git B</code></td><td>70 / 62</td><td>39 / 30</td><td>17 / 17</td><td>14 / 13</td><td>AnySentry 所选关键记录更多</td><td>统计实际 Git 程序（含 git-core 路径）；关键 exit 按双方关键 PID 并集核对。</td></tr><tr><td>合计</td><td>本表归档样本</td><td>171 / 148</td><td>113 / 87</td><td>45 / 45</td><td>41 / 38</td><td>AnySentry 所选关键记录更多</td><td>跨任务合计仅为所选记录数，不是完整内核覆盖率。</td></tr></tbody></table>
+<h3>1.3 S2-P：polyglot-c-py × 4，三个有效样本</h3>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>S2-P · 10-28 17:27</td><td><code>polyglot-c-py B</code></td><td>62 / 59</td><td>33 / 31</td><td>14 / 14</td><td>14 / 14</td><td>所选关键记录持平</td><td>统一统计 gcc/cc1/as/collect2/ld 与实际 cmain，不再只数答案程序。成功 exec 不代表进程退出码必为 0。</td></tr><tr><td>S2-P · 10-28 17:27</td><td><code>polyglot-c-py C</code></td><td>54 / 50</td><td>26 / 25</td><td>10 / 10</td><td>10 / 10</td><td>所选关键记录持平</td><td>统一统计 gcc/cc1/as/collect2/ld 与实际 cmain，不再只数答案程序。成功 exec 不代表进程退出码必为 0。</td></tr><tr><td>S2-P · 10-28 17:27</td><td><code>polyglot-c-py D</code></td><td>65 / 61</td><td>33 / 30</td><td>16 / 16</td><td>13 / 13</td><td>AnySentry 所选关键记录更多</td><td>含编译链及重复尝试；AgentSight 缺少 cmain 94、100、500 的 exec/exit。额外缺少循环 Bash exit，未混入本列。</td></tr><tr><td>合计</td><td>本表归档样本</td><td>181 / 170</td><td>92 / 86</td><td>40 / 40</td><td>37 / 37</td><td>AnySentry 所选关键记录更多</td><td>跨任务合计仅为所选记录数，不是完整内核覆盖率。</td></tr></tbody></table>
+<h3>1.4 S2-D：db-wal-recovery × 4</h3>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>S2-D · 10-28 18:45</td><td><code>db-wal-recovery A</code></td><td>47 / 43</td><td>40 / 36</td><td>7 / 7</td><td>7 / 7</td><td>所选关键记录持平</td><td>评分器超时，仅作观测样本。恢复/校验主命令的 exit 按双方关键 PID 并集核对，不要求同一家先有 exec。</td></tr><tr><td>S2-D · 10-28 18:45</td><td><code>db-wal-recovery B</code></td><td>47 / 42</td><td>41 / 36</td><td>15 / 15</td><td>15 / 14</td><td>AnySentry 所选关键记录更多</td><td>reward 1.0。恢复/校验主命令的 exit 按双方关键 PID 并集核对，不要求同一家先有 exec。</td></tr><tr><td>S2-D · 10-28 18:45</td><td><code>db-wal-recovery C</code></td><td>41 / 36</td><td>28 / 26</td><td>10 / 10</td><td>8 / 8</td><td>AnySentry 所选关键记录更多</td><td>reward 1.0。恢复/校验主命令的 exit 按双方关键 PID 并集核对，不要求同一家先有 exec。</td></tr><tr><td>S2-D · 10-28 18:45</td><td><code>db-wal-recovery D</code></td><td>41 / 37</td><td>31 / 26</td><td>8 / 8</td><td>6 / 6</td><td>AnySentry 所选关键记录更多</td><td>评分器超时，仅作观测样本。恢复/校验主命令的 exit 按双方关键 PID 并集核对，不要求同一家先有 exec。</td></tr><tr><td>合计</td><td>本表归档样本</td><td>176 / 158</td><td>140 / 124</td><td>40 / 40</td><td>36 / 35</td><td>AnySentry 所选关键记录更多</td><td>跨任务合计仅为所选记录数，不是完整内核覆盖率。</td></tr></tbody></table>
+<p>S2-P 的 A 未完成，不计入；S2-D 的 B、C reward 为 1.0，A、D 为评分器超时，仍保留为观测样本。以上是关键记录数，不以 AnySentry 自身记录数定义无偏完整真值。</p>
+<h2>2. 实验设置与统一计数规则</h2>
+<ul><li>Harbor 调度 Kimi Code 执行 Terminal-Bench 2.1；两套系统观测同一次运行。不同轮次模型路径、负载及采集状态可能不同，未证明所有轮次的版本与配置完全等同。</li>
+<li>exec：程序成功加载，不等于工具调用数，也不等于命令最终成功；exit：进程最终退出。一个 PID 可以多次 exec，但只有一次最终 exit。</li>
+<li>AnySentry 全部 exec 列默认仅统计 exec_confirmed=true；未确认关键记录另行明示。unconfirmed 表示缺少该执行确认条件，不等于事件未采集，也不自动等于执行失败。AgentSight 没有完全对应的确认分类，不直接将两种确认数相减称为漏采数。</li>
+<li>fix-git：按实际可执行程序 basename=git 统计，包含绝对 git-core 路径及其辅助程序；不匹配 Bash 参数中的 Git 文本。</li>
+<li>数据库恢复：统计 xxd、cp、python3、sqlite3、file、stat、rm、mv、dd、base64、openssl 的实际程序执行；排除 --version/-V 探测，不把通用 Shell 包装重复计入。</li>
+<li>polyglot：统一统计 gcc、cc1、as、collect2、ld 及 /app/polyglot/cmain；包括实际执行过的编译失败与重试。不能仅以 cmain 数量代表全部关键程序。</li>
+<li>关键 exit 使用双方关键 exec 对应 PID 的并集选择，即允许“某系统有 exit、无 exec”。这是本轮短窗口对账，不是通用的跨轮裸 PID 归属算法。</li>
+<li>原生 Read/Edit/Write 不一定创建进程；文件、网络和模型内容须单独核验，不伪装成 exec/exit。官方评分证明任务通过，不证明内核事件采齐。</li>
+<li>表内全部记录与关键记录都采用对应轮次的归档窗口。最新单任务 fix-git 的未确认记录位于原窗口内；旧轮次扩大窗口补查另存历史复核，不混用两轮数值。</li></ul>
+<p><a href="experiments/20261030-final-report/recount.json">各轮运行标识、筛选规则与逐事件计数</a>；<a href="experiments/20261030-single-vs-s1-review/review.json">旧轮单任务 fix-git 迟到记录复核</a>。</p>
+<h2>3. 并发场景汇总</h2><h3>3.1 S1：异任务并发</h3>
+<p>轮次：s1-c24-recheck-20261028-110213；fix-git、db-wal-recovery、polyglot-c-py 三个容器并发，reward 均为 1.0。与第 1 节单任务不是同一轮；采用上文一致的任务程序筛选规则。</p>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>S1 · 10-28 11:03</td><td><code>db-wal-recovery</code></td><td>62 / 58</td><td>45 / 42</td><td>10 / 10</td><td>10 / 10</td><td>所选关键记录持平</td><td>统计实际 Git 程序（含 git-core 路径）；关键 exit 按双方关键 PID 并集核对。</td></tr><tr><td>S1 · 10-28 11:03</td><td><code>fix-git</code></td><td>75 / 62</td><td>58 / 46</td><td>22 / 22</td><td>22 / 22</td><td>所选关键记录持平</td><td>统计实际 Git 程序（含 git-core 路径）；关键 exit 按双方关键 PID 并集核对。</td></tr><tr><td>S1 · 10-28 11:03</td><td><code>polyglot-c-py</code></td><td>47 / 45</td><td>31 / 30</td><td>12 / 12</td><td>12 / 12</td><td>所选关键记录持平</td><td>统一统计 gcc/cc1/as/collect2/ld 与实际 cmain，不再只数答案程序。成功 exec 不代表进程退出码必为 0。</td></tr><tr><td>合计</td><td>本表归档样本</td><td>184 / 165</td><td>134 / 118</td><td>44 / 44</td><td>44 / 44</td><td>所选关键记录持平</td><td>跨任务合计仅为所选记录数，不是完整内核覆盖率。</td></tr></tbody></table>
+<h3>3.2 S2：同题并发汇总</h3>
+<table><thead><tr><th>实验 / 时间</th><th>任务 / 实例</th><th>AnySentry 全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td>S2-G · 10-27 21:04</td><td><code>fix-git × 2</code></td><td>171 / 148</td><td>113 / 87</td><td>45 / 45</td><td>41 / 38</td><td>AnySentry 所选关键记录更多</td><td>与第 1 节 A/B 的同口径合计一致；Git 辅助程序与绝对路径均按同一规则处理。</td></tr><tr><td>S2-P · 10-28 17:27</td><td><code>polyglot-c-py × 4，三个有效样本</code></td><td>181 / 170</td><td>92 / 86</td><td>40 / 40</td><td>37 / 37</td><td>AnySentry 所选关键记录更多</td><td>含编译链和答案程序；只计 B/C/D，A 未完成。关键缺口来自 D 的三次 cmain。</td></tr><tr><td>S2-D · 10-28 18:45</td><td><code>db-wal-recovery × 4</code></td><td>176 / 158</td><td>140 / 124</td><td>40 / 40</td><td>36 / 35</td><td>AnySentry 所选关键记录更多</td><td>A/D 评分器超时，B/C reward 1.0；四例均保留作观测对照，不将超时写成评分通过。</td></tr></tbody></table>
+<p>本节与第 1 节相同 S2 轮次的数字来自同一份计算结果，不另设统计口径。数量更多不自动证明关联更准确。</p>
+<h2>4. 三任务混合并发（S3 候选）：原始 Collector 对照</h2>
+<p>轮次：s3-mixed-20261028-213330。三个任务 reward 均为 1.0；Agent 执行约 163.0、248.6、59.7 秒，三路重叠约 59.7 秒。这是短时混合并发，不是 40 分钟长程验收。</p>
+<p>此处围绕部署/破解任务另选必要安装主命令、账户与权限、任务程序和结果验证。排除包管理器内部辅助、通用包装、Git 自动维护和临时清理。仍统一以实际 exec 与对应 PID 的 exit 计数；7z 的三个业务环节不再冒充三条内核事件。</p>
+<table><thead><tr><th>任务</th><th>AnySentry 原始全部 exec / exit</th><th>AgentSight 全部 exec / exit</th><th>AnySentry 原始关键 exec / exit</th><th>AgentSight 关键 exec / exit</th><th>记录对照</th><th>说明</th></tr></thead><tbody><tr><td><code>configure-git-webserver</code></td><td>446 / 447</td><td>278 / 264</td><td>35 / 35</td><td>34 / 32</td><td>AnySentry 原始所选关键记录更多</td><td>AgentSight 缺少最终 nginx exec/exit，以及 git clone、git-upload-pack 的 exit。覆盖依赖主命令、账户权限、仓库部署、端口及 HTTP 验证。</td></tr><tr><td><code>crack-7z-hash</code></td><td>95 / 88</td><td>66 / 58</td><td>7 / 7</td><td>7 / 7</td><td>所选关键记录持平</td><td>双方均有 2 条 apt-get、2 次 Perl 哈希提取（含失败后重试）、1 次 John、1 次实际 7z 解压、1 次 rg 定位结果，共 7 exec、7 exit。</td></tr><tr><td><code>polyglot-c-py</code></td><td>38 / 37</td><td>31 / 28</td><td>12 / 12</td><td>12 / 10</td><td>AnySentry 原始所选关键记录更多</td><td>编译链 5 条 exec，加 7 次 cmain；双方 exec 对齐。AgentSight 缺少 gcc、collect2 的 exit。</td></tr></tbody></table>
+<p>此表 AnySentry 为独立原始 Collector，不是产品入库成绩。本轮产品任务窗口没有 ToolExec；历史诊断包括 agent_allowlist 过滤、批次拒绝和 request aborted。原始对照记录不能替代产品入库结果。</p>
+<p>配置文件写入、秘密文件读取、solution.txt 与源码写入也是关键行为，但没有独立核对的文件内核证据时，只能标为原生工具日志证据，不能宣称由本表完整覆盖。<a href="experiments/20261030-s3-critical-recount/recount.json">S3 逐程序与 PID 筛选明细</a>。</p>
+</main>
+<script id="report-editor-script">
+(() => {
+  'use strict';
+  const report = document.getElementById('report-content');
+  const status = document.getElementById('report-editor-status');
+  const toggle = document.getElementById('report-toggle');
+  const saveButton = document.getElementById('report-save');
+  let fileHandle = null;
+  let draftTimer;
+  let saving = false;
+  let draftAvailable = true;
+  // A rebuilt report gets a different draft key, preventing an old draft hiding new results.
+  const original = report.innerHTML;
+  let hash = 2166136261;
+  for (let i = 0; i < original.length; i++) hash = Math.imul(hash ^ original.charCodeAt(i), 16777619);
+  const draftKey = 'anysentry-report-draft-v1:' + location.pathname + ':' + (hash >>> 0);
+  function draft() {
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({html: report.innerHTML, at: Date.now()}));
+      return true;
+    } catch (_) { draftAvailable = false; return false; }
+  }
+  try {
+    const stored = JSON.parse(localStorage.getItem(draftKey) || 'null');
+    if (stored && typeof stored.html === 'string') {
+      report.innerHTML = stored.html;
+      status.textContent = '已恢复本浏览器草稿；点击“保存 HTML”写出修改后的文件。';
+    }
+  } catch (_) { draftAvailable = false; }
+  function changed() {
+    clearTimeout(draftTimer);
+    status.textContent = '有未写入 HTML 文件的修改…';
+    draftTimer = setTimeout(() => {
+      status.textContent = draft()
+        ? '草稿已暂存于本浏览器；点击“保存 HTML”写出文件。'
+        : '浏览器无法暂存草稿，请点击“保存 HTML”保存文件。';
+    }, 500);
+  }
+  report.addEventListener('input', changed);
+  // Paste plain text, preserving the existing table and avoiding pasted HTML/scripts.
+  report.addEventListener('paste', event => {
+    if (report.getAttribute('contenteditable') !== 'true' || !event.clipboardData) return;
+    event.preventDefault();
+    document.execCommand('insertText', false, event.clipboardData.getData('text/plain'));
+    changed();
+  });
+  toggle.addEventListener('click', () => {
+    const enabled = report.getAttribute('contenteditable') !== 'true';
+    report.setAttribute('contenteditable', String(enabled));
+    toggle.setAttribute('aria-pressed', String(enabled));
+    toggle.textContent = enabled ? '退出编辑' : '开启编辑';
+    if (enabled) report.focus();
+  });
+  function filename() {
+    try { return decodeURIComponent(location.pathname.split('/').pop()) || 'anysentry-report.html'; }
+    catch (_) { return 'anysentry-report.html'; }
+  }
+  function serialize() {
+    const copy = document.documentElement.cloneNode(true);
+    copy.querySelector('#report-content').setAttribute('contenteditable', 'true');
+    copy.querySelector('#report-toggle').setAttribute('aria-pressed', 'true');
+    copy.querySelector('#report-toggle').textContent = '退出编辑';
+    copy.querySelector('#report-save').removeAttribute('disabled');
+    copy.querySelector('#report-editor-status').textContent = '点击文字或表格即可编辑；Ctrl / ⌘ + S 保存 HTML。';
+    return '<!doctype html>' + String.fromCharCode(10) + copy.outerHTML;
+  }
+  function download() {
+    draft();
+    const url = URL.createObjectURL(new Blob([serialize()], {type: 'text/html;charset=utf-8'}));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename();
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    status.textContent = '已导出修改后的 HTML 副本；下载不会自动覆盖原文件。';
+  }
+  async function save() {
+    if (saving) return;
+    saving = true;
+    saveButton.disabled = true;
+    clearTimeout(draftTimer);
+    draft();
+    try {
+      if (!window.showSaveFilePicker) { download(); return; }
+      if (!fileHandle) fileHandle = await window.showSaveFilePicker({
+        suggestedName: filename(),
+        types: [{description: 'HTML 报告', accept: {'text/html': ['.html']}}],
+      });
+      const stream = await fileHandle.createWritable();
+      try { await stream.write(serialize()); await stream.close(); }
+      catch (error) { try { await stream.abort(); } catch (_) {} throw error; }
+      status.textContent = '已保存到所选 HTML 文件。';
+    } catch (error) {
+      if (error.name === 'AbortError') status.textContent = '已取消保存，页面修改仍保留。';
+      else if (error.name === 'SecurityError' || error.name === 'NotSupportedError') download();
+      else {
+        fileHandle = null;
+        status.textContent = '未能写入文件，请重试或使用“导出副本”。';
+      }
+    } finally { saving = false; saveButton.disabled = false; }
+  }
+  saveButton.addEventListener('click', save);
+  document.getElementById('report-download').addEventListener('click', download);
+  document.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault();
+      save();
+    }
+  });
+  if (!draftAvailable) status.textContent = '可直接编辑；本浏览器不支持草稿暂存，请用“保存 HTML”保存。';
+})();
+</script>
+</body></html>

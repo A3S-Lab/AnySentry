@@ -1,0 +1,230 @@
+[
+  {
+    "task": "fix-git",
+    "job": "kimi-s1r2-fix-git-20261023-165554",
+    "root_pid": 3681250,
+    "window_ms": [
+      1792745772226,
+      1792745922704
+    ],
+    "agent_execution": {
+      "started_at": "2026-10-23T08:56:17.226467Z",
+      "finished_at": "2026-10-23T08:58:32.704542Z"
+    },
+    "reward": {
+      "reward": 1.0
+    },
+    "exception": null,
+    "agent_seconds": 135.5,
+    "AnySentry": {
+      "FileAccess": 98,
+      "ProcessExit": 25,
+      "ToolExec": 38,
+      "Egress": 6
+    },
+    "AnySentry_exec_confirmed": 38,
+    "AgentSight": {
+      "write": 61,
+      "NET_CONNECT": 4,
+      "NET_BIND": 1,
+      "exec": 40,
+      "exit": 34
+    },
+    "prior_exec_exit": [
+      29,
+      36,
+      14,
+      30
+    ],
+    "native_sessions": [
+      {
+        "path": "/home/zhongyule/.kimi-code/sessions/wd_personal-site_be35bdff3600/session_a2206bf9-3510-4ddd-933c-aa06c45f7eea/agents/main/wire.jsonl",
+        "session_id": "session_a2206bf9-3510-4ddd-933c-aa06c45f7eea",
+        "sha256": "5dafb115aef7a67d09c47fcd42404b1ac0dbe7ac9e192b66a3b9a36cb16d0be3",
+        "counts": {
+          "metadata": 1,
+          "runtime.set_binding": 1,
+          "profile.bind": 1,
+          "permission.set_mode": 1,
+          "agent.message.appended": 16,
+          "agent.turn.started": 1,
+          "turn.prompt": 1,
+          "context.append_message": 3,
+          "plugin.session_start": 1,
+          "context.append_loop_event": 38,
+          "llm.tools_snapshot": 1,
+          "llm.request": 7,
+          "usage.record": 7,
+          "token_counting.measured": 7,
+          "file_history.tracked": 1,
+          "agent.turn.ended": 1,
+          "turn.ended": 1,
+          "token_counting.turn_recorded": 1,
+          "prompt.completed": 1,
+          "file_history.checkpoint": 1
+        },
+        "tokens_in": 151561,
+        "tokens_out": 1413,
+        "tools": null
+      }
+    ],
+    "model_records": {
+      "AgentSight": {
+        "n": 7,
+        "req": 7,
+        "resp": 7
+      }
+    }
+  },
+  {
+    "task": "db-wal-recovery",
+    "job": "kimi-s1r2-db-wal-recovery-20261023-165554",
+    "root_pid": 3681148,
+    "window_ms": [
+      1792745771850,
+      1792745911752
+    ],
+    "agent_execution": {
+      "started_at": "2026-10-23T08:56:16.850145Z",
+      "finished_at": "2026-10-23T08:58:21.752685Z"
+    },
+    "reward": {
+      "reward": 1.0
+    },
+    "exception": null,
+    "agent_seconds": 124.9,
+    "AnySentry": {
+      "FileAccess": 67,
+      "Egress": 6,
+      "ToolExec": 33,
+      "ProcessExit": 25
+    },
+    "AnySentry_exec_confirmed": 33,
+    "AgentSight": {
+      "write": 37,
+      "NET_CONNECT": 5,
+      "NET_BIND": 1,
+      "exec": 37,
+      "exit": 36
+    },
+    "prior_exec_exit": [
+      21,
+      30,
+      7,
+      22
+    ],
+    "native_sessions": [
+      {
+        "path": "/home/zhongyule/.kimi-code/sessions/wd_app_f53b52ad6d21/session_8320ae1d-b087-454b-99af-521aa8dddfb4/agents/main/wire.jsonl",
+        "session_id": "session_8320ae1d-b087-454b-99af-521aa8dddfb4",
+        "sha256": "8eadc2391a2ab9e63e40500c47a5247cdad56dfd07859cd116b889c2892421c8",
+        "counts": {
+          "metadata": 1,
+          "runtime.set_binding": 1,
+          "profile.bind": 1,
+          "permission.set_mode": 1,
+          "agent.message.appended": 15,
+          "agent.turn.started": 1,
+          "turn.prompt": 1,
+          "context.append_message": 3,
+          "plugin.session_start": 1,
+          "context.append_loop_event": 38,
+          "llm.tools_snapshot": 1,
+          "llm.request": 7,
+          "usage.record": 7,
+          "token_counting.measured": 7,
+          "agent.turn.ended": 1,
+          "turn.ended": 1,
+          "token_counting.turn_recorded": 1,
+          "prompt.completed": 1
+        },
+        "tokens_in": 163773,
+        "tokens_out": 2055,
+        "tools": null
+      }
+    ],
+    "model_records": {
+      "AgentSight": {
+        "n": 7,
+        "req": 7,
+        "resp": 7
+      }
+    }
+  },
+  {
+    "task": "polyglot-c-py",
+    "job": "kimi-s1r2-polyglot-c-py-20261023-165554",
+    "root_pid": 3681144,
+    "window_ms": [
+      1792745771837,
+      1792746154415
+    ],
+    "agent_execution": {
+      "started_at": "2026-10-23T08:56:16.837190Z",
+      "finished_at": "2026-10-23T09:02:24.415147Z"
+    },
+    "reward": {
+      "reward": 1.0
+    },
+    "exception": null,
+    "agent_seconds": 367.6,
+    "AnySentry": {
+      "FileAccess": 88,
+      "ToolExec": 52,
+      "ProcessExit": 22,
+      "Egress": 9
+    },
+    "AnySentry_exec_confirmed": 52,
+    "AgentSight": {
+      "write": 67,
+      "NET_CONNECT": 6,
+      "NET_BIND": 2,
+      "exec": 62,
+      "exit": 60
+    },
+    "prior_exec_exit": [
+      397,
+      240,
+      112,
+      218
+    ],
+    "native_sessions": [
+      {
+        "path": "/home/zhongyule/.kimi-code/sessions/wd_app_f53b52ad6d21/session_71015d89-7ae6-4009-8ef1-d20a6179c033/agents/main/wire.jsonl",
+        "session_id": "session_71015d89-7ae6-4009-8ef1-d20a6179c033",
+        "sha256": "be6523c48f36ff9a1fd4eb1b4d8f3fa575323662687a900c2ee5c04c2e333f80",
+        "counts": {
+          "metadata": 1,
+          "runtime.set_binding": 1,
+          "profile.bind": 1,
+          "permission.set_mode": 1,
+          "agent.message.appended": 22,
+          "agent.turn.started": 1,
+          "turn.prompt": 1,
+          "context.append_message": 3,
+          "plugin.session_start": 1,
+          "context.append_loop_event": 61,
+          "llm.tools_snapshot": 1,
+          "llm.request": 11,
+          "usage.record": 11,
+          "token_counting.measured": 11,
+          "file_history.tracked": 1,
+          "agent.turn.ended": 1,
+          "turn.ended": 1,
+          "token_counting.turn_recorded": 1,
+          "prompt.completed": 1
+        },
+        "tokens_in": 290530,
+        "tokens_out": 9789,
+        "tools": null
+      }
+    ],
+    "model_records": {
+      "AgentSight": {
+        "n": 11,
+        "req": 11,
+        "resp": 11
+      }
+    }
+  }
+]

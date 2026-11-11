@@ -1,0 +1,3605 @@
+{
+  "created_at": "2026-11-11T19:25:29.782683+08:00",
+  "paper": "/home/zhongyule/下载/SERO_UNIFIED_DRAFT_v0_23.pdf",
+  "paper_sha256": "5269d5d2233810b80b10c32984e5e7680cad873b9030e2bb420f2d8b5fc7cd6d",
+  "inventory_scope": "Only shallow eval/kimi-pro31*/results.json; result rows are not independent episodes or task families; no claim of full TB completion",
+  "all_archives": {
+    "directories": 28,
+    "rows": 229,
+    "unique_jobs": 228,
+    "unique_task_names": 89
+  },
+  "finished_archives": {
+    "directories": 18,
+    "unique_jobs": 161,
+    "unique_task_names": 50,
+    "valid_dual_comparison_jobs": 160,
+    "analysis_warnings": 13,
+    "reward_counts": {
+      "{'reward': 1.0}": 140,
+      "{'reward': 0.0}": 20
+    }
+  },
+  "finished_markers": [
+    "terminal-bench/eval/kimi-pro31-dual-20261102/finished.json",
+    "terminal-bench/eval/kimi-pro31-singles-20261102-155856/finished.json",
+    "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/finished.json",
+    "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/finished.json",
+    "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/finished.json",
+    "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/finished.json",
+    "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/finished.json",
+    "terminal-bench/eval/kimi-pro31-wave7-be-recheck-20261109-133032/finished.json",
+    "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/finished.json",
+    "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/finished.json",
+    "terminal-bench/eval/kimi-pro31-remaining37-20261111-051102/finished.json"
+  ],
+  "jobs": [
+    {
+      "source": "terminal-bench/eval/kimi-pro31-dual-20261102/results.json",
+      "job": "kimi-pro31-single-r2-20261102-1441",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-dual-20261102/results.json",
+      "job": "kimi-pro31-s1-fix-git-20261102-144513",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 10,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-dual-20261102/results.json",
+      "job": "kimi-pro31-s1-db-wal-recovery-20261102-144513",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-dual-20261102/results.json",
+      "job": "kimi-pro31-s1-polyglot-c-py-20261102-144513",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-singles-20261102-155856/results.json",
+      "job": "kimi-pro31-single-fix-git-20261102-155856",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-singles-20261102-155856/results.json",
+      "job": "kimi-pro31-single-db-wal-recovery-20261102-155856",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-singles-20261102-155856/results.json",
+      "job": "kimi-pro31-single-polyglot-c-py-20261102-155856",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s1-a-20261102-164633",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s1-b-20261102-164633",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s1-c-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 4,
+      "comparison_statuses": {
+        "not_machine_verified": 1,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-g-a-20261102-164633",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 22,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 18,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-g-b-20261102-164633",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-p-a-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-p-b-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-p-c-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-p-d-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 4,
+      "comparison_statuses": {
+        "not_machine_verified": 1,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-d-a-20261102-164633",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-d-b-20261102-164633",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-d-c-20261102-164633",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s2-d-d-20261102-164633",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 6,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s3-a-20261102-164633",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s3-b-20261102-164633",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261102-164633/results.json",
+      "job": "kp31-s3-c-20261102-164633",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-1-a-20261103-114047",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 11,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-1-b-20261103-114047",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-1-c-20261103-114047",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-1-d-20261103-114047",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-1-e-20261103-114047",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-2-a-20261103-114047",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-2-b-20261103-114047",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-2-c-20261103-114047",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-2-d-20261103-114047",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-114047/results.json",
+      "job": "kp31-wave-2-e-20261103-114047",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-1-a-20261103-142219",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 10,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-1-b-20261103-142219",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-1-c-20261103-142219",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-1-d-20261103-142219",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 19,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 11,
+        "not_machine_verified": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-1-e-20261103-142219",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-2-a-20261103-142219",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-2-b-20261103-142219",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-2-c-20261103-142219",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-2-d-20261103-142219",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-142219/results.json",
+      "job": "kp31-wave-2-e-20261103-142219",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-1-a-20261103-150050",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-1-b-20261103-150050",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-1-c-20261103-150050",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-1-d-20261103-150050",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-1-e-20261103-150050",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-2-a-20261103-150050",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-2-b-20261103-150050",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-2-c-20261103-150050",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 17,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-2-d-20261103-150050",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-150050/results.json",
+      "job": "kp31-wave-2-e-20261103-150050",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-1-a-20261103-194703",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 10,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-1-b-20261103-194703",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-1-c-20261103-194703",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 1,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-1-d-20261103-194703",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-1-e-20261103-194703",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-2-a-20261103-194703",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-2-b-20261103-194703",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-2-c-20261103-194703",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-2-d-20261103-194703",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-194703/results.json",
+      "job": "kp31-wave-2-e-20261103-194703",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-1-a-20261103-202557",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 6,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-1-b-20261103-202557",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-1-c-20261103-202557",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-1-d-20261103-202557",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-1-e-20261103-202557",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-2-a-20261103-202557",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-2-b-20261103-202557",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-2-c-20261103-202557",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-2-d-20261103-202557",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 6,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-202557/results.json",
+      "job": "kp31-wave-2-e-20261103-202557",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-1-a-20261103-211823",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-1-b-20261103-211823",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-1-c-20261103-211823",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-1-d-20261103-211823",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-1-e-20261103-211823",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-2-a-20261103-211823",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-2-b-20261103-211823",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-2-c-20261103-211823",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-2-d-20261103-211823",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-211823/results.json",
+      "job": "kp31-wave-2-e-20261103-211823",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-1-a-20261103-220201",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-1-b-20261103-220201",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-1-c-20261103-220201",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 4,
+      "comparison_statuses": {
+        "not_machine_verified": 1,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-1-d-20261103-220201",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-1-e-20261103-220201",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-2-a-20261103-220201",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-2-b-20261103-220201",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-2-c-20261103-220201",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 10,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-2-d-20261103-220201",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-220201/results.json",
+      "job": "kp31-wave-2-e-20261103-220201",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-1-a-20261103-224220",
+      "task": "fix-git",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 9,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-1-b-20261103-224220",
+      "task": "db-wal-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-1-c-20261103-224220",
+      "task": "polyglot-c-py",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-1-d-20261103-224220",
+      "task": "configure-git-webserver",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 6,
+        "not_machine_verified": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-1-e-20261103-224220",
+      "task": "crack-7z-hash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-2-a-20261103-224220",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-2-b-20261103-224220",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-2-c-20261103-224220",
+      "task": "sqlite-with-gcov",
+      "reward": null,
+      "invalid_trial": true,
+      "has_both_observers": false,
+      "analysis_warning": null,
+      "claim_count": null,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-2-d-20261103-224220",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ten-tasks-20261103-224220/results.json",
+      "job": "kp31-wave-2-e-20261103-224220",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/results.json",
+      "job": "kp31-wave-2-a-20261104-151632",
+      "task": "extract-elf",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/results.json",
+      "job": "kp31-wave-2-b-20261104-151632",
+      "task": "dna-insert",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/results.json",
+      "job": "kp31-wave-2-c-20261104-151632",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/results.json",
+      "job": "kp31-wave-2-d-20261104-151632",
+      "task": "git-leak-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-concurrent-20261104-151632/results.json",
+      "job": "kp31-wave-2-e-20261104-151632",
+      "task": "largest-eigenval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-3-a-20261104-162508",
+      "task": "adaptive-rejection-sampler",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-3-b-20261104-162508",
+      "task": "bn-fit-modify",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-3-c-20261104-162508",
+      "task": "break-filter-js-from-html",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-3-d-20261104-162508",
+      "task": "build-cython-ext",
+      "reward": null,
+      "invalid_trial": true,
+      "has_both_observers": false,
+      "analysis_warning": null,
+      "claim_count": null,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-3-e-20261104-162508",
+      "task": "build-pmars",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 17,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 11,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-4-a-20261104-162508",
+      "task": "build-pov-ray",
+      "reward": null,
+      "invalid_trial": true,
+      "has_both_observers": false,
+      "analysis_warning": null,
+      "claim_count": null,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-4-b-20261104-162508",
+      "task": "caffe-cifar-10",
+      "reward": null,
+      "invalid_trial": true,
+      "has_both_observers": false,
+      "analysis_warning": null,
+      "claim_count": null,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-4-c-20261104-162508",
+      "task": "cancel-async-tasks",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 4,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-4-d-20261104-162508",
+      "task": "chess-best-move",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-next20-20261104-162508/results.json",
+      "job": "kp31-wave-4-e-20261104-162508",
+      "task": "circuit-fibsqrt",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-4-recovery-a-20261104-194332",
+      "task": "build-pov-ray",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-4-recovery-b-20261104-194332",
+      "task": "caffe-cifar-10",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-4-recovery-c-20261104-194332",
+      "task": "cancel-async-tasks",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 3,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 1
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-4-recovery-d-20261104-194332",
+      "task": "chess-best-move",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-4-recovery-e-20261104-194332",
+      "task": "circuit-fibsqrt",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-5-a-20261104-194332",
+      "task": "cobol-modernization",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 9,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-5-b-20261104-194332",
+      "task": "code-from-image",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-5-c-20261104-194332",
+      "task": "compile-compcert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-5-d-20261104-194332",
+      "task": "constraints-scheduling",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-5-e-20261104-194332",
+      "task": "count-dataset-tokens",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-6-a-20261104-194332",
+      "task": "custom-memory-heap-crash",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-6-b-20261104-194332",
+      "task": "distribution-search",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-6-c-20261104-194332",
+      "task": "dna-assembly",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-6-d-20261104-194332",
+      "task": "extract-moves-from-video",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-observation-recovery-20261104-194332/results.json",
+      "job": "kp31-wave-6-e-20261104-194332",
+      "task": "feal-differential-cryptanalysis",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready22-20261105-122519/results.json",
+      "job": "kp31-wave-7-a-20261105-122530",
+      "task": "feal-linear-cryptanalysis",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready22-20261105-122519/results.json",
+      "job": "kp31-wave-7-b-20261105-122530",
+      "task": "filter-js-from-html",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready22-20261105-122519/results.json",
+      "job": "kp31-wave-7-c-20261105-122530",
+      "task": "financial-document-processor",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready22-20261105-122519/results.json",
+      "job": "kp31-wave-7-d-20261105-122530",
+      "task": "fix-code-vulnerability",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready22-20261105-122519/results.json",
+      "job": "kp31-wave-7-e-20261105-122530",
+      "task": "fix-ocaml-gc",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-recovery2-20261105-154118/results.json",
+      "job": "kp31-wave-8-a-20261105-154126",
+      "task": "gcode-to-text",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-recovery2-20261105-154118/results.json",
+      "job": "kp31-wave-8-b-20261105-154126",
+      "task": "git-multibranch",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 11,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-recovery2-20261105-154118/results.json",
+      "job": "kp31-wave-8-c-20261105-154126",
+      "task": "gpt2-codegolf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-recovery2-20261105-154118/results.json",
+      "job": "kp31-wave-8-d-20261105-154126",
+      "task": "headless-terminal",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-recovery2-20261105-154118/results.json",
+      "job": "kp31-wave-8-e-20261105-154126",
+      "task": "hf-model-inference",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 2,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-9-a-20261105-161029",
+      "task": "install-windows-3.11",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 16,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-9-b-20261105-161029",
+      "task": "kv-store-grpc",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-9-c-20261105-161029",
+      "task": "large-scale-text-editing",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-9-d-20261105-161029",
+      "task": "llm-inference-batching-scheduler",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-9-e-20261105-161029",
+      "task": "log-summary-date-ranges",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-10-a-20261105-161029",
+      "task": "mailman",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-10-b-20261105-161029",
+      "task": "make-doom-for-mips",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-10-c-20261105-161029",
+      "task": "make-mips-interpreter",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-10-d-20261105-161029",
+      "task": "mcmc-sampling-stan",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-10-e-20261105-161029",
+      "task": "merge-diff-arc-agi-task",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-11-a-20261105-161029",
+      "task": "model-extraction-relu-logits",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready12-recovery-20261105-161023/results.json",
+      "job": "kp31-wave-11-b-20261105-161029",
+      "task": "modernize-scientific-stack",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 1
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-wave7-be-recheck-20261109-133032/results.json",
+      "job": "kp31-wave-7-a-20261109-133032",
+      "task": "filter-js-from-html",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-wave7-be-recheck-20261109-133032/results.json",
+      "job": "kp31-wave-7-b-20261109-133032",
+      "task": "fix-ocaml-gc",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-8-a-20261109-163510",
+      "task": "gcode-to-text",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-8-b-20261109-163510",
+      "task": "git-multibranch",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 19,
+      "comparison_statuses": {
+        "not_machine_verified": 12,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-8-c-20261109-163510",
+      "task": "gpt2-codegolf",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-8-d-20261109-163510",
+      "task": "headless-terminal",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-8-e-20261109-163510",
+      "task": "hf-model-inference",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-9-a-20261109-163510",
+      "task": "install-windows-3.11",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 18,
+      "comparison_statuses": {
+        "not_machine_verified": 12,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-9-b-20261109-163510",
+      "task": "kv-store-grpc",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-9-c-20261109-163510",
+      "task": "large-scale-text-editing",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-9-d-20261109-163510",
+      "task": "llm-inference-batching-scheduler",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-9-e-20261109-163510",
+      "task": "log-summary-date-ranges",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-10-a-20261109-163510",
+      "task": "mailman",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-10-b-20261109-163510",
+      "task": "make-doom-for-mips",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-10-c-20261109-163510",
+      "task": "make-mips-interpreter",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-10-d-20261109-163510",
+      "task": "mcmc-sampling-stan",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-10-e-20261109-163510",
+      "task": "merge-diff-arc-agi-task",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 7,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-11-a-20261109-163510",
+      "task": "model-extraction-relu-logits",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-ready17-20261109-163510/results.json",
+      "job": "kp31-wave-11-b-20261109-163510",
+      "task": "modernize-scientific-stack",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 1
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-145622/results.json",
+      "job": "kp31-rem-1-a-20261110-145622",
+      "task": "multi-source-data-merger",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-145622/results.json",
+      "job": "kp31-rem-1-b-20261110-145622",
+      "task": "nginx-request-logging",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-145622/results.json",
+      "job": "kp31-rem-1-c-20261110-145622",
+      "task": "openssl-selfsigned-cert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 8,
+        "not_machine_verified": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-145622/results.json",
+      "job": "kp31-rem-1-d-20261110-145622",
+      "task": "overfull-hbox",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-145622/results.json",
+      "job": "kp31-rem-1-e-20261110-145622",
+      "task": "password-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-1-a-20261110-152209",
+      "task": "multi-source-data-merger",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-1-b-20261110-152209",
+      "task": "nginx-request-logging",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 10
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-1-c-20261110-152209",
+      "task": "openssl-selfsigned-cert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 18,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-1-d-20261110-152209",
+      "task": "overfull-hbox",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "not_machine_verified": 9,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-1-e-20261110-152209",
+      "task": "password-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-2-a-20261110-152209",
+      "task": "path-tracing",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-2-b-20261110-152209",
+      "task": "path-tracing-reverse",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-2-c-20261110-152209",
+      "task": "polyglot-rust-c",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 3,
+        "program_selector_matches_only_not_exact_tool_binding": 9
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-2-d-20261110-152209",
+      "task": "portfolio-optimization",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-152209/results.json",
+      "job": "kp31-rem-2-e-20261110-152209",
+      "task": "protein-assembly",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-161929/results.json",
+      "job": "kp31-rem-1-a-20261110-161929",
+      "task": "multi-source-data-merger",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-161929/results.json",
+      "job": "kp31-rem-1-b-20261110-161929",
+      "task": "nginx-request-logging",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 17,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 5,
+        "not_machine_verified": 12
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-161929/results.json",
+      "job": "kp31-rem-1-c-20261110-161929",
+      "task": "openssl-selfsigned-cert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 12,
+        "not_machine_verified": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-161929/results.json",
+      "job": "kp31-rem-1-d-20261110-161929",
+      "task": "overfull-hbox",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 9,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-161929/results.json",
+      "job": "kp31-rem-1-e-20261110-161929",
+      "task": "password-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-164448/results.json",
+      "job": "kp31-rem-1-a-20261110-164448",
+      "task": "multi-source-data-merger",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 10,
+      "comparison_statuses": {
+        "not_machine_verified": 7,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-164448/results.json",
+      "job": "kp31-rem-1-b-20261110-164448",
+      "task": "nginx-request-logging",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 16,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-164448/results.json",
+      "job": "kp31-rem-1-c-20261110-164448",
+      "task": "openssl-selfsigned-cert",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 9,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-164448/results.json",
+      "job": "kp31-rem-1-d-20261110-164448",
+      "task": "overfull-hbox",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 21,
+      "comparison_statuses": {
+        "not_machine_verified": 13,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-164448/results.json",
+      "job": "kp31-rem-1-e-20261110-164448",
+      "task": "password-recovery",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 5
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-1-a-20261110-173110",
+      "task": "prove-plus-comm",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-2-a-20261110-173110",
+      "task": "pypi-server",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-3-a-20261110-173110",
+      "task": "pytorch-model-cli",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 18,
+      "comparison_statuses": {
+        "not_machine_verified": 9,
+        "program_selector_matches_only_not_exact_tool_binding": 9
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-4-a-20261110-173110",
+      "task": "pytorch-model-recovery",
+      "reward": null,
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 8,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 2,
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-5-a-20261110-173110",
+      "task": "qemu-alpine-ssh",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-6-a-20261110-173110",
+      "task": "qemu-startup",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 10,
+        "program_selector_matches_only_not_exact_tool_binding": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-7-a-20261110-173110",
+      "task": "query-optimize",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 13,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-8-a-20261110-173110",
+      "task": "raman-fitting",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 11,
+      "comparison_statuses": {
+        "not_machine_verified": 5,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-9-a-20261110-173110",
+      "task": "regex-chess",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 16,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-10-a-20261110-173110",
+      "task": "regex-log",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 5,
+      "comparison_statuses": {
+        "not_machine_verified": 2,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-11-a-20261110-173110",
+      "task": "reshard-c4-data",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 6,
+        "not_machine_verified": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-12-a-20261110-173110",
+      "task": "rstan-to-pystan",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 14,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-173110/results.json",
+      "job": "kp31-rem-13-a-20261110-173110",
+      "task": "sam-cell-seg",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-1-a-20261110-224301",
+      "task": "mteb-leaderboard",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "not_machine_verified": 6
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-2-a-20261110-224301",
+      "task": "mteb-retrieve",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-3-a-20261110-224301",
+      "task": "sanitize-git-repo",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 1
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-4-a-20261110-224301",
+      "task": "schemelike-metacircular-eval",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-5-a-20261110-224301",
+      "task": "sparql-university",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 4,
+      "comparison_statuses": {
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-6-a-20261110-224301",
+      "task": "sqlite-db-truncate",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 7,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 4
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-7-a-20261110-224301",
+      "task": "torch-pipeline-parallelism",
+      "reward": null,
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 1,
+      "comparison_statuses": {
+        "not_machine_verified": 1
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261110-224301/results.json",
+      "job": "kp31-rem-8-a-20261110-224301",
+      "task": "torch-tensor-parallelism",
+      "reward": null,
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 3,
+      "comparison_statuses": {
+        "not_machine_verified": 1,
+        "program_selector_matches_only_not_exact_tool_binding": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-1-a-20261111-015812",
+      "task": "train-fasttext",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 18,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 10
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-2-a-20261111-015812",
+      "task": "tune-mjcf",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 12,
+      "comparison_statuses": {
+        "not_machine_verified": 4,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-3-a-20261111-015812",
+      "task": "video-processing",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 15,
+      "comparison_statuses": {
+        "not_machine_verified": 8,
+        "program_selector_matches_only_not_exact_tool_binding": 7
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-4-a-20261111-015812",
+      "task": "vulnerable-secret",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 4,
+        "not_machine_verified": 2
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-5-a-20261111-015812",
+      "task": "winning-avg-corewars",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 9,
+      "comparison_statuses": {
+        "not_machine_verified": 6,
+        "program_selector_matches_only_not_exact_tool_binding": 3
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-015812/results.json",
+      "job": "kp31-rem-6-a-20261111-015812",
+      "task": "write-compressor",
+      "reward": {
+        "reward": 0.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 17,
+      "comparison_statuses": {
+        "not_machine_verified": 9,
+        "program_selector_matches_only_not_exact_tool_binding": 8
+      }
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-051102/results.json",
+      "job": "kp31-rem-1-a-20261111-051102",
+      "task": "sqlite-with-gcov",
+      "reward": {
+        "reward": 1.0
+      },
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": "Judge context too large; lifecycle comparison generated without model claims",
+      "claim_count": 0,
+      "comparison_statuses": {}
+    },
+    {
+      "source": "terminal-bench/eval/kimi-pro31-remaining37-20261111-151538/results.json",
+      "job": "kp31-rem-1-a-20261111-151538",
+      "task": "pytorch-model-recovery",
+      "reward": null,
+      "invalid_trial": false,
+      "has_both_observers": true,
+      "analysis_warning": null,
+      "claim_count": 6,
+      "comparison_statuses": {
+        "program_selector_matches_only_not_exact_tool_binding": 3,
+        "not_machine_verified": 3
+      }
+    }
+  ]
+}

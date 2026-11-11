@@ -1,0 +1,9 @@
+{
+  "schema": "a3s.clickhouse-exit-tree-comparison.v1",
+  "run_id": "exit-tree-0f41f54cf7fc",
+  "truth_count": 1500,
+  "result": {
+    "rows": "1500",
+    "pids": "1500"
+  }
+}

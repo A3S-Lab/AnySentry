@@ -1,0 +1,134 @@
+{
+  "schema": "a3s.process-identity-live-truth.v1",
+  "run_id": "a-identity-b3a35ffcbe28",
+  "root": "/tmp/a-identity-b3a35ffcbe28-9moi9yeh",
+  "runner_pid": 296144,
+  "note": "fork/wait proves birth and final exit; listed checkpoints describe expected same-PID exec transitions, not an independent kernel trace",
+  "facts": [
+    {
+      "name": "short_true",
+      "pid": 296145,
+      "ppid": 296144,
+      "command": [
+        "/bin/true"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988302289186820,
+      "waited_at_unix_ns": 1792988302290059662,
+      "stdout": "",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "short_false",
+      "pid": 296146,
+      "ppid": 296144,
+      "command": [
+        "/bin/false"
+      ],
+      "exit_code": 1,
+      "started_at_unix_ns": 1792988302290067626,
+      "waited_at_unix_ns": 1792988302290741847,
+      "stdout": "",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "xxd",
+      "pid": 296147,
+      "ppid": 296144,
+      "command": [
+        "xxd",
+        "/tmp/a-identity-b3a35ffcbe28-9moi9yeh/sample.db"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988302290748250,
+      "waited_at_unix_ns": 1792988302327053574,
+      "stdout": "00000000: 0001 0203 0405 0607 0809 0a0b 0c0d 0e0f  ................\n00000010: 1011 1213 1415 1617 1819 1a1b 1c1d 1e1f  ................\n00000020: 2021 2223 2425 2627 2829 2a2b 2c2d 2e2f   !\"#$%&'()*+,-./\n00000030: 3031 3233 3435 3637 3839 3a3b 3c3d 3e3f  0123456789:;<=>?\n",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "head",
+      "pid": 296148,
+      "ppid": 296144,
+      "command": [
+        "head",
+        "-c",
+        "16",
+        "/tmp/a-identity-b3a35ffcbe28-9moi9yeh/sample.db"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988302327068409,
+      "waited_at_unix_ns": 1792988302328383326,
+      "stdout": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\n\u000e\u000f",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "git_log",
+      "pid": 296149,
+      "ppid": 296144,
+      "command": [
+        "git",
+        "log",
+        "--oneline",
+        "-1"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988302328393884,
+      "waited_at_unix_ns": 1792988302331166556,
+      "stdout": "98484b4 merge: align process identity with observer main\n",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "compile_chain",
+      "pid": 296150,
+      "ppid": 296144,
+      "command": [
+        "bash",
+        "-c",
+        "gcc -O0 -o /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain.c && gcc -O1 -o /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain.c && /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain 0 && /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain 50 && /tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain 93"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988302331250846,
+      "waited_at_unix_ns": 1792988303642329840,
+      "stdout": "/tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain:2\n/tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain:2\n/tmp/a-identity-b3a35ffcbe28-9moi9yeh/cmain:2\n",
+      "stderr": "",
+      "exec_checkpoints": []
+    },
+    {
+      "name": "consecutive_exec",
+      "pid": 296265,
+      "ppid": 296144,
+      "command": [
+        "bash",
+        "-c",
+        "exec bash -c 'exec /bin/echo a-identity-b3a35ffcbe28-consecutive'"
+      ],
+      "exit_code": 0,
+      "started_at_unix_ns": 1792988303642341978,
+      "waited_at_unix_ns": 1792988303679166364,
+      "stdout": "a-identity-b3a35ffcbe28-consecutive\n",
+      "stderr": "",
+      "exec_checkpoints": [
+        {
+          "sequence": 1,
+          "image": "bash",
+          "pid_source": "fork_wait_pid"
+        },
+        {
+          "sequence": 2,
+          "image": "bash",
+          "pid_source": "same_pid_exec_checkpoint"
+        },
+        {
+          "sequence": 3,
+          "image": "/bin/echo",
+          "pid_source": "same_pid_exec_checkpoint"
+        }
+      ]
+    }
+  ]
+}

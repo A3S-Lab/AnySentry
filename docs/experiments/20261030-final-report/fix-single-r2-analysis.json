@@ -1,0 +1,42 @@
+{
+  "task": "fix-git",
+  "job": "kimi-fix-single-r2-20261030-145744",
+  "official_reward": 1.0,
+  "all_lifecycle": {
+    "AnySentry_confirmed_exec": 72,
+    "AnySentry_exit": 50,
+    "AgentSight_exec": 66,
+    "AgentSight_exit": 52
+  },
+  "git_critical": {
+    "raw_collector": {"confirmed_exec": 20, "unconfirmed_exec": 1, "exit": 21},
+    "AnySentry": {"confirmed_exec": 20, "unconfirmed_exec": 1, "exit": 21},
+    "AgentSight": {"exec": 21, "exit": 21},
+    "conclusion": "21 Git exec and 21 Git exit are aligned across all three sources"
+  },
+  "unconfirmed_exec_evidence": {
+    "pid": 676583,
+    "command": "git status --short --branch",
+    "argv_incomplete": true,
+    "exec_confirmed": false,
+    "argv_source": "kernel_compact",
+    "captured_argc": 4,
+    "captured_bytes": 24,
+    "observed_argc": 4,
+    "observed_bytes": 24,
+    "clickhouse_event_id": "evt_a3e9c65251d49c7e",
+    "at_ms": 1793343502068,
+    "within_original_window": true,
+    "interpretation": "Captured and persisted, but excluded by confirmed-only statistics; not a missing event and not a late event"
+  },
+  "collector_diagnostics": {
+    "dropped": 0,
+    "output_dropped": 0
+  },
+  "generation": {
+    "missing_start_boottime_ns": [],
+    "process_instance_key_conflicts": [],
+    "creation_parent_mismatches": []
+  },
+  "statistical_note": "Total exec comparisons must report confirmed and unconfirmed events separately. The initial confirmed-only comparison was not a valid coverage comparison."
+}

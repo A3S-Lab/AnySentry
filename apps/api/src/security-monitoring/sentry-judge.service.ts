@@ -2166,6 +2166,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     for (const [key, value] of Object.entries(input.eventKindCounts ?? {})) eventKindCounts[key.slice(0, 64)] = clamp(value);
     const droppedByKind: Record<string, number> = {};
     for (const [key, value] of Object.entries(input.droppedByKind ?? {})) droppedByKind[key.slice(0, 64)] = clamp(value);
+    const outputDroppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(input.outputDroppedByKind ?? {})) {
+      outputDroppedByKind[key.slice(0, 64)] = clamp(value);
+    }
     // Raw Rust and enriched Forwarder heartbeats share an ID. The Forwarder exclusively owns
     // identity/filter delivery metrics; the raw collector exclusively owns ring-before file-filter
     // counters below. Provenance prevents either stream from refreshing the other's state.
@@ -2544,6 +2548,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       queueDepth: clamp(input.queueDepth),
       droppedEvents: clamp(input.droppedEvents),
       outputDropped: clamp(input.outputDropped),
+      ...(Object.keys(outputDroppedByKind).length > 0 ? { outputDroppedByKind } : {}),
       // The Rust CollectorHeartbeat schema has no operational error counter. argv/reassembly
       // quality lives in execEvidence and must never degrade collector transport health.
       errorCount: origin === 'raw_collector' ? 0 : clamp(input.errorCount),

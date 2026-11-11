@@ -1,0 +1,15 @@
+{
+  "schema": "a3s.raw-exit-tree-comparison.v1",
+  "run_id": "exit-tree-0f41f54cf7fc",
+  "truth_count": 1500,
+  "raw_exit_count": 1500,
+  "raw_truth_pids": 1500,
+  "missing": [],
+  "duplicates": [],
+  "window_kinds": {
+    "ToolExec": 8273,
+    "ProcessExit": 1676,
+    "SecurityAction": 4,
+    "Egress": 65
+  }
+}

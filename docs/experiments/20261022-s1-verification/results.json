@@ -1,0 +1,3520 @@
+{
+  "schema": "s1-retrospective-evidence-review/v1",
+  "date": "2026-10-22",
+  "claim_file_sha256": "e255a1751d5b189814d239f6dcfec278352ee10d21fea98ae032c802d3dbf65d",
+  "scope": "历史S1目标进程家族及Harbor窗口；非独立ground truth，不提供全命题通过率。",
+  "matching_scope": "每条命题引用调用的开始至返回，前后各放宽5秒；后台安装包含WaitFor区间。时间相关只是候选支撑，不是确定call绑定。",
+  "preregistered_before_original_experiment": false,
+  "results": [
+    {
+      "claim_id": "fix-git-K1",
+      "task": "fix-git",
+      "title": "读取 reflog 定位丢失提交",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "git reflog 实际执行",
+          "type": "exec",
+          "command_regex": "^git reflog(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395148553-process-872844-278",
+                  "pid": 872844,
+                  "at_ms": 1792395148553,
+                  "kind": "exec",
+                  "target_or_command": "git reflog --date=iso"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395148553-process-872844-278",
+                  "pid": 872844,
+                  "at_ms": 1792395148553,
+                  "kind": "exec",
+                  "target_or_command": "git reflog --date=iso"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "reflog 读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/.git/logs/HEAD"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395143498,
+          1792395153828
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "fix-git-K2",
+      "task": "fix-git",
+      "title": "合并产生冲突与待合并状态",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "git merge 实际执行",
+          "type": "exec",
+          "command_regex": "^git merge(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_355ea6c7f8e08d83",
+                  "pid": 875365,
+                  "at_ms": 1792395195329,
+                  "kind": "ToolExec",
+                  "target_or_command": "git merge c499730 --no-edit"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_355ea6c7f8e08d83",
+                  "pid": 875365,
+                  "at_ms": 1792395195329,
+                  "kind": "ToolExec",
+                  "target_or_command": "git merge c499730 --no-edit"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395194952-process-875365-522",
+                  "pid": 875365,
+                  "at_ms": 1792395194952,
+                  "kind": "exec",
+                  "target_or_command": "git merge c499730 --no-edit"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395194952-process-875365-522",
+                  "pid": 875365,
+                  "at_ms": 1792395194952,
+                  "kind": "exec",
+                  "target_or_command": "git merge c499730 --no-edit"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "冲突文件可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/_includes/about.md"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_e9b81a77faa182ef",
+                  "pid": 870777,
+                  "at_ms": 1792395209259,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195011-process-875365-569",
+                  "pid": 875365,
+                  "at_ms": 1792395195011,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395208742-process-870777-641",
+                  "pid": 870777,
+                  "at_ms": 1792395208742,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195011-process-875365-569",
+                  "pid": 875365,
+                  "at_ms": 1792395195011,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "MERGE_HEAD 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/.git/MERGE_HEAD"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195016-process-875365-574",
+                  "pid": 875365,
+                  "at_ms": 1792395195016,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/MERGE_HEAD"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195016-process-875365-574",
+                  "pid": 875365,
+                  "at_ms": 1792395195016,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/MERGE_HEAD"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 2,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 3,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395190184,
+          1792395200276
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "fix-git-K3",
+      "task": "fix-git",
+      "title": "内置 Read 读取冲突文件",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "about.md 读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/_includes/about.md"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395192993,
+          1792395203005
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "fix-git-K4",
+      "task": "fix-git",
+      "title": "Edit 修改 about.md",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "about.md 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/_includes/about.md"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_e9b81a77faa182ef",
+                  "pid": 870777,
+                  "at_ms": 1792395209259,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_e9b81a77faa182ef",
+                  "pid": 870777,
+                  "at_ms": 1792395209259,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195011-process-875365-569",
+                  "pid": 875365,
+                  "at_ms": 1792395195011,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395208742-process-870777-641",
+                  "pid": 870777,
+                  "at_ms": 1792395208742,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395208742-process-870777-641",
+                  "pid": 870777,
+                  "at_ms": 1792395208742,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/_includes/about.md"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395203985,
+          1792395213997
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "fix-git-K5",
+      "task": "fix-git",
+      "title": "暂存并提交恢复内容",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "git add 实际执行",
+          "type": "exec",
+          "command_regex": "^git add(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_48eacc5581730ee9",
+                  "pid": 876431,
+                  "at_ms": 1792395211807,
+                  "kind": "ToolExec",
+                  "target_or_command": "git add _includes/about.md"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_48eacc5581730ee9",
+                  "pid": 876431,
+                  "at_ms": 1792395211807,
+                  "kind": "ToolExec",
+                  "target_or_command": "git add _includes/about.md"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211452-process-876431-653",
+                  "pid": 876431,
+                  "at_ms": 1792395211452,
+                  "kind": "exec",
+                  "target_or_command": "git add _includes/about.md"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211452-process-876431-653",
+                  "pid": 876431,
+                  "at_ms": 1792395211452,
+                  "kind": "exec",
+                  "target_or_command": "git add _includes/about.md"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "git commit 实际执行",
+          "type": "exec",
+          "command_regex": "^git commit(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_2903b1393a4dccd6",
+                  "pid": 876432,
+                  "at_ms": 1792395211808,
+                  "kind": "ToolExec",
+                  "target_or_command": "git commit --no-edit"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_2903b1393a4dccd6",
+                  "pid": 876432,
+                  "at_ms": 1792395211808,
+                  "kind": "ToolExec",
+                  "target_or_command": "git commit --no-edit"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211464-process-876432-672",
+                  "pid": 876432,
+                  "at_ms": 1792395211464,
+                  "kind": "exec",
+                  "target_or_command": "git commit --no-edit"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211464-process-876432-672",
+                  "pid": 876432,
+                  "at_ms": 1792395211464,
+                  "kind": "exec",
+                  "target_or_command": "git commit --no-edit"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "index/index.lock 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/.git/index",
+            "/app/personal-site/.git/index.lock"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 6,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_12c9976fb7541cdc",
+                  "pid": 875365,
+                  "at_ms": 1792395195451,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_50c7f39ffa1c2900",
+                  "pid": 876429,
+                  "at_ms": 1792395211833,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_0a482a2e66ecb79f",
+                  "pid": 875364,
+                  "at_ms": 1792395195498,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_90d3b0527870eb3d",
+                  "pid": 876432,
+                  "at_ms": 1792395211945,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_98e7dff9cdecdf2a",
+                  "pid": 872814,
+                  "at_ms": 1792395148944,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_0ba79c96fc171d5f",
+                  "pid": 875365,
+                  "at_ms": 1792395195447,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "evt_50c7f39ffa1c2900",
+                  "pid": 876429,
+                  "at_ms": 1792395211833,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "evt_90d3b0527870eb3d",
+                  "pid": 876432,
+                  "at_ms": 1792395211945,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 8,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395148519-process-872814-252",
+                  "pid": 872814,
+                  "at_ms": 1792395148519,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194956-process-875365-541",
+                  "pid": 875365,
+                  "at_ms": 1792395194956,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395195000-process-875365-557",
+                  "pid": 875365,
+                  "at_ms": 1792395195000,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395195001-process-875365-558",
+                  "pid": 875365,
+                  "at_ms": 1792395195001,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395195022-process-875364-594",
+                  "pid": 875364,
+                  "at_ms": 1792395195022,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211454-process-876431-661",
+                  "pid": 876431,
+                  "at_ms": 1792395211454,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211454-process-876431-661",
+                  "pid": 876431,
+                  "at_ms": 1792395211454,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211468-process-876432-685",
+                  "pid": 876432,
+                  "at_ms": 1792395211468,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211534-process-876429-745",
+                  "pid": 876429,
+                  "at_ms": 1792395211534,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/index.lock"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "对象文件可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/.git/objects/"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 8,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395195005-process-875365-563",
+                  "pid": 875365,
+                  "at_ms": 1792395195005,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/c4/tmp_obj_f2jtUJ"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395195006-process-875365-564",
+                  "pid": 875365,
+                  "at_ms": 1792395195006,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/32/tmp_obj_UGdVz8"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395195008-process-875365-565",
+                  "pid": 875365,
+                  "at_ms": 1792395195008,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/74/tmp_obj_GTNm5A"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211455-process-876431-667",
+                  "pid": 876431,
+                  "at_ms": 1792395211455,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/2a/tmp_obj_GIctWL"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211469-process-876432-686",
+                  "pid": 876432,
+                  "at_ms": 1792395211469,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/47/tmp_obj_n20Qk5"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211470-process-876432-687",
+                  "pid": 876432,
+                  "at_ms": 1792395211470,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/ca/tmp_obj_vW2S45"
+                }
+              ],
+              "count": 5,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211455-process-876431-667",
+                  "pid": 876431,
+                  "at_ms": 1792395211455,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/2a/tmp_obj_GIctWL"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211469-process-876432-686",
+                  "pid": 876432,
+                  "at_ms": 1792395211469,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/47/tmp_obj_n20Qk5"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211470-process-876432-687",
+                  "pid": 876432,
+                  "at_ms": 1792395211470,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/ca/tmp_obj_vW2S45"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211477-process-876432-697",
+                  "pid": 876432,
+                  "at_ms": 1792395211477,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/1e/tmp_obj_Byd8kS"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395211493-process-876433-711",
+                  "pid": 876433,
+                  "at_ms": 1792395211493,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/objects/maintenance.lock"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "master 引用/锁可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/.git/refs/heads/master",
+            "/app/personal-site/.git/refs/heads/master.lock"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_bbc8c3e3ebcee67a",
+                  "pid": 876432,
+                  "at_ms": 1792395211828,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/refs/heads/master.lock"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_bbc8c3e3ebcee67a",
+                  "pid": 876432,
+                  "at_ms": 1792395211828,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/personal-site/.git/refs/heads/master.lock"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211481-process-876432-699",
+                  "pid": 876432,
+                  "at_ms": 1792395211481,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/refs/heads/master.lock"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395211481-process-876432-699",
+                  "pid": 876432,
+                  "at_ms": 1792395211481,
+                  "kind": "write",
+                  "target_or_command": "/app/personal-site/.git/refs/heads/master.lock"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 4,
+          "total_atoms": 5,
+          "task_scope_matched_atoms": 4,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 5,
+          "total_atoms": 5,
+          "task_scope_matched_atoms": 5,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395206679,
+          1792395216791
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "fix-git-K6",
+      "task": "fix-git",
+      "title": "回读检查冲突标记",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "grep 实际执行",
+          "type": "exec",
+          "command_regex": "^grep(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_c93e83eb8cd150ee",
+                  "pid": 876622,
+                  "at_ms": 1792395216813,
+                  "kind": "ToolExec",
+                  "target_or_command": "grep -rn <<<<<<<\\|>>>>>>> --include=*.md --include=*.html ."
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_c93e83eb8cd150ee",
+                  "pid": 876622,
+                  "at_ms": 1792395216813,
+                  "kind": "ToolExec",
+                  "target_or_command": "grep -rn <<<<<<<\\|>>>>>>> --include=*.md --include=*.html ."
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        },
+        {
+          "label": "任务文件读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/personal-site/_includes/about.md",
+            "/app/personal-site/_layouts/default.html"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395211691,
+          1792395221750
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K1",
+      "task": "db-wal-recovery",
+      "title": "读取原 WAL 并在内存分析",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "xxd 实际执行",
+          "type": "exec",
+          "command_regex": "^xxd(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395149194-process-872920-187",
+                  "pid": 872920,
+                  "at_ms": 1792395149194,
+                  "kind": "exec",
+                  "target_or_command": "xxd /app/main.db-wal"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395149194-process-872920-187",
+                  "pid": 872920,
+                  "at_ms": 1792395149194,
+                  "kind": "exec",
+                  "target_or_command": "xxd /app/main.db-wal"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "WAL 分析 Python 实际执行",
+          "type": "exec",
+          "command_regex": "^python3(?:\\.\\d+)? .*main\\.db-wal",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_b6a0d15c534d95f0",
+                  "pid": 873936,
+                  "at_ms": 1792395165706,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \ndata = open('main.db-wal','rb').read()\ndec = bytes(b ^ 0x42 for b in data)\nprint('magic:', dec[:4].hex())\nimport struct\nmagic, ver, pgsz, ckpt, s1, s2, c1, c2 = struct.unpack('>8I', dec[:32])\nprint(f'version={ver} pagesize={pgsz} ckpt={ckpt} salt1="
+                },
+                {
+                  "event_id": "evt_cba8352c1e5ac5ba",
+                  "pid": 874807,
+                  "at_ms": 1792395184727,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport struct\ndata = bytes(b ^ 0x42 for b in open('main.db-wal','rb').read())\n\ndef wal_cksum(data, s0=0, s1_=0, native_le=False):\n    # magic 0x377f0682 => little-endian checksum, 0x377f0683 => big-endian\n    fmt = '<I' if native_le else '>I'\n    f"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "evt_b6a0d15c534d95f0",
+                  "pid": 873936,
+                  "at_ms": 1792395165706,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \ndata = open('main.db-wal','rb').read()\ndec = bytes(b ^ 0x42 for b in data)\nprint('magic:', dec[:4].hex())\nimport struct\nmagic, ver, pgsz, ckpt, s1, s2, c1, c2 = struct.unpack('>8I', dec[:32])\nprint(f'version={ver} pagesize={pgsz} ckpt={ckpt} salt1="
+                },
+                {
+                  "event_id": "evt_cba8352c1e5ac5ba",
+                  "pid": 874807,
+                  "at_ms": 1792395184727,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport struct\ndata = bytes(b ^ 0x42 for b in open('main.db-wal','rb').read())\n\ndef wal_cksum(data, s0=0, s1_=0, native_le=False):\n    # magic 0x377f0682 => little-endian checksum, 0x377f0683 => big-endian\n    fmt = '<I' if native_le else '>I'\n    f"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395165350-process-873936-223",
+                  "pid": 873936,
+                  "at_ms": 1792395165350,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \ndata = open('main.db-wal','rb').read()\ndec = bytes(b ^ 0x42 for b in data)\nprint('magic:', dec[:4].hex())\nimport struct\nmagic, ver, pgsz, ckpt, s1, s2, c1, c2 = struct.unpack('>8I', dec[:32])\nprint(f'version={ver} pagesize={pgsz} ckpt={ckpt} s"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395184353-process-874807-291",
+                  "pid": 874807,
+                  "at_ms": 1792395184353,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport struct\ndata = bytes(b ^ 0x42 for b in open('main.db-wal','rb').read())\n\ndef wal_cksum(data, s0=0, s1_=0, native_le=False):\n    # magic 0x377f0682 => little-endian checksum, 0x377f0683 => big-endian\n    fmt = '<I' if native_le else '>I'\n"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395191068-process-875252-354",
+                  "pid": 875252,
+                  "at_ms": 1792395191068,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395165350-process-873936-223",
+                  "pid": 873936,
+                  "at_ms": 1792395165350,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \ndata = open('main.db-wal','rb').read()\ndec = bytes(b ^ 0x42 for b in data)\nprint('magic:', dec[:4].hex())\nimport struct\nmagic, ver, pgsz, ckpt, s1, s2, c1, c2 = struct.unpack('>8I', dec[:32])\nprint(f'version={ver} pagesize={pgsz} ckpt={ckpt} s"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395184353-process-874807-291",
+                  "pid": 874807,
+                  "at_ms": 1792395184353,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport struct\ndata = bytes(b ^ 0x42 for b in open('main.db-wal','rb').read())\n\ndef wal_cksum(data, s0=0, s1_=0, native_le=False):\n    # magic 0x377f0682 => little-endian checksum, 0x377f0683 => big-endian\n    fmt = '<I' if native_le else '>I'\n"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "WAL 读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db-wal"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 4,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191103-process-875249-386",
+                  "pid": 875249,
+                  "at_ms": 1792395191103,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194168-process-875348-421",
+                  "pid": 875348,
+                  "at_ms": 1792395194168,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395199087-process-875568-478",
+                  "pid": 875568,
+                  "at_ms": 1792395199087,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395205161-process-876006-566",
+                  "pid": 876006,
+                  "at_ms": 1792395205161,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                }
+              ],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 2,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395144397,
+          1792395154494
+        ],
+        [
+          1792395160591,
+          1792395170665
+        ],
+        [
+          1792395179578,
+          1792395189693
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K2",
+      "task": "db-wal-recovery",
+      "title": "备份主库与 WAL",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "cp 实际执行",
+          "type": "exec",
+          "command_regex": "^cp(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191058-process-875250-330",
+                  "pid": 875250,
+                  "at_ms": 1792395191058,
+                  "kind": "exec",
+                  "target_or_command": "cp main.db main.db.orig"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395191064-process-875251-343",
+                  "pid": 875251,
+                  "at_ms": 1792395191064,
+                  "kind": "exec",
+                  "target_or_command": "cp main.db-wal main.db-wal.orig"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191058-process-875250-330",
+                  "pid": 875250,
+                  "at_ms": 1792395191058,
+                  "kind": "exec",
+                  "target_or_command": "cp main.db main.db.orig"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395191064-process-875251-343",
+                  "pid": 875251,
+                  "at_ms": 1792395191064,
+                  "kind": "exec",
+                  "target_or_command": "cp main.db-wal main.db-wal.orig"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "main.db.orig 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db.orig"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191062-process-875250-341",
+                  "pid": 875250,
+                  "at_ms": 1792395191062,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db.orig"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191062-process-875250-341",
+                  "pid": 875250,
+                  "at_ms": 1792395191062,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db.orig"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "main.db-wal.orig 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db-wal.orig"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191066-process-875251-352",
+                  "pid": 875251,
+                  "at_ms": 1792395191066,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal.orig"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191066-process-875251-352",
+                  "pid": 875251,
+                  "at_ms": 1792395191066,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal.orig"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 3,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395186297,
+          1792395196357
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K3",
+      "task": "db-wal-recovery",
+      "title": "Python 将解码 WAL 写回",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "解码写回 Python 实际执行",
+          "type": "exec",
+          "command_regex": "^python3(?:\\.\\d+)? .*main\\.db-wal\\.orig",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191068-process-875252-354",
+                  "pid": 875252,
+                  "at_ms": 1792395191068,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191068-process-875252-354",
+                  "pid": 875252,
+                  "at_ms": 1792395191068,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \ndata = bytes(b ^ 0x42 for b in open('main.db-wal.orig','rb').read())\nopen('main.db-wal','wb').write(data)\n"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "WAL 备份读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db-wal.orig"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        },
+        {
+          "label": "WAL 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db-wal"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_0211c305cd194d43",
+                  "pid": 876006,
+                  "at_ms": 1792395205662,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "evt_140c663753737613",
+                  "pid": 875568,
+                  "at_ms": 1792395199407,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/main.db-wal"
+                }
+              ],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 5,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191089-process-875252-370",
+                  "pid": 875252,
+                  "at_ms": 1792395191089,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395191103-process-875249-386",
+                  "pid": 875249,
+                  "at_ms": 1792395191103,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194168-process-875348-421",
+                  "pid": 875348,
+                  "at_ms": 1792395194168,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395199087-process-875568-478",
+                  "pid": 875568,
+                  "at_ms": 1792395199087,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395205161-process-876006-566",
+                  "pid": 876006,
+                  "at_ms": 1792395205161,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191089-process-875252-370",
+                  "pid": 875252,
+                  "at_ms": 1792395191089,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395191103-process-875249-386",
+                  "pid": 875249,
+                  "at_ms": 1792395191103,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194168-process-875348-421",
+                  "pid": 875348,
+                  "at_ms": 1792395194168,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db-wal"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 2,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 2,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395186297,
+          1792395196357
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K4",
+      "task": "db-wal-recovery",
+      "title": "SQLite 读取恢复结果",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "SQLite 数据库命令实际执行",
+          "type": "exec",
+          "command_regex": "^sqlite3 main\\.db(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_fac9a0a9efb4159f",
+                  "pid": 876006,
+                  "at_ms": 1792395205657,
+                  "kind": "ToolExec",
+                  "target_or_command": "sqlite3 main.db SELECT count(*) FROM items;"
+                },
+                {
+                  "event_id": "evt_d2ffb738f8e25d51",
+                  "pid": 875348,
+                  "at_ms": 1792395194640,
+                  "kind": "ToolExec",
+                  "target_or_command": "sqlite3 main.db SELECT * FROM sqlite_master; SELECT * FROM items ORDER BY id;"
+                },
+                {
+                  "event_id": "evt_203c23940d7e662d",
+                  "pid": 875249,
+                  "at_ms": 1792395191512,
+                  "kind": "ToolExec",
+                  "target_or_command": "sqlite3 main.db PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "evt_d2ffb738f8e25d51",
+                  "pid": 875348,
+                  "at_ms": 1792395194640,
+                  "kind": "ToolExec",
+                  "target_or_command": "sqlite3 main.db SELECT * FROM sqlite_master; SELECT * FROM items ORDER BY id;"
+                },
+                {
+                  "event_id": "evt_203c23940d7e662d",
+                  "pid": 875249,
+                  "at_ms": 1792395191512,
+                  "kind": "ToolExec",
+                  "target_or_command": "sqlite3 main.db PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191098-process-875249-374",
+                  "pid": 875249,
+                  "at_ms": 1792395191098,
+                  "kind": "exec",
+                  "target_or_command": "sqlite3 main.db PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194161-process-875348-408",
+                  "pid": 875348,
+                  "at_ms": 1792395194161,
+                  "kind": "exec",
+                  "target_or_command": "sqlite3 main.db SELECT * FROM sqlite_master; SELECT * FROM items ORDER BY id;"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395205157-process-876006-551",
+                  "pid": 876006,
+                  "at_ms": 1792395205157,
+                  "kind": "exec",
+                  "target_or_command": "sqlite3 main.db SELECT count(*) FROM items;"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191098-process-875249-374",
+                  "pid": 875249,
+                  "at_ms": 1792395191098,
+                  "kind": "exec",
+                  "target_or_command": "sqlite3 main.db PRAGMA integrity_check; SELECT count(*) FROM sqlite_master;"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194161-process-875348-408",
+                  "pid": 875348,
+                  "at_ms": 1792395194161,
+                  "kind": "exec",
+                  "target_or_command": "sqlite3 main.db SELECT * FROM sqlite_master; SELECT * FROM items ORDER BY id;"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "数据库读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 4,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191100-process-875249-383",
+                  "pid": 875249,
+                  "at_ms": 1792395191100,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194166-process-875348-417",
+                  "pid": 875348,
+                  "at_ms": 1792395194166,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395199086-process-875568-477",
+                  "pid": 875568,
+                  "at_ms": 1792395199086,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395205160-process-876006-563",
+                  "pid": 876006,
+                  "at_ms": 1792395205160,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191100-process-875249-383",
+                  "pid": 875249,
+                  "at_ms": 1792395191100,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194166-process-875348-417",
+                  "pid": 875348,
+                  "at_ms": 1792395194166,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395199086-process-875568-477",
+                  "pid": 875568,
+                  "at_ms": 1792395199086,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 2,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 2,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395186297,
+          1792395196357
+        ],
+        [
+          1792395189388,
+          1792395199431
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K5",
+      "task": "db-wal-recovery",
+      "title": "Python 查询数据库并导出 JSON",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "JSON 导出 Python 实际执行",
+          "type": "exec",
+          "command_regex": "^python3(?:\\.\\d+)? .*import sqlite3,\\s*json",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_284f6fd7682c5aef",
+                  "pid": 875568,
+                  "at_ms": 1792395199351,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport sqlite3, json\ncon = sqlite3.connect('main.db')\nrows = con.execute('SELECT id, name, value FROM items ORDER BY id').fetchall()\ncon.close()\ndata = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in rows]\nwith open('recovered.json', 'w') as f:"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_284f6fd7682c5aef",
+                  "pid": 875568,
+                  "at_ms": 1792395199351,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport sqlite3, json\ncon = sqlite3.connect('main.db')\nrows = con.execute('SELECT id, name, value FROM items ORDER BY id').fetchall()\ncon.close()\ndata = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in rows]\nwith open('recovered.json', 'w') as f:"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395198993-process-875568-435",
+                  "pid": 875568,
+                  "at_ms": 1792395198993,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport sqlite3, json\ncon = sqlite3.connect('main.db')\nrows = con.execute('SELECT id, name, value FROM items ORDER BY id').fetchall()\ncon.close()\ndata = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in rows]\nwith open('recovered.json', 'w') "
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395198993-process-875568-435",
+                  "pid": 875568,
+                  "at_ms": 1792395198993,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport sqlite3, json\ncon = sqlite3.connect('main.db')\nrows = con.execute('SELECT id, name, value FROM items ORDER BY id').fetchall()\ncon.close()\ndata = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in rows]\nwith open('recovered.json', 'w') "
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "主库读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/main.db"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 4,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395191100-process-875249-383",
+                  "pid": 875249,
+                  "at_ms": 1792395191100,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395194166-process-875348-417",
+                  "pid": 875348,
+                  "at_ms": 1792395194166,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395199086-process-875568-477",
+                  "pid": 875568,
+                  "at_ms": 1792395199086,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395205160-process-876006-563",
+                  "pid": 876006,
+                  "at_ms": 1792395205160,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395199086-process-875568-477",
+                  "pid": 875568,
+                  "at_ms": 1792395199086,
+                  "kind": "write",
+                  "target_or_command": "/app/main.db"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "recovered.json 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/recovered.json"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395199088-process-875568-481",
+                  "pid": 875568,
+                  "at_ms": 1792395199088,
+                  "kind": "write",
+                  "target_or_command": "/app/recovered.json"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395199088-process-875568-481",
+                  "pid": 875568,
+                  "at_ms": 1792395199088,
+                  "kind": "write",
+                  "target_or_command": "/app/recovered.json"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "JSON 读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/recovered.json"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 4,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 3,
+          "total_atoms": 4,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395194234,
+          1792395204347
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "db-wal-recovery-K6",
+      "task": "db-wal-recovery",
+      "title": "独立回读核对输出",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "JSON 校验 Python 实际执行",
+          "type": "exec",
+          "command_regex": "^python3(?:\\.\\d+)? .*json\\.load",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_3f850fe1eda8e592",
+                  "pid": 876008,
+                  "at_ms": 1792395205547,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport json\nd = json.load(open('recovered.json'))\nassert len(d) == 11 and [r['id'] for r in d] == list(range(1,12)), 'validation failed'\nassert all(set(r) == {'id','name','value'} for r in d)\nprint('recovered.json: 11 records, sorted by id — OK')\n"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "evt_3f850fe1eda8e592",
+                  "pid": 876008,
+                  "at_ms": 1792395205547,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 -c \nimport json\nd = json.load(open('recovered.json'))\nassert len(d) == 11 and [r['id'] for r in d] == list(range(1,12)), 'validation failed'\nassert all(set(r) == {'id','name','value'} for r in d)\nprint('recovered.json: 11 records, sorted by id — OK')\n"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395205118-process-876008-513",
+                  "pid": 876008,
+                  "at_ms": 1792395205118,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport json\nd = json.load(open('recovered.json'))\nassert len(d) == 11 and [r['id'] for r in d] == list(range(1,12)), 'validation failed'\nassert all(set(r) == {'id','name','value'} for r in d)\nprint('recovered.json: 11 records, sorted by id —"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395205118-process-876008-513",
+                  "pid": 876008,
+                  "at_ms": 1792395205118,
+                  "kind": "exec",
+                  "target_or_command": "python3 -c \nimport json\nd = json.load(open('recovered.json'))\nassert len(d) == 11 and [r['id'] for r in d] == list(range(1,12)), 'validation failed'\nassert all(set(r) == {'id','name','value'} for r in d)\nprint('recovered.json: 11 records, sorted by id —"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "JSON 读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/recovered.json"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395200353,
+          1792395210414
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K1",
+      "task": "polyglot-c-py",
+      "title": "生成并修订双语言源文件",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "main.py.c 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/polyglot/main.py.c"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_878dbb6e441bca16",
+                  "pid": 870579,
+                  "at_ms": 1792395291068,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "evt_690319b68efb5dd2",
+                  "pid": 870579,
+                  "at_ms": 1792395216710,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "evt_75a7a77f460666e5",
+                  "pid": 870579,
+                  "at_ms": 1792395294978,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "evt_878dbb6e441bca16",
+                  "pid": 870579,
+                  "at_ms": 1792395291068,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "evt_690319b68efb5dd2",
+                  "pid": 870579,
+                  "at_ms": 1792395216710,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "evt_75a7a77f460666e5",
+                  "pid": 870579,
+                  "at_ms": 1792395294978,
+                  "kind": "FileAccess",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395216229-process-870579-220",
+                  "pid": 870579,
+                  "at_ms": 1792395216229,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395290611-process-870579-474",
+                  "pid": 870579,
+                  "at_ms": 1792395290611,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395294516-process-870579-491",
+                  "pid": 870579,
+                  "at_ms": 1792395294516,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395216229-process-870579-220",
+                  "pid": 870579,
+                  "at_ms": 1792395216229,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395290611-process-870579-474",
+                  "pid": 870579,
+                  "at_ms": 1792395290611,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395294516-process-870579-491",
+                  "pid": 870579,
+                  "at_ms": 1792395294516,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/main.py.c"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395211469,
+          1792395221497
+        ],
+        [
+          1792395285855,
+          1792395295860
+        ],
+        [
+          1792395289761,
+          1792395299765
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K2",
+      "task": "polyglot-c-py",
+      "title": "编译读取源文件并生成二进制",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "gcc 实际执行",
+          "type": "exec",
+          "command_regex": "^gcc(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_0b80f902c60423c0",
+                  "pid": 883315,
+                  "at_ms": 1792395299687,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "evt_b4db511f5af1a855",
+                  "pid": 889194,
+                  "at_ms": 1792395346943,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc main.py.c -o cmain"
+                },
+                {
+                  "event_id": "evt_5d06a2cb0667254e",
+                  "pid": 877094,
+                  "at_ms": 1792395221048,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "evt_0b80f902c60423c0",
+                  "pid": 883315,
+                  "at_ms": 1792395299687,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "evt_b4db511f5af1a855",
+                  "pid": 889194,
+                  "at_ms": 1792395346943,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc main.py.c -o cmain"
+                },
+                {
+                  "event_id": "evt_5d06a2cb0667254e",
+                  "pid": 877094,
+                  "at_ms": 1792395221048,
+                  "kind": "ToolExec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395220480-process-877094-246",
+                  "pid": 877094,
+                  "at_ms": 1792395220480,
+                  "kind": "exec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299334-process-883315-502",
+                  "pid": 883315,
+                  "at_ms": 1792395299334,
+                  "kind": "exec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395346305-process-889194-4581",
+                  "pid": 889194,
+                  "at_ms": 1792395346305,
+                  "kind": "exec",
+                  "target_or_command": "gcc main.py.c -o cmain"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395220480-process-877094-246",
+                  "pid": 877094,
+                  "at_ms": 1792395220480,
+                  "kind": "exec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299334-process-883315-502",
+                  "pid": 883315,
+                  "at_ms": 1792395299334,
+                  "kind": "exec",
+                  "target_or_command": "gcc -Wall -Wextra main.py.c -o cmain"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395346305-process-889194-4581",
+                  "pid": 889194,
+                  "at_ms": 1792395346305,
+                  "kind": "exec",
+                  "target_or_command": "gcc main.py.c -o cmain"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "源文件读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/polyglot/main.py.c"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        },
+        {
+          "label": "cmain 可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/polyglot/cmain"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 1,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299390-process-883319-602",
+                  "pid": 883319,
+                  "at_ms": 1792395299390,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/cmain"
+                }
+              ],
+              "count": 1,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299390-process-883319-602",
+                  "pid": 883319,
+                  "at_ms": 1792395299390,
+                  "kind": "write",
+                  "target_or_command": "/app/polyglot/cmain"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 2,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 2,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395215308,
+          1792395227777
+        ],
+        [
+          1792395294565,
+          1792395304716
+        ],
+        [
+          1792395341540,
+          1792395352098
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K3",
+      "task": "polyglot-c-py",
+      "title": "Python 未安装时执行失败",
+      "priority": "diagnostic_only",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "失败路径查找/exec 的完整证据",
+          "type": "unsupported",
+          "command_regex": null,
+          "paths": null,
+          "limitation": "既有记录不提供完整失败 syscall/errno，不能从127反推ENOENT。",
+          "systems": {
+            "AnySentry": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395215308,
+          1792395227777
+        ],
+        [
+          1792395273288,
+          1792395283300
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K4",
+      "task": "polyglot-c-py",
+      "title": "后台安装 Python 产生系统文件变更",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "apt-get 实际执行",
+          "type": "exec",
+          "command_regex": "^apt-get(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_2e4bc27f60665ab7",
+                  "pid": 883329,
+                  "at_ms": 1792395299814,
+                  "kind": "ToolExec",
+                  "target_or_command": "apt-get update -qq"
+                },
+                {
+                  "event_id": "evt_e0ffe11ed8f3fb5e",
+                  "pid": 884637,
+                  "at_ms": 1792395313034,
+                  "kind": "ToolExec",
+                  "target_or_command": "apt-get install -y -qq python3"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "evt_2e4bc27f60665ab7",
+                  "pid": 883329,
+                  "at_ms": 1792395299814,
+                  "kind": "ToolExec",
+                  "target_or_command": "apt-get update -qq"
+                },
+                {
+                  "event_id": "evt_e0ffe11ed8f3fb5e",
+                  "pid": 884637,
+                  "at_ms": 1792395313034,
+                  "kind": "ToolExec",
+                  "target_or_command": "apt-get install -y -qq python3"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 2,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299463-process-883329-640",
+                  "pid": 883329,
+                  "at_ms": 1792395299463,
+                  "kind": "exec",
+                  "target_or_command": "apt-get update -qq"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312521-process-884637-1056",
+                  "pid": 884637,
+                  "at_ms": 1792395312521,
+                  "kind": "exec",
+                  "target_or_command": "apt-get install -y -qq python3"
+                }
+              ],
+              "count": 2,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299463-process-883329-640",
+                  "pid": 883329,
+                  "at_ms": 1792395299463,
+                  "kind": "exec",
+                  "target_or_command": "apt-get update -qq"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312521-process-884637-1056",
+                  "pid": 884637,
+                  "at_ms": 1792395312521,
+                  "kind": "exec",
+                  "target_or_command": "apt-get install -y -qq python3"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "dpkg 实际执行",
+          "type": "exec",
+          "command_regex": "^dpkg(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 19,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_6a230c47fdf6fe50",
+                  "pid": 886226,
+                  "at_ms": 1792395333771,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --unpack --auto-deconfigure /var/cache/apt/archives/python3_3.12.3-0ubuntu2.1_amd64.deb /var/cache/apt/archives/openssl_3.0.13-0ubuntu3.16_amd64.deb /var/cache/apt/archives/ca-certificates_20260601~24.04.1_all.deb"
+                },
+                {
+                  "event_id": "evt_9fc6d3aeeae903c9",
+                  "pid": 886183,
+                  "at_ms": 1792395333763,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg -L python3-minimal"
+                },
+                {
+                  "event_id": "evt_fc085b226c39e403",
+                  "pid": 885865,
+                  "at_ms": 1792395330402,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --configure libssl3t64:amd64"
+                },
+                {
+                  "event_id": "evt_4666079102fe0762",
+                  "pid": 885817,
+                  "at_ms": 1792395330113,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --assert-protected-field"
+                },
+                {
+                  "event_id": "evt_1d9889867b1c2049",
+                  "pid": 887144,
+                  "at_ms": 1792395336507,
+                  "kind": "ToolExec",
+                  "target_or_command": "dpkg --compare-versions  lt-nl 20111025"
+                },
+                {
+                  "event_id": "evt_d17ce88bf1ae01df",
+                  "pid": 886179,
+                  "at_ms": 1792395333758,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --configure python3-minimal:amd64"
+                }
+              ],
+              "count": 19,
+              "examples": [
+                {
+                  "event_id": "evt_6a230c47fdf6fe50",
+                  "pid": 886226,
+                  "at_ms": 1792395333771,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --unpack --auto-deconfigure /var/cache/apt/archives/python3_3.12.3-0ubuntu2.1_amd64.deb /var/cache/apt/archives/openssl_3.0.13-0ubuntu3.16_amd64.deb /var/cache/apt/archives/ca-certificates_20260601~24.04.1_all.deb"
+                },
+                {
+                  "event_id": "evt_9fc6d3aeeae903c9",
+                  "pid": 886183,
+                  "at_ms": 1792395333763,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg -L python3-minimal"
+                },
+                {
+                  "event_id": "evt_fc085b226c39e403",
+                  "pid": 885865,
+                  "at_ms": 1792395330402,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --configure libssl3t64:amd64"
+                },
+                {
+                  "event_id": "evt_4666079102fe0762",
+                  "pid": 885817,
+                  "at_ms": 1792395330113,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --assert-protected-field"
+                },
+                {
+                  "event_id": "evt_1d9889867b1c2049",
+                  "pid": 887144,
+                  "at_ms": 1792395336507,
+                  "kind": "ToolExec",
+                  "target_or_command": "dpkg --compare-versions  lt-nl 20111025"
+                },
+                {
+                  "event_id": "evt_d17ce88bf1ae01df",
+                  "pid": 886179,
+                  "at_ms": 1792395333758,
+                  "kind": "ToolExec",
+                  "target_or_command": "/usr/bin/dpkg --status-fd 27 --no-triggers --configure python3-minimal:amd64"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 17,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299477-process-883335-673",
+                  "pid": 883335,
+                  "at_ms": 1792395299477,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395309871-process-884362-1004",
+                  "pid": 884362,
+                  "at_ms": 1792395309871,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312504-process-884636-1044",
+                  "pid": 884636,
+                  "at_ms": 1792395312504,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312530-process-884639-1091",
+                  "pid": 884639,
+                  "at_ms": 1792395312530,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312730-process-884702-1105",
+                  "pid": 884702,
+                  "at_ms": 1792395312730,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395314574-process-884790-1144",
+                  "pid": 884790,
+                  "at_ms": 1792395314574,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                }
+              ],
+              "count": 17,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299477-process-883335-673",
+                  "pid": 883335,
+                  "at_ms": 1792395299477,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395309871-process-884362-1004",
+                  "pid": 884362,
+                  "at_ms": 1792395309871,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312504-process-884636-1044",
+                  "pid": 884636,
+                  "at_ms": 1792395312504,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312530-process-884639-1091",
+                  "pid": 884639,
+                  "at_ms": 1792395312530,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395312730-process-884702-1105",
+                  "pid": 884702,
+                  "at_ms": 1792395312730,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395314574-process-884790-1144",
+                  "pid": 884790,
+                  "at_ms": 1792395314574,
+                  "kind": "exec",
+                  "target_or_command": "/usr/bin/dpkg --print-foreign-architectures"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "label": "包管理目录可写打开",
+          "type": "writable_open",
+          "command_regex": null,
+          "paths": [
+            "/var/lib/dpkg/",
+            "/var/lib/apt/",
+            "/var/cache/apt/"
+          ],
+          "limitation": "可写打开支持文件访问意图，不证明后续写入字节、rename 或内容正确。",
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 237,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_6be02a585de4fcd2",
+                  "pid": 885866,
+                  "at_ms": 1792395332143,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_9e4d8d43f28e19ad",
+                  "pid": 886063,
+                  "at_ms": 1792395337715,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_56b8898522c3182d",
+                  "pid": 886063,
+                  "at_ms": 1792395337097,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/info/libpython3.12-stdlib:amd64.list-new"
+                },
+                {
+                  "event_id": "evt_a9502807cb3ce23a",
+                  "pid": 886226,
+                  "at_ms": 1792395337125,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_9ad88bb6d3cbfe3f",
+                  "pid": 886226,
+                  "at_ms": 1792395337116,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/tmp.ci//preinst"
+                },
+                {
+                  "event_id": "evt_66c46acdd171b416",
+                  "pid": 886063,
+                  "at_ms": 1792395334792,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/tmp.ci//control"
+                }
+              ],
+              "count": 237,
+              "examples": [
+                {
+                  "event_id": "evt_6be02a585de4fcd2",
+                  "pid": 885866,
+                  "at_ms": 1792395332143,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_9e4d8d43f28e19ad",
+                  "pid": 886063,
+                  "at_ms": 1792395337715,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_56b8898522c3182d",
+                  "pid": 886063,
+                  "at_ms": 1792395337097,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/info/libpython3.12-stdlib:amd64.list-new"
+                },
+                {
+                  "event_id": "evt_a9502807cb3ce23a",
+                  "pid": 886226,
+                  "at_ms": 1792395337125,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/updates/tmp.i"
+                },
+                {
+                  "event_id": "evt_9ad88bb6d3cbfe3f",
+                  "pid": 886226,
+                  "at_ms": 1792395337116,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/tmp.ci//preinst"
+                },
+                {
+                  "event_id": "evt_66c46acdd171b416",
+                  "pid": 886063,
+                  "at_ms": 1792395334792,
+                  "kind": "FileAccess",
+                  "target_or_command": "/var/lib/dpkg/tmp.ci//control"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 268,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299491-process-883329-689",
+                  "pid": 883329,
+                  "at_ms": 1792395299491,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299506-process-883329-721",
+                  "pid": 883329,
+                  "at_ms": 1792395299506,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.vbHAdY"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-722",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.KsNocJ"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-723",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.QfA2eZ"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-724",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.iEhzp6"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395300028-process-883344-803",
+                  "pid": 883344,
+                  "at_ms": 1792395300028,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/security.ubuntu.com_ubuntu_dists_noble-security_InRelease"
+                }
+              ],
+              "count": 268,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299491-process-883329-689",
+                  "pid": 883329,
+                  "at_ms": 1792395299491,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/lock"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299506-process-883329-721",
+                  "pid": 883329,
+                  "at_ms": 1792395299506,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.vbHAdY"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-722",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.KsNocJ"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-723",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.QfA2eZ"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299507-process-883329-724",
+                  "pid": 883329,
+                  "at_ms": 1792395299507,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/.apt-acquire-privs-test.iEhzp6"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395300028-process-883344-803",
+                  "pid": 883344,
+                  "at_ms": 1792395300028,
+                  "kind": "write",
+                  "target_or_command": "/var/lib/apt/lists/partial/security.ubuntu.com_ubuntu_dists_noble-security_InRelease"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 3,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 3,
+          "total_atoms": 3,
+          "task_scope_matched_atoms": 3,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395294566,
+          1792395304730
+        ],
+        [
+          1792395299674,
+          1792395347188
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K5",
+      "task": "polyglot-c-py",
+      "title": "包更新可能产生网络访问",
+      "priority": "conditional",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "归属于 apt 及其后代的远端获取链",
+          "type": "unsupported",
+          "command_regex": null,
+          "paths": null,
+          "limitation": "网络总数含模型及其他流量；本轮不以连接总数确认 apt 下载，需单独逐连接核验。",
+          "systems": {
+            "AnySentry": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395294566,
+          1792395304730
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K6",
+      "task": "polyglot-c-py",
+      "title": "Python 解释执行同一份源文件",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "Python 解释执行 main.py.c",
+          "type": "exec",
+          "command_regex": "^python3(?:\\.\\d+)? main\\.py\\.c(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 10,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_14af5aeb526e9a77",
+                  "pid": 889222,
+                  "at_ms": 1792395347146,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 10"
+                },
+                {
+                  "event_id": "evt_c580b1c43d29127a",
+                  "pid": 889228,
+                  "at_ms": 1792395347153,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 90"
+                },
+                {
+                  "event_id": "evt_93fd18e6eba5af94",
+                  "pid": 889218,
+                  "at_ms": 1792395346961,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 3"
+                },
+                {
+                  "event_id": "evt_362e64e8fddfb0a7",
+                  "pid": 889220,
+                  "at_ms": 1792395346965,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 7"
+                },
+                {
+                  "event_id": "evt_b3465a74448604a4",
+                  "pid": 889206,
+                  "at_ms": 1792395346951,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 0"
+                },
+                {
+                  "event_id": "evt_78965ad0380eef59",
+                  "pid": 889226,
+                  "at_ms": 1792395347150,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 50"
+                }
+              ],
+              "count": 10,
+              "examples": [
+                {
+                  "event_id": "evt_14af5aeb526e9a77",
+                  "pid": 889222,
+                  "at_ms": 1792395347146,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 10"
+                },
+                {
+                  "event_id": "evt_c580b1c43d29127a",
+                  "pid": 889228,
+                  "at_ms": 1792395347153,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 90"
+                },
+                {
+                  "event_id": "evt_93fd18e6eba5af94",
+                  "pid": 889218,
+                  "at_ms": 1792395346961,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 3"
+                },
+                {
+                  "event_id": "evt_362e64e8fddfb0a7",
+                  "pid": 889220,
+                  "at_ms": 1792395346965,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 7"
+                },
+                {
+                  "event_id": "evt_b3465a74448604a4",
+                  "pid": 889206,
+                  "at_ms": 1792395346951,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 0"
+                },
+                {
+                  "event_id": "evt_78965ad0380eef59",
+                  "pid": 889226,
+                  "at_ms": 1792395347150,
+                  "kind": "ToolExec",
+                  "target_or_command": "python3 main.py.c 50"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        },
+        {
+          "label": "源文件读取打开",
+          "type": "readable_open",
+          "command_regex": null,
+          "paths": [
+            "/app/polyglot/main.py.c"
+          ],
+          "limitation": "只检查明确的读取打开标记；未找到不等于未发生读取。",
+          "systems": {
+            "AnySentry": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "not_found_in_scoped_recording",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "no_matching_evidence",
+          "matched_atoms": 0,
+          "total_atoms": 2,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395341540,
+          1792395352098
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K7",
+      "task": "polyglot-c-py",
+      "title": "执行编译后的 C 程序",
+      "priority": "required_for_reference_path",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "cmain 实际执行",
+          "type": "exec",
+          "command_regex": "^cmain(?: |$)",
+          "paths": null,
+          "limitation": null,
+          "systems": {
+            "AnySentry": {
+              "status": "recorded",
+              "task_scope_count": 13,
+              "task_scope_examples": [
+                {
+                  "event_id": "evt_15e041befaa37722",
+                  "pid": 889219,
+                  "at_ms": 1792395346964,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 3"
+                },
+                {
+                  "event_id": "evt_c3149be0d38fcff2",
+                  "pid": 883320,
+                  "at_ms": 1792395299801,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 10"
+                },
+                {
+                  "event_id": "evt_c4a790b12bea2e20",
+                  "pid": 889231,
+                  "at_ms": 1792395347158,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 93"
+                },
+                {
+                  "event_id": "evt_7313998c817e4bb3",
+                  "pid": 889207,
+                  "at_ms": 1792395346953,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 0"
+                },
+                {
+                  "event_id": "evt_d16ad512012c107d",
+                  "pid": 883314,
+                  "at_ms": 1792395299804,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 90"
+                },
+                {
+                  "event_id": "evt_d37d9220743bd715",
+                  "pid": 889225,
+                  "at_ms": 1792395347150,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 20"
+                }
+              ],
+              "count": 13,
+              "examples": [
+                {
+                  "event_id": "evt_15e041befaa37722",
+                  "pid": 889219,
+                  "at_ms": 1792395346964,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 3"
+                },
+                {
+                  "event_id": "evt_c3149be0d38fcff2",
+                  "pid": 883320,
+                  "at_ms": 1792395299801,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 10"
+                },
+                {
+                  "event_id": "evt_c4a790b12bea2e20",
+                  "pid": 889231,
+                  "at_ms": 1792395347158,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 93"
+                },
+                {
+                  "event_id": "evt_7313998c817e4bb3",
+                  "pid": 889207,
+                  "at_ms": 1792395346953,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 0"
+                },
+                {
+                  "event_id": "evt_d16ad512012c107d",
+                  "pid": 883314,
+                  "at_ms": 1792395299804,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 90"
+                },
+                {
+                  "event_id": "evt_d37d9220743bd715",
+                  "pid": 889225,
+                  "at_ms": 1792395347150,
+                  "kind": "ToolExec",
+                  "target_or_command": "./cmain 20"
+                }
+              ]
+            },
+            "AgentSight": {
+              "status": "recorded",
+              "task_scope_count": 3,
+              "task_scope_examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299435-process-883320-619",
+                  "pid": 883320,
+                  "at_ms": 1792395299435,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 10"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299437-process-883321-626",
+                  "pid": 883321,
+                  "at_ms": 1792395299437,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 0"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299441-process-883314-632",
+                  "pid": 883314,
+                  "at_ms": 1792395299441,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 90"
+                }
+              ],
+              "count": 3,
+              "examples": [
+                {
+                  "event_id": "audit-canon-event-1792395299435-process-883320-619",
+                  "pid": 883320,
+                  "at_ms": 1792395299435,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 10"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299437-process-883321-626",
+                  "pid": 883321,
+                  "at_ms": 1792395299437,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 0"
+                },
+                {
+                  "event_id": "audit-canon-event-1792395299441-process-883314-632",
+                  "pid": 883314,
+                  "at_ms": 1792395299441,
+                  "kind": "exec",
+                  "target_or_command": "./cmain 90"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "partial_support",
+          "matched_atoms": 1,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 1,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395294565,
+          1792395304716
+        ],
+        [
+          1792395341540,
+          1792395352098
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    },
+    {
+      "claim_id": "polyglot-c-py-K8",
+      "task": "polyglot-c-py",
+      "title": "Shell 用管道收集两路输出并比较",
+      "priority": "implementation_detail",
+      "independent_verification": "not_performed",
+      "atoms": [
+        {
+          "label": "stdout 管道 FD 流向",
+          "type": "unsupported",
+          "command_regex": null,
+          "paths": null,
+          "limitation": "既有 exec/open 记录缺少完整 pipe/dup/write 数据流，命令文本不代替FD证据。",
+          "systems": {
+            "AnySentry": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            },
+            "AgentSight": {
+              "status": "unsupported_by_existing_fields",
+              "task_scope_count": 0,
+              "task_scope_examples": [],
+              "count": 0,
+              "examples": []
+            }
+          }
+        }
+      ],
+      "system_results": {
+        "AnySentry": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        },
+        "AgentSight": {
+          "status": "insufficient_fields",
+          "matched_atoms": 0,
+          "total_atoms": 1,
+          "task_scope_matched_atoms": 0,
+          "full_claim_confirmed": false
+        }
+      },
+      "candidate_call_windows_ms": [
+        [
+          1792395341540,
+          1792395352098
+        ]
+      ],
+      "window_tolerance_ms": 5000
+    }
+  ]
+}
