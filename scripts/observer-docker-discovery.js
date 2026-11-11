@@ -185,7 +185,23 @@ function dockerEntry(container, options = {}) {
   // role, because a typo must remain visible as unresolved rather than silently changing capture.
   const declaredRole = labels[WORKLOAD_ROLE_LABEL];
   const workloadRole = WORKLOAD_ROLES.has(declaredRole) ? declaredRole : undefined;
-  const selectedAgent = workloadKind === 'agent';
+  // compat30: deployment-declared name fallback. Labels are the preferred stable key
+  // (anysentry.io/workload-kind=agent survives image iterations); this pattern covers
+  // environments whose deploy config cannot carry labels yet - set e.g.
+  // ANYSENTRY_AGENT_NAME_PATTERN='^(office|lab)-agent' in anysentry.env. Container names
+  // from compose services are stable across container recreation, unlike container ids.
+  const namePattern = String(process.env.ANYSENTRY_AGENT_NAME_PATTERN || '').trim();
+  let nameDeclaredAgent = false;
+  if (namePattern) {
+    try {
+      nameDeclaredAgent = new RegExp(namePattern, 'i').test(
+        text(Array.isArray(container.Names) ? container.Names[0] : container.Name).replace(/^\/+/, ''));
+    } catch {
+      // An invalid operator pattern must disable the fallback, never crash discovery.
+      nameDeclaredAgent = false;
+    }
+  }
+  const selectedAgent = workloadKind === 'agent' || nameDeclaredAgent;
   const httpToolBackend = !selectedAgent && isHttpToolBackendLabels(labels);
   const legacyInfrastructure = ['0', 'false', 'off', 'no', 'disabled']
     .includes(text(labels[LEGACY_OBSERVE_LABEL]).toLowerCase());
