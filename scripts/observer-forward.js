@@ -2423,8 +2423,10 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
     const sample = (set) => [...set].slice(0, 2).map((k) => String(k).slice(0, 24)).join(' | ');
     const dockerKeys = dockerEntries.slice(0, 2)
       .map((e) => String(e?.physicalWorkloadId ?? e?.id ?? '?').slice(0, 24)).join(' | ');
+    // compat30: this condition silently disables ALL plaintext capture. Log at ERROR with
+    // the remediation hint so journal-based alerting and operators see it immediately.
     console.error(
-      `[observer-forward] tls whitelist join empty: confirmed(${confirmedIds.size})=[${sample(confirmedIds)}] docker(${dockerEntries.length})=[${dockerKeys}]`,
+      `[observer-forward] ALERT tls whitelist join empty: confirmed(${confirmedIds.size})=[${sample(confirmedIds)}] docker(${dockerEntries.length})=[${dockerKeys}] - plaintext capture is OFF until agents are confirmed (labels anysentry.io/workload-kind=agent, ANYSENTRY_AGENT_NAME_PATTERN, or agents/:id/review)`,
     );
   }
   // Prefer Docker-owned cgroups (label-confirmed Design B agents + identity-promoted CLI labs)
