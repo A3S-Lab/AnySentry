@@ -13,6 +13,10 @@ set -uo pipefail
 
 ENV_FILE=${ANYSENTRY_ENV_FILE:-/etc/anysentry/anysentry.env}
 PG_BIN=/opt/anysentry/postgresql/bin
+# compat30 fix: the background (nohup) re-exec drops inherited env; bundled psql
+# cannot load libpq without this -> every PG step silently failed (field 2026-11-12:
+# DELETE reported 0/fail while manual runs deleted 518k rows).
+export LD_LIBRARY_PATH="$(dirname "$PG_BIN")/../lib:${LD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH=/opt/anysentry/postgresql/lib
 [[ -f $ENV_FILE ]] || { echo "缺 $ENV_FILE" >&2; exit 1; }
 CLICKHOUSE_USER=$(awk -F= '/^CLICKHOUSE_USER=/{print $2}' "$ENV_FILE")
