@@ -680,6 +680,8 @@ let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
 // namespace and argv/environment are never included.
 const SPOOL_WAL_ALERT_BYTES = 512 * 1024 * 1024;
 let lastSpoolWalAlertAt = 0;
+let lastTlsWhitelistAlertAt = 0;
+let lastTlsFallbackNoticeAt = 0;
 let inventoryPushTimer;
 let inventoryPushInFlight = false;
 let lastInventoryHash = '';
@@ -2414,23 +2416,14 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
     dockerEntries,
     confirmedIds,
   );
-  // Whitelist-empty diagnosis: when confirmed identities exist and Docker entries exist but
-  // the promotion produced nothing, the join keys do not match. Log a redacted shape of both
-  // sides (first 24 chars of up to 2 keys) so the mismatch is visible in the field.
-  if (
-    promoted.promotedCgroupIds instanceof Set && promoted.promotedCgroupIds.size === 0
+  // Whitelist-empty diagnosis, deferred to the final admission set (compat31): the
+  // identity-review join can be empty forever once container ids rotate past the reviewed
+  // assets, while labels/name-pattern admission carries the whitelist correctly. ALERT only
+  // when the FINAL whitelist is empty (plaintext truly off); otherwise log a throttled,
+  // correctly-worded fallback notice.
+  const joinEmpty = promoted.promotedCgroupIds instanceof Set && promoted.promotedCgroupIds.size === 0
     && confirmedIds.size > 0
-    && dockerEntries.length > 0
-  ) {
-    const sample = (set) => [...set].slice(0, 2).map((k) => String(k).slice(0, 24)).join(' | ');
-    const dockerKeys = dockerEntries.slice(0, 2)
-      .map((e) => String(e?.physicalWorkloadId ?? e?.id ?? '?').slice(0, 24)).join(' | ');
-    // compat30: this condition silently disables ALL plaintext capture. Log at ERROR with
-    // the remediation hint so journal-based alerting and operators see it immediately.
-    console.error(
-      `[observer-forward] ALERT tls whitelist join empty: confirmed(${confirmedIds.size})=[${sample(confirmedIds)}] docker(${dockerEntries.length})=[${dockerKeys}] - plaintext capture is OFF until agents are confirmed (labels anysentry.io/workload-kind=agent, ANYSENTRY_AGENT_NAME_PATTERN, or agents/:id/review)`,
-    );
-  }
+    && dockerEntries.length > 0;
   // Prefer Docker-owned cgroups (label-confirmed Design B agents + identity-promoted CLI labs)
   // over argv-signature fences. Dual-claiming the same cgroup as both
   // `customer-langgraph-sim-*` and generic `langgraph` marks Collector conflicts and disables
@@ -2443,6 +2436,27 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
     return !id || !ownedCgroups.has(id);
   });
   const entries = [...promoted.entries, ...scopedProcessEntries];
+  if (joinEmpty || entries.length === 0) {
+    const sample = (set) => [...set].slice(0, 2).map((k) => String(k).slice(0, 24)).join(' | ');
+    const dockerKeys = dockerEntries.slice(0, 2)
+      .map((e) => String(e?.physicalWorkloadId ?? e?.id ?? '?').slice(0, 24)).join(' | ');
+    const now = Date.now();
+    if (entries.length === 0 && (confirmedIds.size > 0 || dockerEntries.length > 0)) {
+      if (now - lastTlsWhitelistAlertAt > 60_000) {
+        lastTlsWhitelistAlertAt = now;
+        console.error(
+          `[observer-forward] ALERT tls whitelist EMPTY: plaintext capture is OFF (confirmed=${confirmedIds.size} docker=${dockerEntries.length}) - confirm agents (labels anysentry.io/workload-kind=agent, ANYSENTRY_AGENT_NAME_PATTERN, or agents/:id/review)`,
+        );
+      }
+    } else if (joinEmpty) {
+      if (now - lastTlsFallbackNoticeAt > 10 * 60_000) {
+        lastTlsFallbackNoticeAt = now;
+        console.log(
+          `[observer-forward] tls admission via labels/name-pattern (entries=${entries.length}); identity-review join empty for reviewed ids [${sample(confirmedIds)}] vs docker [${dockerKeys}] - re-confirm after container redeploys to clear this notice`,
+        );
+      }
+    }
+  }
   // Compare only the local admission facts. generatedAt/snapshotVersion are deliberately omitted
   // from the fingerprint so the 5-second liveness timer does not rewrite an unchanged scope and
   // make the Collector churn its TLS allowlist.
