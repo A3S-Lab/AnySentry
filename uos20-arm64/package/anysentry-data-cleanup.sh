@@ -160,8 +160,12 @@ PG_READY=0; "$PG_BIN/pg_isready" -h 127.0.0.1 -p 5432 -q 2>/dev/null && PG_READY
 if [[ $PG_READY == 1 ]]; then
   for te in "${PG_NS_TABLES[@]}"; do
     t=${te%%:*}; col=${te##*:}
-    c=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc "SELECT count(*) FROM $t WHERE $col < $CUTOFF_NS" 2>/dev/null || echo 0)
-    note "  PG ${t}: ${c:-0} 行"; TOTAL=$((TOTAL+${c:-0}))
+    c=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc "SELECT count(*) FROM $t WHERE $col < $CUTOFF_NS" 2>&1)
+    if [[ ${c:-} =~ ^[0-9]+$ ]]; then
+      note "  PG ${t}: ${c} 行"; TOTAL=$((TOTAL+c))
+    else
+      note "  PG ${t}: 查询失败（${c:0:80}）——检查 psql/LD_LIBRARY_PATH"; PG_READY=0
+    fi
   done
   for t in "${PG_FAMILY_TABLES[@]}"; do
     has=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc \
@@ -225,6 +229,7 @@ if [[ $PG_READY == 1 ]]; then
   for te in "${PG_NS_TABLES[@]}"; do
     t=${te%%:*}; col=${te##*:}
     r=$(pgq -c "DELETE FROM $t WHERE $col < $CUTOFF_NS")
+    [[ $r == DELETE* ]] || note "  !! $t 删除失败：$(echo "$r" | head -c 160)"
     note "DELETE $t: $(echo "$r" | grep -oE 'DELETE [0-9]+' || echo "失败:$(echo "$r" | head -c 120)")"
   done
   for t in "${PG_FAMILY_TABLES[@]}"; do
@@ -247,7 +252,7 @@ if [[ $PG_READY == 1 ]]; then
       note "!! 余量不足（需约 2×最大表），跳过 VACUUM FULL——空间已可复用，下次余量充足时再跑"
     else
       note "VACUUM FULL 还磁盘空间（每表短暂锁，API loopback 专用，影响为秒级停顿）..."
-      for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1 anysentry_coverage_gaps_v1 anysentry_agent_conversation_memberships_v2; do
+      for t in anysentry_raw_observations_v1 anysentry_kernel_facts_v1 anysentry_agent_conversation_memberships_v2 anysentry_coverage_gaps_v1 anysentry_semantic_records_v1 anysentry_session_memberships_v1 anysentry_agent_conversation_anchors_v1 anysentry_agent_conversation_threads_v1 anysentry_agent_conversation_segments_v1 anysentry_evidence_links_v1 anysentry_agent_conversation_bindings_v1; do
         pgq -c "CHECKPOINT" >/dev/null 2>&1
         b=$(pgq -tAc "SELECT pg_size_pretty(pg_total_relation_size('$t'))" 2>/dev/null)
         out=$(pgq -c "VACUUM FULL $t" 2>&1)
