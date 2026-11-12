@@ -1,3 +1,4 @@
+import { TtlCache } from './health-views';
 import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, Req, ServiceUnavailableException, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -9757,10 +9758,21 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return { accepted: true, collectorId: rec.collectorId, sourceId: sourceResolution.source?.sourceId, receivedAt: new Date(rec.at).toISOString() } satisfies T.CollectorHeartbeatAck;
   }
 
+  // compat30: the aggregation scans ClickHouse windows per request; UI polling storms
+  // under load pushed API latency to seconds. Serve identical bodies from a short
+  // TTL cache so pollers get coherent snapshots and the heavy path runs once per key.
+  private readonly collectorHealthCache = new TtlCache<unknown>(3_000, 16);
+
   @Post('collectors/health')
   @HttpCode(200)
   async collectorHealth(@Body() f: T.CollectorHealthQuery) {
-    return this.agg.storedCollectorHealth(f);
+    const key = JSON.stringify(f ?? {});
+    const now = Date.now();
+    const cached = this.collectorHealthCache.get(key, now);
+    if (cached !== undefined) return cached;
+    const result = await this.agg.storedCollectorHealth(f);
+    this.collectorHealthCache.set(key, result, now);
+    return result;
   }
 
   @Post('sources/list')

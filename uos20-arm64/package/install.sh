@@ -241,6 +241,9 @@ write_install_summary() {
     printf 'a3s_code_runtime=%s\n' "$A3S_CODE_RUNTIME"
     printf 'startup_failures=%s\n' "$START_FAILURES"
   } >"$INSTALL_LOG_ROOT/summary.txt"
+echo "Data retention hint: observation data grows ~2GB/day. Schedule "
+echo "  bash $(dirname "$0")/anysentry-data-cleanup.sh --keep-days 3 --yes periodically"
+echo "  (cron) to keep disk usage bounded."
   echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
 }
 

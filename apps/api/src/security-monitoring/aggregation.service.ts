@@ -1,3 +1,4 @@
+import { resolveFileFilterView, resolveMetadataView } from './health-views';
 import { Injectable, OnModuleDestroy, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import { createHash } from 'node:crypto';
@@ -199,6 +200,9 @@ const EVENT_SOURCES: T.EventSource[] = ['observer', 'synthetic', 'api'];
 const ACTIVE_MS = 5 * 60_000;
 const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
+// compat30: honor the last-known raw heartbeat this long past the stale bound
+// before falling back to forwarder-shaped rows (zeros). Field 2026-11-11.
+const COLLECTOR_LAST_KNOWN_GRACE_MS = 15 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
 // Without an explicit de-registration fact, retain a silent Collector as down for one operational
 // day, then archive it from the default summary. Explicit collectorId deep links remain queryable.
@@ -7426,11 +7430,13 @@ export class AggregationService implements OnModuleDestroy {
         t - latestForwarderHeartbeat.at <= COLLECTOR_STALE_MS
         ? latestForwarderHeartbeat
         : undefined;
-      const collectorMetadataHeartbeat = freshRawHeartbeat ?? latest;
-      const freshFileFilterHeartbeat = latestRawHeartbeat?.fileFilterMetricsReportedAt !== undefined &&
-        t - latestRawHeartbeat.fileFilterMetricsReportedAt <= COLLECTOR_STALE_MS
-        ? latestRawHeartbeat
-        : undefined;
+      // compat30: prefer the last-known raw heartbeat inside the grace window over a
+      // newer forwarder-shaped row; expose staleness instead of zeroing the view.
+      const metadataView = resolveMetadataView(
+        t, latestRawHeartbeat, COLLECTOR_STALE_MS, COLLECTOR_LAST_KNOWN_GRACE_MS);
+      const collectorMetadataHeartbeat = metadataView.heartbeat ?? latest;
+      const fileFilterView = resolveFileFilterView(
+        t, latestRawHeartbeat, COLLECTOR_STALE_MS, COLLECTOR_LAST_KNOWN_GRACE_MS);
       const freshCaptureProfileHeartbeat = latestCaptureProfileHeartbeat?.captureProfileMetricsReportedAt !== undefined &&
         t - latestCaptureProfileHeartbeat.captureProfileMetricsReportedAt <= COLLECTOR_STALE_MS
         ? latestCaptureProfileHeartbeat
@@ -7659,8 +7665,8 @@ export class AggregationService implements OnModuleDestroy {
           processFallbackProcReads: 0,
           processAncestryProcReads: 0,
         }),
-        fileFilterMetricsReported: freshFileFilterHeartbeat !== undefined,
-        fileFilterMetrics: freshFileFilterHeartbeat?.fileFilterMetrics ?? {
+        fileFilterMetricsReported: fileFilterView.heartbeat !== undefined,
+        fileFilterMetrics: fileFilterView.heartbeat?.fileFilterMetrics ?? {
           fileAccess: 0,
           fileDelete: 0,
           accessKept: 0,
@@ -7677,6 +7683,12 @@ export class AggregationService implements OnModuleDestroy {
           enabled: false,
           epoch: 0,
         },
+        ...(fileFilterView.heartbeat !== undefined && fileFilterView.staleMs > 0
+          ? { fileFilterMetricsStaleMs: fileFilterView.staleMs }
+          : {}),
+        ...(metadataView.heartbeat !== undefined && metadataView.staleMs > 0
+          ? { metadataStaleMs: metadataView.staleMs }
+          : {}),
         captureProfileMetricsReported: freshCaptureProfileHeartbeat !== undefined,
         ...(freshCaptureProfileHeartbeat?.captureProfileMetrics
           ? { captureProfileMetrics: freshCaptureProfileHeartbeat.captureProfileMetrics }

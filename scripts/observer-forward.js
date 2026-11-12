@@ -678,6 +678,8 @@ let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
 // main-process signatures. This never touches the event ingest path: one bounded
 // POST on change plus a slow keepalive. Labels are limited to the anysentry.io/*
 // namespace and argv/environment are never included.
+const SPOOL_WAL_ALERT_BYTES = 512 * 1024 * 1024;
+let lastSpoolWalAlertAt = 0;
 let inventoryPushTimer;
 let inventoryPushInFlight = false;
 let lastInventoryHash = '';
@@ -2778,6 +2780,20 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   }
   const eventQueues = eventQueueMetrics();
   const spoolMetrics = durableSpoolMetrics();
+  // compat30: an abnormally growing WAL means delivery is stalled (field 2026-11-12: the
+  // spool accumulated 1.7G across API outages and only a disk-full exposed it). Surface it
+  // as an ALERT log, throttled to once per 10 minutes, before it becomes a disk incident.
+  if (spoolMetrics.walBytes > SPOOL_WAL_ALERT_BYTES) {
+    const now = Date.now();
+    if (now - lastSpoolWalAlertAt > 10 * 60_000) {
+      lastSpoolWalAlertAt = now;
+      console.error(
+        `[observer-forward] ALERT spool WAL oversized: ${spoolMetrics.walBytes} bytes ` +
+        `(records=${spoolMetrics.records}, oldestAgeMs=${spoolMetrics.oldestAgeMs}) - ` +
+        `delivery appears stalled; inspect API reachability before the disk fills`,
+      );
+    }
+  }
   const controlPlane = controlPlaneMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
