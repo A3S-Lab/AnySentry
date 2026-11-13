@@ -217,6 +217,11 @@ while :; do
   (( $(date +%s) > deadline )) && { note "等待超时（20 分钟）"; break; }
   sleep 5
 done
+# compat32: CH internal bookkeeping tables get 4h retention (not user-facing)
+for it in event_commit_facts_v2 event_revision_identities process_lifecycle_facts event_locators_v1 kernel_fact_locators_v1; do
+  chq "ALTER TABLE anysentry.${it} DELETE WHERE ts < now() - INTERVAL 4 HOUR" >/dev/null 2>&1 || true
+done
+
 # v3: mutation 未完成时绝不进入 PG VACUUM FULL——两场全表重写叠加曾把机器压到 SSH 无响应
 if [[ ${pending:-0} != 0 ]]; then
   echo "!! CH mutation 仍在重写（${pending} 个）。为避免与 PG VACUUM FULL 叠加压垮磁盘，本次到此为止。" >&2
@@ -232,6 +237,11 @@ if [[ $PG_READY == 1 ]]; then
     [[ $r == DELETE* ]] || note "  !! $t 删除失败：$(echo "$r" | head -c 160)"
     note "DELETE $t: $(echo "$r" | grep -oE 'DELETE [0-9]+' || echo "失败:$(echo "$r" | head -c 120)")"
   done
+
+  # compat32: PG kernel facts short retention (4h; CH events is authoritative)
+  SHORT_CUT=$(($(date +%s) - 14400))000000000
+  pgq -c "DELETE FROM anysentry_kernel_facts_v1 WHERE observed_at < $SHORT_CUT" >/dev/null 2>&1 || true
+  pgq -c "DELETE FROM anysentry_raw_observations_v1 WHERE event_at < $(($(date +%s) - 7200))000000000" >/dev/null 2>&1 || true
   for t in "${PG_FAMILY_TABLES[@]}"; do
     has=$("$PG_BIN/psql" -h 127.0.0.1 -U anysentry -d anysentry -tAc \
       "SELECT 1 FROM information_schema.columns WHERE table_name='$t' AND column_name='created_at'" 2>/dev/null)

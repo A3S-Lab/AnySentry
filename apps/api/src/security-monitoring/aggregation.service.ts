@@ -200,6 +200,9 @@ const EVENT_SOURCES: T.EventSource[] = ['observer', 'synthetic', 'api'];
 const ACTIVE_MS = 5 * 60_000;
 const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
+// compat32: skip storing non-LLM (unparsed) interactions entirely. Egress events already
+// capture the network metadata; these records were 168K rows/day of health-check noise.
+const SKIP_UNPARSED_INTERACTIONS = process.env.ANYSENTRY_SKIP_UNPARSED_INTERACTIONS !== 'false';
 // compat30: honor the last-known raw heartbeat this long past the stale bound
 // before falling back to forwarder-shaped rows (zeros). Field 2026-11-11.
 const COLLECTOR_LAST_KNOWN_GRACE_MS = 15 * 60_000;
@@ -1480,6 +1483,7 @@ export class AggregationService implements OnModuleDestroy {
   private readonly interactionHotMaxRecords = 2_000;
   private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
   private interactionHotEvictions = 0;
+  private unparsedSkippedCount = 0;
   private interactionHotExpired = 0;
   private interactionHotDropped = 0;
   private readonly conversationProjectionGate = new BoundedHistoryQueryGate(
@@ -2904,6 +2908,14 @@ export class AggregationService implements OnModuleDestroy {
       this.conversationInteractionRevision += 1;
       this.conversationProjectionRecent.clear();
       this.conversationProjectionRecentBytes = 0;
+    }
+    // compat32: non-LLM (unparsed) interactions are pure noise - health checks and
+    // internal API calls that nobody reads. Skip CH insertion entirely; the counters
+    // below keep the volume visible in heartbeats and the Egress events table already
+    // captures the network metadata (URL/method/status/bytes) for security analysis.
+    if (record.parseState === 'unparsed' && SKIP_UNPARSED_INTERACTIONS) {
+      this.unparsedSkippedCount = (this.unparsedSkippedCount ?? 0) + 1;
+      return { durable: false };
     }
     const durable = await this.judge.persistAgentInteraction(record);
     // SessionMembership is a canonical ingest-time projection, not a side effect of a later

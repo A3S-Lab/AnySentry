@@ -15,6 +15,8 @@ import { captureClassificationDecision } from './identity-judgment-routing';
 import { observedAgentProduct } from './agent-tool-shape';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const UNPARSED_BODY_LIMIT_BYTES = Math.max(0,
+  Number.parseInt(process.env.ANYSENTRY_UNPARSED_BODY_LIMIT_BYTES ?? '1024', 10) || 1024);
 const MAX_LINE_BYTES = 14 * 1024 * 1024;
 const MAX_DERIVED_JSON_BYTES = 512 * 1024;
 const MAX_TOOL_ITEMS = 2_048;
@@ -356,7 +358,12 @@ function decodedBody(body: string, encoding: 'utf8' | 'base64'): Buffer | undefi
 function content(value: unknown): T.AgentInteractionContent | undefined {
   const input = record(value);
   if (!input) return undefined;
-  const body = exactString(input.body, MAX_BODY_BYTES);
+  let body = exactString(input.body, MAX_BODY_BYTES);
+  // compat32: truncate non-LLM (unparsed) bodies to save storage (15.6GB/day field waste).
+  // Metadata (URL/method/status/capturedBytes/sha256) stays complete for attribution.
+  if (body !== undefined && body.length > UNPARSED_BODY_LIMIT_BYTES) {
+    body = body.slice(0, UNPARSED_BODY_LIMIT_BYTES);
+  }
   const encoding = input.encoding === 'base64' ? 'base64' : input.encoding === 'utf8' ? 'utf8' : undefined;
   const contentType = string(input.contentType, 240);
   const capturedBytes = integer(input.capturedBytes, 0, MAX_BODY_BYTES * 8);

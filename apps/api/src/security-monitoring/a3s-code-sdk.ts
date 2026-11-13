@@ -17,7 +17,8 @@ function assertCpuSupportsPublishedAddon(): void {
   if (cachedCpuCompatible === undefined) {
     try {
       const cpuinfo = readFileSync('/proc/cpuinfo', 'utf8');
-      cachedCpuCompatible = /(?:^|\t|\s)avx512f(?:\s|$)/m.test(cpuinfo);
+      const isX86 = process.arch === 'x64' || process.arch === 'ia32'; // compat32: AVX-512 gate is x86-only; ARM64 cpuinfo lists ARM features, never avx512f
+      cachedCpuCompatible = !isX86 || /(?:^|	|\s)avx512f(?:\s|\$)/m.test(cpuinfo);
     } catch {
       cachedCpuCompatible = true; // cannot probe: keep the legacy behaviour
     }
