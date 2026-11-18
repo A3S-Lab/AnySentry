@@ -10,6 +10,7 @@ import { StreamingFindingService } from './streaming-finding.service';
 import { SupplyChainService } from './supply-chain.service';
 import { SystemContextService } from './system-context.service';
 import type { SystemContextBundle } from './system-context-bundle';
+import { DEFAULT_SECURITY_TIME_TYPE } from './time-window';
 import * as T from './types';
 
 type AssistantSession = Pick<Session, 'send' | 'cancelAsync' | 'closeAsync'>;
@@ -296,11 +297,22 @@ export class SecurityAssistantService implements OnModuleDestroy {
   }
 
   private sanitizeContext(input?: T.SecurityAssistantContext): T.SecurityAssistantContext {
-    const timeTypes: Array<NonNullable<T.SecurityTimeFilter['timeType']>> = ['last_3h', 'last_1d', 'last_7d', 'last_30d', 'custom'];
+    const timeTypes: Array<NonNullable<T.SecurityTimeFilter['timeType']>> = [
+      'last_30m',
+      'last_1h',
+      'last_2h',
+      'last_3h',
+      'last_1d',
+      'last_7d',
+      'last_30d',
+      'custom',
+    ];
     return {
       path: cleanText(input?.path, 240),
       view: cleanText(input?.view, 80),
-      timeType: timeTypes.includes(input?.timeType as NonNullable<T.SecurityTimeFilter['timeType']>) ? input?.timeType : 'last_3h',
+      timeType: timeTypes.includes(input?.timeType as NonNullable<T.SecurityTimeFilter['timeType']>)
+        ? input?.timeType
+        : DEFAULT_SECURITY_TIME_TYPE,
       startTime: cleanText(input?.startTime, 64),
       endTime: cleanText(input?.endTime, 64),
       agentId: cleanText(input?.agentId, 160),
@@ -321,7 +333,7 @@ export class SecurityAssistantService implements OnModuleDestroy {
     references: T.SecurityAssistantReference[];
   }> {
     const filter: T.SecurityTimeFilter = {
-      timeType: context.timeType ?? 'last_3h',
+      timeType: context.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
       startTime: context.startTime,
       endTime: context.endTime,
       scope: 'agent',
@@ -468,7 +480,7 @@ export class SecurityAssistantService implements OnModuleDestroy {
 
     try {
       const bundle = await this.systemContext.build({
-        timeType: context.timeType ?? 'last_3h',
+        timeType: context.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
         startTime: context.startTime,
         endTime: context.endTime,
         scope: 'raw',

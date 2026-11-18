@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "anysentry.agent-interaction-phase-minus-one-contract.v1",
+  "approvedAt": "2026-08-27",
+  "scope": "isolated_fixture_only",
+  "productionCaptureMode": "metadata",
+  "fixtureGate": {
+    "captureMode": "fixture_payload",
+    "environment": "isolated_test",
+    "payloadDirection": "agent_to_llm_request_only",
+    "confirmation": "I_UNDERSTAND_PLAINTEXT_CAPTURE",
+    "explicitPidAllowlistRequired": true,
+    "maximumTargetPids": 256,
+    "killSwitchSignal": "SIGUSR2"
+  },
+  "security": {
+    "metadataOnlyPayloadReads": 0,
+    "metadataOnlyPayloadFragments": 0,
+    "metadataOnlyQueryHmacs": 0,
+    "metadataOnlyContentStoreWrites": 0,
+    "plaintextLeakageFindings": 0
+  },
+  "supportedFixtureThresholds": {
+    "byteExactness": 1,
+    "parsedFixtureExactness": 1,
+    "minimumCompleteRequestRatio": 0.999,
+    "maximumRingDropsAtDeclaredLoad": 0,
+    "maximumQueueDropsAtDeclaredLoad": 0,
+    "maximumIncrementalCpuPercent": 5,
+    "maximumIncrementalRssBytes": 67108864,
+    "maximumAgentP95LatencyRegressionRatio": 0.02,
+    "maximumAgentTtftRegressionRatio": 0.02,
+    "maximumKillSwitchLatencyMs": 1000
+  },
+  "declaredLoad": {
+    "durationSeconds": 900,
+    "baselineDurationSeconds": 900,
+    "requestsPerSecond": 100,
+    "concurrency": 32,
+    "measurementDesign": "metadata_before_fixture_metadata_after",
+    "comparisonBaseline": "lower_p95_of_metadata_before_and_after",
+    "requiredEnvironment": "dedicated_quiet_benchmark_node",
+    "requestBytes": {
+      "minimum": 128,
+      "p50": 4096,
+      "p95": 65536,
+      "maximum": 1048576
+    }
+  },
+  "runtimeClaims": [
+    {
+      "runtime": "openssl-3-dynamic",
+      "status": "bounded_1mib_correctness_passed_performance_gate_failed",
+      "requiredSymbols": [
+        "SSL_write",
+        "SSL_write_ex",
+        "SSL_write_ex2"
+      ]
+    },
+    {
+      "runtime": "node",
+      "status": "public_ssl_abi_failed"
+    },
+    {
+      "runtime": "python",
+      "status": "bounded_1mib_correctness_passed_performance_gate_failed"
+    },
+    {
+      "runtime": "codex-cli",
+      "status": "unsupported_until_fingerprint_adapter"
+    },
+    {
+      "runtime": "claude-code-bun",
+      "status": "unsupported_until_boringssl_adapter"
+    },
+    {
+      "runtime": "go-crypto-tls",
+      "status": "unsupported"
+    },
+    {
+      "runtime": "rustls",
+      "status": "unsupported"
+    }
+  ],
+  "gateRule": "No runtime is supported and no payload feature may ship until every numerical threshold, ground-truth check, security scan, and Kill Switch drill passes for its exact binary fingerprint."
+}

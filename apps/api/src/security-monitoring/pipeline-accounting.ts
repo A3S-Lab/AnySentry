@@ -35,8 +35,10 @@ export const PIPELINE_STAGE_REASONS: Readonly<Record<string, readonly string[]>>
     'unknown',
     'discovery_budget',
     'e2e_scope',
+    'file_path_scope',
   ]),
   aggregated: Object.freeze(['file_access_coalesced']),
+  interaction_handoff: Object.freeze(['content_spooled', 'content_unavailable']),
   queue_admitted: Object.freeze(['event', 'collector_heartbeat']),
   queue_dropped: Object.freeze([
     'serialization_error',

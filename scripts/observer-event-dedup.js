@@ -23,17 +23,27 @@ class ToolExecDeduper {
     const cwd = typeof tool.cwd === 'string' ? tool.cwd : '';
     const key = JSON.stringify([pid, ppid, argv, cwd]);
     const now = this.now();
+    const quality = [
+      tool.exec_confirmed === true ? 1 : 0,
+      tool.argv_incomplete === true ? 0 : 1,
+      tool.argv_truncated === true ? 0 : 1,
+    ];
     const previous = this.recent.get(key);
-    this.recent.set(key, now);
+    this.recent.set(key, { seenAt: now, quality });
 
     if (this.recent.size > this.maxKeys) {
       const cutoff = now - this.windowMs;
-      for (const [candidate, seenAt] of this.recent) {
-        if (seenAt < cutoff) this.recent.delete(candidate);
+      for (const [candidate, seen] of this.recent) {
+        if (seen.seenAt < cutoff) this.recent.delete(candidate);
       }
       if (this.recent.size > this.maxKeys) this.recent.clear();
     }
-    return previous !== undefined && now - previous <= this.windowMs;
+    if (!previous || now - previous.seenAt > this.windowMs) return false;
+    for (let index = 0; index < quality.length; index++) {
+      if (quality[index] > previous.quality[index]) return false;
+      if (quality[index] < previous.quality[index]) return true;
+    }
+    return true;
   }
 }
 

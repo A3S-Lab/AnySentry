@@ -1,0 +1,8 @@
+# Patch only the submission controller, preserving an already tested business JAR.
+# Pass immutable local image IDs for a bounded rollout without rebuilding the Flink job.
+ARG NODE_IMAGE=node:20-bookworm-slim
+ARG FLINK_JOB_IMAGE=anysentry-flink-streaming:local
+FROM ${NODE_IMAGE} AS guard-node
+FROM ${FLINK_JOB_IMAGE}
+COPY --from=guard-node /usr/local/bin/node /usr/local/bin/node
+COPY job-guard.mjs /opt/anysentry/job-guard.mjs

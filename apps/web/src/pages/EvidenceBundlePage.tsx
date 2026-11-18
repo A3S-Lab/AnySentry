@@ -1,5 +1,6 @@
 import { useRequest } from "ahooks";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -1047,7 +1048,7 @@ function AuditPanel({ audits, timeType }: { audits: AuditListItem[]; timeType: S
 
 export default function EvidenceBundlePage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [auditId, setAuditId] = useState(searchParams.get("auditId") ?? "");
   const [edgeId, setEdgeId] = useState(searchParams.get("edgeId") ?? "");
   const [eventId, setEventId] = useState(searchParams.get("eventId") ?? "");
@@ -1129,7 +1130,7 @@ export default function EvidenceBundlePage() {
   };
 
   const clearFilters = () => {
-    setTimeType("last_3h");
+    setTimeType(DEFAULT_SECURITY_TIME_TYPE);
     setAuditId("");
     setEdgeId("");
     setEventId("");

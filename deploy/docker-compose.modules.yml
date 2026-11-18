@@ -14,6 +14,10 @@ services:
       context: .
       dockerfile: Dockerfile.modules
       target: api
+      args:
+        ANYSENTRY_BUILD_VERSION: ${ANYSENTRY_BUILD_VERSION:-dev}
+        ANYSENTRY_BUILD_COMMIT: ${ANYSENTRY_BUILD_COMMIT:-unknown}
+        ANYSENTRY_BUILD_TIME: ${ANYSENTRY_BUILD_TIME:-unknown}
     environment:
       NODE_OPTIONS: ${ANYSENTRY_API_NODE_OPTIONS:---max-old-space-size=1024}
       ANYSENTRY_WEB_DIR: /app/empty-web
@@ -97,15 +101,37 @@ services:
         required: false
     environment:
       A3S_OBSERVER_JSON: "1"
+      # Full file-open capture is intentionally opt-in: on a developer host it can produce
+      # tens of thousands of events per minute and starve the forwarder/API. Enable it only
+      # for a short, controlled attribution test with A3S_OBSERVER_FILES=1.
       A3S_OBSERVER_FILES: ${A3S_OBSERVER_FILES:-0}
       A3S_OBSERVER_FILE_ACCESS: ${A3S_OBSERVER_FILE_ACCESS:-0}
       A3S_OBSERVER_FILE_DELETE: ${A3S_OBSERVER_FILE_DELETE:-0}
+      A3S_OBSERVER_FILE_INCLUDE_PATHS: ${A3S_OBSERVER_FILE_INCLUDE_PATHS:-}
       A3S_OBSERVER_FILE_UNKNOWN_POLICY: ${A3S_OBSERVER_FILE_UNKNOWN_POLICY:-keep}
-      A3S_OBSERVER_SSL: ${A3S_OBSERVER_SSL:-1}
+      # Production source-level metadata-only: no TLS payload buffer is read or placed in a ring.
+      A3S_OBSERVER_INTERACTION_CAPTURE_MODE: ${A3S_OBSERVER_INTERACTION_CAPTURE_MODE:-metadata}
+      # The runtime-payload path remains fail-closed unless its explicit consent gates are set.
+      # Once enabled, Observer resolves native Codex ELF inodes from host /proc and /host itself;
+      # it does not read AgentSight data or require an operator-supplied binary path.
+      A3S_OBSERVER_ENVIRONMENT: ${A3S_OBSERVER_ENVIRONMENT:-production}
+      A3S_OBSERVER_ALLOW_RUNTIME_PAYLOAD: ${A3S_OBSERVER_ALLOW_RUNTIME_PAYLOAD:-}
+      A3S_OBSERVER_RUNTIME_TARGET_PIDS: ${A3S_OBSERVER_RUNTIME_TARGET_PIDS:-}
+      A3S_OBSERVER_RUNTIME_AUTO_DISCOVER: ${A3S_OBSERVER_RUNTIME_AUTO_DISCOVER:-1}
+      A3S_OBSERVER_RUNTIME_BINARY: ${A3S_OBSERVER_RUNTIME_BINARY:-}
+      A3S_OBSERVER_RUNTIME_RUSTLS_VARIANT: ${A3S_OBSERVER_RUNTIME_RUSTLS_VARIANT:-all}
+      # Content-safe framing diagnostics (length/hash/byte class only), disabled by default.
+      A3S_OBSERVER_RUNTIME_DEBUG_FRAMING: ${A3S_OBSERVER_RUNTIME_DEBUG_FRAMING:-0}
+      A3S_OBSERVER_HOST_ROOT: /host
+      A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS: ${A3S_OBSERVER_RUNTIME_PROVIDER_HOSTS:-chatgpt.com,api.openai.com,api.anthropic.com,open.bigmodel.cn,generativelanguage.googleapis.com,cloudcode-pa.googleapis.com}
+      A3S_OBSERVER_SSL: "0"
       A3S_OBSERVER_COLLECTOR_ID: ${A3S_OBSERVER_COLLECTOR_ID:-modules-observer}
       A3S_NODE_NAME: ${A3S_NODE_NAME:-modules-docker-host}
       ANYSENTRY_INGEST_URL: http://anysentry:29653/security-center/ingest
       ANYSENTRY_BATCH_INGEST_URL: http://anysentry:29653/security-center/ingest/batch
+      ANYSENTRY_INTERACTIONS: ${ANYSENTRY_INTERACTIONS:-off}
+      ANYSENTRY_INTERACTION_INGEST_URL: http://anysentry:29653/security-center/interactions/ingest
+      ANYSENTRY_INTERACTION_CONTENT_INGEST_URL: http://anysentry:29653/security-center/interactions/ingest-content
       ANYSENTRY_IDENTITY_SNAPSHOT_URL: http://anysentry:29653/security-center/identity/snapshot
       ANYSENTRY_INFRASTRUCTURE_POLICY_URL: http://anysentry:29653/security-center/infrastructure-rules/policy
       ANYSENTRY_INFRASTRUCTURE_MATERIALIZATION_URL: http://anysentry:29653/security-center/infrastructure-rules/materializations/report
@@ -126,12 +152,20 @@ services:
       ANYSENTRY_DOCKER_DISCOVERY: ${ANYSENTRY_DOCKER_DISCOVERY:-on}
       ANYSENTRY_DOCKER_SOCKET: /var/run/docker.sock
       FORWARD_FILTER_MODE: ${FORWARD_FILTER_MODE:-enforce}
+      # Optional benchmark scope. Example: `FORWARD_AGENT_ALLOWLIST=codex` forwards only Codex
+      # roots and their attributed descendants while keeping Collector control telemetry.
+      FORWARD_AGENT_ALLOWLIST: ${FORWARD_AGENT_ALLOWLIST:-}
       FORWARD_RETAIN_UNKNOWN: ${FORWARD_RETAIN_UNKNOWN:-true}
       FORWARD_RETAIN_NON_AGENT: ${FORWARD_RETAIN_NON_AGENT:-false}
       FORWARD_NOISE_POLICY: ${FORWARD_NOISE_POLICY:-balanced}
       FORWARD_FILE_AGGREGATION: ${FORWARD_FILE_AGGREGATION:-true}
-      FORWARD_BATCH_SIZE: ${FORWARD_BATCH_SIZE:-32}
-      FORWARD_BATCH_FLUSH_MS: ${FORWARD_BATCH_FLUSH_MS:-50}
+      # Keep enough events in each request to avoid turning high-volume eBPF fragments into
+      # thousands of tiny HTTP/ClickHouse inserts. The queue and byte limits remain the hard
+      # backpressure boundary; this only changes the preferred batch target.
+      FORWARD_BATCH_SIZE: ${FORWARD_BATCH_SIZE:-128}
+      FORWARD_BATCH_FLUSH_MS: ${FORWARD_BATCH_FLUSH_MS:-100}
+      FORWARD_SPOOL_PATH: /var/lib/anysentry-forwarder/spool.wal
+      ANYSENTRY_INTERACTION_SPOOL_PATH: /var/lib/anysentry-forwarder/interactions.wal
       FORWARD_MAX_OUTSTANDING_EVENTS: ${FORWARD_MAX_OUTSTANDING_EVENTS:-16384}
       FORWARD_MAX_OUTSTANDING_BYTES: ${FORWARD_MAX_OUTSTANDING_BYTES:-67108864}
       FORWARD_PROTECTED_RESERVE_EVENTS: ${FORWARD_PROTECTED_RESERVE_EVENTS:-4096}
@@ -141,10 +175,14 @@ services:
       OBSERVER_SUPERVISOR_FORWARDER_ARGS_JSON: '["/opt/anysentry-forwarder-dev/observer-forward.js"]'
     volumes:
       - /sys:/sys:ro
+      # Host inventory is read-only. Namespace-specific runtimes are resolved through
+      # /proc/<host-pid>/root, while /host covers agents installed directly on the host.
+      - /:/host:ro,rslave
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./scripts:/opt/anysentry-forwarder-dev:ro
       - ${ANYSENTRY_RUNTIME_RULES_DIR:-./.local/observer-rules}:/etc/anysentry:ro
       - observer-filter-rules:/run/anysentry-filter
+      - observer-forward-spool:/var/lib/anysentry-forwarder
     restart: unless-stopped
 
   flink-checkpoint-init:
@@ -179,3 +217,4 @@ services:
 
 volumes:
   observer-filter-rules:
+  observer-forward-spool:

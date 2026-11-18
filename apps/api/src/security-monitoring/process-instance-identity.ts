@@ -10,6 +10,7 @@ export interface CanonicalProcessInstanceInput {
   pid?: number;
   startTimeTicks?: string;
   startTimeNs?: string;
+  startTimeSource?: string;
 }
 function text(value: unknown): string | undefined {
   const normalized = typeof value === 'string' ? value.trim() : '';
@@ -24,11 +25,16 @@ export function canonicalContainerId(cgroup?: string): string | undefined {
 
 /**
  * The one ProcessInstance identifier shared by the canonical stream and trusted-correlation view.
- * Keep this byte-for-byte compatible with the original Canonical v1 `pri` hash.
+ * Explicit kernel boottime events prefer ns; legacy events retain the original v1 precedence.
  */
 export function canonicalProcessInstanceId(input: CanonicalProcessInstanceInput): string {
-  const stableStartTime = input.startTimeTicks ?? input.startTimeNs;
-  const stableStartTimeKind = input.startTimeTicks ? 'ticks' : input.startTimeNs ? 'ns' : undefined;
+  const preferNs = input.startTimeSource === 'kernel_start_boottime';
+  const stableStartTime = preferNs
+    ? input.startTimeNs ?? input.startTimeTicks
+    : input.startTimeTicks ?? input.startTimeNs;
+  const stableStartTimeKind = preferNs
+    ? input.startTimeNs ? 'ns' : input.startTimeTicks ? 'ticks' : undefined
+    : input.startTimeTicks ? 'ticks' : input.startTimeNs ? 'ns' : undefined;
   const parts: Array<string | number | undefined> = [
     input.trustedSourceId,
     input.bootId,

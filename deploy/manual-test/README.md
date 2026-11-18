@@ -92,8 +92,8 @@ This repository includes six manual-test overlays. They leave the canonical mani
 
 - `k8s-observer` pins the Observer, switches the manual collector to `enforce`, disables behavior
   promotion, and loads the complete versioned runtime-signature document. The shared single-node
-  profile keeps ToolExec, Exit, Egress, DNS, process, security, and SSL signals enabled, but disables
-  FileAccess/FileDelete after a full-probe load test exceeded the fixed FILE_EVENTS capacity and
+  profile keeps ToolExec, Exit, Egress, DNS, process, security, and LLM transport metadata enabled,
+  but disables FileAccess/FileDelete after a full-probe load test exceeded the fixed FILE_EVENTS capacity and
   caused real Forwarder loss. A read-only Docker socket mount lets this one node-level Observer
   enrich the retained Docker Agent and Kubernetes workloads into one AnySentry.
 - `k8s-core` rolls out the API and judges before Kafka/Flink are created.
@@ -110,9 +110,9 @@ This repository includes six manual-test overlays. They leave the canonical mani
   reports a ready Capture Profile control plane.
 - `k8s-observer-files-full` is the final, explicitly high-load profile. It enables both FileAccess
   and FileDelete only after their independent gates pass, retains lossless Unknown discovery,
-  keeps all three rollout planes in `enforce`, batches 64 records, and attaches OpenSSL uprobes to
-  the exact read-only host `libssl.so.3` inode. This covers processes using that inode only; it does
-  not imply coverage for container-private OpenSSL, BoringSSL, Go TLS, or static TLS.
+  keeps all three rollout planes in `enforce`, and batches 64 records. It deliberately retains
+  source-level `metadata-only` Interaction collection; the file-load profile neither mounts a host
+  TLS library nor enables plaintext uprobes.
 
 Render with Kustomize's explicit parent-directory allowance and use client-side apply. Do not use
 server-side apply against the existing cluster because its historical field managers own several

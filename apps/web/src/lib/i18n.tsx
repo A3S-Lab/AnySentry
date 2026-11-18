@@ -73,8 +73,6 @@ const ENGLISH: Record<string, string> = {
   "数据接入": "Data Ingestion",
   "采集链路": "Collection",
   "Agent 列表": "Agent List",
-  "对话追踪": "Conversation Tracking",
-  "Agent 对话与上下文追踪": "Agent conversations and context tracking",
   "Agent 安全接入": "Agent Security Access",
   "执行前防护与安全能力": "Pre-execution protection and security capabilities",
   "执行前防护、事件上报与安全能力调用": "Pre-execution protection, event reporting, and security capability calls",

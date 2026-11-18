@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { formatSecurityDateTime } from "@/lib/date-time";
+import { DEFAULT_SECURITY_TIME_TYPE } from "@/lib/api/security-center";
 import {
   BellRing,
   Bot,
@@ -493,7 +494,7 @@ function AuditDetail({ item, timeType }: { item?: AuditListItem; timeType: Secur
 
 export default function AuditPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || "last_3h");
+  const [timeType, setTimeType] = useState<SecurityTimeType>((searchParams.get("timeType") as SecurityTimeType) || DEFAULT_SECURITY_TIME_TYPE);
   const [action, setAction] = useState<AuditAction | "all">((searchParams.get("action") as AuditAction) || "all");
   const [resourceType, setResourceType] = useState<AuditResourceType | "all">((searchParams.get("resourceType") as AuditResourceType) || "all");
   const [resourceId, setResourceId] = useState(searchParams.get("resourceId") ?? "");

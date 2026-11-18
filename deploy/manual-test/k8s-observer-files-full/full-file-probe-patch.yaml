@@ -26,12 +26,7 @@ spec:
             - { name: FORWARD_FILE_AGGREGATION, value: "true" }
             - { name: FORWARD_BATCH_SIZE, value: "64" }
             - { name: FORWARD_BATCH_FLUSH_MS, value: "50" }
-            # A uprobe binds to one exact inode. Mount the host OpenSSL library used by the
-            # single-node test workload instead of attaching to an unused image-private copy.
-            - { name: A3S_OBSERVER_HOST_LIBSSL, value: "/usr/lib/x86_64-linux-gnu/libssl.so.3" }
-            - { name: A3S_OBSERVER_SSL, value: "/opt/host-libs/libssl.so.3" }
-          volumeMounts:
-            - { name: host-libssl, mountPath: /opt/host-libs/libssl.so.3, readOnly: true }
-      volumes:
-        - name: host-libssl
-          hostPath: { path: /usr/lib/x86_64-linux-gnu/libssl.so.3, type: File }
+            # File-load validation must not silently broaden the independent Interaction privacy
+            # boundary. TLS payload probes remain disabled at the source.
+            - { name: A3S_OBSERVER_INTERACTION_CAPTURE_MODE, value: "metadata" }
+            - { name: A3S_OBSERVER_SSL, value: "0" }

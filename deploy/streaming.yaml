@@ -99,42 +99,44 @@ spec:
           persistentVolumeClaim:
             claimName: kafka-data
 ---
-# Creates the closed topic set once per install/upgrade. Repeated CLI/JVM startup was observable as
-# thousands of short-lived internal lifecycle events; Kafka retains topics durably after this Job.
-apiVersion: batch/v1
-kind: Job
+# Reconciles required topics after Kafka starts and after later broker/PVC recovery.
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: kafka-topic-manager
   namespace: anysentry
   labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
 spec:
-  backoffLimit: 20
-  activeDeadlineSeconds: 600
-  ttlSecondsAfterFinished: 600
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka-topic-manager }
   template:
     metadata:
       labels: { app: kafka-topic-manager, io.anysentry.observe: "false", anysentry.io/workload-role: "anysentry_internal" }
     spec:
-      restartPolicy: OnFailure
       containers:
         - name: topic-manager
           image: apache/kafka:4.1.1
           command: ["/bin/bash", "-ec"]
           args:
             - |
-              for topic in \
-                anysentry.events.canonical.v1 \
-                anysentry.judgments.v1 \
-                anysentry.risk-analysis-batches.v1 \
-                anysentry.stream.findings.v1 \
-                anysentry.supply-chain.context.v1 \
-                anysentry.stream.dlq.v1; do
-                /opt/kafka/bin/kafka-topics.sh \
-                  --bootstrap-server kafka:9092 \
-                  --create --if-not-exists \
-                  --topic "${topic}" \
-                  --partitions 2 \
-                  --replication-factor 1
+              while true; do
+                for topic in \
+                  anysentry.events.canonical.v1 \
+                  anysentry.judgments.v1 \
+                  anysentry.risk-analysis-batches.v1 \
+                  anysentry.stream.findings.v1 \
+                  anysentry.supply-chain.context.v1 \
+                  anysentry.interactions.v1 \
+                  anysentry.stream.dlq.v1; do
+                  /opt/kafka/bin/kafka-topics.sh \
+                    --bootstrap-server kafka:9092 \
+                    --create --if-not-exists \
+                    --topic "${topic}" \
+                    --partitions 2 \
+                    --replication-factor 1 || true
+                done
+                sleep 60
               done
           resources:
             requests: { cpu: 50m, memory: 128Mi }
@@ -293,22 +295,7 @@ spec:
       containers:
         - name: job-submit
           image: ghcr.io/a3s-lab/anysentry-flink-streaming:latest
-          command: ["/bin/bash", "-ec"]
-          args:
-            - |
-              until flink list -m flink-jobmanager:8081 >/dev/null 2>&1; do sleep 2; done
-              while true; do
-                if flink list -m flink-jobmanager:8081 2>/dev/null \
-                  | grep -Eq ' : AnySentry Flink Shadow Risk \([[:upper:]_]+\)$'; then
-                  sleep 15
-                  continue
-                fi
-                flink run -d \
-                  -m flink-jobmanager:8081 \
-                  -c org.a3s.anysentry.streaming.AnySentryStreamJob \
-                  /opt/flink/usrlib/anysentry-flink-streaming.jar || true
-                sleep 15
-              done
+          command: ["/usr/local/bin/node", "/opt/anysentry/job-guard.mjs"]
           envFrom:
             - configMapRef:
                 name: anysentry-runtime

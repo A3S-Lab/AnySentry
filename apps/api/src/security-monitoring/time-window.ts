@@ -2,7 +2,11 @@ import { SecurityTimeFilter } from './types';
 
 const MINUTE = 60_000;
 const HOUR = 3_600_000;
-const WINDOW_MS: Record<Exclude<NonNullable<SecurityTimeFilter['timeType']>, 'custom'>, number> = {
+type RelativeSecurityTimeType = Exclude<NonNullable<SecurityTimeFilter['timeType']>, 'custom'>;
+
+export const DEFAULT_SECURITY_TIME_TYPE: RelativeSecurityTimeType = 'last_30m';
+
+const WINDOW_MS: Record<RelativeSecurityTimeType, number> = {
   last_30m: 30 * MINUTE,
   last_1h: HOUR,
   last_2h: 2 * HOUR,
@@ -11,6 +15,13 @@ const WINDOW_MS: Record<Exclude<NonNullable<SecurityTimeFilter['timeType']>, 'cu
   last_7d: 7 * 24 * HOUR,
   last_30d: 30 * 24 * HOUR,
 };
+
+export function securityTimeSpanMs(timeType?: SecurityTimeFilter['timeType']): number {
+  const relativeTimeType = timeType && timeType !== 'custom'
+    ? timeType
+    : DEFAULT_SECURITY_TIME_TYPE;
+  return WINDOW_MS[relativeTimeType] ?? WINDOW_MS[DEFAULT_SECURITY_TIME_TYPE];
+}
 
 export interface ResolvedTimeWindow {
   startMs: number;
@@ -53,8 +64,10 @@ export function resolveTimeWindow(filter: SecurityTimeFilter, clockMs = Date.now
     }
   }
 
-  const timeType = filter.timeType && filter.timeType !== 'custom' ? filter.timeType : 'last_3h';
-  const spanMs = WINDOW_MS[timeType] ?? WINDOW_MS.last_3h;
+  const timeType = filter.timeType && filter.timeType !== 'custom'
+    ? filter.timeType
+    : DEFAULT_SECURITY_TIME_TYPE;
+  const spanMs = securityTimeSpanMs(timeType);
   return {
     startMs: snapshotMs - spanMs,
     endMs: snapshotMs,

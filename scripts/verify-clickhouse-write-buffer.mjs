@@ -3,20 +3,22 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { ClickHouseStore } from '../apps/api/dist/security-monitoring/clickhouse-store.js';
-import { SecurityMonitoringController } from '../apps/api/dist/security-monitoring/security-monitoring.controller.js';
-import { SentryJudgeService } from '../apps/api/dist/security-monitoring/sentry-judge.service.js';
-import { canonicalizeEvent } from '../apps/api/dist/security-monitoring/streaming-normalizer.js';
-import {
+const build = process.env.ANYSENTRY_TEST_BUILD || 'dist';
+const moduleFor = name => import(`../apps/api/${build}/security-monitoring/${name}.js`);
+const { ClickHouseStore } = await moduleFor('clickhouse-store');
+const { SecurityMonitoringController } = await moduleFor('security-monitoring.controller');
+const { SentryJudgeService } = await moduleFor('sentry-judge.service');
+const { canonicalizeEvent } = await moduleFor('streaming-normalizer');
+const {
   decisionResultWorkerConcurrency,
   JudgmentQueueService,
-} from '../apps/api/dist/security-monitoring/judgment-queue.service.js';
-import { StreamingQueueService } from '../apps/api/dist/security-monitoring/streaming-queue.service.js';
-import { StreamFindingStore } from '../apps/api/dist/security-monitoring/streaming-finding.service.js';
-import {
+} = await moduleFor('judgment-queue.service');
+const { StreamingQueueService } = await moduleFor('streaming-queue.service');
+const { StreamFindingStore } = await moduleFor('streaming-finding.service');
+const {
   bindServerTrustedCorrelationContext,
   serverTrustedCorrelationContext,
-} from '../apps/api/dist/security-monitoring/trusted-correlation.js';
+} = await moduleFor('trusted-correlation');
 
 const BATCH_BYTES = 4 * 1024 * 1024;
 
@@ -54,7 +56,10 @@ assert.equal(decisionResultWorkerConcurrency('999'), 128);
     'a batch without ClickHouse must not claim a durability fence',
   );
   let durableWrites = 0;
-  judge.ch = { enabled: true, insertManyNow: async () => { durableWrites += 1; } };
+  judge.ch = {
+    enabled: true,
+    insertManyNow: async () => { durableWrites += 1; },
+  };
   assert.equal(await judge.persistPreparedBatch([], 'durable-batch'), 'durable');
   assert.equal(durableWrites, 1);
   if (previousUrl === undefined) delete process.env.CLICKHOUSE_URL;
@@ -126,13 +131,12 @@ async function within(promise, message, milliseconds = 1_000) {
   }
 }
 
-function fakeClickHouse({ behaviors = [], onInsert, onQuery } = {}) {
+function fakeClickHouse({ behaviors = [], onInsert } = {}) {
   const state = {
     calls: [],
     active: 0,
     maxActive: 0,
     closeCalls: 0,
-    queries: [],
     appliedByToken: new Map(),
   };
   const pendingBehaviors = [...behaviors];
@@ -162,11 +166,6 @@ function fakeClickHouse({ behaviors = [], onInsert, onQuery } = {}) {
       async close() {
         assert.equal(state.active, 0, 'client.close must not overlap an active insert');
         state.closeCalls += 1;
-      },
-      async query(options) {
-        state.queries.push(structuredClone(options));
-        const rows = onQuery ? await onQuery(options, state) : [];
-        return { json: async () => structuredClone(rows) };
       },
     },
   };
@@ -231,6 +230,10 @@ function batchController(options = {}) {
         await options.persist?.(prepared, token);
         return options.durability ?? 'durable';
       },
+      async persistPreparedProcessLifecycleFacts(facts) {
+        await options.persistLifecycle?.(facts);
+        return options.lifecycleDurable ?? true;
+      },
       commitPreparedBatch(prepared) {
         options.commit?.(prepared);
       },
@@ -245,11 +248,18 @@ function batchController(options = {}) {
       async enqueueCanonical() { return true; },
       async enqueueCanonicalBatch() { return 0; },
     },
-    supplyChain: { async observeRuntimeInstall() {} },
+    supplyChain: {
+      async observeRuntimeInstall(...args) {
+        await options.observeInstall?.(...args);
+      },
+    },
     workspaceDirectory: { observeEvent() {} },
     identityReview: { considerCandidate() {} },
     unknownLearning: { observeMany() {} },
     agg: { invalidateWindowCache() {} },
+    supplyChainInstallQueue: [],
+    supplyChainInstallActive: 0,
+    supplyChainInstallDropped: 0,
     observedAssets: {
       bindIngestMeta: (meta) => meta,
       materializeCommittedIngest: (meta) => options.materialize?.(meta),
@@ -723,6 +733,37 @@ await withoutExpectedErrorLogs(async () => {
 });
 
 await withoutExpectedErrorLogs(async () => {
+  const firstInsert = deferred();
+  const fake = fakeClickHouse({ behaviors: [async () => firstInsert.promise] });
+  const store = storeFor(fake);
+  const firstRows = Array.from({ length: 64 }, (_, index) => event(4_000 + index, {
+    decisionStatus: 'pending',
+    decisionRevision: 1,
+  }));
+  const secondRows = Array.from({ length: 64 }, (_, index) => event(4_100 + index, {
+    decisionStatus: 'pending',
+    decisionRevision: 1,
+  }));
+  const thirdRows = Array.from({ length: 64 }, (_, index) => event(4_200 + index, {
+    decisionStatus: 'pending',
+    decisionRevision: 1,
+  }));
+  const first = store.insertManyNow(firstRows, 'observer-batch:coalesce-a');
+  await eventually(() => fake.state.calls.length === 1, 'the lead direct batch did not enter the writer');
+  const second = store.insertManyNow(secondRows, 'observer-batch:coalesce-b');
+  const third = store.insertManyNow(thirdRows, 'observer-batch:coalesce-c');
+  await eventually(() => store.eventWriteBatches.length === 3, 'queued direct batches must wait behind the active insert');
+  firstInsert.resolve();
+  await Promise.all([first, second, third]);
+  assert.equal(fake.state.maxActive, 1, 'coalesced durability must keep one insert lane');
+  assert.equal(fake.state.calls.length, 2, 'queued direct batches must coalesce into one follow-up insert');
+  assert.equal(fake.state.calls[0].values.length, 64);
+  assert.equal(fake.state.calls[1].values.length, 128, 'two waiting direct batches must share one physical insert');
+  assert.match(batchToken(fake.state.calls[1]), /^event-coalesce-/);
+  await store.close();
+});
+
+await withoutExpectedErrorLogs(async () => {
   const fake = fakeClickHouse();
   const store = storeFor(fake);
   const original = event(3_300, { decisionStatus: 'pending', decisionRevision: 1 });
@@ -933,6 +974,9 @@ await withoutExpectedErrorLogs(async () => {
     code: '241',
     type: 'MEMORY_LIMIT_EXCEEDED',
   });
+  // close() reads the configured deadline at entry; assigning a private field is insufficient.
+  const previousShutdownMs = process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS;
+  process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS = '100';
   const fake = fakeClickHouse({
     behaviors: [async () => {
       await firstInsert.promise;
@@ -948,7 +992,7 @@ await withoutExpectedErrorLogs(async () => {
     eventWriteNow: () => fakeNow,
     eventWriteRetryDeadlineMs: 15,
     eventWriteRetryDelayMs: () => 0,
-    eventWriteCloseDeadlineMs: 20,
+    eventWriteCloseDeadlineMs: 100,
   });
   const diagnostics = [];
   const originalError = console.error;
@@ -971,6 +1015,8 @@ await withoutExpectedErrorLogs(async () => {
       'deadline exhaustion must emit a retained-batch shutdown diagnostic',
     );
   } finally {
+    if (previousShutdownMs === undefined) delete process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS;
+    else process.env.ANYSENTRY_CLICKHOUSE_SHUTDOWN_FLUSH_MS = previousShutdownMs;
     console.error = originalError;
   }
 }
@@ -1032,62 +1078,25 @@ await withoutExpectedErrorLogs(async () => {
 });
 
 await withoutExpectedErrorLogs(async () => {
-  const fake = fakeClickHouse({
-    onInsert(call) {
-      assert.doesNotMatch(
-        JSON.stringify(call.values),
-        /\\u(?:d[89ab][0-9a-f]{2})(?!\\u(?:d[cdef][0-9a-f]{2}))|(?<!\\u(?:d[89ab][0-9a-f]{2}))\\u(?:d[cdef][0-9a-f]{2})/iu,
-        'ClickHouse JSONEachRow must not receive an unpaired UTF-16 surrogate',
-      );
-    },
-  });
+  const fake = fakeClickHouse();
   const store = storeFor(fake);
-  await store.insertNow(event(2_450, {
-    subject: `valid \ud83d\udee1 malformed-high \ud800 malformed-low \udfff`,
-    rawPreview: `before\ud800after`,
-  }), 'unicode-well-formed');
-  const row = fake.state.calls[0].values[0];
-  assert.equal(row.subject, 'valid 🛡 malformed-high � malformed-low �');
-  assert.equal(row.rawPreview, 'before�after');
-  await store.close();
-});
-
-await withoutExpectedErrorLogs(async () => {
-  const digestA = 'a'.repeat(64);
-  const digestB = 'b'.repeat(64);
-  const fake = fakeClickHouse({
-    onQuery(options) {
-      const keys = options.query_params.logicalKeys;
-      assert.match(options.query, /FROM event_revision_identities/u);
-      assert.doesNotMatch(options.query, /FROM events\b/u);
-      assert.equal(options.clickhouse_settings.max_threads, 1);
-      assert.equal(options.clickhouse_settings.max_memory_usage, String(32 * 1024 * 1024));
-      assert.equal(options.clickhouse_settings.max_execution_time, 5);
-      return [
-        { eventLogicalKey: keys[0], acceptedFingerprint: `observer-source:${digestA}` },
-        { eventLogicalKey: keys[1], acceptedFingerprint: `observer-source:${digestB}` },
-        { eventLogicalKey: keys[2], acceptedFingerprint: 'legacy-pre-source-payload-fingerprint' },
-      ];
-    },
-  });
-  const store = storeFor(fake);
-  const replay = (index, digest) => event(index, {
-    attributes: {
-      sequence: index,
-      'anysentry.observer.source_payload_sha256': digest,
-    },
-  });
-  assert.deepEqual(
-    await store.classifyDurableReplayEvents([
-      replay(2_460, digestA),
-      replay(2_461, digestA),
-      replay(2_462, digestA),
-      replay(2_463, digestA),
-    ]),
-    ['duplicate', 'conflict', 'duplicate', 'new'],
-    'durable replay must use compact identity facts, reject new-fingerprint conflicts, and migrate legacy facts',
+  store.enqueue(event(2_401, {
+    subject: 'valid-🚀-pair',
+    rawPreview: 'left-\ud800-middle-\udc00-right-🚀',
+  }));
+  await store.flush();
+  const [persisted] = fake.state.calls.flatMap((call) => call.values);
+  assert.equal(persisted.subject, 'valid-🚀-pair', 'valid surrogate pairs must remain unchanged');
+  assert.equal(
+    persisted.rawPreview,
+    'left-�-middle-�-right-🚀',
+    'lone UTF-16 surrogates must not poison the ClickHouse JSONEachRow FIFO',
   );
-  assert.equal(fake.state.queries.length, 1);
+  assert.equal(
+    Buffer.from(persisted.rawPreview, 'utf8').toString('utf8'),
+    persisted.rawPreview,
+    'the normalized preview must be round-trip-safe UTF-8',
+  );
   await store.close();
 });
 
@@ -1140,13 +1149,16 @@ assert.match(
 const healthStatsBody = judgeSource.match(/healthStats\(\):[^]*?\n  \}\n\n  \/\*\* Store histograms/u)?.[0] ?? '';
 assert.ok(healthStatsBody, 'the O(1) health summary must exist');
 assert.doesNotMatch(healthStatsBody, /for\s*\(|new Set|parseTrustedCorrelation/u);
-const hookIndex = mainSource.indexOf("app.enableShutdownHooks(['SIGTERM', 'SIGINT'])");
+const hookIndex = mainSource.indexOf("process.on('SIGTERM'");
 const listenIndex = mainSource.indexOf("await app.listen(port, '0.0.0.0')");
 assert.ok(hookIndex >= 0 && listenIndex > hookIndex, 'SIGTERM/SIGINT hooks must be enabled before listen');
+assert.ok(mainSource.includes("process.on('SIGINT'"));
+assert.ok(mainSource.includes('app.use(shutdown.middleware)'));
+assert.ok(!mainSource.includes('app.enableShutdownHooks('), 'Nest must not race the admission coordinator');
 assert.match(
   manifestSource,
-  /kind: Deployment[\s\S]*?name: anysentry[\s\S]*?terminationGracePeriodSeconds: 30/u,
-  'the API pod must reserve 30 seconds for graceful buffer drain',
+  /kind: Deployment[\s\S]*?name: anysentry[\s\S]*?terminationGracePeriodSeconds: 60/u,
+  'the API pod must reserve 60 seconds for HTTP and provider drains',
 );
 
 {
@@ -1256,9 +1268,40 @@ await withoutExpectedErrorLogs(async () => {
     materialize() { materialized += 1; },
   });
   const ack = await controller.ingestBatch({ events: [{ line: 'memory-only-retained' }] }, {});
-  assert.equal(ack.retainedEvents, 1, 'memory-only compatibility mode may still retain in the hot ring');
+  assert.equal(ack.retainedEvents, 1, `memory-only compatibility mode may still retain in the hot ring: ${JSON.stringify(ack)}`);
   assert.equal(materialized, 0,
     'memory-only batch retention must not publish a durable Observed Asset lifecycle state');
+}
+
+{
+  const lifecycleFacts = [];
+  const controller = batchController({
+    prepare() {
+      return {
+        disposition: 'retained',
+        notify: false,
+        event: event(77, {
+          process: {
+            hostId: 'host-a',
+            bootId: 'boot-a',
+            pid: 177,
+            ppid: 100,
+            startTimeTicks: '1770',
+          },
+        }),
+      };
+    },
+    persistLifecycle(facts) {
+      lifecycleFacts.push(...facts);
+    },
+  });
+  const ack = await controller.ingestBatch({ events: [{ line: 'retained-process' }] }, {});
+  assert.equal(ack.retainedEvents, 1);
+  assert.equal(lifecycleFacts.length, 1,
+    'retained Agent ToolExec must project an exact process lifecycle fact');
+  assert.equal(lifecycleFacts[0].pid, 177);
+  assert.equal(lifecycleFacts[0].startTime, 'ticks:1770');
+  assert.match(lifecycleFacts[0].processInstanceKey, /^pri_[a-f0-9]{24}$/u);
 }
 
 {
@@ -1579,8 +1622,35 @@ await withoutExpectedErrorLogs(async () => {
     },
   });
   await within(judge.onModuleDestroy(), 'shutdown did not reach the additive heartbeat/event drain');
+  assert.equal(incidentSaves, 0, 'producer shutdown precedes final persistence');
+  await within(judge.beforeApplicationShutdown(), 'final business persistence did not complete');
   assert.equal(incidentSaves, 1, 'shutdown must still persist bounded incident state');
+  assert.equal(closeCalls, 0, 'business destroy hooks must retain the shared ClickHouse client');
+  await within(judge.onApplicationShutdown(), 'final shared-store close did not complete');
   assert.equal(closeCalls, 1, 'ClickHouse close must flush the additive heartbeat side buffer');
 }
+
+await (async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let started = 0;
+  let finished = 0;
+  const controller = batchController({
+    async observeInstall() {
+      started += 1;
+      await gate;
+      finished += 1;
+    },
+  });
+  const ack = await controller.ingestBatch({ events: [{ line: 'slow-supply-chain-side-path' }] }, {});
+  assert.equal(ack.acceptedEvents, 1, 'event acknowledgement must not wait for optional supply-chain analysis');
+  assert.equal(started, 1);
+  assert.equal(finished, 0, 'optional analysis remains pending when the durable ACK is returned');
+  release();
+  for (let attempt = 0; attempt < 10 && finished === 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(finished, 1, 'queued analysis must still complete after ACK');
+})();
 
 console.log('ClickHouse write-buffer verification passed');

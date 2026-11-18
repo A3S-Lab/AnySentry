@@ -3,7 +3,6 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { StringDecoder } = require('node:string_decoder');
 
 function boundedNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -31,7 +30,8 @@ class DurableSpool {
     this.fsyncMs = boundedNumber(options.fsyncMs, 250, 10, 60_000);
     this.compactMinBytes = boundedNumber(options.compactMinBytes, 32 * 1024 * 1024, 1024 * 1024, 4 * 1024 * 1024 * 1024);
     this.compactMaxLiveRecords = boundedNumber(options.compactMaxLiveRecords, 16_384, 1, 250_000);
-    this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 4 * 1024 * 1024);
+    this.loadChunkBytes = boundedNumber(options.loadChunkBytes, 1024 * 1024, 64, 16 * 1024 * 1024);
+    this.maxWalLineBytes = boundedNumber(options.maxWalLineBytes, 16 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024);
     this.writeAsync = options.writeAsync || fs.write.bind(fs);
     this.onAsyncError = typeof options.onAsyncError === 'function' ? options.onAsyncError : () => {};
     this.filePath = path.resolve(options.filePath);
@@ -91,47 +91,56 @@ class DurableSpool {
 
   load() {
     if (!fs.existsSync(this.filePath)) return;
+    // WALs can legitimately grow beyond V8's maximum string size while an endpoint is down.
+    // Recover them incrementally so startup memory is proportional to live records plus one WAL
+    // line, rather than live records plus a second copy of the entire file as one giant string.
     const fd = fs.openSync(this.filePath, 'r');
-    const buffer = Buffer.allocUnsafe(this.loadChunkBytes);
-    const decoder = new StringDecoder('utf8');
-    let pending = '';
+    const chunk = Buffer.allocUnsafe(this.loadChunkBytes);
+    let pending = Buffer.alloc(0);
     let lineNumber = 0;
-    const applyLine = (line) => {
-      lineNumber += 1;
-      if (!line) return;
-      try {
-        this.applyLoadedOperation(JSON.parse(line));
-      } catch (error) {
-        throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
-      }
-    };
     try {
-      while (true) {
-        const bytes = fs.readSync(fd, buffer, 0, buffer.length, null);
-        if (bytes === 0) break;
-        pending += decoder.write(buffer.subarray(0, bytes));
+      let bytesRead;
+      do {
+        bytesRead = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (!bytesRead) break;
+        const data = pending.length
+          ? Buffer.concat([pending, chunk.subarray(0, bytesRead)])
+          : chunk.subarray(0, bytesRead);
         let start = 0;
-        while (true) {
-          const newline = pending.indexOf('\n', start);
-          if (newline < 0) break;
-          applyLine(pending.slice(start, newline));
+        for (let newline = data.indexOf(0x0a, start); newline !== -1; newline = data.indexOf(0x0a, start)) {
+          lineNumber += 1;
+          this.applyWalLine(data.subarray(start, newline), lineNumber, false);
           start = newline + 1;
         }
-        pending = pending.slice(start);
-      }
-      pending += decoder.end();
-      if (pending) {
-        // A process or host crash can leave only the final, non-newline-terminated append torn.
-        // A complete final operation is still applied; malformed trailing bytes are ignored.
-        try {
-          this.applyLoadedOperation(JSON.parse(pending));
-        } catch {
-          // Safe replay boundary: every preceding newline-terminated operation was validated.
+        pending = start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
+        if (pending.length > this.maxWalLineBytes) {
+          throw new Error(
+            `Observer spool line ${lineNumber + 1} exceeds ${this.maxWalLineBytes} bytes`,
+          );
         }
+      } while (bytesRead > 0);
+      if (pending.length) {
+        lineNumber += 1;
+        this.applyWalLine(pending, lineNumber, true);
       }
     } finally {
       fs.closeSync(fd);
     }
+  }
+
+  applyWalLine(bytes, lineNumber, allowTornFinalLine) {
+    if (!bytes.length || (bytes.length === 1 && bytes[0] === 0x0d)) return;
+    const line = bytes[bytes.length - 1] === 0x0d ? bytes.subarray(0, -1) : bytes;
+    let operation;
+    try {
+      operation = JSON.parse(line.toString('utf8'));
+    } catch (error) {
+      // A process or host crash can leave only the final append torn. Earlier corruption is not
+      // safe to ignore because doing so could silently discard durable evidence.
+      if (allowTornFinalLine) return;
+      throw new Error(`Observer spool is corrupt at line ${lineNumber}: ${error.message}`);
+    }
+    this.applyLoadedOperation(operation);
   }
 
   append(operation, forceSync = false) {

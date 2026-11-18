@@ -247,6 +247,14 @@ export interface ProcessContext {
   namespacePpid?: number;
   startTimeTicks?: string;
   startTimeNs?: string;
+  startTimeSource?: string;
+  userHz?: number;
+  creationPpid?: number;
+  creationParentStartBoottimeNs?: string;
+  observedPpid?: number;
+  observedParentStartBoottimeNs?: string;
+  parentRelationSource?: string;
+  lineageComplete?: boolean;
   mountNamespace?: number;
   eventTimeNs?: string;
   comm?: string;
@@ -1094,6 +1102,15 @@ export interface PlatformMetricsOverview {
   components: PlatformComponentMetric[];
   anomalies: PlatformMetricAnomaly[];
   message?: string;
+  middleware?: {
+    components: Array<Pick<PlatformComponentMetric, 'id' | 'name' | 'status'> & { message: string }>;
+    series: Array<{
+      key: string;
+      label: string;
+      unit: string;
+      points: PlatformMetricPoint[];
+    }>;
+  };
 }
 
 export interface SecurityWorkspaceRiskDistribution extends ClassifiedResponseMeta {
@@ -2022,9 +2039,11 @@ export interface CollectorHeartbeatRequest {
   enabledFeatures?: string[];
   intervalSecs?: number;
   eventKindCounts?: Record<string, number>;
+  droppedByKind?: Record<string, number>;
   queueDepth?: number;
   droppedEvents?: number;
   outputDropped?: number;
+  outputDroppedByKind?: Record<string, number>;
   errorCount?: number;
   /** Optional explicit semantics for the three legacy operational counters. */
   legacyCounterTemporality?: CollectorPipelineTemporality;
@@ -2262,6 +2281,11 @@ export interface CollectorFilterMetrics {
   outstandingOldestAgeMs?: number;
   outstandingEventLimit?: number;
   outstandingByteLimit?: number;
+  durableRecords?: number;
+  durableBytes?: number;
+  durableWalBytes?: number;
+  durableOldestAgeMs?: number;
+  durableReplayPending?: number;
   protectedReserveEvents?: number;
   protectedReserveBytes?: number;
   identitySnapshotReady: boolean;
@@ -2463,9 +2487,11 @@ export interface CollectorHeartbeatRecord extends Required<Pick<CollectorRawHear
   enabledFeatures: string[];
   intervalSecs: number;
   eventKindCounts: Record<string, number>;
+  droppedByKind?: Record<string, number>;
   queueDepth: number;
   droppedEvents: number;
   outputDropped: number;
+  outputDroppedByKind?: Record<string, number>;
   errorCount: number;
   legacyCounterTemporality?: CollectorPipelineTemporality;
   observedAgents: number;
@@ -3445,8 +3471,10 @@ export type AuditAction =
   | 'unknown_learning.infrastructure_draft_created'
   | 'unknown_learning.infrastructure_draft_reused'
   | 'unknown_learning.infrastructure_draft_rejected'
-  | 'unknown_learning.config_updated';
-export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user';
+  | 'unknown_learning.config_updated'
+  | 'interaction.content.viewed'
+  | 'interaction.content.deleted';
+export type AuditResourceType = 'policy' | 'filter-rule' | 'infrastructure-rule' | 'unknown-learning' | 'supply-chain' | 'incident' | 'alert' | 'remediation' | 'agent' | 'asset' | 'event' | 'maintenance' | 'notification' | 'objective' | 'source' | 'user' | 'interaction';
 export type AuditResult = 'success' | 'failure';
 export interface AuditActor {
   type: AuditActorType;

@@ -23,6 +23,7 @@ accounting.record('parse_error', 'invalid_json');
 accounting.record('classified', 'unknown', 3);
 accounting.record('filtered', 'deduplicated');
 accounting.record('aggregated', 'file_access_coalesced', 2);
+accounting.record('interaction_handoff', 'content_spooled');
 accounting.record('queue_admitted', 'event', 2);
 accounting.record('queue_dropped', 'outstanding_limit');
 accounting.record('api_retained', 'ack');
@@ -52,6 +53,7 @@ assert.deepEqual(
 assert.equal(first.stages.find((stage) => stage.stage === 'received').count, 5);
 assert.equal(first.stages.find((stage) => stage.stage === 'parse_error').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'aggregated').count, 2);
+assert.equal(first.stages.find((stage) => stage.stage === 'interaction_handoff').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'queue_admitted').count, 2);
 assert.equal(first.stages.find((stage) => stage.stage === 'api_retained').count, 1);
 assert.equal(first.stages.find((stage) => stage.stage === 'api_discarded').count, 1);

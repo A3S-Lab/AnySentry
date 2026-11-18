@@ -5,6 +5,7 @@ services:
     environment:
       ANYSENTRY_ASYNC_JUDGE: "on"
       ANYSENTRY_STREAMING: "on"
+      ANYSENTRY_INTERACTIONS: "on"
       ANYSENTRY_STREAM_AGENT_ONLY: "on"
       ANYSENTRY_SUPPLY_CHAIN: "on"
       ANYSENTRY_SUPPLY_CHAIN_RUNTIME: "on"
@@ -55,9 +56,10 @@ services:
       A3S_OBSERVER_FILES: "0"
       A3S_OBSERVER_FILE_ACCESS: "1"
       A3S_OBSERVER_FILE_DELETE: "1"
-      # Attach to the host OpenSSL inode. Container-specific or statically linked TLS runtimes need
-      # additional library-specific probe instances and are outside this single-library uprobe.
-      A3S_OBSERVER_SSL: /opt/host-libs/libssl.so.3
+      # Full modular validation remains source-level metadata-only.
+      A3S_OBSERVER_INTERACTION_CAPTURE_MODE: metadata
+      A3S_OBSERVER_SSL: "0"
+      ANYSENTRY_INTERACTIONS: "on"
       A3S_OBSERVER_FILE_UNKNOWN_POLICY: "keep"
       ANYSENTRY_CAPTURE_PROFILE_MODE: "enforce"
       ANYSENTRY_UNKNOWN_RETENTION_MODE: "enforce"
@@ -74,4 +76,3 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ${ANYSENTRY_RUNTIME_RULES_DIR:-./.local/observer-rules}:/etc/anysentry:ro
       - observer-filter-rules:/run/anysentry-filter
-      - ${A3S_OBSERVER_HOST_LIBSSL:-/usr/lib/x86_64-linux-gnu/libssl.so.3}:/opt/host-libs/libssl.so.3:ro

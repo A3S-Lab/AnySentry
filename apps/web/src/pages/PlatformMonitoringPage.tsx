@@ -116,6 +116,41 @@ function ComponentRow({ item }: { item: PlatformComponentMetric }) {
   );
 }
 
+function middlewareSpec(item: NonNullable<PlatformMetricsOverview["middleware"]>["series"][number]): VChartSpec {
+  const chartData = item.points.map((point) => ({
+    time: Date.parse(point.at),
+    value: point.value,
+  }));
+  const values = chartData.map((point) => point.value);
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+  const span = high - low;
+  const pad = span > 0 ? span * 0.25 : Math.max(Math.abs(high) * 0.08, item.unit === "%" ? 1 : 0.5);
+  return {
+    type: "line",
+    data: [{ id: item.key, values: chartData }],
+    xField: "time",
+    yField: "value",
+    height: 168,
+    padding: { top: 8, right: 12, bottom: 20, left: 52 },
+    point: { visible: chartData.length < 3, style: { size: 4 } },
+    line: { style: { lineWidth: 1.5, stroke: "#38bdf8" } },
+    axes: [
+      {
+        orient: "left",
+        min: low - pad,
+        max: high + pad,
+        tick: { tickCount: 4 },
+        label: {
+          formatMethod: (value: number) => item.unit === "%" ? `${value.toFixed(1)}` : value >= 1000 ? `${Math.round(value)}` : `${Number(value.toFixed(1))}`,
+        },
+      },
+      { orient: "bottom", type: "time", layers: [{ timeFormat: "%H:%M", timeFormatMode: "local" }] },
+    ],
+    tooltip: { visible: true },
+  } as VChartSpec;
+}
+
 function utilizationSpec(data?: PlatformMetricsOverview): VChartSpec {
   const selected = data?.series.filter((series) => ["cpu", "memory", "disk"].includes(series.key)) ?? [];
   const chartData = selected.flatMap((series) => series.points.map((point) => ({
@@ -162,6 +197,10 @@ export default function PlatformMonitoringPage() {
     },
   );
   const chartSpec = useMemo(() => utilizationSpec(data), [data]);
+  const middlewareCharts = useMemo(
+    () => (data?.middleware?.series ?? []).filter((item) => item.points.length > 0),
+    [data],
+  );
   const hasTrend = data?.series.some((series) => series.points.length > 1);
   const summary = data?.summary;
   const cpuStatus = statusFor(summary?.cpuPercent);
@@ -299,6 +338,58 @@ export default function PlatformMonitoringPage() {
               </div>
             </section>
           </div>
+
+          <section className="rounded-[8px] border border-[#232a37] bg-[#0f131a]">
+            <div className="flex h-11 items-center justify-between border-b border-[#232a37] px-3">
+              <div className="flex items-center gap-2">
+                <Database className="size-4 text-teal-300" />
+                <h2 className="text-sm font-semibold text-zinc-100">中间件</h2>
+              </div>
+              <span className="text-[10px] text-zinc-600">API 直接采集 · 15 秒一个点</span>
+            </div>
+            <div className="grid border-b border-[#232a37] sm:grid-cols-2 xl:grid-cols-4">
+              {(data?.middleware?.components ?? []).filter((item) => !item.id.startsWith("collector:")).map((item) => (
+                <div key={item.id} className="border-b border-[#232a37] px-3 py-3 sm:border-r xl:border-b-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-zinc-200">{item.name}</span>
+                    <span className={cn("rounded border px-1.5 py-0.5 text-[10px]", statusClass(item.status))}>{statusLabel(item.status)}</span>
+                  </div>
+                  <p className="mt-1 truncate text-[11px] text-zinc-500" title={item.message}>{item.message}</p>
+                </div>
+              ))}
+            </div>
+            <div className="grid gap-3 p-3 md:grid-cols-2 xl:grid-cols-4">
+              {middlewareCharts.map((item) => {
+                const latest = item.points[item.points.length - 1]?.value;
+                return (
+                  <div key={item.key} className="rounded-md border border-[#232a37] bg-[#0c1016]">
+                    <div className="flex items-baseline justify-between gap-2 px-3 pt-2">
+                      <span className="truncate text-[11px] text-zinc-400">{item.label}</span>
+                      <span className="font-mono text-xs text-zinc-100">{latest === undefined ? "--" : item.unit === "%" ? latest.toFixed(1) : latest >= 100 ? Math.round(latest).toLocaleString("zh-CN") : latest.toFixed(1)} {item.unit}</span>
+                    </div>
+                    <div className="h-[176px]">
+                      <VChartView spec={middlewareSpec(item)} height={168} />
+                    </div>
+                  </div>
+                );
+              })}
+              {middlewareCharts.length === 0 ? (
+                <div className="col-span-full flex min-h-28 flex-col items-center justify-center text-center">
+                  <Database className="size-5 text-zinc-700" />
+                  <p className="mt-2 text-xs text-zinc-500">中间件时序正在积累</p>
+                  <p className="mt-1 text-[10px] text-zinc-700">至少两个采样点后出图，不填充模拟数据</p>
+                </div>
+              ) : null}
+            </div>
+            <div className="grid border-t border-[#232a37] sm:grid-cols-3">
+              {(data?.middleware?.components ?? []).filter((item) => item.id.startsWith("collector:")).map((item) => (
+                <div key={item.id} className="flex items-center justify-between gap-2 border-b border-[#232a37] px-3 py-2 text-[11px] last:border-b-0 sm:border-b-0 sm:border-r sm:last:border-r-0">
+                  <span className="text-zinc-400">{item.name}</span>
+                  <span className={cn("rounded border px-1.5 py-0.5 text-[10px]", statusClass(item.status))}>{item.message}</span>
+                </div>
+              ))}
+            </div>
+          </section>
 
           <section className="rounded-[8px] border border-[#232a37] bg-[#0f131a]">
             <div className="flex h-11 items-center justify-between border-b border-[#232a37] px-3">

@@ -27,13 +27,17 @@ spec:
             - { name: FORWARD_RETAIN_NON_AGENT, value: "false" }
             # FileAccess/FileDelete overwhelms the upstream fixed FILE_EVENTS ring on this shared
             # single node even after the Docker AnySentry backend and duplicate Observer stop.
-            # Keep the lossless ToolExec/Exit, Egress/DNS/process/security and SSL signal set.
+            # Keep the lossless ToolExec/Exit, Egress/DNS/process/security and LLM transport
+            # metadata signal set without reading TLS plaintext.
             - { name: A3S_OBSERVER_FILES, value: "0" }
             # These independent switches override the legacy combined switch. Set both explicitly
             # so applying this stable profile really rolls back a prior Access/full-file canary.
             - { name: A3S_OBSERVER_FILE_ACCESS, value: "0" }
             - { name: A3S_OBSERVER_FILE_DELETE, value: "0" }
-            - { name: A3S_OBSERVER_SSL, value: "1" }
+            - { name: A3S_OBSERVER_INTERACTION_CAPTURE_MODE, value: "metadata" }
+            - { name: A3S_OBSERVER_SSL, value: "0" }
+            - { name: ANYSENTRY_INTERACTIONS, value: "on" }
+            - { name: ANYSENTRY_INTERACTION_INGEST_URL, value: "http://anysentry:29653/security-center/interactions/ingest" }
             # This single host also runs the retained Docker Pi workload. Reuse the same Observer
             # and enrich its eBPF events from the Docker lifecycle/inspect stream.
             - { name: ANYSENTRY_DOCKER_DISCOVERY, value: "on" }

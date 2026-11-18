@@ -36,9 +36,19 @@ RUN pnpm --filter @anysentry/api --prod deploy /out \
 FROM ${NODE_BUILD_IMAGE} AS nodebin
 
 FROM ${NODE_RUNTIME_IMAGE} AS node-runtime
+ARG ANYSENTRY_BUILD_VERSION=dev
+ARG ANYSENTRY_BUILD_COMMIT=unknown
+ARG ANYSENTRY_BUILD_TIME=unknown
 COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    ANYSENTRY_BUILD_VERSION=${ANYSENTRY_BUILD_VERSION} \
+    ANYSENTRY_BUILD_COMMIT=${ANYSENTRY_BUILD_COMMIT} \
+    ANYSENTRY_BUILD_TIME=${ANYSENTRY_BUILD_TIME} \
+    ANYSENTRY_API_VERSION=${ANYSENTRY_BUILD_VERSION}
+LABEL org.opencontainers.image.version="${ANYSENTRY_BUILD_VERSION}" \
+      org.opencontainers.image.revision="${ANYSENTRY_BUILD_COMMIT}" \
+      org.opencontainers.image.created="${ANYSENTRY_BUILD_TIME}"
 COPY --from=api-production-dependencies /out/node_modules ./node_modules
 COPY --from=api-production-dependencies /out/anysentry-production-components.json ./anysentry-production-components.json
 COPY scripts/l3-agent.mjs /opt/anysentry/l3-agent.mjs
@@ -100,6 +110,8 @@ RUN mvn -B -Dmaven.test.skip=true package
 # JobManager and TaskManager use FLINK_RUNTIME_IMAGE directly. Only this submission image contains
 # the AnySentry business JAR, so replacing a job does not roll the stable Flink runtime services.
 FROM ${FLINK_RUNTIME_IMAGE} AS flink-job
+COPY --from=nodebin /usr/local/bin/node /usr/local/bin/node
+COPY streaming/flink/job-guard.mjs /opt/anysentry/job-guard.mjs
 COPY --from=flink-job-build /src/target/anysentry-flink-streaming.jar /opt/flink/usrlib/anysentry-flink-streaming.jar
 COPY --chmod=755 deploy/modules/flink-job-replace.sh /opt/anysentry/flink-job-replace.sh
 ENTRYPOINT ["/bin/bash", "/opt/anysentry/flink-job-replace.sh"]

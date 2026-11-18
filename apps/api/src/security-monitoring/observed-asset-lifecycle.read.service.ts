@@ -662,7 +662,9 @@ export class ObservedAssetLifecycleService implements OnModuleInit, OnModuleDest
           meta.attribution?.agentInstanceId ?? '',
           meta.attribution?.rootStartTime ?? '',
           meta.process?.bootId ?? '',
-          meta.process?.startTimeTicks ?? meta.process?.startTimeNs ?? '',
+          (meta.process?.startTimeSource === 'kernel_start_boottime'
+            ? meta.process.startTimeNs ?? meta.process.startTimeTicks
+            : meta.process?.startTimeTicks ?? meta.process?.startTimeNs) ?? '',
         ]),
         assetBindingReason: resolved.reviewConflict ? 'agent_identity_conflict' : 'agent_identity_binding',
         identityRevision: resolved.reviewRevision ?? 1,

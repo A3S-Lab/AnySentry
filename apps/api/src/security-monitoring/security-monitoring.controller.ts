@@ -1,8 +1,11 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, Param, PayloadTooLargeException, Post, Put, Query, Req, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import type { Request } from 'express';
 import { Observable, exhaustMap, map, mergeMap, timer } from 'rxjs';
 import { SkipWrap } from '../shared/api-response.interceptor';
+import { setHttpShutdownPhase } from '../shared/http-shutdown';
+import { buildInfo } from '../shared/build-info';
 import { AgentMetadataService } from './agent-metadata.service';
 import { AgentRuntimeStateService } from './agent-runtime-state.service';
 import { currentAgentSubjectAssetIds, mergePersistentAgentDirectory } from './agent-directory';
@@ -63,6 +66,8 @@ import {
   SubmitScanResultRequest,
 } from './supply-chain.types';
 import * as T from './types';
+import { DEFAULT_SECURITY_TIME_TYPE } from './time-window';
+import { processLifecycleFact } from './process-lifecycle';
 
 /** Ingest a real observer event: judge it via sentry and record it for the dashboard. */
 interface IngestBody extends Partial<T.EventMeta> {
@@ -89,6 +94,8 @@ const OBSERVER_BATCH_RETRY_AFTER_MS = 1_000;
 const OBSERVER_BATCH_MAX_EVENTS = 256;
 const OBSERVER_BATCH_MAX_BYTES = 4 * 1024 * 1024;
 const OBSERVER_BATCH_CONTROL_YIELD_EVERY = 32;
+const SUPPLY_CHAIN_INSTALL_MAX_CONCURRENCY = 4;
+const SUPPLY_CHAIN_INSTALL_MAX_QUEUE = 1_024;
 const OBSERVER_BATCH_ID_MAX_LENGTH = 200;
 const OBSERVER_BATCH_DIGEST = /^[a-f0-9]{64}$/u;
 const OBSERVER_SOURCE_PAYLOAD_SHA256_ATTRIBUTE = 'anysentry.observer.source_payload_sha256';
@@ -107,6 +114,7 @@ function yieldObserverBatchControl(index: number): Promise<void> | undefined {
   return new Promise((resolve) => setImmediate(resolve));
 }
 let observerBatchResultBytes = 0;
+let observerSlowBatchLogSequence = 0;
 const UNIVERSAL_EVENT_IDEMPOTENCY_CACHE_SIZE = 20_000;
 const universalEventIdempotency = new Map<string, {
   digest: string;
@@ -487,8 +495,25 @@ function processFromObserverLine(process: unknown): T.ProcessContext | undefined
     hostId: stringLikeField('hostId', 'host_id'),
     bootId: stringLikeField('bootId', 'boot_id'),
     eventTimeNs: stringLikeField('eventTimeNs', 'event_time_ns'),
-    startTimeNs: stringLikeField('startTimeNs', 'start_time_ns'),
+    startTimeNs: stringLikeField('startTimeNs', 'startBoottimeNs', 'start_boottime_ns', 'start_time_ns'),
     startTimeTicks: stringLikeField('startTimeTicks', 'start_time_ticks'),
+    startTimeSource: stringLikeField('startTimeSource', 'start_time_source')
+      ?? (stringLikeField('startBoottimeNs', 'start_boottime_ns') ? 'kernel_start_boottime' : undefined),
+    userHz: numberField('userHz') ?? numberField('user_hz'),
+    creationPpid: numberField('creationPpid') ?? numberField('creation_ppid'),
+    creationParentStartBoottimeNs: stringLikeField(
+      'creationParentStartBoottimeNs',
+      'creation_parent_start_boottime_ns',
+    ),
+    observedPpid: numberField('observedPpid') ?? numberField('observed_ppid'),
+    observedParentStartBoottimeNs: stringLikeField(
+      'observedParentStartBoottimeNs',
+      'observed_parent_start_boottime_ns',
+    ),
+    parentRelationSource: stringLikeField('parentRelationSource', 'parent_relation_source'),
+    lineageComplete: typeof (p.lineageComplete ?? p.lineage_complete) === 'boolean'
+      ? (p.lineageComplete ?? p.lineage_complete) as boolean
+      : undefined,
     mountNamespace: numberField('mountNamespace') ?? numberField('mount_namespace'),
     lifecycleSource: parseProcessLifecycleSource(stringLikeField('lifecycleSource', 'lifecycle_source')),
     lifecycleReason: parseUnknownReason(stringLikeField('lifecycleReason', 'lifecycle_reason')),
@@ -739,6 +764,16 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
         if (Number.isFinite(count)) eventKindCounts[key] = count;
       }
     }
+    const droppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(obj(hb.droppedByKind) ?? obj(hb.dropped_by_kind) ?? {})) {
+      const count = Number(value);
+      if (Number.isFinite(count)) droppedByKind[key] = count;
+    }
+    const outputDroppedByKind: Record<string, number> = {};
+    for (const [key, value] of Object.entries(obj(hb.outputDroppedByKind) ?? obj(hb.output_dropped_by_kind) ?? {})) {
+      const count = Number(value);
+      if (Number.isFinite(count)) outputDroppedByKind[key] = count;
+    }
     const exec = nonNegativeSafeIntegerField(hb, 'exec');
     const execTruncated = nonNegativeSafeIntegerField(hb, 'execTruncated', 'exec_truncated');
     const execIncomplete = nonNegativeSafeIntegerField(hb, 'execIncomplete', 'exec_incomplete');
@@ -788,8 +823,10 @@ function parseCollectorHeartbeatLine(line: string): T.CollectorRawHeartbeatReque
       enabledFeatures: strArrayField(hb, 'enabledFeatures', 'enabled_features'),
       intervalSecs: numField(hb, 'intervalSecs', 'interval_secs'),
       eventKindCounts,
+      droppedByKind,
       droppedEvents: numField(hb, 'droppedEvents', 'dropped'),
       outputDropped: numField(hb, 'outputDropped', 'output_dropped'),
+      outputDroppedByKind,
       observedAgents: numField(hb, 'observedAgents', 'observed_agents'),
       errorCount: numField(hb, 'errorCount', 'error_count'),
       legacyCounterTemporality: legacyCounterTemporality === 'delta' || legacyCounterTemporality === 'cumulative'
@@ -2357,7 +2394,16 @@ const SECURITY_PROGRESSIVE_ALIASES: Record<string, { module: string; operation: 
   'security.nextActions': { module: SECURITY_PROGRESSIVE_MODULE, operation: 'planNextActions' },
 };
 
-const SECURITY_TIME_TYPES = ['last_3h', 'last_1d', 'last_7d', 'last_30d', 'custom'];
+const SECURITY_TIME_TYPES: Array<NonNullable<T.SecurityTimeFilter['timeType']>> = [
+  'last_30m',
+  'last_1h',
+  'last_2h',
+  'last_3h',
+  'last_1d',
+  'last_7d',
+  'last_30d',
+  'custom',
+];
 const SECURITY_SEVERITIES: T.Severity[] = ['info', 'low', 'medium', 'high', 'critical'];
 const SECURITY_EVENT_CATEGORIES: T.EventCategory[] = ['tool', 'network', 'file', 'llm', 'security', 'process', 'runtime', 'unknown'];
 const SECURITY_VERDICTS: T.Verdict[] = ['allow', 'block', 'escalate'];
@@ -2381,7 +2427,7 @@ const STRING_OR_STRING_ARRAY_SCHEMA = { oneOf: [{ type: 'string' }, { type: 'arr
 const TIMESTAMP_SCHEMA = { oneOf: [{ type: 'string', format: 'date-time' }, { type: 'number', description: 'Epoch milliseconds.' }] };
 
 const SECURITY_TIME_FILTER_SCHEMA_PROPERTIES = {
-  timeType: { type: 'string', enum: SECURITY_TIME_TYPES, default: 'last_3h' },
+  timeType: { type: 'string', enum: SECURITY_TIME_TYPES, default: DEFAULT_SECURITY_TIME_TYPE },
   startTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
   endTime: { type: 'string', format: 'date-time', description: 'Required when timeType=custom.' },
 };
@@ -2881,7 +2927,7 @@ const SECURITY_PROGRESSIVE_MODULES: T.SecurityApiModule[] = [
         action: 'execute',
         tags: ['security-center', 'remediation', 'agent-plan', 'progressive-api'],
         parameters: [
-          { name: 'timeType', in: 'body', type: 'string', required: false, description: 'last_3h/last_1d/last_7d/last_30d/custom.' },
+          { name: 'timeType', in: 'body', type: 'string', required: false, description: 'last_30m/last_1h/last_2h/last_3h/last_1d/last_7d/last_30d/custom.' },
           { name: 'workspacePath', in: 'body', type: 'string', required: false, description: 'Limit the plan to one workspace.' },
           { name: 'agentId', in: 'body', type: 'string', required: false, description: 'Limit the plan to one agent.' },
           { name: 'maxActions', in: 'body', type: 'number', required: false, description: 'Maximum actions to return; default 5, max 20.' },
@@ -4367,6 +4413,40 @@ export class SecurityMonitoringController {
         ? [{ event: item.prepared.event, observerLine: item.line }]
         : []
     )));
+  }
+
+  private readonly supplyChainInstallQueue: Array<() => Promise<void>> = [];
+  private supplyChainInstallActive = 0;
+  private supplyChainInstallDropped = 0;
+
+  private scheduleSupplyChainInstall(event: T.JudgedEvent, observerLine: string): void {
+    if (this.supplyChainInstallQueue.length >= SUPPLY_CHAIN_INSTALL_MAX_QUEUE) {
+      this.supplyChainInstallDropped += 1;
+      if (this.supplyChainInstallDropped % 100 === 1) {
+        console.warn('[supply-chain] runtime install observation queue is full', {
+          dropped: this.supplyChainInstallDropped,
+          queued: this.supplyChainInstallQueue.length,
+        });
+      }
+      return;
+    }
+    this.supplyChainInstallQueue.push(() => this.observeSupplyChainInstall(event, observerLine));
+    this.drainSupplyChainInstallQueue();
+  }
+
+  private drainSupplyChainInstallQueue(): void {
+    while (
+      this.supplyChainInstallActive < SUPPLY_CHAIN_INSTALL_MAX_CONCURRENCY
+      && this.supplyChainInstallQueue.length > 0
+    ) {
+      const job = this.supplyChainInstallQueue.shift();
+      if (!job) break;
+      this.supplyChainInstallActive += 1;
+      void job().finally(() => {
+        this.supplyChainInstallActive -= 1;
+        this.drainSupplyChainInstallQueue();
+      });
+    }
   }
 
   private async observeSupplyChainInstall(event: T.JudgedEvent, observerLine: string): Promise<void> {
@@ -6735,6 +6815,7 @@ export class SecurityMonitoringController {
       schemaVersion: 'anysentry.health.v1',
       status: 'ok',
       service: 'anysentry-api',
+      build: buildInfo(),
       uptimeSeconds: Math.round(process.uptime()),
       storage: this.judge.storageStatus(),
       businessState: {
@@ -7468,7 +7549,15 @@ export class SecurityMonitoringController {
   async ingestBatch(
     @Body() body: ObserverBatchIngestBody = {},
     @Headers() headers: HeaderBag,
+    @Req() request: Request,
   ): Promise<T.ObserverBatchIngestResult> {
+    const requestStartedAt = Date.now();
+    let preparedAt = requestStartedAt;
+    let lifecycleDurableAt = requestStartedAt;
+    let eventsDurableAt = requestStartedAt;
+    let memoryCommittedAt = requestStartedAt;
+    let downstreamDeliveredAt = requestStartedAt;
+    setHttpShutdownPhase(request, 'validate');
     const events = Array.isArray(body.events) ? body.events : [];
     if (body.durableReplay !== undefined && typeof body.durableReplay !== 'boolean') {
       throw new BadRequestException('observer durableReplay must be a boolean');
@@ -7513,6 +7602,7 @@ export class SecurityMonitoringController {
     const retained: PreparedObserverBatchEvent[] = [];
     const structural: PreparedObserverBatchEvent[] = [];
 
+    setHttpShutdownPhase(request, 'prepare');
     // Prepare is deliberately side-effect free for event persistence, hot-ring state, alerting,
     // judgment jobs, and canonical jobs. Source resolution may refresh its discovery registry, but
     // only after the global count/byte/digest checks above have completed.
@@ -7700,6 +7790,7 @@ export class SecurityMonitoringController {
       if (prepared.disposition === 'retained') retained.push(context);
       else if (prepared.disposition === 'structural_consumed') structural.push(context);
     }
+    preparedAt = Date.now();
 
     // Exact Forwarder retries retain one batchId and payload digest. Source resolution above must
     // still run on every request, but a previously terminal ACK is the authoritative idempotency
@@ -7780,20 +7871,81 @@ export class SecurityMonitoringController {
       ({ prepared }) => prepared as PreparedRetainedJudgeAccept,
     );
     const structuralPrepared = structural.map(({ prepared }) => prepared as PreparedStructuralJudgeAccept);
+    // Retained Agent commands are security evidence and still define exact process generations.
+    // Persist those identities beside structural-only exec/exit facts. Keeping this projection in
+    // the controller's existing concurrent durability phase avoids serializing a second
+    // ClickHouse round trip behind every retained-event batch.
+    const lifecycleFacts = [...new Map([
+      ...structuralPrepared.map(({ fact }) => [fact.factId, fact] as const),
+      ...retainedPrepared.flatMap(({ event }) => {
+        const fact = processLifecycleFact(event);
+        return fact ? [[fact.factId, fact] as const] : [];
+      }),
+    ]).values()];
     let revisionConflict = false;
     let retainedDurability: 'durable' | 'memory_only' = 'memory_only';
-    if (structuralPrepared.length > 0) {
-      const persisted = await this.judge.persistPreparedProcessLifecycleFacts(
-        structuralPrepared.map(({ fact }) => fact),
-      );
-      if (!persisted) {
+    // Lifecycle facts and retained events hit different ClickHouse tables. Persist them concurrently
+    // so ingest wall time is closer to max(phase) than sum(phase), without relaxing either fence.
+    let lifecycleElapsedMs = 0;
+    let eventsElapsedMs = 0;
+    const lifecycleStartedAt = Date.now();
+    const lifecyclePersist = lifecycleFacts.length > 0
+      ? (async () => {
+          setHttpShutdownPhase(request, 'clickhouse.process-lifecycle');
+          const persisted = await this.judge.persistPreparedProcessLifecycleFacts(
+            lifecycleFacts,
+          );
+          lifecycleElapsedMs = Date.now() - lifecycleStartedAt;
+          return persisted;
+        })()
+      : Promise.resolve(true);
+    const eventsStartedAt = Date.now();
+    const eventsPersist = retainedPrepared.length > 0
+      ? (async () => {
+          setHttpShutdownPhase(request, 'clickhouse.events-durable');
+          try {
+            return await this.judge.persistPreparedBatch(
+              retainedPrepared,
+              `observer-batch:${batchScope}:${batchId || 'digest'}:${payload.digest}`,
+            );
+          } finally {
+            eventsElapsedMs = Date.now() - eventsStartedAt;
+          }
+        })()
+      : Promise.resolve('memory_only' as const);
+    const [lifecycleOutcome, eventsOutcome] = await Promise.allSettled([lifecyclePersist, eventsPersist]);
+    lifecycleDurableAt = Date.now();
+    eventsDurableAt = lifecycleDurableAt;
+    if (lifecycleOutcome.status === 'rejected') throw lifecycleOutcome.reason;
+    if (!lifecycleOutcome.value) {
+      return {
+        accepted: false,
+        ...(batchId ? { batchId } : {}),
+        payloadDigest: payload.digest,
+        acceptedEvents: 0,
+        retainedEvents: 0,
+        structuralEvents: 0,
+        discardedEvents: 0,
+        rejectedEvents: 0,
+        retryableEvents: events.length,
+        retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS,
+        items: events.map((_, index) => ({
+          index,
+          accepted: false,
+          disposition: 'retryable',
+          reasonCode: 'clickhouse_event_buffer_full',
+        })),
+      };
+    }
+    if (eventsOutcome.status === 'rejected') {
+      const error = eventsOutcome.reason;
+      if (isClickHouseEventBufferFull(error)) {
         return {
           accepted: false,
           ...(batchId ? { batchId } : {}),
           payloadDigest: payload.digest,
           acceptedEvents: 0,
           retainedEvents: 0,
-          structuralEvents: 0,
           discardedEvents: 0,
           rejectedEvents: 0,
           retryableEvents: events.length,
@@ -7806,40 +7958,16 @@ export class SecurityMonitoringController {
           })),
         };
       }
-    }
-    if (retainedPrepared.length > 0) {
-      try {
-        retainedDurability = await this.judge.persistPreparedBatch(
-          retainedPrepared,
-          `observer-batch:${batchScope}:${batchId || 'digest'}:${payload.digest}`,
-        );
-      } catch (error) {
-        if (isClickHouseEventBufferFull(error)) {
-          return {
-            accepted: false,
-            ...(batchId ? { batchId } : {}),
-            payloadDigest: payload.digest,
-            acceptedEvents: 0,
-            retainedEvents: 0,
-            discardedEvents: 0,
-            rejectedEvents: 0,
-            retryableEvents: events.length,
-            retryAfterMs: OBSERVER_BATCH_RETRY_AFTER_MS,
-            items: events.map((_, index) => ({
-              index,
-              accepted: false,
-              disposition: 'retryable',
-              reasonCode: 'clickhouse_event_buffer_full',
-            })),
-          };
-        }
-        if (!isEventRevisionConflict(error)) throw error;
-        revisionConflict = true;
-      }
+      if (!isEventRevisionConflict(error)) throw error;
+      revisionConflict = true;
+    } else {
+      retainedDurability = eventsOutcome.value;
     }
     if (!revisionConflict && retainedPrepared.length > 0) {
+      setHttpShutdownPhase(request, 'memory-commit');
       await this.judge.commitPreparedBatch(retainedPrepared);
     }
+    memoryCommittedAt = Date.now();
     // The binding pass above is side-effect free. Publish only facts/events that crossed their
     // ClickHouse durability fence; a failed block therefore cannot create a ghost Asset/Runtime.
     for (const context of structural) {
@@ -7863,6 +7991,7 @@ export class SecurityMonitoringController {
     let deliveryError = '';
     if (!revisionConflict && retainedPrepared.length > 0) {
       try {
+        setHttpShutdownPhase(request, 'downstream-delivery');
         await this.judge.enqueuePreparedFastJobs(retainedPrepared);
         await this.enqueueCanonicalBatchMany(retainedForPersistence);
       } catch (error) {
@@ -7870,7 +7999,10 @@ export class SecurityMonitoringController {
         deliveryError = error instanceof Error ? error.message : String(error);
       }
     }
+    downstreamDeliveredAt = Date.now();
     let retainedCommitted = 0;
+    let supplyChainJobs = 0;
+    setHttpShutdownPhase(request, 'post-commit');
     for (let index = 0; index < events.length; index += 1) {
       await yieldObserverBatchControl(index);
       if (deliveryRetryFrom >= 0 && index >= deliveryRetryFrom) break;
@@ -7970,7 +8102,6 @@ export class SecurityMonitoringController {
       }
 
       try {
-        await this.observeSupplyChainInstall(prepared.event, context.line);
         this.observeWorkspaceAssociation(prepared.event);
         this.identityReview.considerCandidate(prepared.event, () => this.agg.invalidateWindowCache());
         unknownLearningEvents.push(prepared.event);
@@ -7978,6 +8109,8 @@ export class SecurityMonitoringController {
           collectorId: context.collectorId,
           workspacePath: prepared.event.workspacePath,
         });
+        supplyChainJobs += 1;
+        this.scheduleSupplyChainInstall(prepared.event, context.line);
         retainedCommitted += 1;
         items[index] = {
           index,
@@ -8051,6 +8184,27 @@ export class SecurityMonitoringController {
       && legacyIndexes.size === 0
     ) {
       rememberObserverBatchResult(batchCacheKey, payload.digest, result);
+    }
+    const completedAt = Date.now();
+    if (completedAt - requestStartedAt >= 1_000) {
+      observerSlowBatchLogSequence += 1;
+      if (observerSlowBatchLogSequence % 5 === 1) {
+        console.warn('[ingest/batch] slow phase sample', {
+          totalMs: completedAt - requestStartedAt,
+          prepareMs: preparedAt - requestStartedAt,
+          // Lifecycle and event durability may overlap; these are exclusive wall times per fence.
+          processLifecycleMs: lifecycleElapsedMs,
+          eventDurabilityMs: eventsElapsedMs,
+          durabilityFenceMs: Math.max(lifecycleDurableAt, eventsDurableAt) - preparedAt,
+          memoryCommitMs: memoryCommittedAt - eventsDurableAt,
+          downstreamDeliveryMs: downstreamDeliveredAt - memoryCommittedAt,
+          postCommitMs: completedAt - downstreamDeliveredAt,
+          events: events.length,
+          retained: retainedPrepared.length,
+          structural: structuralPrepared.length,
+          supplyChainJobs,
+        });
+      }
     }
     return result;
   }

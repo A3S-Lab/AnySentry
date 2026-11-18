@@ -55,6 +55,15 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 
 const BUILTIN_RUNTIMES = [
   {
+    id: 'opencode',
+    displayName: 'OpenCode',
+    variants: [
+      { commExact: ['opencode'] },
+      { exeBasename: ['opencode'] },
+      { argv0Basename: ['opencode'] },
+    ],
+  },
+  {
     id: 'codex',
     displayName: 'Codex',
     variants: [
@@ -68,9 +77,10 @@ const BUILTIN_RUNTIMES = [
     agentScopeId: 'a3s code',
     displayName: 'A3S Code',
     variants: [
-      { commExact: ['a3s', 'a3s-code', 'a3s code'] },
-      { exeBasename: ['a3s', 'a3s-code'] },
-      { argv0Basename: ['a3s', 'a3s-code'] },
+      { commExact: ['a3s-code', 'a3s code'] },
+      { exeBasename: ['a3s-code'] },
+      { argv0Basename: ['a3s-code'] },
+      { commExact: ['tokio-rt-worker'], exeBasename: ['a3s'] },
       { argvPrefix: ['a3s code', 'a3s-code'] },
     ],
   },
@@ -105,8 +115,9 @@ const BUILTIN_RUNTIMES = [
     id: 'kimi-cli',
     displayName: 'Kimi Code CLI',
     variants: [
-      { commExact: ['Kimi Code', 'kimi', 'kimi-cli'] },
-      { argv0Basename: ['kimi', 'kimi-cli'] },
+      { commExact: ['Kimi Code', 'kimi', 'kimi-cli', 'kimi-code'] },
+      { exeBasename: ['kimi', 'kimi-cli', 'kimi-code'] },
+      { argv0Basename: ['kimi', 'kimi-cli', 'kimi-code'] },
     ],
   },
 ];
@@ -457,11 +468,15 @@ function argvText(value) {
 
 function variantMatch(variant, info) {
   const argv = normalized(argvText(info?.argv)).replace(/ +/g, ' ');
+  const argvTokens = argv.split(/\s+/).filter(Boolean);
   const facts = {
     commExact: normalized(info?.comm),
     exeBasename: basename(info?.exe),
     argv0Basename: basename(argv.split(/\s+/)[0]),
-    argvPrefix: normalized(argv),
+    // Prefix signatures describe a command, not its installation directory. Normalize argv[0]
+    // to its basename so `/opt/a3s/bin/a3s code` and `a3s code` share one strict signature while
+    // `a3s info` still cannot match the Agent runtime.
+    argvPrefix: [basename(argvTokens[0]), ...argvTokens.slice(1)].join(' '),
   };
   const evidence = [];
   for (const [field, wanted] of Object.entries(variant)) {

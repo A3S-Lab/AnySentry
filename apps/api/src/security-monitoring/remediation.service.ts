@@ -20,9 +20,9 @@ import {
   Severity,
 } from './types';
 import { cleanText } from './redaction';
+import { securityTimeSpanMs } from './time-window';
 
 const HOUR = 3_600_000;
-const WINDOW: Record<string, number> = { last_3h: 3 * HOUR, last_1d: 24 * HOUR, last_7d: 7 * 24 * HOUR, last_30d: 30 * 24 * HOUR };
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 const RETAIN_LIMIT = 2_000;
 const OVERDUE_SCAN_BUFFER_MS = 250;
@@ -145,6 +145,7 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
   private relationalRefreshTimer?: NodeJS.Timeout;
   private persistInFlight?: Promise<void>;
   private persistRequested = false;
+  private readonly relationalPersistedTasks = new Map<string, RemediationRecord>();
   private initialized = false;
 
   constructor(
@@ -170,6 +171,10 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     if (this.overdueTimer) clearTimeout(this.overdueTimer);
     if (this.relationalRefreshTimer) clearInterval(this.relationalRefreshTimer);
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
     await this.persist();
   }
 
@@ -584,8 +589,8 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
 
   private since(query: RemediationQuery): number {
     const end = Date.now();
-    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - 3 * HOUR;
-    return end - (WINDOW[query.timeType ?? 'last_3h'] ?? 3 * HOUR);
+    if (query.timeType === 'custom' && query.startTime) return parseTime(query.startTime) ?? end - securityTimeSpanMs();
+    return end - securityTimeSpanMs(query.timeType);
   }
 
   private persistSoon(): void {
@@ -614,10 +619,15 @@ export class RemediationService implements OnModuleInit, OnModuleDestroy {
       const tasks = [...this.state.values()]
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, RETAIN_LIMIT);
-      await Promise.all([
-        this.relational.saveRemediations(tasks),
-        this.ch.saveRemediationState(tasks),
-      ]);
+      const changed = tasks.filter((task) => (
+        this.relationalPersistedTasks.get(task.taskId) !== task
+      ));
+      const saved = changed.length === 0 || await this.relational.saveRemediations(changed);
+      if (saved) {
+        for (const task of changed) this.relationalPersistedTasks.set(task.taskId, task);
+      } else {
+        await this.ch.saveRemediationState(tasks);
+      }
     } while (this.persistRequested);
   }
 

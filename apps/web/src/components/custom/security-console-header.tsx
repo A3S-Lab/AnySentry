@@ -17,7 +17,11 @@ import { MobileSecurityNavigation } from "@/components/custom/mobile-security-na
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { SecurityTimeFilter, SecurityTimeType } from "@/lib/api/security-center";
+import {
+  DEFAULT_SECURITY_TIME_TYPE,
+  type SecurityTimeFilter,
+  type SecurityTimeType,
+} from "@/lib/api/security-center";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -54,7 +58,7 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = "anysentry.security-sidebar.collapsed";
 function filterFromSearch(search: string): SecurityTimeFilter {
   const params = new URLSearchParams(search);
   const requested = params.get("timeType") as SecurityTimeType | null;
-  const timeType = TIME_OPTIONS.some((option) => option.value === requested) ? requested! : "last_3h";
+  const timeType = TIME_OPTIONS.some((option) => option.value === requested) ? requested! : DEFAULT_SECURITY_TIME_TYPE;
   return {
     timeType,
     startTime: timeType === "custom" ? params.get("startTime") ?? undefined : undefined,
@@ -116,7 +120,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     if (!params.has("snapshotAsOf")) {
-      params.set("timeType", filter.timeType ?? "last_3h");
+      params.set("timeType", filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE);
       params.set("snapshotAsOf", filter.snapshotAsOf ?? new Date().toISOString());
       if (filter.timeType === "custom" && filter.startTime && filter.endTime) {
         params.set("startTime", filter.startTime);
@@ -143,12 +147,12 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
   const setTimeFilter = (next: SecurityTimeFilter) => {
     const resolved: SecurityTimeFilter = {
       ...next,
-      timeType: next.timeType ?? "last_3h",
+      timeType: next.timeType ?? DEFAULT_SECURITY_TIME_TYPE,
       snapshotAsOf: next.snapshotAsOf ?? new Date().toISOString(),
     };
     setFilter(resolved);
     const params = new URLSearchParams(location.search);
-    params.set("timeType", resolved.timeType ?? "last_3h");
+    params.set("timeType", resolved.timeType ?? DEFAULT_SECURITY_TIME_TYPE);
     params.set("snapshotAsOf", resolved.snapshotAsOf!);
     if (resolved.timeType === "custom" && resolved.startTime && resolved.endTime) {
       params.set("startTime", resolved.startTime);
@@ -249,8 +253,12 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
               <MobileSecurityNavigation />
               <ShieldCheck className="hidden size-5 shrink-0 text-teal-300 sm:block" />
               {!sidebarCollapsed ? (
-                <h1 className="hidden min-w-0 truncate pr-6 text-sm font-semibold tracking-normal text-zinc-50 sm:block">
-                  {t("Agent态势感知")} <span className="text-zinc-300">AnySentry</span>
+                <h1
+                  className="hidden min-w-0 truncate pr-6 text-sm font-semibold tracking-normal text-zinc-50 sm:block"
+                  title={`${t("Agent态势感知")} AnySentry`}
+                >
+                  <span className="sr-only">{t("Agent态势感知")} </span>
+                  AnySentry
                 </h1>
               ) : null}
               <button
@@ -271,7 +279,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
 
             <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2 px-4 py-3">
               <Select
-                value={filter.timeType ?? "last_3h"}
+                value={filter.timeType ?? DEFAULT_SECURITY_TIME_TYPE}
                 onValueChange={(value) => handleTimeTypeChange(value as SecurityTimeType)}
               >
                 <SelectTrigger className="h-11 w-[132px] border-white/10 bg-white/5 text-xs text-zinc-100 sm:h-9">

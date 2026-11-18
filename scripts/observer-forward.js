@@ -16,6 +16,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const { fileScope } = require('./observer-file-scope');
+const fileInConfiguredScope = fileScope(process.env.FORWARD_FILE_INCLUDE_PATHS);
 const { AgentAttributor, readProcStartTime } = require('./observer-agent-attribution');
 const { mergeAttributionClassifications } = require('./observer-attribution-merge');
 const { classificationSemanticsEnvelope } = require('./observer-classification-semantics');
@@ -28,6 +30,10 @@ const {
 const { DockerDiscovery } = require('./observer-docker-discovery');
 const { BehavioralAgentDetector } = require('./observer-behavior-discovery');
 const { DurableSpool, safeId, stableWriterId } = require('./observer-durable-spool');
+const {
+  InteractionForwarder,
+  isAgentInteractionClassification,
+} = require('./observer-interaction-forwarder');
 const { BoundedPriorityQueue } = require('./observer-priority-queue');
 const { ToolExecDeduper } = require('./observer-event-dedup');
 const {
@@ -38,21 +44,13 @@ const {
 const { InfrastructureRootResolver } = require('./observer-infrastructure-roots');
 const { InfrastructurePolicyRegistry } = require('./observer-infrastructure-policy');
 const { alwaysKeepEventKind } = require('./observer-infrastructure-rules');
+const { isAgentKeepDecision } = require('./observer-capture-profile-control');
 const { FilterRulePublisher } = require('./observer-filter-rules');
 const { CaptureProfileReporter } = require('./observer-capture-profile-reporter');
 const { FileAccessAggregator } = require('./observer-file-aggregation');
 const { ForwarderPipelineAccounting } = require('./observer-pipeline-accounting');
+const { PipelineDiagnostics } = require('./observer-pipeline-diagnostics');
 const { UnifiedFilterPolicyRegistry } = require('./observer-unified-filter-policy');
-
-// Only immutable, software-versioned rules may override the generic lifecycle discovery
-// guardrail. User-created SUPPRESS rules can never add an ID to this closed set.
-const PROTECTED_LIFECYCLE_SUPPRESSION_RULES = new Set([
-  'fr_builtin_f2_trusted_infrastructure_lifecycle_suppress',
-  'fr_builtin_f2_trusted_non_agent_family_lifecycle_suppress',
-]);
-const TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES = new Set([
-  'fr_builtin_non_agent_runtime_vscode_cpu_sampler',
-]);
 
 const target = new URL(process.env.ANYSENTRY_INGEST_URL || 'http://localhost:29653/security-center/ingest');
 function defaultHeartbeatUrl(ingestUrl) {
@@ -189,45 +187,15 @@ const RETRY_MAX_DELAY_MS = boundedNumber(
   RETRY_BASE_DELAY_MS,
   2_000,
 );
-const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 45_000, 100, 45_000);
+const RETRY_MAX_AGE_MS = boundedNumber(process.env.FORWARD_RETRY_MAX_AGE_MS, 300_000, 100, 300_000);
+const DURABLE_REPLAY_COOLDOWN_MS = boundedNumber(
+  process.env.FORWARD_DURABLE_REPLAY_COOLDOWN_MS,
+  30_000,
+  1_000,
+  300_000,
+);
 const RETRY_JITTER_RATIO = 0.2;
-const SPOOL_REPLAY_INTERVAL_MS = boundedNumber(
-  process.env.FORWARD_SPOOL_REPLAY_INTERVAL_MS,
-  1_000,
-  100,
-  60_000,
-);
-const SPOOL_REPLAY_BATCH_SIZE = boundedNumber(
-  process.env.FORWARD_SPOOL_REPLAY_BATCH_SIZE,
-  256,
-  1,
-  4_096,
-);
-const SPOOL_DEGRADED_AGE_MS = boundedNumber(
-  process.env.FORWARD_SPOOL_DEGRADED_AGE_MS,
-  60_000,
-  1_000,
-  3_600_000,
-);
-const WAL_PENDING_MAX_EVENTS = boundedNumber(
-  process.env.FORWARD_WAL_PENDING_MAX_EVENTS,
-  65_536,
-  1_024,
-  250_000,
-);
-const WAL_PENDING_MAX_BYTES = boundedNumber(
-  process.env.FORWARD_WAL_PENDING_MAX_BYTES,
-  256 * 1024 * 1024,
-  16 * 1024 * 1024,
-  2 * 1024 * 1024 * 1024,
-);
 const HTTP_TIMEOUT_MS = boundedNumber(process.env.FORWARD_HTTP_TIMEOUT_MS, 10_000, 1_000, 120_000);
-const CONTROL_HTTP_TIMEOUT_MS = boundedNumber(
-  process.env.FORWARD_CONTROL_HTTP_TIMEOUT_MS,
-  15_000,
-  100,
-  120_000,
-);
 const BATCH_ACK_MAX_BYTES = boundedNumber(
   process.env.FORWARD_BATCH_ACK_MAX_BYTES,
   1024 * 1024,
@@ -274,6 +242,172 @@ function text(value) {
   return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
 }
 
+function canonicalAgentSelector(value) {
+  return text(value)
+    .toLowerCase()
+    .replace(/[-_]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function agentAllowlist(value) {
+  const raw = text(value);
+  if (!raw) return new Set();
+  const result = new Set();
+  for (const entry of raw.split(',')) {
+    const selector = canonicalAgentSelector(entry);
+    if (!selector || !/^[a-z0-9][a-z0-9 .]{0,63}$/u.test(selector)) {
+      throw new Error('FORWARD_AGENT_ALLOWLIST must be a comma-separated list of exact Agent IDs');
+    }
+    result.add(selector);
+  }
+  return result;
+}
+
+function agentAllowlistMatch(allowlist, observerEvent, classification) {
+  if (allowlist.size === 0) return true;
+  const attribution = classification?.attribution ?? {};
+  // Process attribution is authoritative for ordinary kernel events. The producer Agent label is
+  // only a fallback for the dedicated plaintext Interaction event, where the exact-PID runtime
+  // capture policy already selected the process before emitting sensitive content.
+  const producerAgent = eventKind(observerEvent) === 'LlmRequestObserved'
+    ? observerEvent?.identity?.agent
+    : undefined;
+  const candidates = [
+    attribution.agentScopeId,
+    attribution.agentId,
+    attribution.agentDisplayName,
+    producerAgent,
+  ];
+  return candidates.some((candidate) => allowlist.has(canonicalAgentSelector(candidate)));
+}
+
+const UNRESOLVED_EXIT_LIMIT = Math.max(0, Number(process.env.ANYSENTRY_UNRESOLVED_EXIT_LIMIT) || 0);
+let unresolvedExitRetained = 0;
+const unresolvedExitGenerations = new Set();
+
+function unresolvedExitCapacity() {
+  return UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitRetained >= UNRESOLVED_EXIT_LIMIT;
+}
+
+function unresolvedProcessKey(observerEvent) {
+  const process = observerEvent?.process ?? {};
+  const hostId = text(process.hostId || process.host_id);
+  const bootId = text(process.bootId || process.boot_id);
+  const startTime = text(
+    process.startBoottimeNs || process.start_boottime_ns || process.startTimeNs || process.start_time_ns,
+  );
+  return hostId && bootId && Number(process.pid) > 0 && startTime
+    ? JSON.stringify([hostId, bootId, Number(process.pid), startTime])
+    : '';
+}
+
+function unresolvedExitIdentityMatch(observerEvent, classification) {
+  if (eventKind(observerEvent) !== 'ProcessExit' || classification?.state !== 'unknown') return false;
+  return Boolean(unresolvedProcessKey(observerEvent));
+}
+
+function unresolvedExitMatch(observerEvent, classification) {
+  if (UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitCapacity()) return false;
+  return unresolvedExitIdentityMatch(observerEvent, classification);
+}
+
+function unresolvedExecIdentityMatch(observerEvent, classification) {
+  if (
+    eventKind(observerEvent) !== 'ToolExec'
+    || classification?.state !== 'unknown'
+    || observerEvent?.event?.ToolExec?.exec_confirmed !== true
+  ) return false;
+  return Boolean(unresolvedProcessKey(observerEvent));
+}
+
+function unresolvedExecMatch(observerEvent, classification, retryExhausted = false) {
+  if (UNRESOLVED_EXIT_LIMIT <= 0 || unresolvedExitCapacity()) return false;
+  if (!unresolvedExecIdentityMatch(observerEvent, classification)) return false;
+  const key = unresolvedProcessKey(observerEvent);
+  return retryExhausted || unresolvedExitGenerations.has(key);
+}
+
+const ATTRIBUTION_RETRY_DELAY_MS = Math.max(0, Math.min(1_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_DELAY_MS) || 50));
+// A parent that is going to be observed in the same Collector burst almost always appears within
+// a few seconds; waiting longer only delays delivery (and can push retained execs past consumer
+// windows) without improving attribution. The bound is a wall-clock budget, not an attempt count.
+const MAX_ATTRIBUTION_RETRY_AGE_MS = Math.max(1_000, Math.min(300_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_AGE_MS) || 5_000));
+const MAX_ATTRIBUTION_RETRY_ATTEMPTS = Math.max(1, Math.min(10_000,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_ATTEMPTS) || 10_000));
+const MAX_ATTRIBUTION_RETRIES = Math.max(1,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_LIMIT) || 16_384);
+const MAX_ATTRIBUTION_RETRY_BYTES = Math.max(1,
+  Number(process.env.ANYSENTRY_ATTRIBUTION_RETRY_MAX_BYTES) || 64 * 1024 * 1024);
+const attributionRetries = new Set();
+let attributionRetryBytes = 0;
+
+function deferAttributionRetry(raw, observerEvent, classification, retryAttempt, retryDeadline = 0) {
+  const process = observerEvent?.process ?? {};
+  const exec = observerEvent?.event?.ToolExec;
+  if (
+    retryAttempt >= MAX_ATTRIBUTION_RETRY_ATTEMPTS
+    || !exec?.exec_confirmed
+    || classification?.state !== 'unknown'
+    || unresolvedExecMatch(observerEvent, classification, retryDeadline > 0 && Date.now() >= retryDeadline)
+    || ATTRIBUTION_RETRY_DELAY_MS <= 0
+  ) return false;
+  const startTime = text(process.startBoottimeNs || process.start_boottime_ns || process.startTimeNs);
+  const parentStart = text(
+    process.creationParentStartBoottimeNs || process.creation_parent_start_boottime_ns,
+  );
+  const parentPid = Number(process.creationPpid || process.creation_ppid);
+  if (
+    !text(process.hostId || process.host_id)
+    || !text(process.bootId || process.boot_id)
+    || Number(process.pid) <= 0
+    || !startTime
+    || parentPid <= 0
+    || !parentStart
+  ) return false;
+  const bytes = Buffer.byteLength(raw);
+  if (
+    attributionRetries.size >= MAX_ATTRIBUTION_RETRIES
+    || attributionRetryBytes + bytes > MAX_ATTRIBUTION_RETRY_BYTES
+  ) {
+    pipelineDiagnostics.record(
+      { ...observerEvent, eventKind: 'ToolExec' },
+      'attribution_retry_capacity',
+      'bounded_pending_attribution',
+    );
+    return false;
+  }
+  const deadline = retryDeadline > 0 ? retryDeadline : Date.now() + MAX_ATTRIBUTION_RETRY_AGE_MS;
+  const retry = { raw, bytes, deadline, timer: undefined };
+  attributionRetries.add(retry);
+  attributionRetryBytes += bytes;
+  if (retryAttempt === 0) {
+    pipelineDiagnostics.record(
+      { ...observerEvent, eventKind: 'ToolExec' },
+      'attribution_deferred',
+      'parent_not_observed',
+    );
+  }
+  retry.timer = setTimeout(() => {
+    attributionRetries.delete(retry);
+    attributionRetryBytes = Math.max(0, attributionRetryBytes - bytes);
+    handleLine(raw, retryAttempt + 1, deadline);
+  }, Math.min(1_000, ATTRIBUTION_RETRY_DELAY_MS * (2 ** Math.min(10, retryAttempt))));
+  return true;
+}
+
+function flushAttributionRetries() {
+  const retries = [...attributionRetries];
+  attributionRetries.clear();
+  attributionRetryBytes = 0;
+  for (const retry of retries) {
+    if (retry.timer) clearTimeout(retry.timer);
+    handleLine(retry.raw, MAX_ATTRIBUTION_RETRY_ATTEMPTS, Date.now() - 1);
+  }
+}
+
 const rawE2eIngestMarkerPrefix = process.env.ANYSENTRY_E2E_INGEST_MARKER_PREFIX;
 const e2eIngestMarkerPrefixMatch = rawE2eIngestMarkerPrefix?.match(
   /^asel-marker-([a-z0-9](?:[a-z0-9-]{0,26}[a-z0-9])?)-(host|docker|k8s)-(shadow|enforce)-$/,
@@ -294,6 +428,13 @@ const E2E_INGEST_MARKERS = new Set((!E2E_INGEST_MARKER_PREFIX
     ? ['non-agent-filter-canary', 'host-codex', 'host-kimi']
     : ['unknown-filter-canary', 'pi']
 ).map((suffix) => E2E_INGEST_MARKER_PREFIX + suffix));
+
+// A temporary, explicit benchmark scope. Attribution still observes every process event so a
+// newly started Codex root and its descendants can be discovered, but only the selected Agent
+// families enter the durable event WAL/API lane. With the variable unset, production retention
+// semantics are unchanged. Collector heartbeat and capture-control summaries use their dedicated
+// paths above this gate.
+const FORWARD_AGENT_ALLOWLIST = agentAllowlist(process.env.FORWARD_AGENT_ALLOWLIST);
 
 const LEGACY_FORWARD_SCOPE = ['agent', 'all', 'shadow'].includes(process.env.FORWARD_SCOPE)
   ? process.env.FORWARD_SCOPE
@@ -384,20 +525,28 @@ const WRITER_ID = stableWriterId([
 ]);
 const SPOOL_PATH = process.env.FORWARD_SPOOL_PATH ||
   path.join(os.tmpdir(), 'anysentry-forwarder', safeId(WRITER_ID), 'spool.wal');
+const pipelineDiagnostics = new PipelineDiagnostics({
+  filePath: process.env.ANYSENTRY_PIPELINE_DIAGNOSTICS_PATH
+    || path.join(path.dirname(SPOOL_PATH), 'pipeline-diagnostics.json'),
+  maxRecords: Math.min(100_000, Math.max(1000,
+    Number(process.env.ANYSENTRY_PIPELINE_DIAGNOSTICS_MAX_RECORDS) || 1000)),
+});
 const spool = new DurableSpool({
   writerId: WRITER_ID,
   filePath: SPOOL_PATH,
   dlqPath: process.env.FORWARD_DLQ_PATH,
   maxRecords: process.env.FORWARD_SPOOL_MAX_RECORDS,
   maxBytes: process.env.FORWARD_SPOOL_MAX_BYTES,
-  compactMaxLiveRecords: process.env.FORWARD_SPOOL_COMPACT_MAX_LIVE_RECORDS,
   fsyncMode: process.env.FORWARD_SPOOL_FSYNC,
   fsyncMs: process.env.FORWARD_SPOOL_FSYNC_MS,
-  onAsyncError(error) {
-    console.error(`[observer-forward] durable spool async operation failed: ${error.message}`);
-    if (rl) rl.pause();
-    process.exitCode = 1;
-  },
+});
+const interactionForwarder = new InteractionForwarder({
+  writerId: WRITER_ID,
+  collectorId: COLLECTOR_ID || NODE_NAME,
+  sourceId: SOURCE_ID,
+  sourceToken: SOURCE_TOKEN,
+  ingestTarget: target,
+  spoolPath: SPOOL_PATH,
 });
 const HEARTBEAT_SECS = Math.max(0, Number(process.env.ANYSENTRY_HEARTBEAT_SECS || 30));
 const heartbeatTarget = new URL(process.env.ANYSENTRY_HEARTBEAT_URL || defaultHeartbeatUrl(target));
@@ -593,20 +742,15 @@ function emptyAttributionCounts() {
     discoveryBudgetDropped: 0,
     wouldDiscoveryBudgetDrop: 0,
     e2eMarkerScopedOut: 0,
+    agentAllowlistScopedOut: 0,
     forwarded: 0,
     queueDropped: 0,
-    queueParked: 0,
     batches: 0,
     batchEvents: 0,
     retryQueued: 0,
     retryAttempts: 0,
     retryRecovered: 0,
     retryExhausted: 0,
-    retryParked: 0,
-    spoolReplayAttempts: 0,
-    spoolReplayAdmitted: 0,
-    spoolReplayDeferred: 0,
-    heartbeatDeliveryFailures: 0,
     workspaceConflict: 0,
     infrastructure: 0,
     deduplicated: 0,
@@ -627,10 +771,8 @@ let outstandingEvents = 0;
 let outstandingBytes = 0;
 let retryOutstandingEvents = 0;
 let retryOutstandingBytes = 0;
-let walPendingEvents = 0;
-let walPendingBytes = 0;
 const outstandingItems = new Set();
-const activeSpoolIds = new Set();
+const durableReplayNotBefore = new Map();
 const pending = new BoundedPriorityQueue(MAX_OUTSTANDING_EVENTS, 5, (item) => item.bytes);
 const retryTasks = [];
 const activeEventRequests = new Set();
@@ -638,6 +780,7 @@ const activeControlRequests = new Set();
 let eventRequestsAborted = false;
 let outputDropped = 0;
 let errorCount = 0;
+let spoolHydrationActive = false;
 let eventKindCounts = Object.create(null);
 const forwarderInstanceId = crypto.randomUUID();
 const pipelineAccounting = new ForwarderPipelineAccounting({
@@ -658,7 +801,7 @@ let runtimeSnapshotTimer;
 let rootLivenessTimer;
 let batchTimer;
 let retryTimer;
-let spoolReplayTimer;
+let durableReplayTimer;
 let shutdownForceTimer;
 let shutdownDeadline = 0;
 let eventDrainDeadline = 0;
@@ -690,53 +833,6 @@ let runtimeSnapshotOperation = 0;
 let reconcileTimer;
 let reconcileRunning = false;
 let reconcilePending = false;
-const controlPlaneLanes = Object.fromEntries(
-  ['identity', 'filter_rules', 'infrastructure_policy', 'runtime_snapshot'].map((lane) => [
-    lane,
-    { lastSuccessAt: 0, lastFailureAt: 0, lastFailure: '' },
-  ]),
-);
-const enabledControlPlaneLanes = new Set([
-  ...(IDENTITY_SNAPSHOT_SECS > 0 ? ['identity'] : []),
-  ...(UNIFIED_FILTER_PROJECTION_SECS > 0 ? ['filter_rules'] : []),
-  ...(INFRASTRUCTURE_POLICY_SECS > 0 ? ['infrastructure_policy'] : []),
-  'runtime_snapshot',
-]);
-
-function markControlPlaneSuccess(lane) {
-  if (!controlPlaneLanes[lane]) return;
-  controlPlaneLanes[lane].lastSuccessAt = Date.now();
-}
-
-function markControlPlaneFailure(lane, reason) {
-  if (!controlPlaneLanes[lane]) return;
-  controlPlaneLanes[lane].lastFailureAt = Date.now();
-  controlPlaneLanes[lane].lastFailure = String(reason || 'control plane failure').slice(0, 500);
-}
-
-function controlPlaneMetrics() {
-  const failedLanes = [];
-  const startingLanes = [];
-  const lanes = {};
-  for (const [lane, state] of Object.entries(controlPlaneLanes)) {
-    if (!enabledControlPlaneLanes.has(lane)) continue;
-    if (!state.lastSuccessAt && !state.lastFailureAt) startingLanes.push(lane);
-    if (state.lastFailureAt > state.lastSuccessAt) failedLanes.push(lane);
-    lanes[lane] = {
-      ...(state.lastSuccessAt ? { lastSuccessAt: new Date(state.lastSuccessAt).toISOString() } : {}),
-      ...(state.lastFailureAt ? {
-        lastFailureAt: new Date(state.lastFailureAt).toISOString(),
-        lastFailure: state.lastFailure,
-      } : {}),
-    };
-  }
-  return {
-    state: failedLanes.length ? 'degraded' : startingLanes.length ? 'starting' : 'healthy',
-    failedLanes,
-    startingLanes,
-    lanes,
-  };
-}
 
 function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotVersion) {
   lastRuntimeSnapshotFailureAt = new Date().toISOString();
@@ -744,7 +840,6 @@ function recordRuntimeSnapshotFailure(reason, snapshotVersion = runtimeSnapshotV
   lastRuntimeSnapshotFailureVersion = Number.isSafeInteger(snapshotVersion) && snapshotVersion > 0
     ? snapshotVersion
     : 0;
-  markControlPlaneFailure('runtime_snapshot', lastRuntimeSnapshotFailure);
 }
 
 function retryableRuntimeSnapshotError(error) {
@@ -789,6 +884,31 @@ function durableRecordKind(body) {
     return eventKind(JSON.parse(String(body?.line || '')));
   } catch {
     return '';
+  }
+}
+
+function durableRecordMatchesAgentAllowlist(body) {
+  if (FORWARD_AGENT_ALLOWLIST.size === 0) return true;
+  try {
+    const observerEvent = JSON.parse(String(body?.line || ''));
+    const kind = eventKind(observerEvent);
+    // These are bounded collector control-plane records rather than host workload evidence.
+    if (kind === 'CollectorHeartbeat' || kind === 'CaptureAggregate') return true;
+    const classification = {
+      state: text(body?.attribution?.classification) || 'unknown',
+      attribution: body?.attribution,
+    };
+    if (agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, observerEvent, classification)) return true;
+    return UNRESOLVED_EXIT_LIMIT > 0
+      && text(observerEvent.process?.lifecycleReason) === 'ancestry_incomplete'
+      && (
+        unresolvedExitIdentityMatch(observerEvent, classification)
+        || unresolvedExecIdentityMatch(observerEvent, classification)
+      );
+  } catch {
+    // A durable record without a valid Observer envelope cannot prove that it belongs to the
+    // selected Agent. Fail closed while an explicit benchmark allowlist is active.
+    return false;
   }
 }
 
@@ -868,7 +988,6 @@ function postJson(url, bodyObj, timeoutMs, done) {
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
-  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -885,7 +1004,6 @@ function postJson(url, bodyObj, timeoutMs, done) {
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
-    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(Boolean(failed), abortReason || reason);
   };
@@ -916,11 +1034,7 @@ function postJson(url, bodyObj, timeoutMs, done) {
   activeControlRequests.add(state);
   req.on('error', () => finish(true));
   absoluteTimer = setTimeout(() => {
-    absoluteTimer = undefined;
-    timeoutAbortImmediate = setImmediate(() => {
-      timeoutAbortImmediate = undefined;
-      state.abort();
-    });
+    state.abort();
   }, timeoutMs);
   req.end(body);
 }
@@ -936,6 +1050,7 @@ function invalidBatchAck(batchLength, reason) {
     retryItems: [],
     acceptedItems: [],
     rejectedItems: [],
+    invalidAck: true,
     pipelineCounts: pipelineCount('api_rejected', 'invalid_ack', batchLength),
     reason,
   };
@@ -955,7 +1070,6 @@ function eventBatchEnvelope(batch) {
     schemaVersion: 'anysentry.observer_batch.v2',
     batchId,
     payloadDigest,
-    durableReplay: batch.some((item) => item.recovered === true),
     writerId: WRITER_ID,
     writerVersion: WRITER_VERSION,
     idempotencyProtocolVersion: IDEMPOTENCY_PROTOCOL_VERSION,
@@ -1077,7 +1191,7 @@ function validateBatchAck(value, batch, envelope = eventBatchEnvelope(batch)) {
       ...pipelineCount('api_rejected', 'ack', rejectedItems),
       ...pipelineCount('api_retryable', 'ack', retryItems.length),
     ],
-    reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s)` : '',
+    reason: rejectedEvents > 0 ? `batch endpoint rejected ${rejectedEvents} event(s); reasonCodes=${[...new Set(items.filter((item) => item.disposition === undefined || item.disposition === 'rejected').map((item) => item.reasonCode || item.reason || 'unknown'))].join(',')}` : '',
   };
 }
 
@@ -1168,7 +1282,18 @@ function postEventBatch(batch, timeoutMs, done) {
         }
         responseBody += chunk;
       });
-      res.on('end', () => finish({ statusCode, responseBody }));
+      res.on('end', () => {
+        try {
+          const ack = JSON.parse(responseBody);
+          if (ack.rejectedEvents > 0) {
+            const reasonCodes = [...new Set((ack.items || [])
+              .filter((item) => item.disposition === undefined || item.disposition === 'rejected')
+              .map((item) => item.reasonCode || item.reason || 'unknown'))];
+            console.error(`[observer-forward] batch rejection reason codes: ${reasonCodes.join(',')}`);
+          }
+        } catch {}
+        finish({ statusCode, responseBody });
+      });
       res.on('aborted', () => finish({ error: new Error('batch acknowledgement aborted'), statusCode }));
       res.on('error', (error) => finish({ error, statusCode }));
       res.on('close', () => {
@@ -1322,7 +1447,6 @@ function postJsonResponse(
   const body = JSON.stringify(bodyObj);
   let settled = false;
   let absoluteTimer;
-  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1339,7 +1463,6 @@ function postJsonResponse(
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
-    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1405,14 +1528,7 @@ function postJsonResponse(
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    absoluteTimer = undefined;
-    // A synchronous WAL or classification burst can resume the event loop after both the
-    // deadline and the HTTP response are already ready. Give the poll phase one turn to consume
-    // that on-time response before an overdue timer destroys its socket.
-    timeoutAbortImmediate = setImmediate(() => {
-      timeoutAbortImmediate = undefined;
-      state.abort('control endpoint request timed out');
-    });
+    state.abort('control endpoint request timed out');
   }, timeoutMs);
   req.end(body);
   return state;
@@ -1431,7 +1547,6 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   }
   let settled = false;
   let absoluteTimer;
-  let timeoutAbortImmediate;
   let req;
   let response;
   let abortReason = '';
@@ -1448,7 +1563,6 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
     if (settled) return;
     settled = true;
     if (absoluteTimer) clearTimeout(absoluteTimer);
-    if (timeoutAbortImmediate) clearImmediate(timeoutAbortImmediate);
     activeControlRequests.delete(state);
     done(abortReason ? new Error(abortReason) : error, value);
   };
@@ -1500,33 +1614,21 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
   activeControlRequests.add(state);
   req.on('error', (error) => finish(error));
   absoluteTimer = setTimeout(() => {
-    absoluteTimer = undefined;
-    // See postJsonResponse: an expired timer must not outrank response bytes that arrived while
-    // the Forwarder event loop was briefly occupied by the data plane.
-    timeoutAbortImmediate = setImmediate(() => {
-      timeoutAbortImmediate = undefined;
-      state.abort('control endpoint request timed out');
-    });
+    state.abort('identity snapshot timeout');
   }, timeoutMs);
   req.end();
   return state;
 }
 
-let identitySnapshotRefreshInFlight = false;
 function refreshIdentitySnapshot() {
-  if (identitySnapshotRefreshInFlight) return;
-  identitySnapshotRefreshInFlight = true;
-  getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
-    identitySnapshotRefreshInFlight = false;
+  getJson(identitySnapshotTarget, 5000, (error, snapshot) => {
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
     if (error || !workloadCache.replace(snapshot)) {
       if (error) workloadCache.errors++;
-      markControlPlaneFailure('identity', error?.message || 'identity snapshot rejected');
       return;
     }
-    markControlPlaneSuccess('identity');
     synchronizeInfrastructurePolicyRules();
-  }, {}, false);
+  });
 }
 
 function synchronizeInfrastructurePolicyRules() {
@@ -1558,19 +1660,14 @@ function synchronizeInfrastructurePolicyRules() {
 
 let lastInfrastructurePolicyError = '';
 let lastLoggedInfrastructurePolicyVersion = -1;
-let infrastructurePolicyRefreshInFlight = false;
 function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
-  if (infrastructurePolicyRefreshInFlight) return;
-  infrastructurePolicyRefreshInFlight = true;
   getJson(
     infrastructurePolicyTarget,
-    CONTROL_HTTP_TIMEOUT_MS,
+    5_000,
     (error, policy) => {
-      infrastructurePolicyRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
       if (error) {
-        markControlPlaneFailure('infrastructure_policy', error.message);
         infrastructurePolicy.recordLoadError();
         filterRulePublisher.degradeToLastKnownGood(error.message);
         if (error.message !== lastInfrastructurePolicyError) {
@@ -1581,7 +1678,6 @@ function refreshInfrastructurePolicy() {
       }
       const loaded = infrastructurePolicy.replace(policy);
       if (!loaded.ok) {
-        markControlPlaneFailure('infrastructure_policy', loaded.error);
         filterRulePublisher.degradeToLastKnownGood(loaded.error);
         if (loaded.error !== lastInfrastructurePolicyError) {
           console.error(`[observer-forward] Infrastructure policy ignored: ${loaded.error}`);
@@ -1590,7 +1686,6 @@ function refreshInfrastructurePolicy() {
         return;
       }
       lastInfrastructurePolicyError = '';
-      markControlPlaneSuccess('infrastructure_policy');
       filterRulePublisher.markControlPlaneReady();
       const synchronized = synchronizeInfrastructurePolicyRules();
       if (loaded.version !== lastLoggedInfrastructurePolicyVersion) {
@@ -1612,28 +1707,20 @@ function refreshInfrastructurePolicy() {
 
 let lastUnifiedFilterProjectionError = '';
 let lastUnifiedFilterProjectionVersion = -1;
-let unifiedFilterProjectionRefreshInFlight = false;
 function refreshUnifiedFilterProjection(done = () => {}) {
   if (!UNIFIED_FILTER_PROJECTION_SECS) {
     done();
     return;
   }
-  if (unifiedFilterProjectionRefreshInFlight) {
-    done();
-    return;
-  }
-  unifiedFilterProjectionRefreshInFlight = true;
   getJson(
     unifiedFilterProjectionTarget,
-    CONTROL_HTTP_TIMEOUT_MS,
+    5_000,
     (error, projection) => {
-      unifiedFilterProjectionRefreshInFlight = false;
       if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) {
         done();
         return;
       }
       if (error) {
-        markControlPlaneFailure('filter_rules', error.message);
         unifiedFilterPolicy.degrade(error.message);
         if (error.message !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection unavailable: ${error.message}`);
@@ -1644,7 +1731,6 @@ function refreshUnifiedFilterProjection(done = () => {}) {
       }
       const loaded = unifiedFilterPolicy.replace(projection);
       if (!loaded.ok) {
-        markControlPlaneFailure('filter_rules', loaded.error);
         unifiedFilterPolicy.degrade(loaded.error);
         if (loaded.error !== lastUnifiedFilterProjectionError) {
           console.error(`[observer-forward] Unified Filter Rule projection ignored: ${loaded.error}`);
@@ -1654,7 +1740,6 @@ function refreshUnifiedFilterProjection(done = () => {}) {
         return;
       }
       lastUnifiedFilterProjectionError = '';
-      markControlPlaneSuccess('filter_rules');
       if (loaded.changed) {
         const signatureResult = signatureRegistry.replaceSafely(
           unifiedFilterPolicy.runtimeSignatureDocument(),
@@ -1715,7 +1800,7 @@ function runtimeLeaseRequest() {
         forwarderPid: processIdentity.pid,
         forwarderStartTimeTicks: processIdentity.startTimeTicks,
       },
-      CONTROL_HTTP_TIMEOUT_MS,
+      5_000,
       (error, ack) => {
         if (error) {
           resolve({ ok: false, reason: error.message, transient: true });
@@ -1793,7 +1878,7 @@ function runtimeSnapshotBody(ready = true) {
   };
 }
 
-function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS) {
+function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = 5_000) {
   if (runtimeLeaseFenced) {
     done(true);
     return;
@@ -1897,7 +1982,6 @@ function sendRuntimeSnapshot(ready = true, done = () => {}, timeoutMs = CONTROL_
         if (attempt > 1) runtimeSnapshotRecovered++;
         lastRuntimeSnapshotAt = new Date().toISOString();
         lastRuntimeSnapshotError = '';
-        markControlPlaneSuccess('runtime_snapshot');
         finish(false);
       });
     };
@@ -1976,7 +2060,13 @@ function eventQueueMetrics(now = Date.now()) {
     if (item.retryOwned) retryOldestAt = Math.min(retryOldestAt, item.retryStartedAt || now);
     if (item.inflightSince) inflightOldestAt = Math.min(inflightOldestAt, item.inflightSince);
   }
+  const durable = spool.status();
   return {
+    durableRecords: durable.records,
+    durableBytes: durable.logicalBytes,
+    durableWalBytes: durable.walBytes,
+    durableOldestAgeMs: durable.oldestMs,
+    durableReplayPending: durableReplayNotBefore.size,
     queueDepth: pending.length,
     queueBytes: pending.totalWeight,
     inflightEvents,
@@ -1994,31 +2084,6 @@ function eventQueueMetrics(now = Date.now()) {
     outstandingByteLimit: MAX_OUTSTANDING_BYTES,
     protectedReserveEvents: PROTECTED_RESERVE_EVENTS,
     protectedReserveBytes: PROTECTED_RESERVE_BYTES,
-    walPendingEvents,
-    walPendingBytes,
-    walPendingEventLimit: WAL_PENDING_MAX_EVENTS,
-    walPendingByteLimit: WAL_PENDING_MAX_BYTES,
-  };
-}
-
-function durableSpoolMetrics() {
-  const status = spool.status();
-  return {
-    records: status.records,
-    activeRecords: activeSpoolIds.size,
-    parkedRecords: Math.max(0, status.records - activeSpoolIds.size),
-    logicalBytes: status.logicalBytes,
-    walBytes: status.walBytes,
-    oldestAgeMs: status.oldestMs,
-    atCapacity: status.atCapacity,
-    fsyncMode: status.fsyncMode,
-    compactionDeferred: status.compactionDeferred,
-    compactions: status.compactions,
-    compactMaxLiveRecords: status.compactMaxLiveRecords,
-    pendingPutRecords: status.pendingPutRecords,
-    pendingPutBytes: status.pendingPutBytes,
-    pendingOperations: status.pendingOperations,
-    asyncSyncActive: status.asyncSyncActive,
   };
 }
 
@@ -2039,16 +2104,15 @@ function deliverPendingHeartbeat(done, timeoutMs) {
       && reason === GRACEFUL_SHUTDOWN_SUPERSEDE;
     if (failed && !intentionallySuperseded) {
       // The failed heartbeat window remains frozen for an exact retry. Its own transport failure
-      // belongs to the active next window, not to the payload whose delivery is uncertain. A
-      // heartbeat transport failure is control evidence, not an event-output loss.
-      attributionCounts.heartbeatDeliveryFailures++;
+      // belongs to the active next window, not to the payload whose delivery is uncertain.
+      outputDropped++;
       errorCount++;
     }
     done(Boolean(failed));
   });
 }
 
-function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shutdownFinal = false) {
+function sendHeartbeat(done = () => {}, timeoutMs = 5_000, shutdownFinal = false) {
   if (!HEARTBEAT_SECS) {
     done(false);
     return;
@@ -2078,8 +2142,6 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
     return;
   }
   const eventQueues = eventQueueMetrics();
-  const spoolMetrics = durableSpoolMetrics();
-  const controlPlane = controlPlaneMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
     queueBytes: eventQueues.queueBytes,
@@ -2118,13 +2180,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   e2eFilterReceipts = [];
   outputDropped = 0;
   errorCount = 0;
-  const status = (
-    dropped > 0
-    || errors > 0
-    || spoolMetrics.parkedRecords > 0
-    || spoolMetrics.oldestAgeMs > SPOOL_DEGRADED_AGE_MS
-    || spoolMetrics.atCapacity
-  ) ? 'degraded' : 'ok';
+  const status = dropped > 0 || errors > 0 ? 'degraded' : 'ok';
   const e2eMarkerScopeMessage = E2E_INGEST_MARKER_PREFIX
     ? `e2e_marker_scope=enabled; e2e_marker_scoped_out=${classifications.e2eMarkerScopedOut}; `
     : '';
@@ -2144,6 +2200,8 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
       pipelineAccounting: accountingWindow,
       filterMetrics: {
         scope: LEGACY_FORWARD_SCOPE ?? 'decoupled',
+        agentAllowlist: [...FORWARD_AGENT_ALLOWLIST],
+        agentAllowlistScopedOut: classifications.agentAllowlistScopedOut,
         // A periodic heartbeat can race with shutdown. Mark only the heartbeat emitted after the
         // final runtime snapshot and bounded event drain so lifecycle checks cannot accept an
         // ordinary interval heartbeat as shutdown evidence.
@@ -2256,36 +2314,12 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         ...(filterReceipts.length ? { e2eFilterReceipts: filterReceipts } : {}),
         deduplicated: classifications.deduplicated,
         queueDropped: classifications.queueDropped,
-        queueParked: classifications.queueParked,
         batches: classifications.batches,
         batchEvents: classifications.batchEvents,
         retryQueued: classifications.retryQueued,
         retryAttempts: classifications.retryAttempts,
         retryRecovered: classifications.retryRecovered,
         retryExhausted: classifications.retryExhausted,
-        retryParked: classifications.retryParked,
-        spoolReplayAttempts: classifications.spoolReplayAttempts,
-        spoolReplayAdmitted: classifications.spoolReplayAdmitted,
-        spoolReplayDeferred: classifications.spoolReplayDeferred,
-        heartbeatDeliveryFailures: classifications.heartbeatDeliveryFailures,
-        controlPlaneState: controlPlane.state,
-        controlPlaneFailedLanes: controlPlane.failedLanes,
-        controlPlaneStartingLanes: controlPlane.startingLanes,
-        controlPlaneLanes: controlPlane.lanes,
-        spoolRecords: spoolMetrics.records,
-        spoolActiveRecords: spoolMetrics.activeRecords,
-        spoolParkedRecords: spoolMetrics.parkedRecords,
-        spoolBytes: spoolMetrics.logicalBytes,
-        spoolWalBytes: spoolMetrics.walBytes,
-        spoolOldestAgeMs: spoolMetrics.oldestAgeMs,
-        spoolAtCapacity: spoolMetrics.atCapacity,
-        spoolFsyncMode: spoolMetrics.fsyncMode,
-        spoolCompactionDeferred: spoolMetrics.compactionDeferred,
-        spoolCompactions: spoolMetrics.compactions,
-        spoolCompactMaxLiveRecords: spoolMetrics.compactMaxLiveRecords,
-        spoolPendingPutRecords: spoolMetrics.pendingPutRecords,
-        spoolPendingPutBytes: spoolMetrics.pendingPutBytes,
-        spoolPendingOperations: spoolMetrics.pendingOperations,
         queueBytes: eventQueues.queueBytes,
         inflightEvents: eventQueues.inflightEvents,
         inflightBytes: eventQueues.inflightBytes,
@@ -2300,12 +2334,13 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         outstandingOldestAgeMs: eventQueues.outstandingOldestAgeMs,
         outstandingEventLimit: eventQueues.outstandingEventLimit,
         outstandingByteLimit: eventQueues.outstandingByteLimit,
+        durableRecords: eventQueues.durableRecords,
+        durableBytes: eventQueues.durableBytes,
+        durableWalBytes: eventQueues.durableWalBytes,
+        durableOldestAgeMs: eventQueues.durableOldestAgeMs,
+        durableReplayPending: eventQueues.durableReplayPending,
         protectedReserveEvents: eventQueues.protectedReserveEvents,
         protectedReserveBytes: eventQueues.protectedReserveBytes,
-        walPendingEvents: eventQueues.walPendingEvents,
-        walPendingBytes: eventQueues.walPendingBytes,
-        walPendingEventLimit: eventQueues.walPendingEventLimit,
-        walPendingByteLimit: eventQueues.walPendingByteLimit,
         identitySnapshotReady: workload.ready,
         identitySnapshotVersion: workload.version,
         identityKubernetesVersion: workload.sources?.kubernetes?.version,
@@ -2387,7 +2422,7 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
         infrastructure: classifications.infrastructure,
         workspaceConflict: classifications.workspaceConflict,
       },
-      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; queue_parked=${classifications.queueParked}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_parked=${classifications.retryParked}; heartbeat_delivery_failures=${classifications.heartbeatDeliveryFailures}; spool_records=${spoolMetrics.records}; spool_parked=${spoolMetrics.parkedRecords}; spool_oldest_ms=${spoolMetrics.oldestAgeMs}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
+      message: `filter_mode=${FILTER_MODE}; ${e2eMarkerScopeMessage}agent_allowlist=${[...FORWARD_AGENT_ALLOWLIST].join(',') || 'disabled'}; agent_allowlist_scoped_out=${classifications.agentAllowlistScopedOut}; retain_unknown=${RETAIN_UNKNOWN}; retain_non_agent=${RETAIN_NON_AGENT}; noise_policy=${NOISE_POLICY}; observed=${classifications.observed}; forwarded=${classifications.forwarded}; confirmed_agent=${classifications.confirmedAgent}; probable_agent=${classifications.probableAgent}; unknown=${classifications.unknown}; non_agent=${classifications.nonAgent}; infrastructure=${classifications.infrastructure}; workspace_conflict=${classifications.workspaceConflict}; filtered_non_agent=${classifications.filteredNonAgent}; would_filter_non_agent=${classifications.wouldFilterNonAgent}; filtered_unknown=${classifications.filteredUnknown}; would_filter_unknown=${classifications.wouldFilterUnknown}; filtered_noise=${classifications.filteredNoise}; would_filter_noise=${classifications.wouldFilterNoise}; discovery_budget_dropped=${classifications.discoveryBudgetDropped}; would_discovery_budget_drop=${classifications.wouldDiscoveryBudgetDrop}; aggregated_file_events=${classifications.aggregatedFileEvents}; aggregation_outputs=${classifications.aggregationOutputs}; filter_rule_version=${filterRules.version}; filter_rule_entries=${filterRules.entries}; deduplicated=${classifications.deduplicated}; queue_dropped=${classifications.queueDropped}; batches=${classifications.batches}; batch_events=${classifications.batchEvents}; retry_queued=${classifications.retryQueued}; retry_attempts=${classifications.retryAttempts}; retry_recovered=${classifications.retryRecovered}; retry_exhausted=${classifications.retryExhausted}; retry_queue_depth=${eventQueues.retryQueueDepth}; retry_outstanding=${eventQueues.retryOutstandingEvents}; outstanding_events=${eventQueues.outstandingEvents}; outstanding_bytes=${eventQueues.outstandingBytes}; identity_snapshot_ready=${workload.ready}; identity_snapshot_version=${workload.version}; identity_snapshot_age_seconds=${workload.ageSeconds}; identity_cache_entries=${workload.entries}; identity_cache_hits=${workload.hits}; identity_cache_misses=${workload.misses}; identity_cgroup_hits=${workload.cgroupHits}; identity_cgroup_misses=${workload.cgroupMisses}; process_cache_hits=${processes.cacheHits}; process_cache_misses=${processes.cacheMisses}; process_proc_reads=${processes.procReads}; process_bootstrap_proc_reads=${processes.bootstrapProcReads}; process_fallback_proc_reads=${processes.fallbackProcReads}; process_ancestry_proc_reads=${processes.ancestryProcReads}; identity_errors=${workload.errors}; docker_enabled=${docker.enabled}; docker_ready=${docker.ready}; docker_entries=${docker.entries}; docker_reconnects=${docker.reconnects}; docker_errors=${docker.errors}; behavior_workloads=${behavior.workloads}; behavior_candidates=${behavior.candidates}; behavior_promoted=${behavior.promoted}; behavior_evicted=${behavior.evicted}; output_drops=${dropped}; errors=${errors}`,
       ...sourceFields(),
   };
   pendingHeartbeatDelivery = { body: heartbeatBody, shutdownFinal };
@@ -2399,8 +2434,8 @@ function closeTransports() {
   transportsClosed = true;
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = undefined;
-  if (spoolReplayTimer) clearTimeout(spoolReplayTimer);
-  spoolReplayTimer = undefined;
+  if (durableReplayTimer) clearTimeout(durableReplayTimer);
+  durableReplayTimer = undefined;
   if (reconcileTimer) clearTimeout(reconcileTimer);
   reconcileTimer = undefined;
   captureProfileReporter.close();
@@ -2415,12 +2450,9 @@ function closeTransports() {
   eventHttpsAgent.destroy();
   controlHttpAgent.destroy();
   controlHttpsAgent.destroy();
-  try {
-    spool.close();
-  } catch (error) {
-    console.error(`[observer-forward] durable spool close failed: ${error.message}`);
-    process.exitCode = 1;
-  }
+  pipelineDiagnostics.close();
+  spool.close();
+  interactionForwarder.close();
   if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
   shutdownForceTimer = undefined;
 }
@@ -2467,7 +2499,6 @@ function recordPipelineCounts(counts) {
 function trackOutstanding(item) {
   item.settled = false;
   outstandingItems.add(item);
-  if (item.spoolId) activeSpoolIds.add(item.spoolId);
   outstandingEvents++;
   outstandingBytes += item.bytes;
 }
@@ -2482,7 +2513,6 @@ function settleOutstanding(items) {
     item.settled = true;
     item.inflightSince = 0;
     outstandingItems.delete(item);
-    if (item.spoolId) activeSpoolIds.delete(item.spoolId);
     settled++;
     bytes += item.bytes;
     if (item.retryOwned) {
@@ -2494,7 +2524,6 @@ function settleOutstanding(items) {
   outstandingBytes = Math.max(0, outstandingBytes - bytes);
   retryOutstandingEvents = Math.max(0, retryOutstandingEvents - retrySettled);
   retryOutstandingBytes = Math.max(0, retryOutstandingBytes - retryBytes);
-  if (settled > 0 && !closing) scheduleSpoolReplay(0);
   return settled;
 }
 
@@ -2511,19 +2540,24 @@ function markRetryOwned(items) {
   }
 }
 
+function deferDurableReplay(items) {
+  const replayAt = Date.now() + DURABLE_REPLAY_COOLDOWN_MS;
+  for (const item of items) {
+    if (item.spoolId) durableReplayNotBefore.set(item.spoolId, replayAt);
+  }
+  scheduleDurableReplayWakeup();
+}
+
 function recordRetryExhausted(items, operationalError = true, reason = 'retry_exhausted') {
-  const unsettled = items.filter((item) => !item.settled);
-  const parked = unsettled.filter((item) => item.spoolId).length;
-  const durableIds = unsettled.map((item) => item.spoolId).filter(Boolean);
-  const count = settleOutstanding(unsettled);
+  const count = settleOutstanding(items);
   if (!count) return;
+  deferDurableReplay(items);
   attributionCounts.retryExhausted += count;
-  attributionCounts.retryParked += parked;
-  outputDropped += Math.max(0, count - parked);
+  outputDropped += count;
   pipelineAccounting.record('queue_dropped', reason, count);
-  spool.defer(durableIds);
+  for (const item of items) pipelineDiagnostics.record(item.body, 'queue_dropped', reason);
   if (operationalError) errorCount++;
-  scheduleSpoolReplay();
+  scheduleDurableReplayWakeup();
 }
 
 function retryDelayMs(item, retryAfterMs) {
@@ -2584,6 +2618,7 @@ function takeReadyRetryBatch(now = Date.now()) {
 }
 
 function finishBatch(batch, outcome, retryDelivery) {
+  outputDropped += outcome.dropped;
   errorCount += outcome.errors;
   recordPipelineCounts(outcome.pipelineCounts);
   inflight = Math.max(0, inflight - 1);
@@ -2596,21 +2631,17 @@ function finishBatch(batch, outcome, retryDelivery) {
   const terminalItems = batch.filter((item) => !retrySet.has(item));
   const acceptedItems = outcome.acceptedItems ?? [];
   const rejectedItems = outcome.rejectedItems ?? [];
-  const acceptedSet = new Set(acceptedItems);
-  const rejectedSet = new Set(rejectedItems);
-  const unresolvedTerminalItems = terminalItems.filter((item) =>
-    !acceptedSet.has(item) && !rejectedSet.has(item));
-  const parkedDropped = Math.min(
-    outcome.dropped,
-    unresolvedTerminalItems.filter((item) => item.spoolId).length,
-  );
-  outputDropped += Math.max(0, outcome.dropped - parkedDropped);
-  if (parkedDropped > 0) {
-    if (retryDelivery) attributionCounts.retryParked += parkedDropped;
-    else attributionCounts.queueParked += parkedDropped;
+  for (const item of retryItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_retry', outcome.reason || 'retry_scheduled');
+  }
+  for (const item of acceptedItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_accepted', outcome.reason || 'accepted');
+  }
+  for (const item of rejectedItems) {
+    pipelineDiagnostics.record(item.body, 'ingest_rejected', outcome.reason || 'rejected');
   }
   if (acceptedItems.length) {
-    spool.ackAsync(acceptedItems.map((item) => item.spoolId).filter(Boolean));
+    spool.ack(acceptedItems.map((item) => item.spoolId).filter(Boolean));
   }
   if (rejectedItems.length) {
     spool.deadLetter(
@@ -2624,6 +2655,26 @@ function finishBatch(batch, outcome, retryDelivery) {
         })),
       outcome.reason || 'permanent ingest rejection',
     );
+  }
+  const durablySettled = new Set([...acceptedItems, ...rejectedItems]);
+  const unresolvedTerminalItems = terminalItems.filter((item) => !durablySettled.has(item));
+  if (outcome.invalidAck && unresolvedTerminalItems.length) {
+    spool.deadLetter(
+      unresolvedTerminalItems
+        .filter((item) => item.spoolId)
+        .map((item) => ({
+          id: item.spoolId,
+          body: item.body,
+          priority: item.priority,
+          queuedAt: item.createdAt,
+        })),
+      outcome.reason || 'invalid ingest acknowledgement',
+    );
+  } else {
+    for (const item of unresolvedTerminalItems) {
+      pipelineDiagnostics.record(item.body, 'ingest_unresolved', outcome.reason || 'unresolved');
+    }
+    if (unresolvedTerminalItems.length) deferDurableReplay(unresolvedTerminalItems);
   }
   if (retryDelivery) {
     const exhausted = Math.min(terminalItems.length, outcome.dropped);
@@ -2677,8 +2728,86 @@ function takePendingBatch() {
   return pending.takeWeighted(adaptiveBatchSize, BATCH_MAX_BYTES, (item) => item.bytes);
 }
 
+function scheduleDurableReplayWakeup() {
+  if (closing || eventRequestsAborted || durableReplayTimer || durableReplayNotBefore.size === 0) {
+    return;
+  }
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const replayAt of durableReplayNotBefore.values()) earliest = Math.min(earliest, replayAt);
+  durableReplayTimer = setTimeout(() => {
+    durableReplayTimer = undefined;
+    pumpEventWork();
+  }, Math.max(1, earliest - Date.now()));
+  durableReplayTimer.unref();
+}
+
+// The durable WAL can be much larger than the bounded in-memory ownership window. Refill that
+// window after every acknowledgement instead of replaying only its first window at startup. The
+// old one-shot replay left the remaining WAL records unreachable; once the WAL reached capacity,
+// readline stayed paused forever and eventually forced the Collector's stdout queues to drop
+// process and Interaction events.
+function hydrateFromSpool() {
+  if (eventRequestsAborted || spoolHydrationActive) return 0;
+  const availableSlots = MAX_OUTSTANDING_EVENTS - outstandingEvents;
+  const availableBytes = MAX_OUTSTANDING_BYTES - outstandingBytes;
+  if (availableSlots <= 0 || availableBytes <= 0) return 0;
+
+  const ownedIds = new Set();
+  for (const item of outstandingItems) {
+    if (item.spoolId) ownedIds.add(item.spoolId);
+  }
+  const now = Date.now();
+  for (const [id, replayAt] of durableReplayNotBefore) {
+    if (replayAt <= now) durableReplayNotBefore.delete(id);
+    else ownedIds.add(id);
+  }
+  // Bound each synchronous WAL walk. Subsequent batch completions continue hydration, while the
+  // priority-aware spool iterator ensures protected records are recovered first.
+  const records = spool.available(ownedIds, Math.min(availableSlots, 2_048));
+  if (records.length === 0) {
+    scheduleDurableReplayWakeup();
+    return 0;
+  }
+
+  let admitted = 0;
+  const scopedOutIds = [];
+  spoolHydrationActive = true;
+  try {
+    for (const record of records) {
+      if (!durableRecordMatchesAgentAllowlist(record.body)) {
+        scopedOutIds.push(record.id);
+        attributionCounts.agentAllowlistScopedOut++;
+        pipelineAccounting.record('filtered', 'agent_allowlist');
+        continue;
+      }
+      if (
+        outstandingEvents >= MAX_OUTSTANDING_EVENTS
+        || outstandingBytes + record.bytes > MAX_OUTSTANDING_BYTES
+      ) break;
+      const accepted = enqueue(
+        record.body,
+        record.priority,
+        false,
+        durableRecordKind(record.body),
+        true,
+      );
+      if (!accepted) break;
+      admitted++;
+    }
+    if (scopedOutIds.length) spool.ack(scopedOutIds);
+  } finally {
+    spoolHydrationActive = false;
+  }
+  // A recovered WAL window may contain only pre-allowlist host noise. Continue draining it on the
+  // next event-loop turn instead of waiting for an HTTP completion that will never occur.
+  if (scopedOutIds.length && admitted === 0) setImmediate(pumpEventWork);
+  scheduleDurableReplayWakeup();
+  return admitted;
+}
+
 function pumpEventWork() {
   if (eventRequestsAborted) return;
+  hydrateFromSpool();
   while (inflight < MAX_INFLIGHT) {
     const retryBatch = takeReadyRetryBatch();
     if (retryBatch?.length) {
@@ -2699,22 +2828,24 @@ function flushPending() {
   pumpEventWork();
 }
 
-function recordQueueDrop(kind, priority, reason, durablyParked = false) {
-  if (durablyParked) attributionCounts.queueParked++;
-  else outputDropped++;
+function recordQueueDrop(kind, priority, reason, body) {
+  outputDropped++;
   attributionCounts.queueDropped++;
   const dropClass = queueDropClass(kind, priority);
   attributionCounts.queueDroppedByClass[dropClass] =
     (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
   if (priority >= PROTECTED_PRIORITY) attributionCounts.protectedQueueDropped++;
   pipelineAccounting.record('queue_dropped', reason);
+  if (body) pipelineDiagnostics.record(body, 'queue_dropped', reason);
 }
 
 function dropQueuedItem(item, reason = 'priority_evicted') {
   if (!item) return;
   settleOutstanding([item]);
-  recordQueueDrop(item.kind, item.priority, reason, Boolean(item.spoolId));
-  scheduleSpoolReplay();
+  // The event is still present in the durable WAL. Delay its re-admission so a protected event
+  // can actually use the ownership slot it just reclaimed instead of racing an immediate replay.
+  deferDurableReplay([item]);
+  recordQueueDrop(item.kind, item.priority, reason, item.body);
 }
 
 function makeQueueRoom(bytes, priority) {
@@ -2738,76 +2869,19 @@ function makeQueueRoom(bytes, priority) {
 }
 
 function inputAtCapacity() {
-  return (
-    walPendingEvents >= WAL_PENDING_MAX_EVENTS
-    || walPendingBytes >= WAL_PENDING_MAX_BYTES
-    || spool.atCapacity()
-  );
+  // The bounded in-memory ownership window controls HTTP work, not stdin durability. Once an
+  // event has been appended to the WAL it may wait there without occupying an outstanding slot.
+  // Pausing at the in-memory limit leaves fresh Collector output in the finite OS pipe; the
+  // Collector must then drop kernel events even though the durable spool still has room. Keep
+  // draining stdin until the WAL itself reaches its explicit capacity and let hydration refill
+  // the HTTP window as acknowledgements release slots.
+  return spool.atCapacity();
 }
 
 function updateInputFlow() {
   if (!rl || closing) return;
   if (inputAtCapacity()) rl.pause();
   else rl.resume();
-}
-
-function admitDurableEvent(
-  durableBody,
-  bytes,
-  spoolId,
-  priority,
-  countForwarded,
-  kind,
-  recovered,
-) {
-  if (!makeQueueRoom(bytes, priority)) {
-    if (recovered) attributionCounts.spoolReplayDeferred++;
-    else recordQueueDrop(
-      kind,
-      priority,
-      priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
-      Boolean(spoolId),
-    );
-    scheduleSpoolReplay();
-    return false;
-  }
-  const item = {
-    body: durableBody,
-    spoolId,
-    kind,
-    priority,
-    bytes,
-    createdAt: Date.now(),
-    retryAttempt: 0,
-    retryOwned: false,
-    retryStartedAt: 0,
-    retryDeadlineAt: 0,
-    inflightSince: 0,
-    recovered,
-    settled: false,
-  };
-  const result = pending.push(item, priority);
-  if (!result.accepted) {
-    if (recovered) attributionCounts.spoolReplayDeferred++;
-    else recordQueueDrop(kind, priority, 'queue_rejected', Boolean(spoolId));
-    scheduleSpoolReplay();
-    return false;
-  }
-  if (result.dropped && !result.droppedIncoming) {
-    dropQueuedItem(result.dropped);
-  }
-  trackOutstanding(item);
-  if (!recovered) {
-    pipelineAccounting.record(
-      'queue_admitted',
-      countForwarded ? 'event' : 'collector_heartbeat',
-    );
-  }
-  if (countForwarded) attributionCounts.forwarded++;
-  if (pending.length >= BATCH_SIZE) flushPending();
-  else scheduleBatch();
-  updateInputFlow();
-  return true;
 }
 
 function enqueue(body, priority, countForwarded = true, kind = '', recovered = false) {
@@ -2827,98 +2901,71 @@ function enqueue(body, priority, countForwarded = true, kind = '', recovered = f
   const spoolId = kind === 'CollectorHeartbeat'
     ? undefined
     : String(durableBody.sourceEventId || '');
-  if (!spoolId || recovered) {
-    return admitDurableEvent(
-      durableBody,
-      bytes,
-      spoolId,
-      priority,
-      countForwarded,
-      kind,
-      recovered,
-    );
+  if (spoolId && !recovered) {
+    try {
+      spool.put({
+        id: spoolId,
+        body: durableBody,
+        priority,
+        queuedAt: observedAt,
+      });
+    } catch (error) {
+      recordQueueDrop(kind, priority, 'durable_spool_error');
+      console.error(`[observer-forward] durable spool write failed: ${error.message}`);
+      if (rl) rl.pause();
+      process.exitCode = 1;
+      return false;
+    }
   }
-  if (
-    walPendingEvents + 1 > WAL_PENDING_MAX_EVENTS
-    || walPendingBytes + bytes > WAL_PENDING_MAX_BYTES
-    || spool.atCapacity()
-  ) {
-    recordQueueDrop(kind, priority, 'wal_pending_capacity');
-    updateInputFlow();
+  if (!makeQueueRoom(bytes, priority)) {
+    // A replay record remains durable in the WAL and will be retried when ownership is released;
+    // it has not been lost and therefore must not inflate queue-drop accounting.
+    if (!recovered) {
+      recordQueueDrop(
+        kind,
+        priority,
+        priority >= PROTECTED_PRIORITY ? 'outstanding_limit' : 'protected_reserve',
+      );
+      if (spoolId) deferDurableReplay([{ spoolId }]);
+    }
     return false;
   }
-  walPendingEvents += 1;
-  walPendingBytes += bytes;
-  spool.putAsync({
-    id: spoolId,
+  const item = {
     body: durableBody,
+    spoolId,
+    kind,
     priority,
-    queuedAt: observedAt,
-  }, (error, inserted) => {
-    walPendingEvents = Math.max(0, walPendingEvents - 1);
-    walPendingBytes = Math.max(0, walPendingBytes - bytes);
-    if (error) {
-      recordQueueDrop(kind, priority, 'durable_spool_error');
-      updateInputFlow();
-      return;
+    bytes,
+    createdAt: Date.now(),
+    retryAttempt: 0,
+    retryOwned: false,
+    retryStartedAt: 0,
+    retryDeadlineAt: 0,
+    inflightSince: 0,
+    settled: false,
+  };
+  const result = pending.push(item, priority);
+  if (!result.accepted) {
+    if (!recovered) {
+      recordQueueDrop(kind, priority, 'queue_rejected');
+      if (spoolId) deferDurableReplay([{ spoolId }]);
     }
-    if (inserted) {
-      admitDurableEvent(
-        durableBody,
-        bytes,
-        spoolId,
-        priority,
-        countForwarded,
-        kind,
-        false,
-      );
-    }
-    updateInputFlow();
-  });
+    return false;
+  }
+  if (result.dropped && !result.droppedIncoming) {
+    dropQueuedItem(result.dropped);
+  }
+  trackOutstanding(item);
+  pipelineAccounting.record(
+    'queue_admitted',
+    countForwarded ? 'event' : 'collector_heartbeat',
+  );
+  pipelineDiagnostics.record(durableBody, 'queue_admitted', kind);
+  if (countForwarded) attributionCounts.forwarded++;
+  if (pending.length >= BATCH_SIZE) flushPending();
+  else scheduleBatch();
   updateInputFlow();
   return true;
-}
-
-function scheduleSpoolReplay(delayMs = SPOOL_REPLAY_INTERVAL_MS) {
-  if (closing || transportsClosed || spoolReplayTimer) return;
-  spoolReplayTimer = setTimeout(() => {
-    spoolReplayTimer = undefined;
-    pumpDurableSpool();
-  }, Math.max(0, delayMs));
-  spoolReplayTimer.unref();
-}
-
-function pumpDurableSpool() {
-  if (closing || transportsClosed) return;
-  const spoolStatus = spool.status();
-  if (spoolStatus.records <= activeSpoolIds.size) {
-    scheduleSpoolReplay();
-    return;
-  }
-  const availableSlots = Math.max(0, MAX_OUTSTANDING_EVENTS - outstandingEvents);
-  if (availableSlots <= 0 || outstandingBytes >= MAX_OUTSTANDING_BYTES) {
-    scheduleSpoolReplay();
-    return;
-  }
-  const records = spool.available(
-    activeSpoolIds,
-    Math.min(SPOOL_REPLAY_BATCH_SIZE, availableSlots),
-  );
-  let admitted = 0;
-  for (const record of records) {
-    attributionCounts.spoolReplayAttempts++;
-    if (!enqueue(
-      record.body,
-      record.priority,
-      false,
-      durableRecordKind(record.body),
-      true,
-    )) break;
-    admitted++;
-    attributionCounts.spoolReplayAdmitted++;
-  }
-  if (admitted > 0) pumpEventWork();
-  scheduleSpoolReplay(admitted > 0 ? 0 : SPOOL_REPLAY_INTERVAL_MS);
 }
 
 function abandonPendingEvents() {
@@ -2938,21 +2985,6 @@ function remainingShutdownMs() {
   return Math.max(100, shutdownDeadline - Date.now());
 }
 
-function sendFinalHeartbeat(done) {
-  const attempt = () => {
-    const remainingMs = remainingShutdownMs();
-    const timeoutMs = Math.min(5_000, remainingMs);
-    sendHeartbeat((failed) => {
-      if (failed && Date.now() + 100 < shutdownDeadline) {
-        setTimeout(attempt, 50);
-        return;
-      }
-      done(Boolean(failed));
-    }, timeoutMs, true);
-  };
-  attempt();
-}
-
 function finishShutdownControlPlane() {
   if (shutdownFinalizing || transportsClosed) return;
   shutdownFinalizing = true;
@@ -2966,7 +2998,8 @@ function finishShutdownControlPlane() {
   // The API derives `unobserved` when this forwarder stops reporting. A ready snapshot is
   // intentionally monotonic, so do not attempt to regress it during graceful shutdown.
   sendRuntimeSnapshot(true, () => {
-    sendFinalHeartbeat(() => closeTransports());
+    const heartbeatTimeout = Math.min(5_000, remainingShutdownMs());
+    sendHeartbeat(() => closeTransports(), heartbeatTimeout, true);
   }, snapshotTimeout);
 }
 
@@ -2981,6 +3014,7 @@ function forceShutdown() {
 function flushAndClose() {
   if (closing) return;
   closing = true;
+  interactionForwarder.beginDrain();
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (identitySnapshotTimer) clearInterval(identitySnapshotTimer);
   if (infrastructurePolicyTimer) clearInterval(infrastructurePolicyTimer);
@@ -2993,24 +3027,32 @@ function flushAndClose() {
   captureProfileReporter.close();
   fileAccessAggregator.flushAll();
   filterRulePublisher.close();
+  flushAttributionRetries();
   shutdownDeadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
   shutdownForceTimer = setTimeout(forceShutdown, SHUTDOWN_TIMEOUT_MS);
-  // Event evidence is already durable in the WAL, while the final runtime snapshot and heartbeat
-  // are the only lifecycle proof that the API can use during a rollout. Reserve half of the
-  // Forwarder budget for those two serial control requests instead of leaving them an exact,
-  // scheduler-fragile five-second tail.
-  const controlReserveMs = Math.min(10_000, Math.max(2_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 2)));
+  const controlReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(SHUTDOWN_TIMEOUT_MS / 3)));
   eventDrainDeadline = shutdownDeadline - controlReserveMs;
   pumpEventWork();
   const waitForInflight = () => {
     pumpEventWork();
-    const spoolStatus = spool.status();
-    const hasEventWork = inflight > 0
+    // Fresh Collector input can already be durable while waiting outside the bounded in-memory
+    // ownership window. Treat those WAL records as shutdown work as well; otherwise EOF may let
+    // the Forwarder exit after delivering only the first window and defer the rest until a future
+    // restart. The shutdown deadline remains the bound for a genuinely unavailable API.
+    // Records whose durable-replay cooldown outlives the event drain horizon can never be
+    // replayed before the deadline (retry exhaustion defers them by a full cooldown), so waiting
+    // on them only delays shutdown without delivering anything.
+    let deferredBeyondHorizon = 0;
+    for (const replayAt of durableReplayNotBefore.values()) {
+      if (replayAt > eventDrainDeadline) deferredBeyondHorizon++;
+    }
+    const durableBacklog = spool.status().records > deferredBeyondHorizon;
+    const hasEventWork =
+      inflight > 0
       || pending.length > 0
       || retryTasks.length > 0
-      || walPendingEvents > 0
-      || spoolStatus.pendingOperations > 0
-      || spoolStatus.asyncSyncActive;
+      || interactionForwarder.hasPendingWork()
+      || durableBacklog;
     if (hasEventWork && Date.now() < eventDrainDeadline) {
       setTimeout(waitForInflight, 50);
       return;
@@ -3093,8 +3135,8 @@ function enqueueClassifiedRecord(record) {
   );
 }
 
-function handleLine(raw) {
-  const line = raw.trim();
+function handleLine(raw, retryAttempt = 0, retryDeadline = 0) {
+  let line = raw.trim();
   if (!line) return;
   pipelineAccounting.record('received', 'input');
   let o;
@@ -3107,6 +3149,7 @@ function handleLine(raw) {
     return;
   }
   const kind = eventKind(o);
+  const diagnosticBody = () => ({ ...o, sourceEventId: sourceEventId(line), eventKind: kind });
   if (kind === 'CollectorHeartbeat') {
     // Collector health is control-plane telemetry, not Agent activity. It must reach the raw
     // heartbeat ingest seam even when Enforce suppresses unknown workloads, and it must not
@@ -3190,13 +3233,49 @@ function handleLine(raw) {
     }, 0, true, kind);
     return;
   }
+  const processClassification = attributor.classify(o);
+  if (deferAttributionRetry(raw, o, processClassification, retryAttempt, retryDeadline)) return;
   attributionCounts.observed++;
   if (toolExecDeduper.isDuplicate(o)) {
     attributionCounts.deduplicated++;
     pipelineAccounting.record('filtered', 'deduplicated');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'deduplicated');
     return;
   }
-  const processClassification = attributor.classify(o);
+  if (processClassification.processContext) {
+    const recovered = processClassification.processContext;
+    const process = { ...o.process };
+    for (const [key, value] of Object.entries(recovered)) {
+      if (value !== undefined && (!process[key] || process[key] === '0')) process[key] = value;
+    }
+    o.process = process;
+    line = JSON.stringify(o);
+  }
+  if (!fileInConfiguredScope(o)) {
+    pipelineAccounting.record('filtered', 'file_path_scope');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'file_path_scope');
+    return;
+  }
+  const allowlistMatched = agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification);
+  const unresolvedExit = !allowlistMatched && unresolvedExitMatch(o, processClassification);
+  const retryExpired = retryAttempt >= MAX_ATTRIBUTION_RETRY_ATTEMPTS
+    || (retryDeadline > 0 && Date.now() >= retryDeadline);
+  const unresolvedExec = !allowlistMatched && !unresolvedExit
+    && unresolvedExecMatch(o, processClassification, retryExpired);
+  const unresolvedExitLimited = !allowlistMatched && !unresolvedExit && !unresolvedExec
+    && eventKind(o) === 'ProcessExit' && processClassification.state === 'unknown' && unresolvedExitCapacity();
+  const unresolvedExitDisabled = unresolvedExitLimited && UNRESOLVED_EXIT_LIMIT <= 0;
+  if (unresolvedExit || unresolvedExec) unresolvedExitRetained++;
+  if (unresolvedExit) unresolvedExitGenerations.add(unresolvedProcessKey(o));
+  if (unresolvedExit || unresolvedExec) {
+    o.process = { ...o.process, lifecycleReason: 'ancestry_incomplete' };
+    line = JSON.stringify(o);
+    pipelineDiagnostics.record(
+      diagnosticBody(),
+      unresolvedExit ? 'unresolved_exit_retained' : 'unresolved_exec_retained',
+      'ancestry_incomplete',
+    );
+  }
   const workloadClassification = workloadCache.classify(o);
   const activity = classifyEventActivity(o, processClassification, workloadClassification);
   const templateClassification = templateRegistry.classifyEvent(o);
@@ -3206,24 +3285,9 @@ function handleLine(raw) {
     templateClassification,
   ) ?? processClassification;
   let catalogClassification = baseClassification;
-  let trustedNonAgentRuleId = '';
   for (const candidate of unifiedFilterPolicy.identityCandidates(o, catalogClassification)) {
-    if (
-      candidate.attribution?.classification === 'non_agent'
-      && TRUSTED_NON_AGENT_PROCESS_FAMILY_RULES.has(candidate.ruleId)
-    ) {
-      trustedNonAgentRuleId = candidate.ruleId;
-    }
     catalogClassification = mergeAttributionClassifications(catalogClassification, candidate)
       ?? catalogClassification;
-  }
-  if (
-    trustedNonAgentRuleId
-    && catalogClassification.state === 'non_agent'
-    && catalogClassification.attribution?.classification === 'non_agent'
-    && catalogClassification.attribution?.conflict !== true
-  ) {
-    attributor.rememberTrustedNonAgent(o, trustedNonAgentRuleId);
   }
   const infrastructureEvaluation = infrastructurePolicy.evaluate(o, workloadClassification);
   // Stable authoritative inventory is resolved before heuristic behavior discovery. A weak
@@ -3268,10 +3332,68 @@ function handleLine(raw) {
     classification,
     resolvedCaptureDecision,
   );
+  // The coarse env-based Agent allowlist must not override a specific published keep decision:
+  // The rule catalog can identify an Agent even when the initial classification is inconclusive.
+  if (
+    !isAgentKeepDecision(decision)
+    && !allowlistMatched
+    && !unresolvedExit
+    && !unresolvedExec
+  ) {
+    attributionCounts.agentAllowlistScopedOut++;
+    const reason = unresolvedExitDisabled
+      ? 'unresolved_exit_disabled'
+      : unresolvedExitLimited ? 'unresolved_exit_capacity' : 'agent_allowlist';
+    pipelineAccounting.record('filtered', reason);
+    pipelineDiagnostics.record(
+      { ...diagnosticBody(), classification: processClassification.state },
+      'filtered',
+      reason,
+    );
+    return;
+  }
   // Runtime lifecycle is rooted in ProcessKey, but placement/confirmation can come from Docker,
   // Kubernetes, or a trusted template. Enrich the root after field-level merge without replacing
   // its process-instance ID with a workload-level ID.
   attributor.enrichRuntimeRoot(processClassification, classification);
+  // LlmRequestObserved/LlmResponseObserved contain sensitive content captured by AnySentry's
+  // exact-PID TLS probes. They have one legal destination: the encrypted Interaction content
+  // lane. Never enqueue the raw Observer line in the ordinary event WAL, evidence ingest,
+  // filter pipeline, or DLQ.
+  // Explicit capture policy already selected the PID, so an unavailable catalog classification
+  // must not silently discard the observation; attribution remains optional metadata.
+  if (kind === 'LlmRequestObserved' || kind === 'LlmResponseObserved') {
+    const accepted = interactionForwarder.observe(o, {
+      line,
+      agentInstanceId:
+        classification.state === 'agent'
+          ? classification.attribution?.agentInstanceId
+          : undefined,
+      agentDisplayName:
+        classification.state === 'agent'
+          ? classification.attribution?.agentDisplayName
+          : undefined,
+      workspacePath:
+        classification.state === 'agent'
+          ? classification.workspacePath
+          : undefined,
+    });
+    pipelineAccounting.record(
+      'interaction_handoff',
+      accepted ? 'content_spooled' : 'content_unavailable',
+    );
+    return;
+  }
+  // A provider-looking TLS connection is not itself an Agent conversation. Keep unknown,
+  // non-Agent, and infrastructure observations in the ordinary evidence lane; only a process
+  // already attributed as an Agent may create conversation-adjacent Interaction metadata.
+  if (kind === 'LlmCall' && isAgentInteractionClassification(classification)) {
+    interactionForwarder.observe(o, {
+      line,
+      agentInstanceId: classification.attribution?.agentInstanceId,
+      workspacePath: classification.workspacePath,
+    });
+  }
   const classificationName = classification.attribution?.classification;
   if (classification.state === 'agent' && classificationName === 'confirmed_agent') {
     attributionCounts.confirmedAgent++;
@@ -3298,13 +3420,8 @@ function handleLine(raw) {
   // workload identity was learned. Exact self/manual non-Agent inventory may suppress routine
   // syscall detail, but it must never suppress these event kinds merely because no central
   // Infrastructure rule happened to materialize for the same workload.
+  const alwaysKeep = alwaysKeepEventKind(kind);
   const semanticDecision = unifiedFilterPolicy.semanticDecision(o, classification);
-  const trustedLifecycleSuppression = (
-    (kind === 'ToolExec' || kind === 'ProcessExit')
-    && semanticDecision?.action === 'suppress'
-    && PROTECTED_LIFECYCLE_SUPPRESSION_RULES.has(semanticDecision.ruleId)
-  );
-  const alwaysKeep = alwaysKeepEventKind(kind) && !trustedLifecycleSuppression;
   if (!alwaysKeep && semanticDecision) {
     if (semanticDecision.action === 'suppress') {
       filterReason = semanticDecision.reasonCode || 'non_agent';
@@ -3356,12 +3473,14 @@ function handleLine(raw) {
         attributionCounts.filteredNoise++;
       }
       pipelineAccounting.record('filtered', filterReason);
+      pipelineDiagnostics.record(diagnosticBody(), 'filtered', filterReason);
       return;
     }
   }
   if (!matchesE2eIngestMarkerScope(o)) {
     attributionCounts.e2eMarkerScopedOut++;
     pipelineAccounting.record('filtered', 'e2e_scope');
+    pipelineDiagnostics.record(diagnosticBody(), 'filtered', 'e2e_scope');
     return;
   }
   const record = {
@@ -3394,13 +3513,19 @@ async function start() {
   rl.pause();
   rl.on('line', handleLine);
   rl.on('close', flushAndClose);
+  hydrateFromSpool();
   const spoolStatus = spool.status();
   console.error(
     `[observer-forward] durable spool: writer=${WRITER_ID}; path=${spoolStatus.filePath}; `
     + `recovered=${spoolStatus.records}; bytes=${spoolStatus.logicalBytes}; `
     + `fsync=${spoolStatus.fsyncMode}`,
   );
-  pumpDurableSpool();
+  if (FORWARD_AGENT_ALLOWLIST.size > 0) {
+    console.error(
+      `[observer-forward] Agent event allowlist enabled: ${[...FORWARD_AGENT_ALLOWLIST].join(',')}; `
+      + 'only matching Agent families enter the durable event/API lane',
+    );
+  }
 
   // The central catalog is the authoritative definition source. ConfigMap signatures and
   // deployment environment values above remain a bounded bootstrap/LKG path only; wait for one
@@ -3498,7 +3623,11 @@ async function start() {
   rootLivenessTimer = setInterval(() => attributor.checkRootLiveness(), ROOT_LIVENESS_SECS * 1_000);
   rootLivenessTimer.unref();
 
-  rl.resume();
+  // Startup WAL hydration may already own the full bounded window (or the durable spool may still
+  // be at capacity). Respect that state instead of unconditionally releasing a burst of Collector
+  // lines into an already-full queue.
+  if (closing) rl.resume();
+  else updateInputFlow();
 }
 
 process.once('SIGINT', () => handleShutdownSignal('SIGINT'));

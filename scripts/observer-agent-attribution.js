@@ -9,11 +9,11 @@ const {
   legacyRootNameDocument,
 } = require('./observer-agent-runtime-signatures');
 
-const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code';
+const DEFAULT_ROOT_NAMES = 'codex,a3s,a3s-code,a3s code,claude,claude-code,claude code,gemini,gemini-cli,gemini cli';
 const DEFAULT_MAX_PROCS = 20_000;
 const DEFAULT_MAX_ANCESTORS = 32;
 const RECORD_TTL_MS = 30 * 60_000;
-const DEFAULT_TOMBSTONE_TTL_MS = 15_000;
+const DEFAULT_TOMBSTONE_TTL_MS = 300_000;
 const DEFAULT_ROOT_TERMINAL_TTL_MS = 60 * 60_000;
 const DEFAULT_LIVENESS_MISSES = 2;
 const DEFAULT_ACTIVITY_IDLE_MS = 60_000;
@@ -50,6 +50,7 @@ function canonicalAgentName(value) {
   const normalized = text(value).toLowerCase();
   if (normalized === 'a3s' || normalized === 'a3s-code' || normalized === 'a3s code') return 'a3s code';
   if (normalized === 'claude' || normalized === 'claude-code' || normalized === 'claude code') return 'Claude Code';
+  if (normalized === 'gemini' || normalized === 'gemini-cli' || normalized === 'gemini cli') return 'Gemini CLI';
   return normalized;
 }
 
@@ -181,6 +182,31 @@ function processKey(info, defaults = {}) {
   ]);
 }
 
+function startTimeTicksFromNs(value, userHz) {
+  const ns = text(value);
+  const hz = positiveInt(userHz);
+  if (!ns || !hz) return undefined;
+  try {
+    const divisor = 1_000_000_000n / BigInt(hz);
+    return divisor > 0n ? (BigInt(ns) / divisor).toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameProcessGeneration(left, right) {
+  const leftNs = text(left?.startTimeNs);
+  const rightNs = text(right?.startTimeNs);
+  if (leftNs && rightNs) return leftNs === rightNs;
+  const leftTicks = text(left?.startTimeTicks);
+  const rightTicks = text(right?.startTimeTicks);
+  if (leftTicks && rightTicks) return leftTicks === rightTicks;
+  const hz = positiveInt(left?.userHz) || positiveInt(right?.userHz);
+  const convertedLeft = leftTicks || startTimeTicksFromNs(leftNs, hz);
+  const convertedRight = rightTicks || startTimeTicksFromNs(rightNs, hz);
+  return Boolean(convertedLeft && convertedRight && convertedLeft === convertedRight);
+}
+
 function readProcStartTime(pid, procRoot = '/proc') {
   try {
     const stat = fs.readFileSync(path.join(procRoot, String(pid), 'stat'), 'utf8');
@@ -230,8 +256,15 @@ class ProcessRecordStore {
   getFor(info, allowPidFallback = false) {
     const normalized = this.normalize(info);
     const key = processKey(normalized, this.defaults);
-    if (key) return this.records.get(key);
-    return allowPidFallback ? this.get(normalized.pid, normalized.hostId, normalized.bootId) : undefined;
+    if (key) {
+      const exact = this.records.get(key);
+      if (exact) return exact;
+    }
+    const candidate = this.get(normalized.pid, normalized.hostId, normalized.bootId);
+    if (candidate && ((!key && allowPidFallback) || sameProcessGeneration(normalized, candidate))) {
+      return candidate;
+    }
+    return undefined;
   }
 
   getByKey(key) {
@@ -409,55 +442,6 @@ class AgentAttributor {
     return cached.startTime;
   }
 
-  /**
-   * Memoize an immutable unified-rule negative root so immediately spawned helpers inherit the
-   * same Non-Agent provenance through ProcessKey ancestry. Exit-only observations are never
-   * reinserted after lifecycle cleanup, and PID reuse remains fenced by start/cgroup identity.
-   */
-  rememberTrustedNonAgent(observerEvent, ruleId) {
-    const normalizedRuleId = text(ruleId);
-    if (!normalizedRuleId || Object.hasOwn(observerEvent?.event ?? {}, 'ProcessExit')) return false;
-    const payload = eventPayload(observerEvent);
-    const processInfo = observerEvent?.process && typeof observerEvent.process === 'object'
-      ? observerEvent.process
-      : {};
-    const pid = positiveInt(processInfo.pid) || positiveInt(payload.pid) || positiveInt(observerEvent?.identity?.task);
-    if (!pid) return false;
-    const observed = {
-      hostId: text(processInfo.hostId) || text(processInfo.host_id) || this.hostId,
-      bootId: text(processInfo.bootId) || text(processInfo.boot_id) || this.bootId,
-      pid,
-      tgid: positiveInt(processInfo.tgid),
-      ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
-      startTime: text(
-        processInfo.startTimeTicks ?? processInfo.start_time_ticks
-        ?? processInfo.startTimeNs ?? processInfo.start_time_ns,
-      ),
-      cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
-      comm: text(processInfo.comm),
-      exe: text(processInfo.exe),
-      argv: argvText(payload.argv),
-      cgroup: text(processInfo.cgroup),
-      cwd: text(processInfo.cwd) || text(payload.cwd),
-    };
-    this.discardReusedPid(observed);
-    const cached = this.procs.getFor(observed, !observed.startTime);
-    const now = this.now();
-    this.remember({
-      ...(cached ?? {}),
-      ...observed,
-      ppid: observed.ppid || cached?.ppid,
-      startTime: observed.startTime || cached?.startTime,
-      cgroupId: observed.cgroupId || cached?.cgroupId,
-      state: 'non_agent',
-      nonAgentRuleId: normalizedRuleId,
-      evidence: [`filter_rule:${normalizedRuleId}:r1`, 'process_family:trusted_non_agent'],
-      lastSeen: now,
-      nextResolveAt: now + Math.max(5_000, this.negativeTtlMs),
-    });
-    return true;
-  }
-
   agentInstanceId(agentId, rootKey) {
     return `ari_${crypto.createHash('sha256')
       .update(text(agentId))
@@ -562,6 +546,9 @@ class AgentAttributor {
       pid: normalized.pid,
       rootPid: normalized.pid,
       startTime: normalized.startTime,
+      startTimeTicks: normalized.startTimeTicks,
+      startTimeNs: normalized.startTimeNs,
+      userHz: normalized.userHz,
       comm: text(normalized.comm),
       exe: text(normalized.exe),
       cgroup: text(normalized.cgroup),
@@ -686,14 +673,24 @@ class AgentAttributor {
       checked++;
       this.stats.rootLivenessChecks++;
       const observedStart = text(this.readStartTime(root.pid));
+      const sameStart = observedStart && (
+        observedStart === root.startTime || sameProcessGeneration(
+          {
+            startTimeTicks: root.startTimeTicks || (root.startTimeNs ? undefined : root.startTime),
+            startTimeNs: root.startTimeNs,
+            userHz: root.userHz,
+          },
+          { startTimeTicks: observedStart, userHz: root.userHz },
+        )
+      );
       root.lastLivenessCheckAt = checkedAt;
-      if (observedStart && observedStart === root.startTime) {
+      if (sameStart) {
         root.missedLivenessChecks = 0;
         root.lastLivenessAt = checkedAt;
         continue;
       }
       this.stats.rootLivenessMisses++;
-      root.missedLivenessChecks += observedStart && observedStart !== root.startTime
+      root.missedLivenessChecks += observedStart && !sameStart
         ? this.livenessMissThreshold
         : 1;
       if (root.missedLivenessChecks < this.livenessMissThreshold) continue;
@@ -1029,11 +1026,35 @@ class AgentAttributor {
       pid,
       tgid: positiveInt(processInfo.tgid),
       ppid: positiveInt(processInfo.ppid) || positiveInt(payload.ppid),
+      creationPpid: positiveInt(processInfo.creationPpid) || positiveInt(processInfo.creation_ppid),
+      observedPpid: positiveInt(processInfo.observedPpid) || positiveInt(processInfo.observed_ppid),
+      creationParentStartTimeNs:
+        text(processInfo.creationParentStartBoottimeNs) ||
+        text(processInfo.creation_parent_start_boottime_ns),
+      observedParentStartTimeNs:
+        text(processInfo.observedParentStartBoottimeNs) ||
+        text(processInfo.observed_parent_start_boottime_ns),
+      parentRelationSource:
+        text(processInfo.parentRelationSource) || text(processInfo.parent_relation_source),
+      lineageComplete:
+        (processInfo.lineageComplete ?? processInfo.lineage_complete) === false ? false : undefined,
+      userHz: positiveInt(processInfo.userHz) || positiveInt(processInfo.user_hz),
       startTime:
+        text(processInfo.startBoottimeNs) ||
+        text(processInfo.start_boottime_ns) ||
+        text(processInfo.startTimeNs) ||
+        text(processInfo.start_time_ns) ||
         text(processInfo.startTimeTicks) ||
-        text(processInfo.start_time_ticks) ||
+        text(processInfo.start_time_ticks),
+      startTimeTicks: text(processInfo.startTimeTicks) || text(processInfo.start_time_ticks),
+      startTimeNs:
+        text(processInfo.startBoottimeNs) ||
+        text(processInfo.start_boottime_ns) ||
         text(processInfo.startTimeNs) ||
         text(processInfo.start_time_ns),
+      pidNamespace: text(processInfo.pidNamespace) || text(processInfo.pid_namespace),
+      namespacePid: positiveInt(processInfo.namespacePid) || positiveInt(processInfo.namespace_pid),
+      namespacePpid: positiveInt(processInfo.namespacePpid) || positiveInt(processInfo.namespace_ppid),
       cgroupId: text(processInfo.cgroupId) || text(processInfo.cgroup_id),
       // `identity.agent` is a claimed/inherited scope label from the Observer envelope. It is not
       // process executable evidence. Falling back to it here promoted short-lived bwrap, shell,
@@ -1052,6 +1073,7 @@ class AgentAttributor {
       cached &&
       (
         (observed.startTime && cached.startTime === observed.startTime) ||
+        sameProcessGeneration(observed, cached) ||
         (!observed.startTime &&
           observed.cgroupId &&
           cached.cgroupId &&
@@ -1062,7 +1084,24 @@ class AgentAttributor {
       ...(sameCachedProcess ? cached : {}),
       ...observed,
       ppid: observed.ppid || (sameCachedProcess ? cached.ppid : undefined),
+      creationPpid: observed.creationPpid || (sameCachedProcess ? cached.creationPpid : undefined),
+      observedPpid: observed.observedPpid || (sameCachedProcess ? cached.observedPpid : undefined),
+      creationParentStartTimeNs:
+        observed.creationParentStartTimeNs ||
+        (sameCachedProcess ? cached.creationParentStartTimeNs : undefined),
+      observedParentStartTimeNs:
+        observed.observedParentStartTimeNs ||
+        (sameCachedProcess ? cached.observedParentStartTimeNs : undefined),
+      parentRelationSource:
+        observed.parentRelationSource || (sameCachedProcess ? cached.parentRelationSource : undefined),
+      lineageComplete: observed.lineageComplete ?? (sameCachedProcess ? cached.lineageComplete : undefined),
+      userHz: observed.userHz || (sameCachedProcess ? cached.userHz : undefined),
       startTime: observed.startTime || (sameCachedProcess ? cached.startTime : undefined),
+      startTimeTicks: observed.startTimeTicks || (sameCachedProcess ? cached.startTimeTicks : undefined),
+      startTimeNs: observed.startTimeNs || (sameCachedProcess ? cached.startTimeNs : undefined),
+      pidNamespace: observed.pidNamespace || (sameCachedProcess ? cached.pidNamespace : undefined),
+      namespacePid: observed.namespacePid || (sameCachedProcess ? cached.namespacePid : undefined),
+      namespacePpid: observed.namespacePpid || (sameCachedProcess ? cached.namespacePpid : undefined),
       cgroupId: observed.cgroupId || (sameCachedProcess ? cached.cgroupId : undefined),
       comm: observed.comm || (sameCachedProcess ? cached.comm : ''),
       exe: observed.exe || (sameCachedProcess ? cached.exe : ''),
@@ -1074,9 +1113,15 @@ class AgentAttributor {
     else this.stats.cacheMisses++;
 
     const existing = sameCachedProcess ? cached : undefined;
+    // Python CLIs can setproctitle after exec. A newly observed runtime signature must
+    // establish its own nested Agent boundary instead of inheriting a cached parent forever.
+    const runtimeIdentityChanged = Boolean(existing && (
+      (observed.comm && observed.comm !== existing.comm)
+      || (observed.exe && observed.exe !== existing.exe)
+    ));
     // A stable cached binding is the hot path. ToolExec still evaluates the executable first so a
     // nested Agent (for example Pi launched by Codex) can establish its own root instance.
-    if (!toolExec && existing?.state === 'agent' && this.rootForRecord(existing, false)) {
+    if (!toolExec && !runtimeIdentityChanged && existing?.state === 'agent' && this.rootForRecord(existing, false)) {
       const workspace = canonicalWorkspacePath(observed.cwd)
         ? this.resolveWorkspace(current.cwd, existing.workspacePath)
         : {
@@ -1123,7 +1168,7 @@ class AgentAttributor {
       );
     }
 
-    const directAgent = this.matchAgentExecutable(current);
+    const directAgent = this.matchAgent(current);
     const existingScope = existing?.state === 'agent' ? this.agentScope(existing) : undefined;
     const directMatchesExistingScope = Boolean(
       directAgent &&
@@ -1133,7 +1178,7 @@ class AgentAttributor {
     if (
       existing?.state === 'agent' &&
       this.rootForRecord(existing) &&
-      (!toolExec || !directAgent || directMatchesExistingScope)
+      ((!toolExec && !runtimeIdentityChanged) || !directAgent || directMatchesExistingScope)
     ) {
       // A short process can emit ToolExec and ProcessExit after /proc/<pid>/cwd has already
       // disappeared. Preserve an earlier conflict decision for the same PID instead of silently
@@ -1151,7 +1196,7 @@ class AgentAttributor {
     if (existing?.state === 'infrastructure') {
       return this.finish(pid, this.infrastructureResult(existing), exiting, current);
     }
-    const tombstone = exiting ? this.tombstoneFor(current) : undefined;
+    const tombstone = (exiting || toolExec) ? this.tombstoneFor(current) : undefined;
     if (tombstone?.state === 'agent') {
       return this.finish(pid, this.agentResult(tombstone, true), exiting, current);
     }
@@ -1159,8 +1204,8 @@ class AgentAttributor {
     // Routine file/network/security observations reuse a recent negative result. ToolExec and
     // ProcessExit re-evaluate because they are lifecycle/high-signal boundaries and can repair
     // out-of-order parent information.
-    if (!toolExec && !exiting && existing?.nextResolveAt > now) {
-      if (existing.state === 'non_agent') return this.nonAgentResult(existing);
+    if (!toolExec && !exiting && !runtimeIdentityChanged && existing?.nextResolveAt > now) {
+      if (existing.state === 'non_agent') return this.nonAgentResult();
       return this.unknown();
     }
 
@@ -1168,7 +1213,12 @@ class AgentAttributor {
     // labels and same-scope implementation wrappers from fragmenting one Agent lifecycle. A
     // different, registry-verified executable remains a real nested Agent boundary (for example
     // Pi launched by Codex), so it may establish an independent root below the owner.
-    const ancestry = this.resolveAncestry(current.ppid, now);
+    const ancestry = this.resolveAncestry(
+      current.ppid,
+      now,
+      current.creationParentStartTimeNs,
+      current.userHz,
+    );
     if (ancestry.state === 'agent') {
       if (directAgent && text(directAgent.agentId) !== text(ancestry.agentId)) {
         return this.finish(
@@ -1208,9 +1258,10 @@ class AgentAttributor {
       );
     }
 
-    // Only a registry-verified process signature can create a root after ownership resolution.
-    // `identity.agent` is intentionally absent from `current`, so an envelope claim cannot enter
-    // this branch.
+    // Only a registry signature or a narrowly validated command prefix can create a root after
+    // ownership resolution. The latter is needed for Node-packaged CLIs such as Gemini, whose
+    // executable is the generic `node` binary. `identity.agent` is intentionally absent from
+    // `current`, so an envelope claim cannot enter this branch.
     if (directAgent) {
       return this.finish(
         pid,
@@ -1227,27 +1278,15 @@ class AgentAttributor {
     }
 
     if (ancestry.state === 'non_agent') {
-      const record = {
-        ...current,
-        state: 'non_agent',
-        nonAgentRuleId: ancestry.nonAgentRuleId,
-        evidence: ancestry.evidence,
-        lastSeen: now,
-        nextResolveAt: ancestry.nonAgentRuleId
-          ? now + Math.max(5_000, this.negativeTtlMs)
-          : undefined,
-      };
-      this.remember(record);
-      return this.finish(pid, this.nonAgentResult(record), exiting, current);
+      this.remember({ ...current, state: 'non_agent', lastSeen: now });
+      return this.finish(pid, this.nonAgentResult(), exiting, current);
     }
 
     this.remember({ ...current, state: 'unknown', lastSeen: now });
     return this.finish(pid, this.unknown(), exiting, current);
   }
 
-  nonAgentResult(record = {}) {
-    const ruleId = text(record.nonAgentRuleId);
-    const evidence = Array.isArray(record.evidence) ? record.evidence.map(text).filter(Boolean) : [];
+  nonAgentResult() {
     return {
       state: 'non_agent',
       attribution: {
@@ -1256,10 +1295,7 @@ class AgentAttributor {
         confidence: 1,
         reason: 'not_agent',
         source: 'process_graph',
-        evidence: [...new Set([
-          ...evidence,
-          ...(ruleId ? [`filter_rule:${ruleId}:r1`, 'process_lineage:trusted_non_agent_family'] : ['process_lineage:pid1']),
-        ])].slice(0, 16),
+        evidence: ['process_lineage:pid1'],
       },
     };
   }
@@ -1279,6 +1315,24 @@ class AgentAttributor {
           : undefined
       );
       if (record?.startTime) this.rememberTombstone(record);
+      // An exited process is already absent from /proc. Preserve the namespace and generation
+      // actually observed before exit, before deleting this cache entry. Never manufacture a
+      // clock unit from the generic startTime field or borrow another Agent's root identity.
+      if (record?.pidNamespace && (record.startTimeTicks || record.startTimeNs)
+        && record.startTime === current.startTime
+        && record.cgroupId && record.cgroupId === current.cgroupId) {
+        result.processContext = {
+          hostId: record.hostId,
+          bootId: record.bootId,
+          pid: record.pid,
+          ppid: record.ppid,
+          pidNamespace: record.pidNamespace,
+          namespacePid: record.namespacePid,
+          namespacePpid: record.namespacePpid,
+          ...(record.startTimeTicks ? { startTimeTicks: record.startTimeTicks } : {}),
+          ...(record.startTimeNs ? { startTimeNs: record.startTimeNs } : {}),
+        };
+      }
       const root = record?.rootKey ? this.rootsByKey.get(record.rootKey) : undefined;
       if (root && record.processKey === root.rootKey && root.runtimeState === 'running') {
         this.transition(root, 'exited', {
@@ -1293,17 +1347,21 @@ class AgentAttributor {
   }
 
   tombstoneFor(info) {
-    this.pruneTombstones();
     const key = this.processKey(info);
     if (!key) return undefined;
     const tombstone = this.tombstones.get(key);
-    if (!tombstone || tombstone.expiresAt <= this.now()) return undefined;
+    if (!tombstone) return undefined;
+    if (tombstone.expiresAt <= this.now()) {
+      this.tombstones.delete(key);
+      return undefined;
+    }
     return tombstone.record;
   }
 
   rememberTombstone(record) {
     const key = record.processKey || this.processKey(record);
     if (!key) return;
+    this.pruneTombstones();
     this.tombstones.set(key, {
       record: { ...record },
       expiresAt: this.now() + this.tombstoneTtlMs,
@@ -1322,8 +1380,10 @@ class AgentAttributor {
     }
   }
 
-  resolveAncestry(initialPpid, now) {
+  resolveAncestry(initialPpid, now, initialParentStartNs, initialUserHz) {
     let pid = positiveInt(initialPpid);
+    let expectedStartNs = text(initialParentStartNs);
+    let userHz = positiveInt(initialUserHz);
     if (!pid) return { state: 'unknown' };
     const visited = new Set();
 
@@ -1331,33 +1391,83 @@ class AgentAttributor {
       if (visited.has(pid)) return { state: 'unknown' };
       visited.add(pid);
 
-      const cached = this.procs.get(pid);
+      const cached = this.procs.getFor(
+        { pid, startTimeNs: expectedStartNs, userHz },
+        !expectedStartNs,
+      );
+      const cachedGeneration = expectedStartNs ? this.procs.getFor({ pid }, true) : undefined;
+      if (expectedStartNs && cachedGeneration?.startTime && !sameProcessGeneration(
+        { startTimeNs: expectedStartNs, userHz },
+        {
+          startTimeTicks: cachedGeneration.startTimeTicks || cachedGeneration.startTime,
+          startTimeNs: cachedGeneration.startTimeNs,
+          userHz: cachedGeneration.userHz || userHz,
+        },
+      )) {
+        return { state: 'non_agent', reason: 'parent_generation_mismatch' };
+      }
       if (cached?.state === 'agent') {
         const scope = this.agentScope(cached);
         if (scope.state === 'agent') return scope;
       }
       if (cached?.state === 'infrastructure') return this.infrastructureScope(cached);
-      if (cached?.state === 'non_agent' && cached.nextResolveAt > now) {
-        return {
-          state: 'non_agent',
-          nonAgentRuleId: cached.nonAgentRuleId,
-          evidence: cached.evidence,
-        };
+      if (cached?.state === 'non_agent') {
+        const matcherHash = text(this.signatureRegistry.matcherHash);
+        const signatureChanged = text(cached.signatureMatcherHash) !== matcherHash;
+        if (signatureChanged) {
+          const cachedAgent = this.matchAgent(cached);
+          if (cachedAgent) {
+            const ancestor = this.resolveSameScopeAncestor(cached.ppid, cachedAgent);
+            this.rememberAgent(
+              cached,
+              ancestor || cachedAgent,
+              ancestor?.rootPid || pid,
+              ancestor ? 'process_lineage' : 'hint_only',
+              ancestor ? 'process_graph' : 'process_signature',
+              ancestor?.workspacePath,
+            );
+            const scope = this.agentScope(this.procs.getFor(cached));
+            if (scope.state === 'agent') return scope;
+          }
+          cached.signatureMatcherHash = matcherHash;
+          cached.nextResolveAt = now + this.negativeTtlMs;
+        }
+        if (cached.nextResolveAt > now) return { state: 'non_agent' };
       }
       if (pid === 1) return { state: 'non_agent' };
 
-      // A recent unknown entry still contains useful parent/start facts. Follow that cached
-      // parent without re-reading /proc; once the negative TTL expires, refresh it normally.
-      if (cached?.state === 'unknown' && cached.nextResolveAt > now) {
+      // A generation-matched unknown parent is durable evidence, not a liveness claim. Follow its
+      // cached ancestry after exit instead of requiring /proc to remain available.
+      if (cached?.state === 'unknown' && cached.startTime) {
+        const cachedAgent = this.matchAgent(cached);
+        if (cachedAgent) {
+          const ancestor = this.resolveSameScopeAncestor(cached.ppid, cachedAgent);
+          this.rememberAgent(
+            cached,
+            ancestor || cachedAgent,
+            ancestor?.rootPid || pid,
+            ancestor ? 'process_lineage' : 'hint_only',
+            ancestor ? 'process_graph' : 'process_signature',
+            ancestor?.workspacePath,
+          );
+          const scope = this.agentScope(this.procs.getFor(cached));
+          if (scope.state === 'agent') return scope;
+        }
         pid = positiveInt(cached.ppid);
+        expectedStartNs = text(cached.creationParentStartTimeNs);
+        userHz = positiveInt(cached.userHz);
         if (!pid) return { state: 'unknown' };
         continue;
       }
 
       const live = this.readProcess(pid, 'ancestry');
-      if (!live) return cached?.state === 'non_agent'
-        ? { state: 'non_agent', nonAgentRuleId: cached.nonAgentRuleId, evidence: cached.evidence }
-        : { state: 'unknown' };
+      if (!live) return cached?.state === 'non_agent' ? { state: 'non_agent' } : { state: 'unknown' };
+      if (expectedStartNs && !sameProcessGeneration(
+        { startTimeNs: expectedStartNs, userHz },
+        { startTimeTicks: live.startTime, userHz },
+      )) {
+        return { state: 'non_agent', reason: 'parent_generation_mismatch' };
+      }
       this.discardReusedPid(live);
 
       const containerScope = this.matchInfrastructure(live);
@@ -1450,6 +1560,8 @@ class AgentAttributor {
 
       this.remember({ ...live, state: 'unknown', lastSeen: now });
       pid = positiveInt(live.ppid);
+      expectedStartNs = '';
+      userHz = undefined;
       if (!pid) return { state: 'unknown' };
     }
     return { state: 'unknown' };
@@ -1464,7 +1576,7 @@ class AgentAttributor {
     const executableMatch = this.matchAgentExecutable(info);
     if (executableMatch) return executableMatch;
     if (!this.builtinHintsEnabled) return undefined;
-    const argv = text(info.argv).toLowerCase();
+    const argv = argvText(info.argv).toLowerCase();
     if (!argv) return undefined;
     // Only the command prefix is identity evidence. Scanning every argument lets untrusted
     // prompts such as "Actor: a3s code" misclassify an ordinary node process as an Agent.
@@ -1473,12 +1585,33 @@ class AgentAttributor {
     if (command === 'codex') return 'codex';
     if (command === 'a3s-code' || (command === 'a3s' && tokens[1] === 'code')) return 'a3s code';
     if (command === 'claude' || command === 'claude-code' || (command === 'claude' && tokens[1] === 'code')) return 'Claude Code';
+    if (command === 'gemini' || command === 'gemini-cli') return 'Gemini CLI';
+    if (
+      (command === 'node' || command.startsWith('node-'))
+      && text(tokens[1]).replaceAll('\\', '/').includes('/@google/gemini-cli/')
+    ) return 'Gemini CLI';
     return undefined;
   }
 
   matchAgentExecutable(info) {
     if (isInternalAgentHelper(info)) return undefined;
-    return this.signatureRegistry.match(info);
+    const direct = this.signatureRegistry.match(info);
+    if (direct) return direct;
+    const args = argvText(info.argv).split(/\s+/u).filter(Boolean);
+    if (['node', 'bun'].includes(basename(args[0]))
+      && /\/opencode-ai\/bin\/opencode$/u.test(text(args[1]))) {
+      return this.signatureRegistry.match({ ...info, comm: '', exe: '', argv: ['opencode'] });
+    }
+    if (/^python(?:3(?:\.\d+)?)?$/u.test(basename(args[0]))) {
+      const entrypoint = basename(args[1]);
+      if (['kimi', 'kimi-cli', 'kimi-code'].includes(entrypoint)
+        || (args[1] === '-m' && ['kimi_cli', 'kimi_cli.cli'].includes(args[2]))) {
+        // Resolve the exact Python entrypoint through the configured signature registry.
+        // Prompt text and later flags are never identity evidence.
+        return this.signatureRegistry.match({ ...info, comm: '', exe: '', argv: ['kimi'] });
+      }
+    }
+    return undefined;
   }
 
   rememberAgent(info, agentId, rootPid, reason, source, inheritedWorkspacePath) {
@@ -1721,7 +1854,10 @@ class AgentAttributor {
     const hostId = text(info.hostId) || this.hostId;
     const bootId = text(info.bootId) || this.bootId;
     const existing = this.procs.get(info.pid, hostId, bootId);
-    if (existing?.startTime && info.startTime && existing.startTime !== info.startTime) {
+    if (
+      existing?.startTime && info.startTime && existing.startTime !== info.startTime
+      && !sameProcessGeneration(existing, info)
+    ) {
       this.procs.deleteRecord(existing);
     }
   }

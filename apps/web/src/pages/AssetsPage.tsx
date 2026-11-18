@@ -189,7 +189,7 @@ function AssetRow({ asset, active, query }: { asset: ObservedAsset; active: bool
       aria-current={active ? "page" : undefined}
       className={cn(
         "grid min-h-16 grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-3 border-b border-[#232a37] px-3 py-2.5 text-left transition-colors",
-        active ? "bg-[#1c222d] shadow-[inset_2px_0_0_#f97316]" : "hover:bg-[#151a23]",
+        active ? "bg-[#10213d] shadow-[inset_2px_0_0_#22d3ee]" : "hover:bg-[#151a23]",
       )}
     >
       <span className="flex size-8 items-center justify-center rounded-md border border-[#2e3645] bg-[#151a23] text-[#818a9c]"><Icon className="size-4" /></span>
@@ -292,7 +292,7 @@ function AssetDetail({
       <div className="flex flex-col gap-3 border-b border-[#232a37] px-4 py-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <Icon className="size-4 text-[#f97316]" /><span className="text-xs font-semibold text-[#818a9c]">{t(TYPE_LABEL[asset.subjectAssetType])}</span>
+            <Icon className="size-4 text-[#38bdf8]" /><span className="text-xs font-semibold text-[#818a9c]">{t(TYPE_LABEL[asset.subjectAssetType])}</span>
             <span className={cn("inline-flex rounded border px-2 py-0.5 text-[10px] font-semibold", classificationClass(asset.identity.classification))}>{t(CLASSIFICATION_LABEL[asset.identity.classification])}</span>
             <span className="rounded border border-[#2e3645] px-2 py-0.5 text-[10px] text-[#b6bdcc]">{t("观测")}：{t(OBSERVATION_LABEL[asset.observationState])}</span>
           </div>
@@ -328,7 +328,7 @@ function AssetDetail({
         {asset.subjectAssetType === "agent" ? (
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#2e3645] bg-[#151a23] px-3 py-3">
             <p className="text-xs leading-5 text-[#b6bdcc]">{t("Agent 资产继续使用强身份键审核流程，避免统一资产的通用操作绕过 Agent recall 保护。")}</p>
-            <Button asChild size="sm" className="min-h-11 bg-[#f97316] text-white hover:bg-[#fb8128] sm:min-h-9"><Link to={`/agents?selectedAgentAssetId=${encodeURIComponent(asset.subjectAssetId)}&focus=review`}>{t("打开 Agent 审核")}</Link></Button>
+            <Button asChild size="sm" className="min-h-11 bg-[#2563eb] text-white hover:bg-[#3b82f6] sm:min-h-9"><Link to={`/agents?selectedAgentAssetId=${encodeURIComponent(asset.subjectAssetId)}&focus=review`}>{t("打开 Agent 审核")}</Link></Button>
           </div>
         ) : reviewImpactLoading ? (
           <p className="mt-3 text-xs text-[#818a9c]">{t("正在计算当前绑定与规则影响…")}</p>
@@ -353,7 +353,7 @@ function AssetDetail({
                 <div className="flex flex-wrap gap-2">
                   {reviewImpact.actions.markNonAgent ? <Button type="button" variant="secondary" size="sm" disabled={reviewSaving || !reviewReason.trim()} onClick={() => void submitReview("non_agent")} className="min-h-11 border border-slate-400/20 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20 sm:min-h-9"><Ban className="size-3.5" />{t("标记为非 Agent")}</Button> : null}
                   {reviewImpact.actions.setPending ? <Button type="button" variant="secondary" size="sm" disabled={reviewSaving || !reviewReason.trim()} onClick={() => void submitReview("unknown")} className="min-h-11 border border-[#2e3645] bg-[#151a23] text-[#d6dbe5] hover:bg-[#1c222d] sm:min-h-9">{t("设为待确认")}</Button> : null}
-                  {reviewImpact.actions.restoreAutomatic ? <Button type="button" size="sm" disabled={reviewSaving || !reviewReason.trim()} onClick={() => void submitReview("clear")} className="min-h-11 bg-[#f97316] text-white hover:bg-[#fb8128] sm:min-h-9"><RotateCcw className="size-3.5" />{t("恢复自动识别")}</Button> : null}
+                  {reviewImpact.actions.restoreAutomatic ? <Button type="button" size="sm" disabled={reviewSaving || !reviewReason.trim()} onClick={() => void submitReview("clear")} className="min-h-11 bg-[#2563eb] text-white hover:bg-[#3b82f6] sm:min-h-9"><RotateCcw className="size-3.5" />{t("恢复自动识别")}</Button> : null}
                 </div>
               </>
             )}
@@ -378,7 +378,7 @@ function AssetDetail({
         <h3 className="text-sm font-semibold text-[#e8ecf3]">{t("生命周期与规则边界")}</h3>
         {recentFacts.length === 0 ? <p className="mt-2 text-xs text-[#818a9c]">{t("暂无低频生命周期事实。")}</p> : (
           <div className="mt-3 border-l border-[#343c4b] pl-4">
-            {recentFacts.map((fact) => <div key={fact.factId} className="relative border-b border-[#232a37] py-3 last:border-b-0"><span className="absolute -left-[19px] top-4 size-2 rounded-full border border-[#f97316] bg-[#0f131a]" /><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-xs font-semibold text-[#d6dbe5]">{fact.factKind.replaceAll("_", " ")}</span><span className="font-mono text-[10px] text-[#697386]">{formatDate(fact.effectiveAt)}</span></div><p className="mt-1 text-[11px] leading-5 text-[#818a9c]">{fact.reasonCode}{fact.nextState ? ` → ${fact.nextState}` : ""}</p></div>)}
+            {recentFacts.map((fact) => <div key={fact.factId} className="relative border-b border-[#232a37] py-3 last:border-b-0"><span className="absolute -left-[19px] top-4 size-2 rounded-full border border-[#38bdf8] bg-[#0f131a]" /><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-xs font-semibold text-[#d6dbe5]">{fact.factKind.replaceAll("_", " ")}</span><span className="font-mono text-[10px] text-[#697386]">{formatDate(fact.effectiveAt)}</span></div><p className="mt-1 text-[11px] leading-5 text-[#818a9c]">{fact.reasonCode}{fact.nextState ? ` → ${fact.nextState}` : ""}</p></div>)}
           </div>
         )}
       </section>
@@ -446,16 +446,16 @@ export default function AssetsPage() {
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <Button asChild variant="secondary" size="sm" className="min-h-11 shrink-0 border border-[#2e3645] bg-[#151a23] text-[#e8ecf3] hover:bg-[#1c222d] sm:min-h-9"><Link to="/"><ArrowLeft className="size-3.5" />{t("返回")}</Link></Button>
-            <div className="min-w-0"><div className="flex items-center gap-2"><Layers3 className="size-5 shrink-0 text-[#f97316]" /><h1 className="truncate text-lg font-semibold">{t("资产与身份")}</h1></div><p className="mt-0.5 truncate text-xs text-[#818a9c]">{t("当前资产口径 · 资产、Runtime、身份、角色与观测状态独立")}</p></div>
+            <div className="min-w-0"><div className="flex items-center gap-2"><Layers3 className="size-5 shrink-0 text-[#38bdf8]" /><h1 className="truncate text-lg font-semibold">{t("资产与身份")}</h1></div><p className="mt-0.5 truncate text-xs text-[#818a9c]">{t("当前资产口径 · 资产、Runtime、身份、角色与观测状态独立")}</p></div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-md border border-[#2e3645] bg-[#151a23] px-3 sm:min-h-9 sm:min-w-64"><Search className="size-3.5 shrink-0 text-[#818a9c]" /><Input value={queryText} onChange={(event) => setQueryText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") applySearch(); }} placeholder={t("搜索资产、服务或位置")} className="h-11 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 sm:h-8" /></div>
             <Button type="button" variant="secondary" size="sm" onClick={applySearch} className="min-h-11 border border-[#2e3645] bg-[#151a23] text-[#e8ecf3] hover:bg-[#1c222d] sm:min-h-9">{t("搜索")}</Button>
-            <Button type="button" size="sm" onClick={refreshDirectory} disabled={loading} className="min-h-11 bg-[#f97316] text-white hover:bg-[#fb8128] sm:min-h-9">{loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}{t("刷新")}</Button>
+            <Button type="button" size="sm" onClick={refreshDirectory} disabled={loading} className="min-h-11 bg-[#2563eb] text-white hover:bg-[#3b82f6] sm:min-h-9">{loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}{t("刷新")}</Button>
           </div>
         </div>
         <div className="mt-3 flex gap-1 overflow-x-auto border-t border-[#232a37] pt-2" aria-label={t("资产分类")}>
-          {TABS.map((item) => <button key={item.value} type="button" onClick={() => selectTab(item.value)} className={cn("min-h-11 min-w-11 shrink-0 rounded px-3 text-xs font-medium sm:min-h-9 sm:min-w-0", tab === item.value ? "bg-[#272d38] text-[#f4f6fa] shadow-[inset_0_-2px_0_#f97316]" : "text-[#818a9c] hover:bg-[#151a23] hover:text-[#d6dbe5]")}>{t(item.label)}</button>)}
+          {TABS.map((item) => <button key={item.value} type="button" onClick={() => selectTab(item.value)} className={cn("min-h-11 min-w-11 shrink-0 rounded px-3 text-xs font-medium sm:min-h-9 sm:min-w-0", tab === item.value ? "bg-[#132a4f] text-[#eaf4ff] shadow-[inset_0_-2px_0_#22d3ee]" : "text-[#818a9c] hover:bg-[#151a23] hover:text-[#d6dbe5]")}>{t(item.label)}</button>)}
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#818a9c]">
           <span>{data ? `${data.total} ${t("个资产")}` : t("正在读取资产")}</span><span>Agent {data?.summary.byType.agent ?? "--"} · {t("服务")} {data?.summary.byType.service ?? "--"} · {t("基础设施")} {data?.summary.byType.infrastructure ?? "--"} · {t("工作负载")} {data?.summary.byType.workload ?? "--"} · {t("待识别")} {data?.summary.byIdentity.unknown ?? "--"} · {t("已排除")} {data?.summary.byIdentity.non_agent ?? "--"}</span><span className="inline-flex items-center gap-1"><Clock3 className="size-3" />{data?.updateTime ? formatDate(data.updateTime) : t("等待刷新")}</span>{data?.readStatus.partial ? <span className="text-amber-200">partial: {data.readStatus.reasons.slice(0, 3).join(" / ")}</span> : null}

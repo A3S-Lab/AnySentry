@@ -23,6 +23,7 @@
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sqlite3": "5.1.7",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

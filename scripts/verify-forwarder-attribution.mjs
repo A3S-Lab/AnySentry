@@ -60,28 +60,101 @@ function attributor(procEntries = []) {
 }
 
 {
-  const judge = attributor([
-    { pid: 700, ppid: 600, startTime: '70', comm: 'parent', exe: '/opt/parent' },
-    { pid: 701, ppid: 700, startTime: '71', comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh' },
-    { pid: 702, ppid: 701, startTime: '72', comm: 'tr', exe: '/usr/bin/tr' },
-  ]);
-  const root = observerEvent({
-    pid: 701, ppid: 700, comm: 'cpuUsage.sh', exe: '/opt/vscode/cpuUsage.sh',
-    startTimeNs: '71', argv: ['/opt/vscode/cpuUsage.sh'],
-  });
-  assert.equal(judge.classify(root).state, 'unknown');
-  assert.equal(
-    judge.rememberTrustedNonAgent(root, 'fr_builtin_non_agent_runtime_vscode_cpu_sampler'),
-    true,
-  );
-  const child = judge.classify(observerEvent({
-    pid: 702, ppid: 701, comm: 'tr', exe: '/usr/bin/tr', startTimeNs: '72', argv: ['tr', 'a-z', 'A-Z'],
+  const judge = attributor();
+  const observed = observerEvent({ pid: 88201, ppid: 1, comm: 'kimi-code', exe: '/opt/kimi/bin/kimi',
+    hostId: 'host-exit', bootId: 'boot-exit', argv: ['kimi'] });
+  Object.assign(observed.process, { cgroupId: '100', pidNamespace: 'pidns-exit', namespacePid: 12, startTimeTicks: '1234' });
+  judge.classify(observed);
+  const terminal = processExitEvent({ pid: 88201, comm: 'kimi-code', hostId: 'host-exit', bootId: 'boot-exit' });
+  terminal.process.cgroupId = '100';
+  const result = judge.classify(terminal);
+  assert.equal(result.processContext?.startTimeTicks, '1234', 'exit must retain the observed generation after /proc disappears');
+  assert.equal(result.processContext?.pidNamespace, 'pidns-exit');
+  assert.equal(result.processContext?.namespacePid, 12);
+  judge.classify(observed);
+  const reused = structuredClone(terminal);
+  reused.process.startTimeTicks = '5678';
+  assert.equal(judge.classify(reused).processContext, undefined, 'a changed generation must not inherit cached namespace evidence');
+  judge.classify(observed);
+  const foreign = structuredClone(terminal);
+  foreign.process.cgroupId = '200';
+  assert.equal(judge.classify(foreign).processContext, undefined, 'a different cgroup must not inherit exit context');
+}
+
+{
+  const judge = attributor();
+  judge.classify(observerEvent({ pid: 88101, ppid: 1, comm: 'codex', exe: '/bin/codex', startTimeNs: '100', argv: ['codex'] }));
+  const root = judge.classify(observerEvent({ pid: 88102, ppid: 88101, comm: 'kimi-code', exe: '/opt/kimi-code/bin/kimi-code', startTimeNs: '200', argv: ['kimi-code'] }));
+  assert.equal(root.attribution.agentScopeId, 'kimi-cli');
+  assert.equal(root.attribution.rootPid, 88102, 'native Kimi must establish its own root below Codex');
+  const tool = judge.classify(observerEvent({ pid: 88103, ppid: 88102, comm: 'bash', exe: '/bin/bash', startTimeNs: '300', argv: ['bash', '-c', 'true'] }));
+  assert.equal(tool.attribution.agentScopeId, 'kimi-cli');
+  assert.equal(tool.attribution.rootPid, 88102, 'native Kimi shell descendants must retain the Kimi root');
+}
+
+{
+  const judge = attributor();
+  judge.classify(observerEvent({pid:88001,ppid:1,comm:'codex',exe:'/bin/codex',startTimeNs:'100',argv:['codex']}));
+  const python = observerEvent({pid:88002,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'200',argv:['python3','/opt/launcher.py']});
+  assert.equal(judge.classify(python).attribution.agentScopeId,'codex');
+  const renamed = structuredClone(python);
+  renamed.process.comm='Kimi Code';
+  renamed.event={FileAccess:{pid:88002,path:'/tmp/kimi/sessions/wire.jsonl',write:true}};
+  const identified=judge.classify(renamed);
+  assert.equal(identified.attribution.agentScopeId,'kimi-cli');
+  assert.equal(identified.attribution.rootPid,88002,'setproctitle creates independent Kimi boundary');
+  const shell=judge.classify(observerEvent({pid:88003,ppid:88002,comm:'bash',exe:'/bin/bash',startTimeNs:'300',argv:['bash','-c','true']}));
+  assert.equal(shell.attribution.rootPid,88002);
+  const entry = judge.classify(observerEvent({pid:88004,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'400',argv:['python3','/opt/bin/kimi']}));
+  assert.equal(entry.attribution.agentScopeId,'kimi-cli');
+  assert.equal(entry.attribution.rootPid,88004);
+  const misleading = judge.classify(observerEvent({pid:88005,ppid:88001,comm:'python3',exe:'/bin/python3',startTimeNs:'500',argv:['python3','-c','print("kimi")']}));
+  assert.equal(misleading.attribution.agentScopeId,'codex','Python prompt text is not runtime identity');
+}
+
+{
+  const geminiRoot = {
+    pid: 870,
+    tgid: 870,
+    ppid: 1,
+    startTime: '8700',
+    comm: 'node',
+    exe: '/usr/bin/node',
+    argv: [
+      '/usr/bin/node',
+      '/home/user/.local/lib/node_modules/@google/gemini-cli/dist/index.js',
+    ],
+    cwd: '/home/user/workspace',
+  };
+  const judge = attributor([geminiRoot]);
+  const classified = judge.classify(observerEvent({
+    pid: 870,
+    ppid: 1,
+    comm: 'node',
+    exe: '/usr/bin/node',
+    startTimeNs: '8700',
+    cwd: '/home/user/workspace',
+    argv: geminiRoot.argv,
   }));
-  assert.equal(child.state, 'non_agent');
-  assert(
-    child.attribution.evidence.includes('filter_rule:fr_builtin_non_agent_runtime_vscode_cpu_sampler:r1'),
-    'trusted negative rule provenance must propagate to short-lived descendants',
-  );
+  assert.equal(classified.state, 'agent');
+  assert.equal(classified.attribution.agentDisplayName, 'Gemini CLI');
+
+  const ordinaryNode = attributor([{
+    ...geminiRoot,
+    pid: 871,
+    startTime: '8710',
+    argv: ['/usr/bin/node', '/home/user/app.js', '--model', 'gemini-2.5-pro'],
+  }]).classify(observerEvent({
+    pid: 871,
+    ppid: 1,
+    comm: 'node',
+    exe: '/usr/bin/node',
+    startTimeNs: '8710',
+    cwd: '/home/user/workspace',
+    argv: ['/usr/bin/node', '/home/user/app.js', '--model', 'gemini-2.5-pro'],
+  }));
+  assert.notEqual(ordinaryNode.state, 'agent');
+  console.log('PASS Gemini CLI Node package entrypoint is exact identity evidence without generic Node false positives');
 }
 
 {
@@ -794,15 +867,47 @@ function attributor(procEntries = []) {
   assert.equal(judge.classify(exitEvent).state, 'agent');
   assert.equal(judge.metrics().tombstones, 1);
   const late = observerEvent({ pid: 600, ppid: 999, comm: 'bash', exe: '/usr/bin/bash', startTimeNs: '60', argv: ['bash', '-c', 'echo late'] });
-  assert.notEqual(
+  assert.equal(
     judge.classify(late).state,
     'agent',
-    'a root tombstone may deduplicate ProcessExit but must not revive the exited subtree',
+    'an exact-generation tombstone must retain a late ToolExec without reviving the root',
   );
+  assert.equal([...judge.rootsByKey.values()].find((root) => root.pid === 600)?.runtimeState, 'exited');
+  const wrongGeneration = structuredClone(late);
+  wrongGeneration.process.startTimeNs = '61';
+  assert.notEqual(judge.classify(wrongGeneration).state, 'agent');
   const reused = judge.classify(observerEvent({ pid: 600, ppid: 999, comm: 'short-task', exe: '/usr/bin/short-task', startTimeNs: '', argv: ['short-task'] }));
   assert.equal(reused.state, 'unknown');
   now += 5_001;
   assert.equal(judge.metrics().tombstones, 0);
+}
+
+{
+  const judge = new AgentAttributor({ readProc: () => undefined, listPids: () => [] });
+  const root = { pid: 610, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '100', argv: ['codex'] };
+  const child = { pid: 611, ppid: 610, comm: 'git', exe: '/usr/lib/git-core/git', startTimeNs: '200', argv: ['git', 'maintenance', 'run'] };
+  assert.equal(judge.classify(observerEvent(root)).state, 'agent');
+  assert.equal(judge.classify(observerEvent(child)).state, 'agent');
+  assert.equal(judge.classify(processExitEvent(child)).state, 'agent');
+  assert.equal(judge.classify(processExitEvent(root)).state, 'agent');
+  const late = judge.classify(observerEvent(child));
+  assert.equal(late.state, 'agent', 'child exec arriving after both exits must retain its exact-generation attribution');
+  assert.equal(late.attribution.rootPid, 610);
+}
+
+{
+  let now = 1_000_000;
+  const judge = new AgentAttributor({ now: () => now, readProc: () => undefined, listPids: () => [] });
+  const root = { pid: 620, ppid: 1, comm: 'codex', exe: '/usr/bin/codex', startTimeNs: '100', argv: ['codex'] };
+  const child = { pid: 621, ppid: 620, comm: 'git', exe: '/usr/bin/git', startTimeNs: '200', argv: ['git', 'diff', '--check'] };
+  judge.classify(observerEvent(root));
+  judge.classify(observerEvent(child));
+  judge.classify(processExitEvent(child));
+  judge.classify(processExitEvent(root));
+  now += 61_000;
+  assert.equal(judge.classify(observerEvent(child)).state, 'agent', 'a delayed exec must remain attributable beyond the old 15s and 60s tombstone TTLs');
+  now += 239_001;
+  assert.notEqual(judge.classify(observerEvent(child)).state, 'agent', 'the 300s tombstone bound must still expire');
 }
 
 {
@@ -954,6 +1059,32 @@ function attributor(procEntries = []) {
     )?.runtimeState,
     'running',
   );
+}
+
+{
+  const judge = new AgentAttributor({
+    readProc: () => undefined,
+    readStartTime: () => '575354',
+    livenessMissThreshold: 1,
+    listPids: () => [],
+  });
+  const root = observerEvent({ pid: 2_450, ppid: 1, comm: 'kimi', exe: '/opt/kimi-bin/kimi', startTimeNs: '5753545984160', argv: ['kimi'] });
+  root.process.startTimeTicks = '575354';
+  root.process.userHz = 100;
+  assert.equal(judge.classify(root).state, 'agent');
+  judge.discardReusedPid({
+    pid: 2_450,
+    hostId: judge.hostId,
+    bootId: judge.bootId,
+    startTime: '575354',
+    startTimeTicks: '575354',
+    userHz: 100,
+  });
+  assert.equal(judge.procs.getFor(root.process)?.state, 'agent', 'equivalent identities must not evict the agent cache');
+  judge.discardReusedPid({ pid: 2_450, hostId: judge.hostId, bootId: judge.bootId, startTime: '999', startTimeTicks: '999' });
+  assert.equal(judge.procs.getFor(root.process), undefined, 'a genuinely reused PID must still evict the old generation');
+  assert.equal(judge.checkRootLiveness().lost, 0, 'equivalent tick and nanosecond identities must stay live');
+  assert.equal(judge.runtimeSnapshot().entries[0]?.runtimeState, 'running');
 }
 
 {
@@ -1402,6 +1533,15 @@ function attributor(procEntries = []) {
   assert.equal(deduper.isDuplicate(otherPid), false);
   const otherArgv = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo two'] });
   assert.equal(deduper.isDuplicate(otherArgv), false);
+
+  const incomplete = observerEvent({ pid: 800, ppid: 700, comm: 'bash', exe: '/usr/bin/bash', argv: ['bash', '-c', 'echo one'] });
+  incomplete.event.ToolExec.exec_confirmed = true;
+  incomplete.event.ToolExec.argv_incomplete = true;
+  const complete = structuredClone(incomplete);
+  complete.event.ToolExec.argv_incomplete = false;
+  assert.equal(deduper.isDuplicate(incomplete), false);
+  assert.equal(deduper.isDuplicate(complete), false);
+  assert.equal(deduper.isDuplicate(incomplete), true);
 
   now += 5001;
   assert.equal(deduper.isDuplicate(event), false);

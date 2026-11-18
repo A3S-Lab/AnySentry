@@ -523,7 +523,7 @@ export class AgentMetadataService implements OnModuleInit, OnModuleDestroy {
     }
     if (event.process?.pid && (event.process.startTimeTicks || event.process.startTimeNs)) {
       return cleanIdentityKeys([
-        `host:${host}:${boot}:process:${event.process.pid}:${event.process.startTimeTicks ?? event.process.startTimeNs}:${event.process.exe ?? event.process.comm ?? event.agentId}`,
+        `host:${host}:${boot}:process:${event.process.pid}:${event.process.startTimeSource === 'kernel_start_boottime' ? event.process.startTimeNs ?? event.process.startTimeTicks : event.process.startTimeTicks ?? event.process.startTimeNs}:${event.process.exe ?? event.process.comm ?? event.agentId}`,
         ...logicalKeys,
       ]);
     }
