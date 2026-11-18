@@ -75,7 +75,6 @@ try {
     ANYSENTRY_DOCKER_DISCOVERY: 'off',
     ANYSENTRY_INTERACTIONS: 'off',
     ANYSENTRY_UNRESOLVED_EXIT_LIMIT: '2',
-    ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS: 'evaluation-cgroup',
     ANYSENTRY_PIPELINE_DIAGNOSTICS_PATH: diagnosticsPath,
     FORWARD_AGENT_ALLOWLIST: 'kimi-cli',
     FORWARD_FILTER_MODE: 'enforce',
@@ -111,7 +110,7 @@ try {
   } finally { clearTimeout(timer); }
   const forwarded = received.map(item => JSON.parse(item.line));
   const exits = forwarded.filter(event => event.event.ProcessExit).map(event => event.process.pid);
-  assert.deepEqual(new Set(exits), new Set([93001, 93002, 93004, 1]));
+  assert.deepEqual(new Set(exits), new Set([93001, 93002, 93004]));
   assert.ok(forwarded.some(event => event.event.ToolExec?.pid === 93005), 'unresolved exec must survive WAL replay');
   const receipts = JSON.parse(await readFile(diagnosticsPath, 'utf8'));
   assert.ok(receipts.some(item => item.pid === 93001 && item.stage === 'unresolved_exit_retained'));

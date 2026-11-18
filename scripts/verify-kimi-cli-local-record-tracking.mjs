@@ -55,7 +55,6 @@ try {
   Object.assign(process.env, {ANYSENTRY_LOCAL_RECORD_TRACKING:'on',ANYSENTRY_LOCAL_CODEX_SESSIONS_DIR:join(dir,'none'),ANYSENTRY_LOCAL_KIMI_SESSIONS_DIR:sessions,ANYSENTRY_LOCAL_PROCESS_TRACKING:'on',ANYSENTRY_LOCAL_PROCESS_ROOT:proc});
   delete process.env.ANYSENTRY_LOCAL_KIMI_SESSIONS_DIRS;
   for(const agent of ['A3S','CLAUDE','GEMINI']){process.env[`ANYSENTRY_LOCAL_${agent}_SESSIONS_DIR`]=join(dir,'none');delete process.env[`ANYSENTRY_LOCAL_${agent}_SESSIONS_DIRS`];}
-  delete process.env.ANYSENTRY_LOCAL_HARBOR_JOBS_DIR;
   const candidates=[];
   const service=new LocalRecordTrackingService({status:()=>({enabled:false,projection:{postgresql:false,clickhouse:false}})}, {
     resolveBinding:async c=>{candidates.push(c);return undefined},

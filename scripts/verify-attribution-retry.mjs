@@ -37,7 +37,6 @@ try {
     ANYSENTRY_IDENTITY_SNAPSHOT_URL: `${base}/identity/snapshot`,
     ANYSENTRY_DOCKER_DISCOVERY: 'off',
     ANYSENTRY_INTERACTIONS: 'off',
-    ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS: 'retry-cgroup',
     ANYSENTRY_ATTRIBUTION_RETRY_DELAY_MS: '10',
     ANYSENTRY_ATTRIBUTION_RETRY_MAX_ATTEMPTS: '10000',
     ANYSENTRY_ATTRIBUTION_RETRY_MAX_AGE_MS: '200',
@@ -133,7 +132,7 @@ try {
   assert.ok(receipts.some(item => item.pid === 92005 && item.stage === 'unresolved_exec_retained'));
   assert.ok(receipts.some(item => item.pid === 92004 && item.stage === 'unresolved_exec_retained'));
   assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'attribution_deferred'));
-  assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'evaluation_lifecycle_retained'));
+  assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'unresolved_exit_retained'));
   assert.ok(receipts.some(item => item.pid === 92002 && item.stage === 'ingest_accepted'));
   console.log('PASS scoped unresolved exit and bounded parent-order exec retry');
 } finally {

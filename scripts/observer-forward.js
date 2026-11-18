@@ -282,46 +282,6 @@ function agentAllowlistMatch(allowlist, observerEvent, classification) {
   return candidates.some((candidate) => allowlist.has(canonicalAgentSelector(candidate)));
 }
 
-const evaluationLifecycleCgroupPath = text(process.env.ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_PATH)
-  || '/diagnostics/evaluation-cgroups.json';
-const EVALUATION_LIFECYCLE_CGROUPS = new Set(
-  text(process.env.ANYSENTRY_EVALUATION_LIFECYCLE_CGROUP_IDS)
-    .split(/[\s,]+/u)
-    .filter(Boolean),
-);
-
-// Evaluation harnesses learn the task container cgroup ids only after the containers start, so
-// the id set must be refreshable at runtime: a JSON array (or comma string) written to a
-// host-mounted file is merged into the env-provided baseline on a short poll.
-function refreshEvaluationLifecycleCgroups() {
-  if (!evaluationLifecycleCgroupPath) return;
-  try {
-    const raw = JSON.parse(fs.readFileSync(evaluationLifecycleCgroupPath, 'utf8'));
-    const ids = (Array.isArray(raw) ? raw : text(raw).split(/[\s,]+/u))
-      .map((id) => text(id))
-      .filter(Boolean);
-    EVALUATION_LIFECYCLE_CGROUPS.clear();
-    for (const id of ids.slice(0, 4096)) EVALUATION_LIFECYCLE_CGROUPS.add(id);
-  } catch {
-    // Absent or malformed harness file: keep the last known set (env baseline persists).
-  }
-}
-refreshEvaluationLifecycleCgroups();
-if (evaluationLifecycleCgroupPath) {
-  const evaluationLifecycleTimer = setInterval(refreshEvaluationLifecycleCgroups, 5_000);
-  evaluationLifecycleTimer.unref();
-}
-
-function evaluationLifecycleMatch(observerEvent, classification) {
-  if (
-    EVALUATION_LIFECYCLE_CGROUPS.size === 0
-    || !['unknown', 'non_agent', 'infrastructure'].includes(classification?.state)
-  ) return false;
-  const process = observerEvent?.process ?? {};
-  const cgroupId = text(process.cgroupId || process.cgroup_id);
-  return EVALUATION_LIFECYCLE_CGROUPS.has(cgroupId);
-}
-
 const UNRESOLVED_EXIT_LIMIT = Math.max(0, Number(process.env.ANYSENTRY_UNRESOLVED_EXIT_LIMIT) || 0);
 let unresolvedExitRetained = 0;
 const unresolvedExitGenerations = new Set();
@@ -939,7 +899,6 @@ function durableRecordMatchesAgentAllowlist(body) {
       attribution: body?.attribution,
     };
     if (agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, observerEvent, classification)) return true;
-    if (evaluationLifecycleMatch(observerEvent, classification)) return true;
     return UNRESOLVED_EXIT_LIMIT > 0
       && text(observerEvent.process?.lifecycleReason) === 'ancestry_incomplete'
       && (
@@ -3298,25 +3257,22 @@ function handleLine(raw, retryAttempt = 0, retryDeadline = 0) {
     return;
   }
   const allowlistMatched = agentAllowlistMatch(FORWARD_AGENT_ALLOWLIST, o, processClassification);
-  const evaluationLifecycle = !allowlistMatched && evaluationLifecycleMatch(o, processClassification);
-  const unresolvedExit = !allowlistMatched && !evaluationLifecycle && unresolvedExitMatch(o, processClassification);
+  const unresolvedExit = !allowlistMatched && unresolvedExitMatch(o, processClassification);
   const retryExpired = retryAttempt >= MAX_ATTRIBUTION_RETRY_ATTEMPTS
     || (retryDeadline > 0 && Date.now() >= retryDeadline);
-  const unresolvedExec = !allowlistMatched && !evaluationLifecycle && !unresolvedExit
+  const unresolvedExec = !allowlistMatched && !unresolvedExit
     && unresolvedExecMatch(o, processClassification, retryExpired);
-  const unresolvedExitLimited = !allowlistMatched && !evaluationLifecycle && !unresolvedExit && !unresolvedExec
+  const unresolvedExitLimited = !allowlistMatched && !unresolvedExit && !unresolvedExec
     && eventKind(o) === 'ProcessExit' && processClassification.state === 'unknown' && unresolvedExitCapacity();
   const unresolvedExitDisabled = unresolvedExitLimited && UNRESOLVED_EXIT_LIMIT <= 0;
   if (unresolvedExit || unresolvedExec) unresolvedExitRetained++;
   if (unresolvedExit) unresolvedExitGenerations.add(unresolvedProcessKey(o));
-  if (evaluationLifecycle || unresolvedExit || unresolvedExec) {
+  if (unresolvedExit || unresolvedExec) {
     o.process = { ...o.process, lifecycleReason: 'ancestry_incomplete' };
     line = JSON.stringify(o);
     pipelineDiagnostics.record(
       diagnosticBody(),
-      evaluationLifecycle
-        ? 'evaluation_lifecycle_retained'
-        : unresolvedExit ? 'unresolved_exit_retained' : 'unresolved_exec_retained',
+      unresolvedExit ? 'unresolved_exit_retained' : 'unresolved_exec_retained',
       'ancestry_incomplete',
     );
   }
@@ -3377,14 +3333,10 @@ function handleLine(raw, retryAttempt = 0, retryDeadline = 0) {
     resolvedCaptureDecision,
   );
   // The coarse env-based Agent allowlist must not override a specific published keep decision:
-  // evaluation task workloads are frequently classified as infrastructure by the broad inventory
-  // while the filter rules already proved the same cgroup belongs to an Agent family. Without
-  // this exemption the allowlist silently wipes their FileAccess/FileDelete evidence, breaking
-  // file-level task verification even though the same cgroup's exec/exit records are retained.
+  // The rule catalog can identify an Agent even when the initial classification is inconclusive.
   if (
     !isAgentKeepDecision(decision)
     && !allowlistMatched
-    && !evaluationLifecycle
     && !unresolvedExit
     && !unresolvedExec
   ) {

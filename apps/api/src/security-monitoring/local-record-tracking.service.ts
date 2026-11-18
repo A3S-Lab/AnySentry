@@ -172,7 +172,6 @@ interface LocalRecordRoot {
   adapter: LocalRecordAdapter;
   path: string;
   hostPath?: string;
-  harborJobs?: boolean;
 }
 
 interface SummaryCacheEntry {
@@ -2242,10 +2241,6 @@ export class LocalRecordTrackingService {
 
   private configuredRoots(): LocalRecordRoot[] {
     const roots: LocalRecordRoot[] = [];
-    const harborJobs = process.env.ANYSENTRY_LOCAL_HARBOR_JOBS_DIR?.trim();
-    if (harborJobs && isAbsolute(harborJobs)) {
-      roots.push({ adapter: 'codex', path: resolve(harborJobs), harborJobs: true });
-    }
     const codexRoot = this.configuredCodexRoot();
     if (codexRoot) {
       roots.push({
@@ -3464,13 +3459,6 @@ export class LocalRecordTrackingService {
           if (child.isSymbolicLink()) continue;
           const childPath = join(directory, child.name);
           if (child.isDirectory()) {
-            // A Harbor archive is job/trial/agent/sessions/YYYY/MM/DD. Never
-            // crawl verifier artifacts, task data or arbitrary task JSONL files.
-            if (configuredRoot.harborJobs) {
-              const parts = relative(root, childPath).split(sep);
-              if ((parts.length === 3 && parts[2] !== 'agent')
-                || (parts.length >= 4 && parts[3] !== 'sessions')) continue;
-            }
             // Codex stores sessions directly below its root, while A3S Code v1
             // nests them under `v1/sessions`. Recurse for both adapters; only
             // supported JSON/JSONL files become records. A3S companion folders
@@ -3493,11 +3481,6 @@ export class LocalRecordTrackingService {
                 && /^[^/]+\/chats\/(?:session-[^/]+\.jsonl?|[^/]+\/[^/]+\.jsonl)$/iu.test(normalizedPath)
               : child.isFile() && child.name.endsWith('.jsonl');
           if (!supported) continue;
-          if (configuredRoot.harborJobs) {
-            const parts = relativePath.split(sep);
-            if (parts.length < 5 || parts[2] !== 'agent' || parts[3] !== 'sessions'
-              || !child.name.startsWith('rollout-')) continue;
-          }
           if (
             relativePath.startsWith(`..${sep}`)
             || relativePath === '..'
@@ -3532,8 +3515,6 @@ export class LocalRecordTrackingService {
               size: details.size + companionStats.reduce((sum, item) => sum + item.size, 0),
               mtimeMs: Math.max(details.mtimeMs, ...companionStats.map((item) => item.mtimeMs)),
               birthtimeMs: details.birthtimeMs,
-              ...(configuredRoot.harborJobs && Number.isSafeInteger(details.dev) && Number.isSafeInteger(details.ino)
-                ? { fileIdentity: `${details.dev}:${details.ino}` } : {}),
             });
           } catch {
             // A session may rotate while discovery is running. The next refresh will retry it.

@@ -85,7 +85,6 @@ try {
   for (const agent of ['CODEX', 'A3S', 'CLAUDE', 'GEMINI', 'KIMI']) {
     process.env[`ANYSENTRY_LOCAL_${agent}_SESSIONS_DIR`] = join(dir, 'none'); delete process.env[`ANYSENTRY_LOCAL_${agent}_SESSIONS_DIRS`];
   }
-  delete process.env.ANYSENTRY_LOCAL_HARBOR_JOBS_DIR;
   const anchors = [];
   const service = new LocalRecordTrackingService({ status: () => ({ enabled: false, projection: { postgresql: false, clickhouse: false } }) }, {
     resolveBinding: async () => { throw new Error('shared SQLite FD must never bind a Session'); },
