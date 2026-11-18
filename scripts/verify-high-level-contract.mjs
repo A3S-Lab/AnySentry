@@ -17,7 +17,6 @@ const observerRoot = new URL('../Observer/', root);
 const read = (relative, base = root) => readFile(new URL(relative, base), 'utf8');
 const [
   packageText,
-  handbook,
   controller,
   judge,
   correlation,
@@ -45,7 +44,6 @@ const [
   deployment,
 ] = await Promise.all([
   read('package.json'),
-  read('docs/anysentry-trusted-correlation-and-capture-roadmap.md'),
   read('apps/api/src/security-monitoring/security-monitoring.controller.ts'),
   read('apps/api/src/security-monitoring/sentry-judge.service.ts'),
   read('apps/api/src/security-monitoring/trusted-correlation.ts'),
@@ -120,11 +118,8 @@ function assertPayloadDiscard(label, source, probe) {
 console.log('CONTRACT static-wiring-and-safety (not runtime, load, kernel-verifier, or E2E evidence)');
 
 pass('[SCOPE] package entry runs this static contract without an implicit build',
-  packageJson.scripts?.['verify:roadmap-high-level'] ===
-    'node scripts/verify-roadmap-high-level-contract.mjs');
-
-pass('[ARCH] handbook retains the control/learning and fast-data loops',
-  handbook.includes('控制与学习闭环') && handbook.includes('快速数据闭环'));
+  packageJson.scripts?.['verify:high-level-contract'] ===
+    'node scripts/verify-high-level-contract.mjs');
 
 pass('[IDENTITY] trusted correlation stays additive and never aliases legacy Trace',
   correlation.includes('TRUSTED_CORRELATION_SCHEMA_VERSION') &&
@@ -390,4 +385,4 @@ pass('[COMPAT/ENTRY-S2] package exposes S2 persistence plus off/shadow API gates
   s2Persistence.includes("assert.equal(persisted.traceId, 'legacy-trace-1')") &&
   s2Persistence.includes('trusted correlation must be additive to every canonical v1 legacy identity field'));
 
-console.log('AnySentry static High-level roadmap wiring/safety contract passed');
+console.log('AnySentry static High-level wiring/safety contract passed');

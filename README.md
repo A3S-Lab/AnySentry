@@ -242,9 +242,8 @@ can produce candidates for human review, but it cannot create a confirmed identi
 
 Start from [`deploy/agent-templates.example.json`](deploy/agent-templates.example.json) for optional
 operator-owned deployment hints. See
-[`docs/agent-discovery-filter.md`](docs/agent-discovery-filter.md) for workload identity precedence,
-event budgets, cache and queue behavior, configuration, and the observation-only enforcement
-boundary.
+[`docs/infrastructure-rules-v1.md`](docs/infrastructure-rules-v1.md) for workload identity precedence
+and the observation-only enforcement boundary.
 
 ## Security and operating boundaries
 
@@ -324,7 +323,7 @@ skills/l3/                   L3 investigation prompts
 ## Documentation
 
 - [Deployment runbook](deploy/README.md)
-- [Agent discovery and workload-aware filtering](docs/agent-discovery-filter.md)
+- [Infrastructure rules](docs/infrastructure-rules-v1.md)
 - [Performance testing](docs/performance-testing.md)
 - [AnySentry Progressive API Skill](integrations/skills/anysentry-api/SKILL.md)
 

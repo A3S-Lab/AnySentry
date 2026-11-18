@@ -1,7 +1,5 @@
 # Infrastructure rules v1
 
-后续产品与生命周期设计：[统一资产生命周期、人工身份审核与采集规则治理优化设计](./anysentry-unified-asset-lifecycle-and-capture-rule-governance.md)
-
 The authoritative API stores `anysentry.infrastructure_rule_state.v1` in PostgreSQL and publishes
 `anysentry.infrastructure_policy_snapshot.v1`. The Forwarder adapts that snapshot into the pure
 `anysentry.infrastructure_rules.v1` resolver, matches stable workload facts, and publishes the

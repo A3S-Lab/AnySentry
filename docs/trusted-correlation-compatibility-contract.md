@@ -1,9 +1,7 @@
 # Trusted correlation compatibility contract
 
-This contract is the S0 migration boundary for
-[the trusted-correlation and capture roadmap](./anysentry-trusted-correlation-and-capture-roadmap.md).
-It records the legacy consumers that must remain stable while the additive correlation view is
-introduced.
+This contract records the legacy consumers that must remain stable while the additive correlation
+view is introduced.
 
 ## Permanent compatibility rules
 
