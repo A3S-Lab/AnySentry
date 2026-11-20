@@ -38,6 +38,10 @@ function stableId(prefix: string, value: string): string {
   return `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 24)}`;
 }
 
+export function assetOnlyConversationId(agentAssetId: string): string {
+  return stableId('asset', `asset-only\u0000${agentAssetId}`);
+}
+
 function normalized(value: string | undefined): string {
   return value?.trim().toLowerCase() ?? '';
 }
@@ -1095,7 +1099,7 @@ function assetOnlySummary(
 ): T.AgentConversationSummary {
   const coverage = conversationCoverage(evidence);
   return {
-    conversationId: stableId('asset', `asset-only\u0000${asset.agentAssetId}`),
+    conversationId: assetOnlyConversationId(asset.agentAssetId),
     idSource: 'inferred',
     ...(asset.tenantId ? { tenantId: asset.tenantId } : {}),
     ...(asset.ownerId ? { ownerId: asset.ownerId } : {}),

@@ -66,6 +66,7 @@ import {
   ToolEvidenceResponse,
 } from './tool-evidence-linker';
 import {
+  assetOnlyConversationId,
   conversationCoverage,
   projectAgentConversations,
   projectConversationTimeline,
@@ -3696,12 +3697,36 @@ export class AggregationService implements OnModuleDestroy {
               totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
             }
           : undefined;
-    const [interactions, inventory] = await Promise.all([
+    const modelInteractionsPromise = resolveConversationId
+      ? Promise.resolve(undefined)
+      : this.readAgentInteractions(
+          { ...interactionQuery, interactionType: 'model' },
+          interactionReadOptions,
+        );
+    const [interactions, inventory, modelInteractions] = await Promise.all([
       this.readAgentInteractions(interactionQuery, interactionReadOptions),
       inventoryPromise,
+      modelInteractionsPromise,
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);
     });
+    if (modelInteractions?.items.length) {
+      const merged = new Map<string, T.AgentInteractionRecord>();
+      for (const item of interactions.items) merged.set(item.interactionId, item);
+      for (const item of modelInteractions.items) merged.set(item.interactionId, item);
+      interactions.items = [...merged.values()]
+        .sort((left, right) => right.at - left.at || right.interactionId.localeCompare(left.interactionId));
+      interactions.total = Math.max(interactions.total, modelInteractions.total);
+      interactions.totalMode = 'omitted';
+      interactions.coverage.partial ||= modelInteractions.coverage.partial;
+      interactions.coverage.completeness = interactions.coverage.partial ? 'partial' : interactions.coverage.completeness;
+      interactions.coverage.partialReason = interactions.coverage.partialReason
+        ?? modelInteractions.coverage.partialReason;
+      if (modelInteractions.dataSource === 'clickhouse') {
+        interactions.dataSource = 'clickhouse';
+        interactions.coverage.source = 'clickhouse+hot_delta';
+      }
+    }
     let boundInteractions = this.conversationBindings
       ? await this.conversationBindings.applyPersistedBindings(interactions.items)
       : interactions.items;
@@ -3734,6 +3759,32 @@ export class AggregationService implements OnModuleDestroy {
         byId.set(item.interactionId, item);
       }
       boundInteractions = [...byId.values()];
+    }
+    let requestedAssetOnlyId: string | undefined;
+    if (
+      requestedConversationId?.startsWith('asset_')
+      && !(exactMembershipIds?.length)
+    ) {
+      const asset = inventory.items.find((item) =>
+        assetOnlyConversationId(item.agentAssetId) === requestedConversationId);
+      if (asset) {
+        requestedAssetOnlyId = asset.agentAssetId;
+        const assetInteractions = await this.readAgentInteractions({
+          ...interactionQuery,
+          agentAssetId: asset.agentAssetId,
+          agentInstanceId: undefined,
+          model: undefined,
+          interactionType: 'model',
+        }, { totalLimit: 256 });
+        interactions.items = assetInteractions.items;
+        interactions.total = assetInteractions.total;
+        interactions.totalMode = assetInteractions.totalMode;
+        interactions.coverage = assetInteractions.coverage;
+        interactions.dataSource = assetInteractions.dataSource;
+        boundInteractions = this.conversationBindings
+          ? await this.conversationBindings.applyPersistedBindings(assetInteractions.items)
+          : assetInteractions.items;
+      }
     }
     // Cross-hop relatedConversations are expressed by directory + EvidenceLink, not by widening a
     // selected Thread into a last_1h fair sample. That scan was marking complete point-reads
@@ -3779,6 +3830,10 @@ export class AggregationService implements OnModuleDestroy {
           ? projection.summaries.find((summary) =>
             projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
               (record.canonicalSessionId ?? record.sessionId) === requestedConversationId))
+          : undefined)
+        ?? (requestedAssetOnlyId
+          ? projection.summaries.find((summary) =>
+            summary.hasContent && summary.agentAssetId === requestedAssetOnlyId)
           : undefined);
       canonicalConversationId = pointReadCanonicalConversationId({
         requestedConversationId,

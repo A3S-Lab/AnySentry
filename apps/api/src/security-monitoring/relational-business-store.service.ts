@@ -737,6 +737,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
+         ),
+         deduplicated AS (
+           SELECT DISTINCT ON (record->>'canonicalAgentInstanceId') record
+             FROM incoming
+             ORDER BY record->>'canonicalAgentInstanceId', (record->>'updatedAt')::bigint DESC
          )
          INSERT INTO anysentry_agent_runtime_instances_v2 (
            canonical_instance_id, agent_scope_id, runtime_state, last_seen_at,
@@ -750,7 +755,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
            NULLIF(record->>'endedAt', '')::bigint,
            record - 'updatedAt',
            (record->>'updatedAt')::bigint
-         FROM incoming
+         FROM deduplicated
          ON CONFLICT (canonical_instance_id) DO UPDATE SET
            agent_scope_id = EXCLUDED.agent_scope_id,
            runtime_state = EXCLUDED.runtime_state,
@@ -775,6 +780,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
+         ),
+         deduplicated AS (
+           SELECT DISTINCT ON (record->>'alias') record
+             FROM incoming
+             ORDER BY record->>'alias', (record->>'lastSeenAt')::bigint DESC
          )
          INSERT INTO anysentry_agent_runtime_instance_aliases_v1 (
            alias_instance_id, canonical_instance_id, first_seen_at, last_seen_at
@@ -784,7 +794,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
            record->>'canonical',
            (record->>'firstSeenAt')::bigint,
            (record->>'lastSeenAt')::bigint
-         FROM incoming
+         FROM deduplicated
          ON CONFLICT (alias_instance_id) DO UPDATE SET
            canonical_instance_id = EXCLUDED.canonical_instance_id,
            first_seen_at = LEAST(
