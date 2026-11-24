@@ -1143,13 +1143,18 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       )) this.segments.set(segment.segmentId, segment);
     }
 
+    const threadsByScope = new Map<string, T.AgentConversationThreadRecord[]>();
+    for (const thread of this.threads.values()) {
+      const group = threadsByScope.get(thread.logicalScopeKey) ?? [];
+      group.push(thread);
+      threadsByScope.set(thread.logicalScopeKey, group);
+    }
     for (const record of remainingUnbound.sort(compareInteraction)) {
       const scope = conversationLogicalScopeKey(record);
       const lineage = userLineage(record);
       const resultIds = new Set(record.toolResults.map((result) => result.toolCallId));
-      const candidates = [...this.threads.values()]
-        .filter((thread) => thread.logicalScopeKey === scope
-          && threadAcceptsUnboundRecord(thread, record))
+      const candidates = (threadsByScope.get(scope) ?? [])
+        .filter((thread) => threadAcceptsUnboundRecord(thread, record))
         .map((thread) => {
           const sameInstance = Boolean(record.agentInstanceId
             && thread.agentInstanceIds.includes(record.agentInstanceId));
