@@ -62,29 +62,34 @@ function canonicalJson(value: unknown): string {
 
 class EstimatedMap<K, V> extends Map<K, V> {
   estimatedBytes = 0;
+  private readonly valueBytesByKey = new Map<K, number>();
 
   private static valueBytes(value: unknown): number {
     try { return Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return 1_024; }
   }
 
   set(key: K, value: V): this {
-    const previousBytes = super.has(key) ? EstimatedMap.valueBytes(super.get(key)) : 0;
+    const previousBytes = this.valueBytesByKey.get(key) ?? 0;
     const nextBytes = EstimatedMap.valueBytes(value);
     super.set(key, value);
+    this.valueBytesByKey.set(key, nextBytes);
     this.estimatedBytes = Math.max(0, this.estimatedBytes + nextBytes - previousBytes);
     return this;
   }
 
   delete(key: K): boolean {
-    if (!super.has(key)) return false;
-    const previousBytes = EstimatedMap.valueBytes(super.get(key));
+    const previousBytes = this.valueBytesByKey.get(key) ?? 0;
     const deleted = super.delete(key);
-    if (deleted) this.estimatedBytes = Math.max(0, this.estimatedBytes - previousBytes);
+    if (deleted) {
+      this.valueBytesByKey.delete(key);
+      this.estimatedBytes = Math.max(0, this.estimatedBytes - previousBytes);
+    }
     return deleted;
   }
 
   clear(): void {
     super.clear();
+    this.valueBytesByKey.clear();
     this.estimatedBytes = 0;
   }
 }
@@ -1143,57 +1148,75 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       )) this.segments.set(segment.segmentId, segment);
     }
 
-    const threadsByScope = new Map<string, T.AgentConversationThreadRecord[]>();
+    const threadsByScope = new Map<string, Array<{
+      thread: T.AgentConversationThreadRecord;
+      agentInstanceIds: Set<string>;
+      pendingToolCallIds: Set<string>;
+    }>>();
     for (const thread of this.threads.values()) {
       const group = threadsByScope.get(thread.logicalScopeKey) ?? [];
-      group.push(thread);
+      group.push({
+        thread,
+        agentInstanceIds: new Set(thread.agentInstanceIds),
+        pendingToolCallIds: new Set(thread.pendingToolCallIds),
+      });
       threadsByScope.set(thread.logicalScopeKey, group);
     }
     for (const record of remainingUnbound.sort(compareInteraction)) {
       const scope = conversationLogicalScopeKey(record);
       const lineage = userLineage(record);
       const resultIds = new Set(record.toolResults.map((result) => result.toolCallId));
-      const candidates = (threadsByScope.get(scope) ?? [])
-        .filter((thread) => threadAcceptsUnboundRecord(thread, record))
-        .map((thread) => {
-          const sameInstance = Boolean(record.agentInstanceId
-            && thread.agentInstanceIds.includes(record.agentInstanceId));
-          const resolvesPending = thread.pendingToolCallIds.some((id) => resultIds.has(id));
-          const sameRequest = thread.lastRequestSha256 === record.request.sha256;
-          const extendedLineage = properPrefix(thread.userLineageHashes, lineage);
-          const repeatedLineage = equalLineage(thread.userLineageHashes, lineage);
-          let score = 0;
-          const evidence: string[] = [];
-          if (resolvesPending) {
-            score += 100;
-            evidence.push('tool_call_id');
+      const candidates: Array<{
+        thread: T.AgentConversationThreadRecord;
+        score: number;
+        evidence: string[];
+      }> = [];
+      for (const candidate of threadsByScope.get(scope) ?? []) {
+        const { thread } = candidate;
+        if (!threadAcceptsUnboundRecord(thread, record)) continue;
+        const sameInstance = Boolean(record.agentInstanceId
+          && candidate.agentInstanceIds.has(record.agentInstanceId));
+        let resolvesPending = false;
+        for (const id of resultIds) {
+          if (candidate.pendingToolCallIds.has(id)) {
+            resolvesPending = true;
+            break;
           }
-          if (sameRequest && sameInstance) {
-            score += 80;
-            evidence.push('request_sha256');
-          }
-          const resumableLineage = record.sessionMode !== 'per_request'
-            && record.sessionIdentityQuality !== 'ephemeral';
-          if (extendedLineage && (sameInstance || resumableLineage)) {
-            score += sameInstance ? 70 : 60;
-            evidence.push(sameInstance ? 'same_instance_lineage' : 'cli_resume_lineage');
-          } else if (sameInstance && repeatedLineage) {
-            score += 40;
-            evidence.push('same_instance_equal_lineage');
-          }
-          return { thread, score, evidence };
-        })
-        .filter((candidate) => candidate.score > 0)
-        .sort((left, right) => {
-          const score = right.score - left.score;
-          if (score) return score;
-          const lineage = right.thread.userLineageHashes.length
-            - left.thread.userLineageHashes.length;
-          if (lineage) return lineage;
-          const rightAt = BigInt(right.thread.lastActivityAtUnixNs);
-          const leftAt = BigInt(left.thread.lastActivityAtUnixNs);
-          return rightAt === leftAt ? 0 : rightAt > leftAt ? -1 : 1;
-        });
+        }
+        const sameRequest = thread.lastRequestSha256 === record.request.sha256;
+        const extendedLineage = properPrefix(thread.userLineageHashes, lineage);
+        const repeatedLineage = equalLineage(thread.userLineageHashes, lineage);
+        let score = 0;
+        const evidence: string[] = [];
+        if (resolvesPending) {
+          score += 100;
+          evidence.push('tool_call_id');
+        }
+        if (sameRequest && sameInstance) {
+          score += 80;
+          evidence.push('request_sha256');
+        }
+        const resumableLineage = record.sessionMode !== 'per_request'
+          && record.sessionIdentityQuality !== 'ephemeral';
+        if (extendedLineage && (sameInstance || resumableLineage)) {
+          score += sameInstance ? 70 : 60;
+          evidence.push(sameInstance ? 'same_instance_lineage' : 'cli_resume_lineage');
+        } else if (sameInstance && repeatedLineage) {
+          score += 40;
+          evidence.push('same_instance_equal_lineage');
+        }
+        if (score > 0) candidates.push({ thread, score, evidence });
+      }
+      candidates.sort((left, right) => {
+        const score = right.score - left.score;
+        if (score) return score;
+        const lineage = right.thread.userLineageHashes.length
+          - left.thread.userLineageHashes.length;
+        if (lineage) return lineage;
+        const rightAt = BigInt(right.thread.lastActivityAtUnixNs);
+        const leftAt = BigInt(left.thread.lastActivityAtUnixNs);
+        return rightAt === leftAt ? 0 : rightAt > leftAt ? -1 : 1;
+      });
       const best = candidates[0];
       const tied = best && candidates[1]?.score === best.score
         && candidates[1].thread.userLineageHashes.length === best.thread.userLineageHashes.length;

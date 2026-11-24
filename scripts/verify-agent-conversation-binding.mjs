@@ -1236,12 +1236,27 @@ assert.ok(
     const afterWrites = serializations;
     for (let index = 0; index < 20; index += 1) statsService.hotStateStats();
     assert.equal(serializations, afterWrites, 'hot-state stats must not reserialize every record');
+    const beforeReplace = statsService.hotStateStats().estimatedBytes;
+    const previousValue = statsService.bindings.get('mi_hot_state_0');
+    const replacement = { ...previousValue, conversationId: 'cv_hot_state_replaced' };
+    statsService.bindings.set('mi_hot_state_0', replacement);
+    assert.equal(serializations, afterWrites + 1,
+      'replacing a record must serialize only the new value');
+    assert.equal(statsService.hotStateStats().estimatedBytes,
+      beforeReplace + Buffer.byteLength(originalStringify(replacement), 'utf8')
+        - Buffer.byteLength(originalStringify(previousValue), 'utf8'),
+      'replacing a record must adjust the estimate by the cached size delta');
     const beforeDelete = statsService.hotStateStats().estimatedBytes;
     statsService.bindings.delete('mi_hot_state_0');
     assert.ok(statsService.hotStateStats().estimatedBytes < beforeDelete,
       'deleting a record must decrement the incremental byte estimate');
     assert.equal(serializations, afterWrites + 1,
-      'only the deleted value may be serialized during incremental accounting');
+      'deleting a record must reuse its cached size without serialization');
+    statsService.bindings.clear();
+    assert.equal(statsService.hotStateStats().estimatedBytes, 0,
+      'clearing hot state must reset the incremental byte estimate');
+    assert.equal(serializations, afterWrites + 1,
+      'clearing hot state must not serialize retained values');
   } finally {
     JSON.stringify = originalStringify;
   }
