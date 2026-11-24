@@ -4795,6 +4795,25 @@ export interface InteractionResponseObservation {
         protocol: "codex_app_server";
         outputScope: "codex_thread_agent_message";
         itemId: string;
+      }
+    | {
+        protocol: "responses_api" | "messages_api" | "generate_content_api" | "chat_completions_api";
+        outputScope: "llm_response_assistant_message";
+        requestPath: string;
+        transportProtocol: "http1" | "websocket";
+        providerHost: string;
+        endpointAttribution:
+          | "observed_headers"
+          | "observed_handshake"
+          | "configured_endpoint"
+          | "configured_late_attach";
+        model?: string;
+        statusCode?: number;
+        finishReason?: string;
+        inputTokens?: number;
+        outputTokens?: number;
+        totalTokens?: number;
+        toolCalls?: { id?: string; name: string }[];
       };
   capture: {
     captureMethod: "ebpf_stdout" | "codex_app_server";

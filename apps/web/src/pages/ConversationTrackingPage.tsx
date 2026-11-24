@@ -1575,6 +1575,7 @@ export default function LocalRecordTrackingPage() {
   async function loadOlder() {
     if (!selectedRecordId || nextBeforeOffset === undefined || olderRequest.loading) return;
     const page = await olderRequest.runAsync(selectedRecordId, nextBeforeOffset);
+    if (!page) return;
     setOlderEvents((current) => [...page.events, ...current]);
     setOlderBeforeOffset(page.page.nextBeforeOffset);
     setOlderHasMore(page.page.hasMore);

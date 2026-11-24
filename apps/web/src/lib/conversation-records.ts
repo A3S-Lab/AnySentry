@@ -61,7 +61,7 @@ function toRecordSummary(item: InteractionConversationSummary): LocalRecordSumma
   };
 }
 
-function synthesizedStatus(items: LocalRecordSummary[]): LocalRecordTrackingStatus {
+function synthesizedStatus(items: LocalRecordSummary[], updateTime: string): LocalRecordTrackingStatus {
   return {
     schemaVersion: "anysentry.local-record-tracking-status.v1",
     enabled: true,
@@ -74,13 +74,16 @@ function synthesizedStatus(items: LocalRecordSummary[]): LocalRecordTrackingStat
     contentSource: "local_session_files",
     systemEvidence: "unavailable",
     processObservation: {
-      schemaVersion: "anysentry.local-record-process-observation.v1",
       enabled: false,
-      bound: 0,
-      unbound: items.length,
-      scanErrors: 0,
+      available: false,
+      source: "not_configured",
     },
-  } as LocalRecordTrackingStatus;
+    limitations: [
+      "Process binding is unavailable for observer-captured plaintext conversations.",
+      "Content is limited to retained observer plaintext evidence.",
+    ],
+    updateTime,
+  };
 }
 
 export async function conversationRecordList(query: { limit?: number } = {}): Promise<LocalRecordList> {
@@ -91,7 +94,7 @@ export async function conversationRecordList(query: { limit?: number } = {}): Pr
   const count = (predicate: (item: LocalRecordSummary) => boolean) => items.filter(predicate).length;
   return {
     schemaVersion: "anysentry.local-record-list.v1",
-    status: synthesizedStatus(items),
+    status: synthesizedStatus(items, list.updateTime),
     items,
     total: list.total,
     aggregates: {
@@ -264,7 +267,8 @@ export async function conversationRecordDetail(
     tokenUsage: record.tokenUsage,
   };
   const contentObserved = detail.observations.some(
-    (observation) => observation.contentAvailability === "available",
+    (observation) => observation.eventType !== "LlmTransportObserved"
+      && observation.contentAvailability === "available",
   );
   return {
     schemaVersion: "anysentry.local-record-detail.v1",
