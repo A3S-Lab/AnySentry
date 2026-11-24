@@ -15,7 +15,6 @@ import {
   type ClickHouseSettings,
 } from "@clickhouse/client";
 import { createHash, randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
 import {
   agentIdentityKeyForEvent,
   agentRuntimeInstanceIdForEvent,
@@ -9760,9 +9759,8 @@ export class ClickHouseStore {
           });
         };
         if (typeof result.stream === 'function') {
-          const lines = createInterface({ input: result.stream(), crlfDelay: Infinity });
-          for await (const line of lines) {
-            if (line.trim()) append(JSON.parse(line) as Parameters<typeof append>[0]);
+          for await (const rows of result.stream()) {
+            for (const row of rows) append(row.json() as Parameters<typeof append>[0]);
           }
         } else {
           const rows = (await result.json()) as Array<Parameters<typeof append>[0]>;

@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
+import { ResultSet } from '../apps/api/node_modules/@clickhouse/client/dist/index.js';
 import {
   AggregationService,
   BoundedHistoryQueryGate,
@@ -161,13 +162,13 @@ fake.state.calls.length = 0;
     async query(options) {
       calls.push(options);
       const ids = options.query_params.interactionIds;
-      const lines = ids.flatMap((interactionId) => [
-        JSON.stringify({ interactionId, revision: 1, payload: 'old-revision' }),
-        JSON.stringify({ interactionId, revision: 2, payload: 'latest-revision' }),
-      ]);
+      const rows = ids.flatMap((interactionId) => [
+        { interactionId, revision: 1, payload: 'old-revision' },
+        { interactionId, revision: 2, payload: 'latest-revision' },
+      ]).map((row) => ({ text: JSON.stringify(row), json: () => row }));
       return {
         stream() {
-          return Readable.from(lines.map((line) => `${line}\n`));
+          return Readable.from([rows]);
         },
         async json() {
           throw new Error('payload streaming must not fall back to whole-document JSON parsing');
@@ -182,6 +183,24 @@ fake.state.calls.length = 0;
   assert.equal(calls[0].query_params.interactionIds.length, 64);
   assert.equal(calls[1].query_params.interactionIds.length, 1);
   for (const payload of payloads.values()) assert.equal(payload, 'latest-revision');
+}
+
+// Exercise the actual @clickhouse/client ResultSet contract: stream chunks are arrays of Row
+// objects with json(), not JSON text lines.
+{
+  const result = ResultSet.instance({
+    stream: Readable.from([
+      Buffer.from('{"interactionId":"mi_real_result_set","revision":1,"payload":"real-row"}\n'),
+    ]),
+    format: 'JSONEachRow',
+    query_id: 'verify-payload-stream',
+    response_headers: new Headers(),
+  });
+  const resultStore = new ClickHouseStore();
+  resultStore.ready = true;
+  resultStore.client = { async query() { return result; } };
+  const payloads = await resultStore.queryAgentInteractionPayloadsByIds(['mi_real_result_set']);
+  assert.equal(payloads.get('mi_real_result_set'), 'real-row');
 }
 
 // contentQuery pushes a parameterized case-insensitive payload predicate down to ClickHouse.
