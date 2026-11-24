@@ -46,8 +46,12 @@ SERVICES=(
   anysentry-composite-judge.service
   anysentry-supply-chain.service
   anysentry-observer.service
+  anysentry-prometheus.service
+  anysentry-node-exporter.service
+  anysentry-postgresql.service
 )
 START_SERVICES=(
+  anysentry-postgresql.service
   anysentry-clickhouse.service
   anysentry-redis.service
   anysentry-kafka.service
@@ -62,8 +66,15 @@ START_SERVICES=(
   anysentry-composite-judge.service
   anysentry-supply-chain.service
   anysentry-observer.service
+  anysentry-prometheus.service
+  anysentry-node-exporter.service
+  anysentry-postgresql.service
 )
 STOP_SERVICES=(
+  anysentry.service
+  anysentry-postgresql.service
+  anysentry-node-exporter.service
+  anysentry-prometheus.service
   anysentry-observer.service
   anysentry-supply-chain.service
   anysentry-composite-judge.service
@@ -230,6 +241,9 @@ write_install_summary() {
     printf 'a3s_code_runtime=%s\n' "$A3S_CODE_RUNTIME"
     printf 'startup_failures=%s\n' "$START_FAILURES"
   } >"$INSTALL_LOG_ROOT/summary.txt"
+echo "Data retention hint: observation data grows ~2GB/day. Schedule "
+echo "  bash $(dirname "$0")/anysentry-data-cleanup.sh --keep-days 3 --yes periodically"
+echo "  (cron) to keep disk usage bounded."
   echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
 }
 
@@ -503,6 +517,12 @@ preflight() {
   validate_redis_runtime
   collector_version=$("$PACKAGE_ROOT/observer/bin/a3s-observer-collector" --version 2>&1) ||
     fail "bundled Observer cannot execute: $collector_version"
+  prometheus_version=$("$PACKAGE_ROOT/prometheus/bin/prometheus" --version 2>&1) ||
+    fail "bundled Prometheus cannot execute: $prometheus_version"
+  node_exporter_version=$("$PACKAGE_ROOT/prometheus/bin/node_exporter" --version 2>&1) ||
+    fail "bundled node_exporter cannot execute: $node_exporter_version"
+  LD_LIBRARY_PATH="$PACKAGE_ROOT/postgresql/lib" "$PACKAGE_ROOT/postgresql/bin/postgres" --version >/dev/null 2>&1 ||
+    fail "bundled PostgreSQL cannot execute"
   validate_bpf_abi
   free_kb=$(df -Pk "${INSTALL_PARENT:-/}" 2>/dev/null | awk 'NR == 2 {print $4}')
   [[ -n $free_kb ]] || free_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
@@ -518,6 +538,14 @@ stop_services() {
 }
 
 start_available_services() {
+  # Bundled PostgreSQL bootstrap: idempotent initdb + database + env wiring.
+  if [[ -x $INSTALL_ROOT/init-postgresql.sh ]]; then
+    bash $INSTALL_ROOT/init-postgresql.sh >>"$INSTALL_LOG_ROOT/postgresql-bootstrap.txt" 2>&1 || true
+    if grep -q '^ANYSENTRY_DATABASE_URL=' "$ENV_FILE" 2>/dev/null; then
+      systemctl restart anysentry.service
+      echo 'PostgreSQL bootstrap: relational lane enabled, API restarted'
+    fi
+  fi
   local unit
   for unit in "${START_SERVICES[@]}"; do
     [[ -f $SYSTEMD_DIR/$unit ]] || continue
@@ -644,11 +672,43 @@ wait_for_flink() {
   wait_for_url http://127.0.0.1:8081/overview
 }
 
+wire_postgresql_paths() {
+  # Debian-built postgres resolves share/ and lib/ from compiled-in absolute paths
+  # (/usr/share/postgresql/13, /usr/lib/postgresql/13/lib). Point them at the bundled
+  # tree; a system PostgreSQL already occupying those paths aborts the install.
+  install -d -m 0755 /usr/share/postgresql /usr/lib/postgresql/13
+  local pair link target missing=()
+  for pair in "/usr/share/postgresql/13:$INSTALL_ROOT/postgresql/share" \
+              "/usr/lib/postgresql/13/lib:$INSTALL_ROOT/postgresql/lib"; do
+    link=${pair%%:*}
+    target=${pair#*:}
+    if [[ -e $link && ! -L $link ]]; then
+      fail "$link exists and is not a symlink (system PostgreSQL conflict?)"
+    fi
+    ln -sfn "$target" "$link"
+  done
+  [[ -f $INSTALL_ROOT/postgresql/share/postgres.bki ]] || missing+=('postgres.bki')
+  [[ -d $INSTALL_ROOT/postgresql/share/timezonesets ]] || missing+=('timezonesets/')
+  [[ -d $INSTALL_ROOT/postgresql/share/timezone ]] || missing+=('timezone/')
+  ((${#missing[@]} == 0)) || fail "bundled PostgreSQL share incomplete: ${missing[*]}"
+  [[ -e /usr/share/postgresql/13/timezonesets ]] || fail "share symlink not effective"
+}
+
+wait_for_postgresql() {
+  local i
+  for i in $(seq 1 60); do
+    LD_LIBRARY_PATH=$INSTALL_ROOT/postgresql/lib \
+      "$INSTALL_ROOT/postgresql/bin/pg_isready" -h 127.0.0.1 -p 5432 -q 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
 record_unit_startup_log() {
   local unit=$1 name=$2 dest errors
   dest=$INSTALL_LOG_ROOT/startup-$name.log
   errors=$INSTALL_LOG_ROOT/startup-$name.errors.txt
-  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 200 \
+  journalctl -u "$unit" --since "$INSTALL_START_TIME" --no-pager -o short-precise -n 2000 \
     >"$dest" 2>&1 || true
   echo "----- $name ($unit) startup journal: $dest -----"
   if grep -E -i 'error|fail|exception|cannot find module|libzvec|GLIBC_|@a3s-lab/code' \
@@ -748,6 +808,27 @@ activate_release() {
   done
   systemctl daemon-reload
   : >"$INSTALL_LOG_ROOT/startup-failures.txt"
+  set_stage wire-postgresql-paths
+  wire_postgresql_paths
+  set_stage start-postgresql
+  if [[ -x /init-postgresql.sh ]]; then
+    # Pre-start pass: initdb on a fresh PGDATA (script exits 0 after initdb —
+    # DB creation and env wiring happen post-start). Without this, postgres
+    # starts against an empty cluster directory and crash-loops.
+    bash "/init-postgresql.sh" >>"/postgresql-bootstrap.txt" 2>&1 ||
+      remember_start_failure "PostgreSQL initdb pass failed"
+  fi
+  start_unit anysentry-postgresql.service postgresql
+  if systemctl is-active --quiet anysentry-postgresql.service; then
+    wait_for_postgresql || remember_start_failure "PostgreSQL readiness timeout"
+  fi
+  if [[ -x $INSTALL_ROOT/init-postgresql.sh ]]; then
+    # Fresh installs need the post-start pass: CREATE DATABASE + DATABASE_URL wiring.
+    bash "$INSTALL_ROOT/init-postgresql.sh" >>"$INSTALL_LOG_ROOT/postgresql-bootstrap.txt" 2>&1 ||
+      remember_start_failure "PostgreSQL bootstrap failed"
+    grep -q '^ANYSENTRY_DATABASE_URL=' "$ENV_FILE" 2>/dev/null &&
+      echo 'PostgreSQL bootstrap: relational lane wired (ANYSENTRY_DATABASE_URL present)'
+  fi
   set_stage start-clickhouse
   start_unit anysentry-clickhouse.service clickhouse
   if systemctl is-active --quiet anysentry-clickhouse.service; then
@@ -774,8 +855,32 @@ activate_release() {
   start_unit anysentry-flink-job.service flink-job
   set_stage start-api-and-observer
   systemctl enable anysentry.service anysentry-observer.service
-  if ! systemctl start anysentry.service anysentry-observer.service; then
+  # compat22: a pre-install manual pipeline (collector + forwarder left from field
+  # debugging) survives installs and runs beside the systemd supervisor: two collectors
+  # compete for the BPF map budget and both write collector_heartbeats (field
+  # 2026-11-06: drop counter alternated 0 <-> 41.6M across the acceptance window). Kill
+  # anything not owned by the units we are about to start.
+  for _pid in $(pgrep -f 'a3s-observer-collector' 2>/dev/null; pgrep -f 'observer-forward' 2>/dev/null); do
+    echo "stopping stray observer process pid=$_pid before observer start"
+    kill "$_pid" 2>/dev/null || true
+  done
+  sleep 2
+  for _pid in $(pgrep -f 'a3s-observer-collector' 2>/dev/null; pgrep -f 'observer-forward' 2>/dev/null); do
+    echo "force-killing stray observer process pid=$_pid"
+    kill -9 "$_pid" 2>/dev/null || true
+  done
+  # compat19: start the API alone and wait for healthz BEFORE starting the observer.
+  # Starting both at once raced the forwarder into the API reboot window (field
+  # 2026-11-05: ECONNRESET x N, verify's smoke event missed its retry budget).
+  if ! systemctl start anysentry.service; then
     systemctl start --job-mode=ignore-dependencies anysentry.service || true
+  fi
+  api_port=$(env_value PORT "$ENV_FILE")
+  [[ -n $api_port ]] || api_port=29653
+  if ! wait_for_url "http://127.0.0.1:$api_port/security-center/healthz"; then
+    remember_start_failure "API did not become healthy before observer start"
+  fi
+  if ! systemctl start anysentry-observer.service; then
     systemctl start --job-mode=ignore-dependencies anysentry-observer.service || true
   fi
   sleep 2
@@ -802,12 +907,96 @@ activate_release() {
   start_unit anysentry-stream-worker.service stream-worker
   start_unit anysentry-composite-judge.service composite-judge
   start_unit anysentry-supply-chain.service supply-chain
+  set_stage start-monitoring
+  start_unit anysentry-prometheus.service prometheus
+  start_unit anysentry-node-exporter.service node-exporter
   capture_diagnostics activation
   finish_if_start_failures
+  set_stage wait-observer-delivery
+  # compat20: after a full-stack restart the forwarder's first delivery lands
+  # 90-120s in (field: hb bursts at +2min across installs) while verify's own
+  # window starts immediately and misses it. Poll until the observer source's
+  # acceptedEvents actually moves, then let verify take its baseline.
+  admin_token=$(env_value ANYSENTRY_ADMIN_TOKEN "$ENV_FILE")
+  api_port=$(env_value PORT "$ENV_FILE")
+  [[ -n $api_port ]] || api_port=29653
+  obs_sid=$(env_value ANYSENTRY_SOURCE_ID "$ENV_FILE")
+  if [[ -n $admin_token && -n $obs_sid ]]; then
+    _poll_body="{\"sourceId\":\"$obs_sid\",\"limit\":5}"
+    _acc_of() { curl -sS -m 8 -X POST "http://127.0.0.1:$api_port/security-center/sources/list"       -H 'Content-Type: application/json' -H "Authorization: Bearer $admin_token"       --data "$_poll_body" 2>/dev/null | grep -o '"acceptedEvents":[0-9]*' | head -1 | cut -d: -f2; }
+    _base=$(_acc_of); _prev=${_base:-0}
+    for _ in $(seq 1 60); do
+      sleep 3
+      _now=$(_acc_of); _now=${_now:-0}
+      if [[ $_now =~ ^[0-9]+$ && $_prev =~ ^[0-9]+$ && $_now -gt $_prev ]]; then
+        echo "observer delivery confirmed (acceptedEvents $_prev -> $_now)"
+        break
+      fi
+      _prev=$_now
+    done
+  fi
+  # compat23: the kernel-side unknown-file drop policy must actually reach the collector
+  # process (field 2026-11-08: fileFilterMetrics reported enabled=false/epoch=0 with no
+  # snapshot-load line in the journal, so the storm valve was silently absent).
+  _cpid=$(pgrep -f 'a3s-observer-collector' | head -1)
+  if [[ -n $_cpid ]]; then
+    _pol=$(tr '\0' '\n' < "/proc/$_cpid/environ" 2>/dev/null | sed -n 's/^A3S_OBSERVER_FILE_UNKNOWN_POLICY=//p' | head -1)
+    _backend=$(cat "$INSTALL_ROOT/observer/BACKEND" 2>/dev/null || true)
+    if [[ $_backend == perf-kprobe-legacy ]]; then
+      # compat24 postmortem: kernel-side file filtering is a modern-backend feature; the 4.19
+      # legacy backend does not consume this variable (userspace aggregation + delivery SLO
+      # backstop the pipeline). Keep the plumbing check, do not imply kernel enforcement.
+      echo "collector unknown-file policy: ${_pol:-unset} (plumbed; kernel-side enforcement requires the modern backend - legacy relies on userspace aggregation + delivery SLO)"
+    else
+      echo "collector unknown-file policy: ${_pol:-unset} (expect drop)"
+      if [[ ${_pol:-} != drop ]]; then
+        echo "WARN: unknown-file policy did not reach the collector; file-event storms can saturate the pipeline"
+      fi
+    fi
+  fi
+  # compat22: the delivery gate must end with exactly one collector heartbeating. Two
+  # writers mean a stray pipeline survived the cleanup and is stealing BPF budget.
+  _ch_user=$(env_value CLICKHOUSE_USER "$ENV_FILE")
+  _ch_pass=$(env_value CLICKHOUSE_PASSWORD "$ENV_FILE")
+  if [[ -n $_ch_user && -n $_ch_pass ]]; then
+    _writers=$(curl -sS -m 8 --data-binary \
+      "SELECT uniqExact(JSONExtractString(payload,'collectorId')) FROM collector_heartbeats WHERE at >= (now() - 300) * 1000" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" 2>/dev/null | tr -d '[:space:]')
+    if [[ $_writers =~ ^[0-9]+$ && $_writers -gt 1 ]]; then
+      echo "observer heartbeat writers in last 5m: $_writers (expected 1)"
+      remember_start_failure "multiple collector heartbeat writers detected"
+    fi
+  fi
+
   set_stage verify-activation
   "$INSTALL_ROOT/verify.sh" 2>&1 | tee "$INSTALL_LOG_ROOT/verify.log" ||
     fail "activation verification failed"
   ACTIVATED=0
+
+  # compat23: backfill the interaction payload projection only after verify passed. Scheduling
+  # it from API bootstrap made the 9.7 GB part rewrite compete with the activation window on a
+  # loaded box and helped push collector delivery past its SLO (field 2026-11-08). The API also
+  # self-heals this after 10 minutes of uptime when the migration key is still unrecorded.
+  _ch_user=$(env_value CLICKHOUSE_USER "$ENV_FILE")
+  _ch_pass=$(env_value CLICKHOUSE_PASSWORD "$ENV_FILE")
+  if [[ -n $_ch_user && -n $_ch_pass ]]; then
+    _mat_done=$(curl -sS -m 15 --data-binary \
+      "SELECT count() FROM system.mutations WHERE table = 'agent_interactions_v1' AND NOT is_done AND command LIKE '%interaction_payload_by_id%'" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n $_mat_done && $_mat_done != "0" ]]; then
+      echo "interaction payload projection materialize already in progress"
+    else
+      curl -sS -m 20 --data-binary \
+        "ALTER TABLE anysentry.agent_interactions_v1 MATERIALIZE PROJECTION interaction_payload_by_id SETTINGS mutations_sync = 0" \
+        "http://127.0.0.1:8123/" -u "$_ch_user:$_ch_pass" >/dev/null 2>&1 \
+        && echo "interaction payload projection materialize scheduled (post-verify)" \
+        || echo "WARN: projection materialize scheduling failed; API self-heals after 10m uptime"
+    fi
+    _now_ms=$(( $(date +%s) * 1000 ))
+    curl -sS -m 10 --data-binary \
+      "INSERT INTO anysentry.config (key, value, updated_at) FORMAT JSONEachRow {"key":"schema.agent_interactions.payload_projection.v1","value":"scheduled","updated_at":$_now_ms}" \
+      "http://127.0.0.1:8123/?database=anysentry" -u "$_ch_user:$_ch_pass" >/dev/null 2>&1 || true
+  fi
 }
 
 main() {
@@ -846,7 +1035,8 @@ main() {
     "$STATE_DIR/flink" "$STATE_DIR/flink/log" \
     "$STATE_DIR/flink/checkpoints" "$STATE_DIR/flink/savepoints" \
     "$STATE_DIR/flink/blob" "$STATE_DIR/flink/tmp" "$STATE_DIR/l3" \
-    "$STATE_DIR/a3s-memory" "$STATE_DIR/a3s-l2-workspace" "$LOG_DIR"
+    "$STATE_DIR/a3s-memory" "$STATE_DIR/a3s-l2-workspace" \
+    "$STATE_DIR/prometheus" "$STATE_DIR/forwarder" "$STATE_DIR/postgresql" "$LOG_DIR"
   set_stage normalize-configuration
   install_environment 2>&1 | tee "$INSTALL_LOG_ROOT/config-validation.txt"
   set_stage persist-resource-configuration
@@ -858,6 +1048,8 @@ main() {
   [[ ! -f $ROLLBACK_ENV ]] || rm -f "$ROLLBACK_ENV"
   set_stage completed
   echo "AnySentry installation or upgrade completed. Dashboard: http://<host>:$(env_value PORT "$ENV_FILE")/"
+  [[ -f $INSTALL_ROOT/VERSION ]] &&
+    echo "Installed release: $(sed -n 's/^RELEASE_VERSION=//p' "$INSTALL_ROOT/VERSION")"
   [[ $HAD_PREVIOUS -eq 0 ]] || echo "Previous program retained for rollback: $ROLLBACK_ROOT"
 }
 

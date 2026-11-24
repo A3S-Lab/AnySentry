@@ -3,13 +3,14 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 ensure_stage
 
-for dir in app runtime native clickhouse redis observer l3 java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
+for dir in app runtime native clickhouse redis observer l3 prometheus postgresql java kafka flink diagnostics; do [[ -d "$STAGE_DIR/$dir" ]] || die "staged component missing: $dir"; done
 
 install -d -m 0755 "$STAGE_DIR/config" "$STAGE_DIR/systemd"
 for file in config/anysentry.env.example config/clickhouse-config.xml config/clickhouse-users.xml config/redis.conf config/kafka-server.properties config/flink-config.yaml; do install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-config.xml" "$STAGE_DIR/clickhouse/etc/config.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/clickhouse-users.xml" "$STAGE_DIR/clickhouse/etc/users.d/anysentry.xml"
 install -m 0644 "$CHANNEL_DIR/package/config/redis.conf" "$STAGE_DIR/redis/etc/redis.conf"
+install -m 0644 "$CHANNEL_DIR/package/config/prometheus.yml" "$STAGE_DIR/prometheus/conf/prometheus.yml"
 install -d -m 0755 "$STAGE_DIR/kafka/config"
 install -m 0644 "$CHANNEL_DIR/package/config/kafka-log4j2.yaml" "$STAGE_DIR/kafka/config/log4j2.yaml"
 install -m 0644 "$CHANNEL_DIR/package/config/kafka-tools-log4j2.yaml" "$STAGE_DIR/kafka/config/tools-log4j2.yaml"
@@ -28,7 +29,10 @@ for file in \
   systemd/anysentry-stream-worker.service \
   systemd/anysentry-composite-judge.service \
   systemd/anysentry-supply-chain.service \
-  systemd/anysentry-observer.service
+  systemd/anysentry-observer.service \
+  systemd/anysentry-prometheus.service \
+  systemd/anysentry-node-exporter.service \
+  systemd/anysentry-postgresql.service
 do
   install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
 done
@@ -39,7 +43,7 @@ install -m 0644 "$CHANNEL_DIR/package/AnySentry脚本说明.md" "$STAGE_DIR/AnyS
 install -m 0644 "$CHANNEL_DIR/package/现场问题采集.md" "$STAGE_DIR/现场问题采集.md"
 install -m 0644 "$CHANNEL_DIR/package/UOS现场诊断规则.md" "$STAGE_DIR/UOS现场诊断规则.md"
 install -m 0644 "$CHANNEL_DIR/package/DIAGNOSTICS.md" "$STAGE_DIR/diagnostics/DIAGNOSTICS.md"
-for file in install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh anysentry-services.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
+for file in install.sh init-postgresql.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh wait-clickhouse.sh run-l3-worker.sh run-kafka.sh init-kafka-topics.sh run-flink.sh uninstall.sh anysentry-services.sh; do install -m 0755 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"; done
 install -m 0755 "$CHANNEL_DIR/package/provision-observer.mjs" "$STAGE_DIR/provision-observer.mjs"
 install -d -m 0755 "$STAGE_DIR/glm-lab"
 for file in Dockerfile requirements.txt app.py server.py mcp_server.py glm.env.example GLM观测测试.md .dockerignore; do
@@ -59,6 +63,8 @@ source "$BUILD_DIR/source-provenance.env"
   printf 'CLICKHOUSE_VERSION=%s\nCLICKHOUSE_PROFILE=%s\nREDIS_VERSION=%s\nNODE_VERSION=%s\nA3S_CODE_VERSION=%s\nSENTRY_NPM_VERSION=%s\n' "$CLICKHOUSE_VERSION" "$CLICKHOUSE_PROFILE" "$REDIS_VERSION" "$NODE_VERSION" "$CODE_VERSION" "$SENTRY_NPM_VERSION"
   printf 'JAVA_VERSION=%s\nKAFKA_VERSION=%s\nFLINK_VERSION=%s\nFLINK_KAFKA_CONNECTOR_VERSION=%s\nPUBLIC_BASE_PATH=/anysentry\n' "$JAVA_DISPLAY_VERSION" "$KAFKA_VERSION" "$FLINK_VERSION" "$FLINK_KAFKA_CONNECTOR_VERSION"
 } > "$STAGE_DIR/VERSION"
+grep -q "^RELEASE_VERSION=$RELEASE_VERSION$" "$STAGE_DIR/VERSION" ||
+  die "VERSION file mislabelled (expected $RELEASE_VERSION)"
 {
   cat "$STAGE_DIR/VERSION"
   printf 'REDIS_SOURCE_SHA256=%s\n' "$REDIS_SOURCE_SHA256"

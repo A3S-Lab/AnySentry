@@ -1,0 +1,27 @@
+[Unit]
+Description=AnySentry bundled PostgreSQL (canonical relational lane, loopback)
+After=network.target
+Before=anysentry.service
+
+[Service]
+Type=simple
+User=anysentry
+Group=anysentry
+Environment=PGDATA=/var/lib/anysentry/postgresql
+Environment=LD_LIBRARY_PATH=/opt/anysentry/postgresql/lib
+ExecStart=/opt/anysentry/postgresql/bin/postgres -D /var/lib/anysentry/postgresql -c listen_addresses=127.0.0.1 -c port=5432
+ExecReload=/bin/kill -HUP $MAINPID
+StateDirectory=anysentry/postgresql
+StateDirectoryMode=0750
+RuntimeDirectory=postgresql
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/anysentry/postgresql /run/postgresql
+
+[Install]
+WantedBy=multi-user.target

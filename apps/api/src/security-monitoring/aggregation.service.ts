@@ -1,3 +1,4 @@
+import { resolveFileFilterView, resolveMetadataView } from './health-views';
 import { Injectable, OnModuleDestroy, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { Sentry } from '@a3s-lab/sentry';
 import { createHash } from 'node:crypto';
@@ -65,6 +66,7 @@ import {
   ToolEvidenceResponse,
 } from './tool-evidence-linker';
 import {
+  assetOnlyConversationId,
   conversationCoverage,
   projectAgentConversations,
   projectConversationTimeline,
@@ -199,6 +201,12 @@ const EVENT_SOURCES: T.EventSource[] = ['observer', 'synthetic', 'api'];
 const ACTIVE_MS = 5 * 60_000;
 const STALE_MS = 60 * 60_000;
 const COLLECTOR_STALE_MS = 3 * 60_000;
+// compat32: skip storing non-LLM (unparsed) interactions entirely. Egress events already
+// capture the network metadata; these records were 168K rows/day of health-check noise.
+const SKIP_UNPARSED_INTERACTIONS = process.env.ANYSENTRY_SKIP_UNPARSED_INTERACTIONS !== 'false';
+// compat30: honor the last-known raw heartbeat this long past the stale bound
+// before falling back to forwarder-shaped rows (zeros). Field 2026-11-11.
+const COLLECTOR_LAST_KNOWN_GRACE_MS = 15 * 60_000;
 const COLLECTOR_DOWN_MS = 10 * 60_000;
 // Without an explicit de-registration fact, retain a silent Collector as down for one operational
 // day, then archive it from the default summary. Explicit collectorId deep links remain queryable.
@@ -309,7 +317,12 @@ export function deliveryEvaluation(
   }
   if ((metrics.protectedQueueDropped ?? 0) > 0) hard.push('protected_queue_pressure');
   if (metrics.spoolAtCapacity || metrics.spoolWalAtCapacity) hard.push('spool_at_capacity');
-  if ((metrics.spoolRecords ?? 0) > 0 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
+  // A real delivery backlog is a growing live set, not a handful of stranded records: collector
+  // restarts can park one or two exhausted records in the durable spool that never age out
+  // (field 2026-11-08: single stuck records aged 53 minutes kept this channel hard-degraded for
+  // hours while the pipeline itself had fully drained). Parked records stay visible through the
+  // soft spool_backlog reason below; the hard SLO now requires an actual live backlog.
+  if ((metrics.spoolRecords ?? 0) >= 16 && (metrics.spoolOldestAgeMs ?? 0) >= 60_000) {
     hard.push('spool_backlog_over_slo');
   }
   if ((metrics.queueParked ?? 0) > 0) soft.push('queue_parked');
@@ -968,6 +981,23 @@ function semanticResultForCall(
     .at(0);
 }
 
+async function boundedAbortableRelationRead<T>(
+  factory: (signal: AbortSignal) => Promise<T>,
+  fallback: T,
+  timeoutMs = 1_500,
+): Promise<{ value: T; failed: boolean }> {
+  const controller = new AbortController();
+  try {
+    return await boundedRelationRead(factory(controller.signal), fallback, timeoutMs);
+  } finally {
+    // An abandoned read must also stop the server work: the bare-promise variant kept the
+    // ClickHouse response downloading and JSON-parsing on the event loop long after the caller
+    // had fallen back to the hot ring (UOS 2026-11-06: tens of MiB per conversations call).
+    // Aborting after a settled read is a no-op.
+    controller.abort();
+  }
+}
+
 async function boundedRelationRead<T>(
   operation: Promise<T>,
   fallback: T,
@@ -1454,6 +1484,7 @@ export class AggregationService implements OnModuleDestroy {
   private readonly interactionHotMaxRecords = 2_000;
   private readonly interactionHotMaxBytes = 64 * 1024 * 1024;
   private interactionHotEvictions = 0;
+  private unparsedSkippedCount = 0;
   private interactionHotExpired = 0;
   private interactionHotDropped = 0;
   private readonly conversationProjectionGate = new BoundedHistoryQueryGate(
@@ -2879,6 +2910,14 @@ export class AggregationService implements OnModuleDestroy {
       this.conversationProjectionRecent.clear();
       this.conversationProjectionRecentBytes = 0;
     }
+    // compat32: non-LLM (unparsed) interactions are pure noise - health checks and
+    // internal API calls that nobody reads. Skip CH insertion entirely; the counters
+    // below keep the volume visible in heartbeats and the Egress events table already
+    // captures the network metadata (URL/method/status/bytes) for security analysis.
+    if (record.parseState === 'unparsed' && SKIP_UNPARSED_INTERACTIONS) {
+      this.unparsedSkippedCount = (this.unparsedSkippedCount ?? 0) + 1;
+      return { durable: false };
+    }
     const durable = await this.judge.persistAgentInteraction(record);
     // SessionMembership is a canonical ingest-time projection, not a side effect of a later
     // conversation page read. Keep it available in the memory-only profile as well as PostgreSQL;
@@ -3242,8 +3281,8 @@ export class AggregationService implements OnModuleDestroy {
     // An empty membership selection is still an exact query, never a request for all history.
     const persisted = exactMembershipRead && exactInteractionIds.size === 0
       ? (options.membershipDurable === true ? [] : null)
-      : (await boundedRelationRead(
-          this.judge.storedAgentInteractions(query),
+      : (await boundedAbortableRelationRead(
+          (signal) => this.judge.storedAgentInteractions(query, signal),
           null,
           AGENT_INTERACTION_QUERY_TIMEOUT_MS,
         )).value;
@@ -3658,12 +3697,36 @@ export class AggregationService implements OnModuleDestroy {
               totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
             }
           : undefined;
-    const [interactions, inventory] = await Promise.all([
+    const modelInteractionsPromise = resolveConversationId
+      ? Promise.resolve(undefined)
+      : this.readAgentInteractions(
+          { ...interactionQuery, interactionType: 'model' },
+          interactionReadOptions,
+        );
+    const [interactions, inventory, modelInteractions] = await Promise.all([
       this.readAgentInteractions(interactionQuery, interactionReadOptions),
       inventoryPromise,
+      modelInteractionsPromise,
     ]).finally(() => {
       if (inventoryTimer) clearTimeout(inventoryTimer);
     });
+    if (modelInteractions?.items.length) {
+      const merged = new Map<string, T.AgentInteractionRecord>();
+      for (const item of interactions.items) merged.set(item.interactionId, item);
+      for (const item of modelInteractions.items) merged.set(item.interactionId, item);
+      interactions.items = [...merged.values()]
+        .sort((left, right) => right.at - left.at || right.interactionId.localeCompare(left.interactionId));
+      interactions.total = Math.max(interactions.total, modelInteractions.total);
+      interactions.totalMode = 'omitted';
+      interactions.coverage.partial ||= modelInteractions.coverage.partial;
+      interactions.coverage.completeness = interactions.coverage.partial ? 'partial' : interactions.coverage.completeness;
+      interactions.coverage.partialReason = interactions.coverage.partialReason
+        ?? modelInteractions.coverage.partialReason;
+      if (modelInteractions.dataSource === 'clickhouse') {
+        interactions.dataSource = 'clickhouse';
+        interactions.coverage.source = 'clickhouse+hot_delta';
+      }
+    }
     let boundInteractions = this.conversationBindings
       ? await this.conversationBindings.applyPersistedBindings(interactions.items)
       : interactions.items;
@@ -3696,6 +3759,32 @@ export class AggregationService implements OnModuleDestroy {
         byId.set(item.interactionId, item);
       }
       boundInteractions = [...byId.values()];
+    }
+    let requestedAssetOnlyId: string | undefined;
+    if (
+      requestedConversationId?.startsWith('asset_')
+      && !(exactMembershipIds?.length)
+    ) {
+      const asset = inventory.items.find((item) =>
+        assetOnlyConversationId(item.agentAssetId) === requestedConversationId);
+      if (asset) {
+        requestedAssetOnlyId = asset.agentAssetId;
+        const assetInteractions = await this.readAgentInteractions({
+          ...interactionQuery,
+          agentAssetId: asset.agentAssetId,
+          agentInstanceId: undefined,
+          model: undefined,
+          interactionType: 'model',
+        }, { totalLimit: 256 });
+        interactions.items = assetInteractions.items;
+        interactions.total = assetInteractions.total;
+        interactions.totalMode = assetInteractions.totalMode;
+        interactions.coverage = assetInteractions.coverage;
+        interactions.dataSource = assetInteractions.dataSource;
+        boundInteractions = this.conversationBindings
+          ? await this.conversationBindings.applyPersistedBindings(assetInteractions.items)
+          : assetInteractions.items;
+      }
     }
     // Cross-hop relatedConversations are expressed by directory + EvidenceLink, not by widening a
     // selected Thread into a last_1h fair sample. That scan was marking complete point-reads
@@ -3741,6 +3830,10 @@ export class AggregationService implements OnModuleDestroy {
           ? projection.summaries.find((summary) =>
             projection.interactionsByConversation.get(summary.conversationId)?.some((record) =>
               (record.canonicalSessionId ?? record.sessionId) === requestedConversationId))
+          : undefined)
+        ?? (requestedAssetOnlyId
+          ? projection.summaries.find((summary) =>
+            summary.hasContent && summary.agentAssetId === requestedAssetOnlyId)
           : undefined);
       canonicalConversationId = pointReadCanonicalConversationId({
         requestedConversationId,
@@ -3841,15 +3934,20 @@ export class AggregationService implements OnModuleDestroy {
       if (pageRecords.length) {
         // Kernel search must stay hop/conversation-scoped. A page-wide load over last_1h
         // truncates later Egress rows, so LLM aliases (run_python) cannot fold onto execute.
-        for (const item of items) {
-          const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
-          if (!records.length) continue;
-          const toolItems = await this.toolEvidenceItemsForInteractions(records);
-          item.coverageLayers = observabilityCoverageLayers(
-            records,
-            toolItems,
-            item.coverage,
-          );
+        // Page items resolve in bounded concurrent chunks — the former serial per-conversation
+        // await multiplied the kernel-read latency by the conversation count on every call.
+        const CONVERSATION_EVIDENCE_CHUNK = 8;
+        for (let start = 0; start < items.length; start += CONVERSATION_EVIDENCE_CHUNK) {
+          await Promise.all(items.slice(start, start + CONVERSATION_EVIDENCE_CHUNK).map(async (item) => {
+            const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
+            if (!records.length) return;
+            const toolItems = await this.toolEvidenceItemsForInteractions(records);
+            item.coverageLayers = observabilityCoverageLayers(
+              records,
+              toolItems,
+              item.coverage,
+            );
+          }));
         }
       }
     }
@@ -3931,9 +4029,11 @@ export class AggregationService implements OnModuleDestroy {
     const records = resolvedConversationId
       ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
-    const segments = resolvedConversationId && this.conversationBindings
-      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
-      : [];
+    // Read-path support: PG-authoritative segments + technical activities with
+    // on-read derivation fallback — the hot maps are restart-volatile.
+    const segments = (resolvedConversationId && this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(resolvedConversationId, records)
+      : { segments: [] }).segments;
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
@@ -4038,17 +4138,18 @@ export class AggregationService implements OnModuleDestroy {
     const records = resolvedConversationId
       ? projection.interactionsByConversation.get(resolvedConversationId) ?? []
       : [];
-    const segments = resolvedConversationId && this.conversationBindings
-      ? this.conversationBindings.segmentsForConversation(resolvedConversationId)
-      : [];
+    // Read-path support: PG-authoritative segments + technical activities with
+    // on-read derivation fallback — the hot maps are restart-volatile.
+    const timelineSupport = resolvedConversationId && this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(resolvedConversationId, records)
+      : { segments: [], technicalActivities: [] };
+    const segments = timelineSupport.segments;
     const turns = thread?.hasContent
       ? projectSemanticConversationTimeline(thread, records, segments)
       : [];
     const instanceIds = new Set(segments.map((segment) => segment.agentInstanceId));
-    const technicalActivitySummaries = this.conversationBindings
-      ? this.conversationBindings.listTechnicalActivities()
-        .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId))
-      : [];
+    const technicalActivitySummaries = timelineSupport.technicalActivities
+      .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId));
     const resolutionRevision = this.conversationBindings?.currentResolutionRevision() ?? 0;
     const requestKey = createHash('sha256').update([
       resolvedConversationId ?? requestedConversationId ?? '',
@@ -4128,8 +4229,12 @@ export class AggregationService implements OnModuleDestroy {
     return this.conversationBindings?.currentResolutionRevision() ?? 0;
   }
 
-  agentRunTechnicalActivities(agentInstanceId?: string): T.AgentRunTechnicalActivitySummary[] {
-    return this.conversationBindings?.listTechnicalActivities(agentInstanceId) ?? [];
+  async agentRunTechnicalActivities(
+    agentInstanceId?: string,
+  ): Promise<T.AgentRunTechnicalActivitySummary[]> {
+    if (!this.conversationBindings) return [];
+    if (!agentInstanceId) return this.conversationBindings.listTechnicalActivities();
+    return this.conversationBindings.technicalActivitiesForInstance(agentInstanceId);
   }
 
   async agentSemanticEvidence(
@@ -4143,7 +4248,9 @@ export class AggregationService implements OnModuleDestroy {
     const conversationId = canonicalConversationId ?? query.conversationId;
     const thread = projection.summaries.find((item) => item.conversationId === conversationId);
     const records = projection.interactionsByConversation.get(conversationId) ?? [];
-    const segments = this.conversationBindings?.segmentsForConversation(conversationId) ?? [];
+    const segments = (this.conversationBindings
+      ? await this.conversationBindings.conversationTimelineSupport(conversationId, records)
+      : { segments: [] }).segments;
     if (!thread?.hasContent || records.length === 0) return undefined;
     const turns = projectSemanticConversationTimeline(thread, records, segments);
     const events = turns.flatMap((turn) => turn.events);
@@ -7390,11 +7497,13 @@ export class AggregationService implements OnModuleDestroy {
         t - latestForwarderHeartbeat.at <= COLLECTOR_STALE_MS
         ? latestForwarderHeartbeat
         : undefined;
-      const collectorMetadataHeartbeat = freshRawHeartbeat ?? latest;
-      const freshFileFilterHeartbeat = latestRawHeartbeat?.fileFilterMetricsReportedAt !== undefined &&
-        t - latestRawHeartbeat.fileFilterMetricsReportedAt <= COLLECTOR_STALE_MS
-        ? latestRawHeartbeat
-        : undefined;
+      // compat30: prefer the last-known raw heartbeat inside the grace window over a
+      // newer forwarder-shaped row; expose staleness instead of zeroing the view.
+      const metadataView = resolveMetadataView(
+        t, latestRawHeartbeat, COLLECTOR_STALE_MS, COLLECTOR_LAST_KNOWN_GRACE_MS);
+      const collectorMetadataHeartbeat = metadataView.heartbeat ?? latest;
+      const fileFilterView = resolveFileFilterView(
+        t, latestRawHeartbeat, COLLECTOR_STALE_MS, COLLECTOR_LAST_KNOWN_GRACE_MS);
       const freshCaptureProfileHeartbeat = latestCaptureProfileHeartbeat?.captureProfileMetricsReportedAt !== undefined &&
         t - latestCaptureProfileHeartbeat.captureProfileMetricsReportedAt <= COLLECTOR_STALE_MS
         ? latestCaptureProfileHeartbeat
@@ -7623,8 +7732,8 @@ export class AggregationService implements OnModuleDestroy {
           processFallbackProcReads: 0,
           processAncestryProcReads: 0,
         }),
-        fileFilterMetricsReported: freshFileFilterHeartbeat !== undefined,
-        fileFilterMetrics: freshFileFilterHeartbeat?.fileFilterMetrics ?? {
+        fileFilterMetricsReported: fileFilterView.heartbeat !== undefined,
+        fileFilterMetrics: fileFilterView.heartbeat?.fileFilterMetrics ?? {
           fileAccess: 0,
           fileDelete: 0,
           accessKept: 0,
@@ -7641,6 +7750,12 @@ export class AggregationService implements OnModuleDestroy {
           enabled: false,
           epoch: 0,
         },
+        ...(fileFilterView.heartbeat !== undefined && fileFilterView.staleMs > 0
+          ? { fileFilterMetricsStaleMs: fileFilterView.staleMs }
+          : {}),
+        ...(metadataView.heartbeat !== undefined && metadataView.staleMs > 0
+          ? { metadataStaleMs: metadataView.staleMs }
+          : {}),
         captureProfileMetricsReported: freshCaptureProfileHeartbeat !== undefined,
         ...(freshCaptureProfileHeartbeat?.captureProfileMetrics
           ? { captureProfileMetrics: freshCaptureProfileHeartbeat.captureProfileMetrics }

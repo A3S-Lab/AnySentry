@@ -1,3 +1,4 @@
+import { TtlCache } from './health-views';
 import { BadRequestException, Body, ConflictException, Controller, Get, Header, Headers, HttpCode, NotFoundException, OnModuleDestroy, Optional, Param, PayloadTooLargeException, Post, Put, Query, Req, ServiceUnavailableException, Sse, UnauthorizedException, UseGuards } from '@nestjs/common';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -7367,6 +7368,10 @@ function otlpMetricsToUniversal(
 @UseGuards(ManagementAuthGuard)
 @Controller('security-center')
 export class SecurityMonitoringController implements OnModuleDestroy {
+  // healthz serves a short-TTL snapshot so probes and dashboards never rebuild ~40 subsystem
+  // status objects per request (UOS 2026-11-06: healthz queued 4-10s behind conversations reads).
+  private static readonly HEALTHZ_SNAPSHOT_TTL_MS = 5_000;
+  private healthzSnapshot?: { at: number; body: Record<string, unknown> };
   private readonly canonicalDirectoryCache = new Map<string, CanonicalDirectoryCacheEntry>();
   private readonly canonicalDirectoryInFlight = new Map<
     string,
@@ -8887,7 +8892,7 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     @Headers() headers: HeaderBag,
   ): Promise<T.AgentConversationDirectoryListV3> {
     const legacy = await this.agentConversationDirectoryV2(f, headers);
-    const technical = this.agg.agentRunTechnicalActivities();
+    const technical = await this.agg.agentRunTechnicalActivities();
     return {
       ...legacy,
       apiVersion: 3,
@@ -9753,10 +9758,21 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return { accepted: true, collectorId: rec.collectorId, sourceId: sourceResolution.source?.sourceId, receivedAt: new Date(rec.at).toISOString() } satisfies T.CollectorHeartbeatAck;
   }
 
+  // compat30: the aggregation scans ClickHouse windows per request; UI polling storms
+  // under load pushed API latency to seconds. Serve identical bodies from a short
+  // TTL cache so pollers get coherent snapshots and the heavy path runs once per key.
+  private readonly collectorHealthCache = new TtlCache<unknown>(3_000, 16);
+
   @Post('collectors/health')
   @HttpCode(200)
   async collectorHealth(@Body() f: T.CollectorHealthQuery) {
-    return this.agg.storedCollectorHealth(f);
+    const key = JSON.stringify(f ?? {});
+    const now = Date.now();
+    const cached = this.collectorHealthCache.get(key, now);
+    if (cached !== undefined) return cached;
+    const result = await this.agg.storedCollectorHealth(f);
+    this.collectorHealthCache.set(key, result, now);
+    return result;
   }
 
   @Post('sources/list')
@@ -14235,6 +14251,23 @@ export class SecurityMonitoringController implements OnModuleDestroy {
 
   @Get('healthz')
   healthz() {
+    const nowMs = Date.now();
+    if (
+      !this.healthzSnapshot
+      || nowMs - this.healthzSnapshot.at > SecurityMonitoringController.HEALTHZ_SNAPSHOT_TTL_MS
+    ) {
+      this.healthzSnapshot = { at: nowMs, body: this.buildHealthzBody() };
+    }
+    // uptime is process state, not observability state — keep it fresh on every probe. The rest
+    // of the contract is unchanged for readers; values may lag the clock by up to the TTL.
+    return {
+      ...this.healthzSnapshot.body,
+      uptimeSeconds: Math.round(process.uptime()),
+      snapshotAgeSeconds: Math.round((nowMs - this.healthzSnapshot.at) / 1000),
+    };
+  }
+
+  private buildHealthzBody(): Record<string, unknown> {
     const stats = this.judge.healthStats();
     const policy = this.judge.getPolicy();
     return {

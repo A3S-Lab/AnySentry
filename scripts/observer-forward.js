@@ -678,6 +678,10 @@ let latestDockerIdentitySnapshot = { entries: [], version: 0, generatedAt: '' };
 // main-process signatures. This never touches the event ingest path: one bounded
 // POST on change plus a slow keepalive. Labels are limited to the anysentry.io/*
 // namespace and argv/environment are never included.
+const SPOOL_WAL_ALERT_BYTES = 512 * 1024 * 1024;
+let lastSpoolWalAlertAt = 0;
+let lastTlsWhitelistAlertAt = 0;
+let lastTlsFallbackNoticeAt = 0;
 let inventoryPushTimer;
 let inventoryPushInFlight = false;
 let lastInventoryHash = '';
@@ -987,6 +991,7 @@ let e2eFilterReceipts = [];
 let attributionCounts = emptyAttributionCounts();
 let closing = false;
 let heartbeatTimer;
+let strandedSweepTimer;
 let heartbeatDeliveryInFlight = false;
 let pendingHeartbeatDelivery;
 let identitySnapshotTimer;
@@ -1896,9 +1901,23 @@ function getJson(url, timeoutMs, done, extraHeaders = {}, requestAgent, maxRespo
 }
 
 let identitySnapshotRefreshInFlight = false;
+// Same stuck-flag protection as the infrastructure-policy lane; the identity snapshot feeds
+// workload attribution, so a frozen refresh silently degrades identity quality too.
+let identitySnapshotRefreshStartedAt = 0;
 function refreshIdentitySnapshot() {
-  if (identitySnapshotRefreshInFlight) return;
+  if (identitySnapshotRefreshInFlight) {
+    if (
+      identitySnapshotRefreshStartedAt > 0
+      && Date.now() - identitySnapshotRefreshStartedAt > IDENTITY_SNAPSHOT_SECS * 3000
+    ) {
+      console.error('[observer-forward] identity snapshot refresh watchdog reset a stuck in-flight request');
+      identitySnapshotRefreshInFlight = false;
+    } else {
+      return;
+    }
+  }
   identitySnapshotRefreshInFlight = true;
+  identitySnapshotRefreshStartedAt = Date.now();
   getJson(identitySnapshotTarget, CONTROL_HTTP_TIMEOUT_MS, (error, snapshot) => {
     identitySnapshotRefreshInFlight = false;
     if (closing && error?.message === GRACEFUL_SHUTDOWN_SUPERSEDE) return;
@@ -1935,6 +1954,29 @@ function synchronizeInfrastructurePolicyRules() {
     const captureDecision = infrastructurePolicy.materializeCaptureProfile(facts);
     if (captureDecision) decisions.push(captureDecision);
   }
+  // compat27: hybrid kernels may key bpf_get_current_cgroup_id by a v1 hierarchy inode
+  // instead of the unified one (field 2026-11-09: unified-only rules never hit). Emit one
+  // decision per known cgroup id of the same workload so every hierarchy id matches.
+  const altIdsByPrimary = new Map();
+  for (const entry of (Array.isArray(latestDockerIdentitySnapshot?.entries)
+    ? latestDockerIdentitySnapshot.entries : [])) {
+    const primary = text(entry?.cgroupId);
+    const ids = Array.isArray(entry?.cgroupIds)
+      ? entry.cgroupIds.map((id) => text(id)).filter(Boolean) : [];
+    if (primary && ids.length > 1) altIdsByPrimary.set(primary, ids.filter((id) => id !== primary));
+  }
+  if (altIdsByPrimary.size) {
+    const expanded = [];
+    for (const decision of decisions) {
+      expanded.push(decision);
+      const primary = text(decision?.cgroupId);
+      for (const alt of (altIdsByPrimary.get(primary) || [])) {
+        expanded.push({ ...decision, cgroupId: alt, scopeKey: `cgroup:${alt}` });
+      }
+    }
+    decisions.length = 0;
+    decisions.push(...expanded);
+  }
   const synchronized = filterRulePublisher.synchronizePolicyDecisions(
     decisions,
     policyMetrics.policyVersion,
@@ -1946,10 +1988,26 @@ function synchronizeInfrastructurePolicyRules() {
 let lastInfrastructurePolicyError = '';
 let lastLoggedInfrastructurePolicyVersion = -1;
 let infrastructurePolicyRefreshInFlight = false;
+// Absolute deadline of the in-flight infrastructure-policy request. The HTTP call has its
+// own timeout, but any callback-loss path (socket-level hang, agent edge case) would leave
+// the in-flight flag set forever and freeze rule refresh in lkg_degraded until a restart
+// (observed in the field). The watchdog below resets it after 3x the refresh period.
+let infrastructurePolicyRefreshStartedAt = 0;
 function refreshInfrastructurePolicy() {
   if (!INFRASTRUCTURE_POLICY_SECS) return;
-  if (infrastructurePolicyRefreshInFlight) return;
+  if (infrastructurePolicyRefreshInFlight) {
+    if (
+      infrastructurePolicyRefreshStartedAt > 0
+      && Date.now() - infrastructurePolicyRefreshStartedAt > INFRASTRUCTURE_POLICY_SECS * 3000
+    ) {
+      console.error('[observer-forward] infrastructure policy refresh watchdog reset a stuck in-flight request');
+      infrastructurePolicyRefreshInFlight = false;
+    } else {
+      return;
+    }
+  }
   infrastructurePolicyRefreshInFlight = true;
+  infrastructurePolicyRefreshStartedAt = Date.now();
   getJson(
     infrastructurePolicyTarget,
     CONTROL_HTTP_TIMEOUT_MS,
@@ -2353,10 +2411,19 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
   const dockerEntries = Array.isArray(latestDockerIdentitySnapshot?.entries)
     ? latestDockerIdentitySnapshot.entries
     : [];
+  const confirmedIds = workloadCache.confirmedPhysicalWorkloadIds();
   const promoted = promoteConfirmedDockerTlsEntries(
     dockerEntries,
-    workloadCache.confirmedPhysicalWorkloadIds(),
+    confirmedIds,
   );
+  // Whitelist-empty diagnosis, deferred to the final admission set (compat31): the
+  // identity-review join can be empty forever once container ids rotate past the reviewed
+  // assets, while labels/name-pattern admission carries the whitelist correctly. ALERT only
+  // when the FINAL whitelist is empty (plaintext truly off); otherwise log a throttled,
+  // correctly-worded fallback notice.
+  const joinEmpty = promoted.promotedCgroupIds instanceof Set && promoted.promotedCgroupIds.size === 0
+    && confirmedIds.size > 0
+    && dockerEntries.length > 0;
   // Prefer Docker-owned cgroups (label-confirmed Design B agents + identity-promoted CLI labs)
   // over argv-signature fences. Dual-claiming the same cgroup as both
   // `customer-langgraph-sim-*` and generic `langgraph` marks Collector conflicts and disables
@@ -2369,6 +2436,27 @@ function publishTlsAgentRuntimeScope(processSnapshot = attributor.runtimeSnapsho
     return !id || !ownedCgroups.has(id);
   });
   const entries = [...promoted.entries, ...scopedProcessEntries];
+  if (joinEmpty || entries.length === 0) {
+    const sample = (set) => [...set].slice(0, 2).map((k) => String(k).slice(0, 24)).join(' | ');
+    const dockerKeys = dockerEntries.slice(0, 2)
+      .map((e) => String(e?.physicalWorkloadId ?? e?.id ?? '?').slice(0, 24)).join(' | ');
+    const now = Date.now();
+    if (entries.length === 0 && (confirmedIds.size > 0 || dockerEntries.length > 0)) {
+      if (now - lastTlsWhitelistAlertAt > 60_000) {
+        lastTlsWhitelistAlertAt = now;
+        console.error(
+          `[observer-forward] ALERT tls whitelist EMPTY: plaintext capture is OFF (confirmed=${confirmedIds.size} docker=${dockerEntries.length}) - confirm agents (labels anysentry.io/workload-kind=agent, ANYSENTRY_AGENT_NAME_PATTERN, or agents/:id/review)`,
+        );
+      }
+    } else if (joinEmpty) {
+      if (now - lastTlsFallbackNoticeAt > 10 * 60_000) {
+        lastTlsFallbackNoticeAt = now;
+        console.log(
+          `[observer-forward] tls admission via labels/name-pattern (entries=${entries.length}); identity-review join empty for reviewed ids [${sample(confirmedIds)}] vs docker [${dockerKeys}] - re-confirm after container redeploys to clear this notice`,
+        );
+      }
+    }
+  }
   // Compare only the local admission facts. generatedAt/snapshotVersion are deliberately omitted
   // from the fingerprint so the 5-second liveness timer does not rewrite an unchanged scope and
   // make the Collector churn its TLS allowlist.
@@ -2706,6 +2794,20 @@ function sendHeartbeat(done = () => {}, timeoutMs = CONTROL_HTTP_TIMEOUT_MS, shu
   }
   const eventQueues = eventQueueMetrics();
   const spoolMetrics = durableSpoolMetrics();
+  // compat30: an abnormally growing WAL means delivery is stalled (field 2026-11-12: the
+  // spool accumulated 1.7G across API outages and only a disk-full exposed it). Surface it
+  // as an ALERT log, throttled to once per 10 minutes, before it becomes a disk incident.
+  if (spoolMetrics.walBytes > SPOOL_WAL_ALERT_BYTES) {
+    const now = Date.now();
+    if (now - lastSpoolWalAlertAt > 10 * 60_000) {
+      lastSpoolWalAlertAt = now;
+      console.error(
+        `[observer-forward] ALERT spool WAL oversized: ${spoolMetrics.walBytes} bytes ` +
+        `(records=${spoolMetrics.records}, oldestAgeMs=${spoolMetrics.oldestAgeMs}) - ` +
+        `delivery appears stalled; inspect API reachability before the disk fills`,
+      );
+    }
+  }
   const controlPlane = controlPlaneMetrics();
   const accountingWindow = pipelineAccounting.beginDelivery({
     queueEvents: eventQueues.queueDepth,
@@ -3464,6 +3566,28 @@ function recordQueueDrop(kind, priority, reason, durablyParked = false) {
     (attributionCounts.queueDroppedByClass[dropClass] || 0) + 1;
   if (priority >= PROTECTED_PRIORITY) attributionCounts.protectedQueueDropped++;
   pipelineAccounting.record('queue_dropped', reason);
+}
+
+// compat24: an admitted item whose batch can never settle (a completion lost across a restart,
+// or an edge case that leaves it neither inflight nor retry-scheduled) pins its durable record
+// in activeSpoolIds forever, parking the delivery channel past its SLO with no self-healing.
+// Items that are neither inflight nor retry-pending and have outlived four retry budgets are
+// settled as retry-exhausted; their spool records are deferred like any other exhaustion.
+let strandedSweepRunning = false;
+function sweepStrandedOutstanding(now = Date.now()) {
+  if (strandedSweepRunning || closing) return;
+  strandedSweepRunning = true;
+  try {
+    const stranded = [];
+    for (const item of outstandingItems) {
+      if (item.settled || item.inflightSince || item.retryOwned) continue;
+      const deadline = (item.retryDeadlineAt || item.createdAt || now) + RETRY_MAX_AGE_MS * 4;
+      if (now >= deadline) stranded.push(item);
+    }
+    if (stranded.length) recordRetryExhausted(stranded, true, 'stranded_outstanding_sweep');
+  } finally {
+    strandedSweepRunning = false;
+  }
 }
 
 function dropQueuedItem(item, reason = 'priority_evicted') {
@@ -4564,6 +4688,8 @@ async function start() {
     heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_SECS * 1000);
     heartbeatTimer.unref();
   }
+  strandedSweepTimer = setInterval(sweepStrandedOutstanding, 30_000);
+  strandedSweepTimer.unref();
   if (IDENTITY_SNAPSHOT_SECS > 0) {
     refreshIdentitySnapshot();
     identitySnapshotTimer = setInterval(refreshIdentitySnapshot, IDENTITY_SNAPSHOT_SECS * 1000);

@@ -35,7 +35,7 @@ while (($#)); do
 done
 
 case "$component" in
-  all|sentry|node|app|clickhouse|redis|observer|l3|java|kafka|flink|diagnostics|assemble) ;;
+  all|sentry|node|app|clickhouse|redis|observer|l3|prometheus|postgresql|java|kafka|flink|diagnostics|assemble) ;;
   *) die "unsupported component: $component" ;;
 esac
 
@@ -78,6 +78,8 @@ case "$component" in
     run_component redis
     run_component observer
     run_component l3
+    run_component prometheus
+    run_component postgresql
     run_component java
     run_component kafka
     run_component flink

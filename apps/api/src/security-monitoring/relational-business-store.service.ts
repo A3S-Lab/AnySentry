@@ -120,7 +120,8 @@ const SEMANTIC_KERNEL_RELATION_MAX_ROWS = 100_000;
 const SEMANTIC_KERNEL_RELATION_MAX_BYTES = 32 * 1024 * 1024;
 const CANONICAL_WRITE_MAX_BYTES = 64 * 1024 * 1024;
 const COVERAGE_GAP_REVISION_KEEP = 32;
-const COVERAGE_GAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const COVERAGE_GAP_TTL_MS = Math.max(1_000,
+  Number.parseInt(process.env.ANYSENTRY_COVERAGE_GAP_TTL_MS ?? '', 10) || 7 * 24 * 60 * 60 * 1000);
 const COVERAGE_GAP_TTL_PRUNE_EVERY = 256;
 /** One ingest save must not delete the historic 7-day tail in a single statement.
  *  An unbounded `DELETE WHERE last_seen_at < ttl` on this table wrote ~1 GiB WAL
@@ -736,6 +737,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
+         ),
+         deduplicated AS (
+           SELECT DISTINCT ON (record->>'canonicalAgentInstanceId') record
+             FROM incoming
+             ORDER BY record->>'canonicalAgentInstanceId', (record->>'updatedAt')::bigint DESC
          )
          INSERT INTO anysentry_agent_runtime_instances_v2 (
            canonical_instance_id, agent_scope_id, runtime_state, last_seen_at,
@@ -749,7 +755,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
            NULLIF(record->>'endedAt', '')::bigint,
            record - 'updatedAt',
            (record->>'updatedAt')::bigint
-         FROM incoming
+         FROM deduplicated
          ON CONFLICT (canonical_instance_id) DO UPDATE SET
            agent_scope_id = EXCLUDED.agent_scope_id,
            runtime_state = EXCLUDED.runtime_state,
@@ -774,6 +780,11 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
         `WITH incoming AS (
            SELECT item AS record
              FROM jsonb_array_elements($1::jsonb) AS source(item)
+         ),
+         deduplicated AS (
+           SELECT DISTINCT ON (record->>'alias') record
+             FROM incoming
+             ORDER BY record->>'alias', (record->>'lastSeenAt')::bigint DESC
          )
          INSERT INTO anysentry_agent_runtime_instance_aliases_v1 (
            alias_instance_id, canonical_instance_id, first_seen_at, last_seen_at
@@ -783,7 +794,7 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
            record->>'canonical',
            (record->>'firstSeenAt')::bigint,
            (record->>'lastSeenAt')::bigint
-         FROM incoming
+         FROM deduplicated
          ON CONFLICT (alias_instance_id) DO UPDATE SET
            canonical_instance_id = EXCLUDED.canonical_instance_id,
            first_seen_at = LEAST(
@@ -1170,7 +1181,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
    * observation/revision are idempotent, while a conflicting idempotency key is rejected by the
    * unique constraint and surfaced as `false` to the hot-store caller.
    */
+  private readonly pgRawObsEnabled = process.env.ANYSENTRY_PG_RAW_OBSERVATIONS_ENABLED !== 'false';
   async saveRawObservations(observations: readonly RawObservation[]): Promise<boolean> {
+    if (!this.pgRawObsEnabled) return false;
     if (observations.length === 0) return true;
     return new Promise<boolean>((resolve) => {
       this.rawBatchQueue.push({ rows: observations, resolve });
@@ -1410,7 +1423,9 @@ export class RelationalBusinessStore implements OnModuleInit, OnApplicationShutd
    * cannot rewrite the original JSONB payload.  The in-memory KernelFactStore remains the hot
    * fallback when PostgreSQL is not configured or temporarily unavailable.
    */
+  private readonly pgKernelFactsEnabled = process.env.ANYSENTRY_PG_KERNEL_FACTS_ENABLED !== 'false';
   async saveKernelFacts(facts: readonly KernelFact[]): Promise<boolean> {
+    if (!this.pgKernelFactsEnabled) return false;
     if (facts.length === 0) return true;
     if (facts.length > KERNEL_FACT_LIMIT) return false;
     const bounded = facts.slice(0, KERNEL_FACT_LIMIT);

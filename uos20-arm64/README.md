@@ -53,17 +53,17 @@ Environment 值含空格必须整体加双引号（如 `Environment="NODE_OPTION
 常规基线包使用全量构建：
 
 ```bash
-cd /home/chensicheng/.config/superpowers/worktrees/AnySentry/uos20-arm64-0.4.0
-ANYSENTRY_RELEASE_DIR=/home/chensicheng/a3s/security/release \
+cd "$(git rev-parse --show-toplevel)"
+ANYSENTRY_RELEASE_DIR="${ANYSENTRY_RELEASE_DIR:-$PWD/release}" \
   bash uos20-arm64/build.sh --version 0.4.0-compat34
 ```
 
-输出目录：
+输出目录（未设置 `ANYSENTRY_RELEASE_DIR` 时为工作区的 `release/`）：
 
 ```text
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64/
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz
-/home/chensicheng/a3s/security/release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz.sha256
+release/anysentry-security-suite-0.4.0-compat34-uos20-arm64/
+release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz
+release/anysentry-security-suite-0.4.0-compat34-uos20-arm64.tar.gz.sha256
 ```
 
 仅检查并准备锁定源码：

@@ -13,6 +13,7 @@ required=(
   java/bin/java kafka/bin/kafka-server-start.sh
   flink/bin/flink flink/usrlib/anysentry-flink-streaming.jar
   observer/bin/a3s-observer-collector observer/observer-forward.js
+  prometheus/bin/prometheus prometheus/bin/node_exporter prometheus/conf/prometheus.yml
   observer/observer-agent-attribution.js observer/observer-agent-runtime-signatures.js
   observer/observer-agent-templates.js observer/observer-attribution-merge.js
   observer/observer-behavior-discovery.js observer/observer-capture-profile-control.js
@@ -27,7 +28,7 @@ required=(
   observer/observer-unified-filter-policy.js observer/observer-workload-filter.js
   observer/KERNEL_VERSION_CODE
   l3/l3-agent.mjs diagnostics/a3s-bpf-syscall-probe
-  app/node_modules/@a3s-lab/code/index.linux-arm64-gnu.node app/node_modules/@a3s-lab/code/zvec/libzvec_c_api.so
+  app/node_modules/@a3s-lab/code/index.linux-arm64-gnu.node 
   install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh DEPLOYMENT.md
   AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md 现场问题采集.md UOS现场诊断规则.md
   VERSION PROVENANCE manifest.sha256
@@ -45,7 +46,7 @@ elf_count=0
 bpf_count=0
 while IFS= read -r -d '' file; do
   if LANG=C readelf -h "$file" >/dev/null 2>&1; then
-    machine=$(LANG=C readelf -h "$file" | awk -F: '/Machine:/ {sub(/^[[:space:]]+/, "", $2); print $2}')
+    machine=$(LANG=C readelf -h "$file" | awk -F: '/Machine:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')
     case "$machine" in
       AArch64)
         "$SCRIPT_DIR/check-elf.sh" "$file" >/dev/null

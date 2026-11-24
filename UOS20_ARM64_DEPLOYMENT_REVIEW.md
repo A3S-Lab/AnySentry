@@ -108,7 +108,7 @@ a3s-code 未收到记忆目录时，默认写 `<工作目录>/.a3s/memory`，于
 
 `@a3s-lab/code` 的 `.node` 和 `zvec/libzvec_c_api.so` 必须同时在 pnpm 真实目录和 L3 拷贝里。只更新 `app/dist` 的组装不会重新编译这份原生库；全量 `app` 构建会删掉旁边的 `*.node`，之后要再跑 L3 安装步骤，从 glibc 2.28 缓存放回去。`--component assemble` 使用已经放好的 stage。上一版 stage 里手工打进 `dist` 的补丁，要先把 stage 复制到新 compat 目录，否则会丢。
 
-发布包输出目录是 `ANYSENTRY_RELEASE_DIR`。未设置时写到工作区的 `release/`。现场交付文件放在 `/home/chensicheng/a3s/security/release/`。
+发布包输出目录是 `ANYSENTRY_RELEASE_DIR`。未设置时写到工作区的 `release/`。现场交付文件应从该目录获取，不依赖打包人员的个人工作区路径。
 
 ### 现场分析脚本
 

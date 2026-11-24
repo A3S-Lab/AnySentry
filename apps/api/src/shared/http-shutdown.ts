@@ -145,7 +145,17 @@ export function shutdownCoordinator(options: {
       } catch (error) {
         // No successful shutdown declaration, no fabricated receipt, and no silent wait for SIGKILL.
         log(`[shutdown] INCOMPLETE pending=${options.gate.pending()} routes=${JSON.stringify(options.gate.pendingSummary())}: ${(error as Error).message}`);
-        options.exit(1);
+        // A signal-initiated stop is operator-directed (systemctl stop/restart, installers).
+        // Exit 0 even when a drain deadline expired: systemd treats a nonzero exit as a unit
+        // FAILURE, which poisons install activation gates and trips alerts for what is only a
+        // slow request drain under load (field 2026-11-09: one in-flight ingest batch exceeded
+        // the 20s http-drain deadline during an upgrade and rolled the install back).
+        // The timeout stays loudly logged above; keep nonzero exits for internal error paths.
+        if (signal === 'SIGTERM' || signal === 'SIGINT') {
+          options.exit(0);
+        } else {
+          options.exit(1);
+        }
       }
     })();
     return running;

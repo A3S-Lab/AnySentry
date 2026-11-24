@@ -482,6 +482,7 @@ const exactMembershipAggregation = new AggregationService(
     applyPersistedBindings: async (records) => records,
     routeAlias: () => undefined,
     segmentsForConversation: () => [],
+    conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
   },
 );
 exactMembershipAggregation.agentInventory = async () => ({
@@ -544,6 +545,7 @@ const emptyMembershipAggregation = new AggregationService(
     applyPersistedBindings: async (records) => records,
     routeAlias: () => undefined,
     segmentsForConversation: () => [],
+    conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
   },
 );
 emptyMembershipAggregation.agentInventory = exactMembershipAggregation.agentInventory;
@@ -596,6 +598,7 @@ const sessionFallbackAggregation = new AggregationService(
     applyPersistedBindings: async (records) => records,
     routeAlias: () => undefined,
     segmentsForConversation: () => [],
+    conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
   },
   {
     configured: () => true,
@@ -697,6 +700,7 @@ function hopTimelineAggregation(conversationId, membershipIds) {
       })),
       routeAlias: () => undefined,
       segmentsForConversation: () => [],
+    conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
     },
     {
       configured: () => true,
@@ -770,6 +774,7 @@ function canonicalAggregation(selection, records = canonicalRecords) {
     applyPersistedBindings: async (items) => items,
     routeAlias: () => undefined,
     segmentsForConversation: () => [],
+    conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
   });
   agg.agentInventory = exactMembershipAggregation.agentInventory;
   return { agg, reads };

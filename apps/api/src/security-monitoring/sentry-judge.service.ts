@@ -221,6 +221,28 @@ export function hotEvictionIndices(
   }
   return selected.sort((left, right) => left - right);
 }
+
+/** Cheap size estimate for hot-ring byte budgeting. Exact serialization length is not worth the
+ *  CPU on the ingest path; summing the variable-length string fields bounds the ring within a
+ *  factor of the JSON size, which is all the eviction guard needs. */
+function approximateEventBytes(event: JudgedEvent): number {
+  let total = 512;
+  total += event.subject.length
+    + event.workspacePath.length
+    + event.agentId.length
+    + event.sessionId.length
+    + event.eventId.length;
+  if (event.rawPreview) total += event.rawPreview.length;
+  if (event.actionTarget) total += event.actionTarget.length;
+  for (const [key, value] of Object.entries(event.attributes ?? {})) {
+    total += key.length + (typeof value === 'string' ? value.length : 8);
+  }
+  if (event.process) {
+    total += (event.process.cwd?.length ?? 0) + (event.process.comm?.length ?? 0) + 256;
+  }
+  if (event.judgment) total += (event.judgment.stopReason?.length ?? 0) + 256;
+  return total;
+}
 const pid = () => 1000 + Math.floor(Math.random() * 60000);
 const pick = <T>(xs: T[]): T => xs[Math.floor(Math.random() * xs.length)];
 
@@ -535,6 +557,22 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     64,
     this.MAX,
   );
+  // UOS field 2026-11-06: the count cap alone cannot bound memory when events carry large
+  // plaintext evidence (LlmInteraction) — 10k fat events held ~1.5-2 GB and forced multi-second
+  // full-GC pauses that surfaced as healthz probe timeouts. Keep the count cap, add a byte budget.
+  private readonly MAX_HOT_EVENT_BYTES = boundedEnvInt(
+    'ANYSENTRY_HOT_EVENT_BYTES',
+    512 * 1024 * 1024,
+    64 * 1024 * 1024,
+    8 * 1024 * 1024 * 1024,
+  );
+  private readonly HOT_EVENT_BYTE_FLOOR = boundedEnvInt(
+    'ANYSENTRY_HOT_EVENT_BYTE_FLOOR',
+    1_000,
+    128,
+    this.MAX,
+  );
+  private hotRingBytes = 0;
   private hotProtectedCount = 0;
   private hotAgentCounts: Map<string, number> = new Map();
   private hotSessionCounts: Map<string, number> = new Map();
@@ -644,6 +682,7 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       for (const rec of hist) {
         this.storeById.set(rec.eventId, rec);
         this.addHotIdentity(rec);
+        this.hotRingBytes += approximateEventBytes(rec);
         this.ingestIncident(rec);
         historicalScopes.push({ event: rec, incidentId: this.incidentId(rec) });
       }
@@ -789,6 +828,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     clickhouseReady: boolean;
     hotRingSize: number;
     hotRingCapacity: number;
+    hotRingBytes: number;
+    hotRingBytesBudget: number;
     hotProtectedSize: number;
     hotProtectedReserve: number;
     postCommitProjection: {
@@ -812,6 +853,8 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       clickhouseReady,
       hotRingSize: this.store.length,
       hotRingCapacity: this.MAX,
+      hotRingBytes: this.hotRingBytes,
+      hotRingBytesBudget: this.MAX_HOT_EVENT_BYTES,
       hotProtectedSize: this.hotProtectedCount,
       hotProtectedReserve: this.HOT_PROTECTED_RESERVE,
       postCommitProjection: {
@@ -913,8 +956,10 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
     endMs: number;
     fairPerAgentLimit?: number;
     interactionIds?: readonly string[];
-  }): Promise<AgentInteractionRecord[] | null> {
-    return this.ch.queryAgentInteractions(input);
+  }, signal?: AbortSignal): Promise<AgentInteractionRecord[] | null> {
+    // The signal lets bounded callers abort the transport instead of abandoning a query whose
+    // (potentially large) response would still be downloaded and parsed on the event loop.
+    return this.ch.queryAgentInteractions(input, signal);
   }
 
   committedEventCutoffMs(): number | undefined {
@@ -2195,7 +2240,9 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       const wasProtected = isHotProtectedEvent(current);
       const previousAgentId = current.agentId;
       const previousSessionId = current.sessionId;
+      const previousBytes = approximateEventBytes(current);
       Object.assign(current, rec);
+      this.hotRingBytes = Math.max(0, this.hotRingBytes - previousBytes + approximateEventBytes(current));
       const isProtected = isHotProtectedEvent(current);
       if (wasProtected !== isProtected) this.hotProtectedCount += isProtected ? 1 : -1;
       if (previousAgentId !== current.agentId) {
@@ -2211,34 +2258,57 @@ export class SentryJudgeService implements OnModuleInit, OnModuleDestroy {
       this.store.push(rec);
       this.storeById.set(rec.eventId, rec);
       this.addHotIdentity(rec);
+      this.hotRingBytes += approximateEventBytes(rec);
       if (isHotProtectedEvent(rec)) this.hotProtectedCount += 1;
     }
     if (this.store.length > this.MAX) {
-      const indices = new Set(hotEvictionIndices(
+      this.compactHotStore(new Set(hotEvictionIndices(
         this.store,
         this.MAX,
         this.HOT_PROTECTED_RESERVE,
         this.TRIM_BATCH,
+      )));
+    }
+    // Byte budget enforcement evicts oldest-unprotected batches until the ring is back under
+    // budget; HOT_EVENT_BYTE_FLOOR keeps a minimum working set even with pathological bodies.
+    let byteGuard = 0;
+    while (
+      this.hotRingBytes > this.MAX_HOT_EVENT_BYTES
+      && this.store.length > this.HOT_EVENT_BYTE_FLOOR
+      && byteGuard < 64
+    ) {
+      byteGuard += 1;
+      const indices = new Set(hotEvictionIndices(
+        this.store,
+        this.store.length - 1,
+        this.HOT_PROTECTED_RESERVE,
+        this.TRIM_BATCH,
       ));
-      let writeIndex = 0;
-      for (let index = 0; index < this.store.length; index += 1) {
-        const removed = this.store[index];
-        if (!indices.has(index)) {
-          this.store[writeIndex] = removed;
-          writeIndex += 1;
-          continue;
-        }
-        this.removeHotIdentity(removed);
-        if (isHotProtectedEvent(removed)) this.hotProtectedCount -= 1;
-        if (this.storeById.get(removed.eventId) === removed) this.storeById.delete(removed.eventId);
-      }
-      this.store.length = writeIndex;
+      if (!indices.size) break;
+      this.compactHotStore(indices);
     }
     const effective = current ?? rec;
     // Replaying a durably committed batch may carry a newer receipt timestamp for the same immutable
     // revision. Refresh the cache, but do not recreate incidents or alerts for that duplicate.
     if (notify && advancesRevision) this.applyBusinessEffects(effective);
     return effective;
+  }
+
+  private compactHotStore(indices: Set<number>): void {
+    let writeIndex = 0;
+    for (let index = 0; index < this.store.length; index += 1) {
+      const removed = this.store[index];
+      if (!indices.has(index)) {
+        this.store[writeIndex] = removed;
+        writeIndex += 1;
+        continue;
+      }
+      this.removeHotIdentity(removed);
+      if (isHotProtectedEvent(removed)) this.hotProtectedCount -= 1;
+      if (this.storeById.get(removed.eventId) === removed) this.storeById.delete(removed.eventId);
+      this.hotRingBytes = Math.max(0, this.hotRingBytes - approximateEventBytes(removed));
+    }
+    this.store.length = writeIndex;
   }
 
   private applyBusinessEffects(event: JudgedEvent): void {

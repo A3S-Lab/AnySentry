@@ -11,7 +11,7 @@ zigbuild=$TOOLS/cargo-zigbuild-$CARGO_ZIGBUILD_VERSION/bin/cargo-zigbuild
 observer=$SOURCE_DIR/observer
 bpf=$BUILD_DIR/observer-bpf/probes-legacy.o
 install -d -m 0755 "$(dirname "$bpf")"
-bpf_cflags=(-mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables
+bpf_cflags=(-mcpu=v1 -O2 -g0 -Wall -Werror -fno-stack-protector -fno-asynchronous-unwind-tables -D A3S_BPF_LEGACY_CURSOR
   -mllvm -enable-tail-merge=0 -mllvm -disable-branch-fold -mllvm -disable-block-placement)
 if [[ ${A3S_BPF_LOCAL_CLANG:-} == zig ]]; then
   # Fallback for a wedged Docker daemon: zig cc embeds the same LLVM BPF backend.
@@ -66,6 +66,7 @@ do
   install -m 0644 "$SOURCE_DIR/anysentry/scripts/$module" "$STAGE_DIR/observer/$module"
 done
 install -m 0644 "$bpf" "$STAGE_DIR/observer/probes-legacy.o"
+install -m 0755 "$CHANNEL_DIR/package/observer-run.sh" "$STAGE_DIR/observer/run-observer.sh"
 printf '%s\n' 'perf-kprobe-legacy' > "$STAGE_DIR/observer/BACKEND"
 printf '%s\n' "$UOS_BPF_KERNEL_VERSION" > "$STAGE_DIR/observer/KERNEL_VERSION"
 printf '%s\n' "$UOS_BPF_KERNEL_VERSION_CODE" > "$STAGE_DIR/observer/KERNEL_VERSION_CODE"

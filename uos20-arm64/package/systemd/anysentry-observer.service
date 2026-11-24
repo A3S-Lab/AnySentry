@@ -24,31 +24,17 @@ Environment=A3S_OBSERVER_PERF_RING_PAGES=128
 # 慢车道。900s 覆盖思考期，请求/响应合为一条记录且噪音不滞留。
 Environment=A3S_OBSERVER_INFLIGHT_IDLE_TIMEOUT_SECONDS=900
 Environment=ANYSENTRY_FILTER_RULES_FILE=/run/anysentry-filter/filter-rules.json
+# compat23: 现场实测（2026-11-08 map-app-56）310M 文件事件/3h，99.97% 为非 Agent 噪音，且
+# unknownPolicy=keep 让它们全部进 ring → ring 溢出（capture_pipeline_loss）→ forwarder 排空
+# 不及（spool 积压 373MB、outputDropped 1.47 亿）→ 采集器健康降级、安装验证失败。
+# unknown（未识别为 Agent 的进程）文件事件在 eBPF 内核态直接丢弃，不进 ring；Agent 进程的
+# 文件事件不受影响。如需保留未知进程的抽样可见性，改为 sample（受
+# A3S_OBSERVER_FILE_UNKNOWN_PER_* 与 SAMPLE_WINDOW_MS 限制），或 keep 恢复全量。
+Environment=A3S_OBSERVER_FILE_UNKNOWN_POLICY=drop
 Environment=NODE_OPTIONS=--max-old-space-size=1024
 Environment=FORWARD_HTTP_TIMEOUT_MS=20000
 Environment="FORWARD_DROP_PATHS=/sys/,/proc/,/run/,/dev/,/var/lib/anysentry/clickhouse/,/var/lib/anysentry/redis/,/var/log/anysentry/"
-ExecStart=/bin/bash -o pipefail -c '/opt/anysentry/observer/bin/a3s-observer-collector | /opt/anysentry/runtime/node/bin/node /opt/anysentry/observer/observer-forward.js'
-Restart=on-failure
-RestartSec=5s
-TimeoutStartSec=60s
-TimeoutStopSec=30s
-KillMode=control-group
+# compat18: dedicated supervisor keeps the collector|forwarder FIFO data path
+# AND fails fast on either member's death (self-restarting loop inside the script).
+ExecStart=/opt/anysentry/observer/run-observer.sh
 LimitMEMLOCK=infinity
-LimitNOFILE=65536
-MemoryHigh=2G
-MemoryMax=3G
-# CAP_SYS_PTRACE：uprobe 采集需要读白名单进程的 /proc/pid/maps（libssl 发现）与
-# /proc/pid/root（容器内库路径解析）；无此权限时 uprobe 静默不挂接（kprobe 兜底不受影响）。
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-
-[Install]
-WantedBy=multi-user.target

@@ -616,6 +616,63 @@ function collapseContainedSegments(
     .map((segment, index) => ({ ...segment, ordinal: index + 1 }));
 }
 
+/**
+ * Read-path segment derivation: rebuild ConversationInstanceSegments from bound
+ * interaction records with the same run-grouping and stable segment-id formula
+ * as the ingest path. Conversations ingested while the relational lane was down
+ * have no persisted segments; timeline reads still need instance segmentation
+ * to merge technical activities, so the read path reconstructs it from the
+ * records it already loaded.
+ */
+export function deriveConversationSegmentsFromRecords(
+  conversationId: string,
+  records: readonly T.AgentInteractionRecord[],
+): T.ConversationInstanceSegment[] {
+  const ordered = [...records].sort((left, right) => {
+    const leftStart = BigInt(left.startedAtUnixNs ?? 0n);
+    const rightStart = BigInt(right.startedAtUnixNs ?? 0n);
+    return leftStart === rightStart
+      ? left.interactionId.localeCompare(right.interactionId)
+      : leftStart < rightStart ? -1 : 1;
+  });
+  const segments: T.ConversationInstanceSegment[] = [];
+  let segment: T.ConversationInstanceSegment | undefined;
+  for (const record of ordered) {
+    const instanceId = record.agentInstanceId ?? `unlinked:${record.interactionId}`;
+    if (!segment || segment.agentInstanceId !== instanceId) {
+      segment = {
+        schemaVersion: 'anysentry.agent_conversation_segment.v1',
+        segmentId: stableId(
+          'seg',
+          `${conversationId}\u0000${instanceId}\u0000${record.interactionId}`,
+        ),
+        conversationId,
+        agentInstanceId: instanceId,
+        ...(record.canonicalAgentInstanceId
+          ? { canonicalAgentInstanceId: record.canonicalAgentInstanceId }
+          : {}),
+        runtimeInstanceId: record.runtimeInstanceId ?? instanceId,
+        ...(record.terminalContextId ? { terminalContextId: record.terminalContextId } : {}),
+        ordinal: segments.length + 1,
+        startedAtUnixNs: record.startedAtUnixNs,
+        firstInteractionId: record.interactionId,
+        lastInteractionId: record.interactionId,
+        interactionCount: 1,
+        correlationQuality: record.correlationQuality ?? 'inferred',
+        resolverVersion: AGENT_CONVERSATION_RESOLVER_VERSION,
+        updatedAt: record.receivedAt,
+      };
+      segments.push(segment);
+    } else {
+      segment.lastInteractionId = record.interactionId;
+      segment.interactionCount += 1;
+      segment.updatedAt = Math.max(segment.updatedAt, record.receivedAt);
+    }
+    segment.endedAtUnixNs = record.endedAtUnixNs;
+  }
+  return collapseContainedSegments(segments);
+}
+
 @Injectable()
 export class AgentConversationBindingService implements OnModuleDestroy {
   private readonly bindings = new Map<string, T.AgentConversationBindingRecord>();
@@ -1888,6 +1945,63 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     const canonical = this.canonicalConversationId(conversationId);
     return collapseContainedSegments([...this.segments.values()]
       .filter((segment) => segment.conversationId === canonical));
+  }
+
+  /**
+   * Timeline read-path support. PostgreSQL is authoritative for segments and
+   * technical activities; the hot maps are a bounded, restart-volatile cache.
+   * Merge hot + persisted segments, derive from bound records when neither has
+   * any, and hydrate technical activities for the merged instance ids. Results
+   * are returned directly (the hot maps are not written) so TTL eviction cannot
+   * invalidate an already-served timeline.
+   */
+  async conversationTimelineSupport(
+    conversationId: string,
+    records: readonly T.AgentInteractionRecord[] = [],
+  ): Promise<{
+    segments: T.ConversationInstanceSegment[];
+    technicalActivities: TechnicalActivityProjection[];
+  }> {
+    this.pruneHotState();
+    const canonical = this.canonicalConversationId(conversationId);
+    let segments = canonical
+      ? collapseContainedSegments([...this.segments.values()]
+        .filter((segment) => segment.conversationId === canonical))
+      : [];
+    if (segments.length === 0 && canonical && this.relationalStore?.configured()) {
+      const persisted = await this.relationalStore.loadAgentConversationSegments([canonical]);
+      if (persisted.length > 0) segments = collapseContainedSegments(persisted);
+    }
+    if (segments.length === 0 && records.length > 0) {
+      segments = deriveConversationSegmentsFromRecords(canonical || conversationId, records);
+    }
+    const instanceIds = new Set(segments.map((segment) => segment.agentInstanceId));
+    const mergedActivities = new Map(this.technicalActivities);
+    if (instanceIds.size > 0 && this.relationalStore?.configured()) {
+      const persisted = await this.relationalStore.loadAgentRunTechnicalActivities(
+        [...instanceIds],
+      );
+      for (const activity of persisted) {
+        if (!mergedActivities.has(activity.technicalActivityId)) {
+          mergedActivities.set(activity.technicalActivityId, activity);
+        }
+      }
+    }
+    const technicalActivities = [...mergedActivities.values()]
+      .filter((activity) => activity.agentInstanceId && instanceIds.has(activity.agentInstanceId))
+      .sort((left, right) =>
+        BigInt(left.startedAtUnixNs) < BigInt(right.startedAtUnixNs) ? -1 : 1);
+    return { segments, technicalActivities };
+  }
+
+  /** PG-backed technical-activity lookup for an explicit agent instance id. */
+  async technicalActivitiesForInstance(
+    agentInstanceId: string,
+  ): Promise<TechnicalActivityProjection[]> {
+    const hot = this.listTechnicalActivities(agentInstanceId);
+    if (hot.length > 0 || !this.relationalStore?.configured()) return hot;
+    const persisted = await this.relationalStore.loadAgentRunTechnicalActivities([agentInstanceId]);
+    return persisted.filter((activity) => activity.agentInstanceId === agentInstanceId);
   }
 
   routeAlias(conversationId: string): ConversationRouteAliasV1 | undefined {
