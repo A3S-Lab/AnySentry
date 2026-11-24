@@ -79,6 +79,8 @@ export interface InteractionQuery {
   until?: number;
   /** Read-only consumers may select the ClickHouse projection and avoid a degraded SQL pool. */
   projection?: 'auto' | 'clickhouse' | 'postgresql';
+  /** Conversation-page size for index-first UOS reads; detail and other observation reads omit it. */
+  summaryLimit?: number;
 }
 
 export interface RuntimeInstructionObservation {
@@ -615,10 +617,12 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     // `limit` is a conversation-page size, not an observation cap. A single native Agent thread
     // can legitimately contain hundreds of user/assistant items; summarize the full bounded
     // observation window before slicing conversation rows.
+    const uosSummary: { uosConversationCount?: number } = {};
     const records = await this.loadRecords({
       ...query,
       limit: MAX_QUERY_RECORDS,
-    });
+      summaryLimit: limit,
+    }, undefined, uosSummary);
     const summaries = summarizeInteractionRecords(records);
     const contentRecords = records.filter(
       (record): record is InteractionContentRecord =>
@@ -697,7 +701,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     return {
       schemaVersion: 'anysentry.interaction-conversations.v1',
       items: summaries.slice(0, limit),
-      total: summaries.length,
+      total: Math.max(summaries.length, uosSummary.uosConversationCount ?? 0),
       contentCapture: contentAvailable
         ? 'encrypted_available'
         : 'metadata_only',
@@ -1061,7 +1065,12 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(`Interaction metadata lane ready on Kafka topic ${this.topic}`);
   }
 
-  private uosRecordsCache?: { key: string; at: number; records: InteractionRecord[] };
+  private uosRecordsCache?: {
+    key: string;
+    at: number;
+    records: InteractionRecord[];
+    conversationCount: number;
+  };
   /** Parsed-and-projected record cache keyed by interactionId. Interaction rows are immutable
    *  after argMax(revision) resolution, so the expensive work (tolerant payload parse, template
    *  extraction, record shaping) is done once per interaction instead of on every 10s-cache miss.
@@ -1097,9 +1106,11 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
   private async loadUosPlaintextRecordsCached(
     normalized: Parameters<InteractionService['loadUosPlaintextRecords']>[0],
     conversationId?: string,
+    summary?: { uosConversationCount?: number },
   ): Promise<InteractionRecord[]> {
     const key = JSON.stringify({
       limit: normalized.limit,
+      summaryLimit: normalized.summaryLimit,
       collectorId: normalized.collectorId,
       agentInstanceId: normalized.agentInstanceId,
       workspacePath: normalized.workspacePath,
@@ -1110,17 +1121,25 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     });
     const now = Date.now();
     if (this.uosRecordsCache && this.uosRecordsCache.key === key && now - this.uosRecordsCache.at < 10_000) {
+      if (summary) summary.uosConversationCount = this.uosRecordsCache.conversationCount;
       return this.uosRecordsCache.records;
     }
-    const records = await this.loadUosPlaintextRecords(normalized, conversationId);
-    this.uosRecordsCache = { key, at: now, records };
-    return records;
+    const result = await this.loadUosPlaintextRecords(normalized, conversationId);
+    this.uosRecordsCache = {
+      key,
+      at: Date.now(),
+      records: result.records,
+      conversationCount: result.conversationCount,
+    };
+    if (summary) summary.uosConversationCount = result.conversationCount;
+    return result.records;
   }
 
   /** Load observer-plaintext interactions (agent_interactions_v1) as upstream-model records. */
   private async loadUosPlaintextRecords(
     normalized: {
       limit: number;
+      summaryLimit?: number;
       collectorId?: string;
       agentInstanceId?: string;
       workspacePath?: string;
@@ -1128,10 +1147,8 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       until?: number;
     },
     conversationId?: string,
-  ): Promise<InteractionRecord[]> {
-    if (!this.uosPlaintextEnabled) return [];
-    // An absent `until` arrives as MAX_SAFE_INTEGER from the shared query normalizer; anchoring
-    // the default window to that sentinel would select nothing, so clamp it to now first.
+  ): Promise<{ records: InteractionRecord[]; conversationCount: number }> {
+    if (!this.uosPlaintextEnabled) return { records: [], conversationCount: 0 };
     const now = Date.now();
     const until = normalized.until && normalized.until < now + 86_400_000
       ? normalized.until
@@ -1139,24 +1156,56 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     const since = normalized.since ?? until - 7 * 24 * 3_600_000;
     const anchor = conversationId ? uosConversationAnchor(conversationId) : undefined;
     const sessionFilter = anchor && anchor.startsWith('sess_') ? anchor : undefined;
-    // Index-only read first (scalar columns, ~1MB); payloads are fetched only for interactions
-    // absent from the parsed-record cache, so a polling list call re-reads a few KB instead of
-    // hundreds of MiB of plaintext bodies.
     const indexRows = await this.clickhouse.queryAgentInteractionIndex({
       startMs: since,
       endMs: until,
       limit: normalized.limit,
       ...(sessionFilter ? { sessionId: sessionFilter } : {}),
     });
-    if (!indexRows || indexRows.length === 0) return [];
-    const uncachedIds = indexRows
-      .map((row) => row.interactionId)
-      .filter((id) => !this.uosParsedCache.has(id));
-    const payloadById = uncachedIds.length > 0
-      ? await this.clickhouse.queryAgentInteractionPayloadsByIds(uncachedIds)
-      : new Map<string, string>();
-    if (uncachedIds.length > 0 && payloadById === null) return [];
-    const payloadOf = (interactionId: string): string | undefined => payloadById?.get(interactionId);
+    if (!indexRows || indexRows.length === 0) return { records: [], conversationCount: 0 };
+    const groups = new Map<string, typeof indexRows>();
+    for (const row of indexRows) {
+      const key = uosConversationId(row);
+      const group = groups.get(key) ?? [];
+      group.push(row);
+      groups.set(key, group);
+    }
+    const records: InteractionRecord[] = [];
+    let projectedConversations = 0;
+    for (const rows of groups.values()) {
+      const uncachedIds = rows
+        .map((row) => row.interactionId)
+        .filter((id) => !this.uosParsedCache.has(id));
+      const payloadById = uncachedIds.length > 0
+        ? await this.clickhouse.queryAgentInteractionPayloadsByIds(uncachedIds)
+        : new Map<string, string>();
+      if (uncachedIds.length > 0 && payloadById === null) {
+        return { records: [], conversationCount: 0 };
+      }
+      const payloadOf = (interactionId: string): string | undefined => payloadById?.get(interactionId);
+      const projected = this.projectUosPlaintextRows(rows, normalized, conversationId, payloadOf);
+      if (projected.length > 0) {
+        records.push(...projected);
+        projectedConversations += 1;
+      }
+      if (normalized.summaryLimit !== undefined && projectedConversations >= normalized.summaryLimit) break;
+    }
+    return {
+      records,
+      conversationCount: normalized.summaryLimit === undefined ? projectedConversations : groups.size,
+    };
+  }
+
+  private projectUosPlaintextRows(
+    indexRows: NonNullable<Awaited<ReturnType<ClickHouseStore['queryAgentInteractionIndex']>>>,
+    normalized: {
+      collectorId?: string;
+      agentInstanceId?: string;
+      workspacePath?: string;
+    },
+    conversationId: string | undefined,
+    payloadOf: (interactionId: string) => string | undefined,
+  ): InteractionRecord[] {
     return indexRows
       .filter((row) => {
         if (normalized.collectorId) {
@@ -1175,16 +1224,11 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
         const cacheKey = row.interactionId ?? '';
         let entry = cacheKey ? this.uosParsedCache.get(cacheKey) : undefined;
         if (entry) {
-          // LRU refresh: move to the tail so long-lived conversations survive eviction.
           this.uosParsedCache.delete(cacheKey);
           this.uosParsedCache.set(cacheKey, entry);
         } else {
           const payload = payloadOf(row.interactionId);
-          if (payload === undefined) {
-            // Payload fetch missed this id (transient CH failure or race): do not cache, so the
-            // next poll retries the fetch instead of pinning an empty verdict.
-            return [];
-          }
+          if (payload === undefined) return [];
           const parsed = parseUosPayload(payload);
           if (!parsed) {
             entry = { llm: false, collectorId: '', workspacePath: '', records: [] };
@@ -1304,10 +1348,12 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
   private async loadRecords(
     query: InteractionQuery,
     conversationId?: string,
+    summary?: { uosConversationCount?: number },
   ): Promise<InteractionRecord[]> {
     const projection = query.projection ?? 'auto';
     const normalized = {
       limit: boundedInteger(query.limit, 5_000, 1, MAX_QUERY_RECORDS),
+      summaryLimit: query.summaryLimit,
       collectorId: query.collectorId?.trim().slice(0, 180),
       agentInstanceId: query.agentInstanceId?.trim().slice(0, 240),
       workspacePath: query.workspacePath?.trim().slice(0, 500),
@@ -1325,10 +1371,10 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       const projected = projection === 'clickhouse'
         ? (await this.clickhouse.loadInteractionMetadata(normalized)) ?? []
         : (await this.relational.loadInteractionMetadata(normalized)) ?? [];
-      const uos = await this.loadUosPlaintextRecordsCached(normalized, conversationId);
+      const uos = await this.loadUosPlaintextRecordsCached(normalized, conversationId, summary);
       return deduplicateInteractionRecords([...projected, ...uos]);
     }
-    const uos = await this.loadUosPlaintextRecordsCached(normalized, conversationId);
+    const uos = await this.loadUosPlaintextRecordsCached(normalized, conversationId, summary);
     const postgres = await this.relational.loadInteractionMetadata(normalized);
     if (postgres !== null) return deduplicateInteractionRecords([...postgres, ...uos]);
     return deduplicateInteractionRecords([
