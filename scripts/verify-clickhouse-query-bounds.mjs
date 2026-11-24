@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import {
   AggregationService,
   BoundedHistoryQueryGate,
@@ -125,9 +126,12 @@ fake.state.calls.length = 0;
 // Resolve only small IDs first and hydrate precisely those IDs, including beyond the 256-per-agent
 // directory budget. An empty selector result must never trigger a broad payload read.
 for (const key of ['sessionId', 'runId', 'traceId']) {
-  fake.state.responses.push([{ interactionId: 'mi_correlated' }], [{ payload: JSON.stringify({
-    schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_correlated', [key]: 'correlation-test',
-  }) }]);
+  fake.state.responses.push([{ interactionId: 'mi_correlated' }], [{
+    interactionId: 'mi_correlated',
+    payload: JSON.stringify({
+      schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_correlated', [key]: 'correlation-test',
+    }),
+  }]);
   const records = await store.queryAgentInteractions({
     startMs: 100, endMs: 200, [key]: 'correlation-test', limit: 500,
   });
@@ -147,16 +151,53 @@ assert.equal(fake.state.calls.length, 1);
 assert.doesNotMatch(fake.state.calls[0].query, /argMax\(payload/u);
 fake.state.calls.length = 0;
 
+// Explicit payload reads use bounded batches and JSONEachRow streaming instead of buffering one
+// large JSON document. Latest-revision selection remains unchanged across both batches.
+{
+  const streamingStore = new ClickHouseStore();
+  streamingStore.ready = true;
+  const calls = [];
+  streamingStore.client = {
+    async query(options) {
+      calls.push(options);
+      const ids = options.query_params.interactionIds;
+      const lines = ids.flatMap((interactionId) => [
+        JSON.stringify({ interactionId, revision: 1, payload: 'old-revision' }),
+        JSON.stringify({ interactionId, revision: 2, payload: 'latest-revision' }),
+      ]);
+      return {
+        stream() {
+          return Readable.from(lines.map((line) => `${line}\n`));
+        },
+        async json() {
+          throw new Error('payload streaming must not fall back to whole-document JSON parsing');
+        },
+      };
+    },
+  };
+  const ids = Array.from({ length: 65 }, (_, index) => `mi_stream_${index}`);
+  const payloads = await streamingStore.queryAgentInteractionPayloadsByIds(ids);
+  assert.equal(payloads.size, 65);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].query_params.interactionIds.length, 64);
+  assert.equal(calls[1].query_params.interactionIds.length, 1);
+  for (const payload of payloads.values()) assert.equal(payload, 'latest-revision');
+}
+
 // contentQuery pushes a parameterized case-insensitive payload predicate down to ClickHouse.
-fake.state.responses.push([{ payload: JSON.stringify({
-  schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_content',
-  request: { body: '{"messages":[{"content":"hello-marker"}]}' },
-}) }]);
+fake.state.responses.push([{ interactionId: 'mi_content' }], [{
+  interactionId: 'mi_content',
+  payload: JSON.stringify({
+    schemaVersion: 'anysentry.agent_interaction.v1', interactionId: 'mi_content',
+    request: { body: '{"messages":[{"content":"hello-marker"}]}' },
+  }),
+}]);
 const contentRecords = await store.queryAgentInteractions({
   startMs: 100, endMs: 200, contentQuery: 'Hello-Marker', limit: 50,
 });
 assert.equal(contentRecords.length, 1);
-const contentCall = fake.state.calls.at(-1);
+assert.equal(fake.state.calls.length, 2);
+const contentCall = fake.state.calls[0];
 assert.match(contentCall.query, /positionCaseInsensitive\(payload, \{contentQuery:String\}\) > 0/u);
 assert.equal(contentCall.query_params.contentQuery, 'Hello-Marker');
 fake.state.calls.length = 0;

@@ -15,6 +15,7 @@ import {
   type ClickHouseSettings,
 } from "@clickhouse/client";
 import { createHash, randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
 import {
   agentIdentityKeyForEvent,
   agentRuntimeInstanceIdForEvent,
@@ -564,6 +565,7 @@ const EVENT_EVIDENCE_INDEX_NAMES = [
 ] as const;
 const EVENT_EVIDENCE_INDEX_MIGRATION_KEY = 'schema.events.evidence_indexes.v4';
 const INTERACTION_PAYLOAD_PROJECTION = 'interaction_payload_by_id';
+const INTERACTION_PAYLOAD_LOOKUP_BATCH_SIZE = 64;
 const INTERACTION_PAYLOAD_PROJECTION_MIGRATION_KEY = 'schema.agent_interactions.payload_projection.v1';
 // UOS field 2026-11-08: scheduling the projection MATERIALIZE from bootstrap made the 9.7 GB
 // agent_interactions_v1 rewrite compete with the install's activation window on a loaded box
@@ -9721,37 +9723,51 @@ export class ClickHouseStore {
   /** Latest-revision payload rows for explicit interaction ids. Ordered (interactionId, revision)
    *  in the interaction_payload_by_id projection this is a primary-key point lookup instead of an
    *  argMax GROUP BY full scan; picking the winning revision client-side also keeps payload and
-   *  routeShape row-consistent. */
+   *  routeShape row-consistent. Bounded batches and JSONEachRow streaming prevent a large response
+   *  from being buffered and parsed as one event-loop-blocking JSON document. */
   private async fetchInteractionPayloadRows(
     interactionIds: readonly string[],
     signal?: AbortSignal,
   ): Promise<Array<{ interactionId: string; payload: string; routeShape?: string }> | null> {
     if (!this.client || !this.ready || interactionIds.length === 0) return null;
     try {
-      const result = await this.client.query({
-        query: `
-          SELECT interactionId, revision, payload, routeShape
-          FROM ${AGENT_INTERACTION_TABLE}
-          WHERE interactionId IN {interactionIds:Array(String)}
-          ORDER BY interactionId, revision`,
-        query_params: { interactionIds: [...interactionIds] },
-        clickhouse_settings: { max_execution_time: 10 },
-        ...(signal ? { abort_signal: signal } : {}),
-        format: "JSONEachRow",
-      });
-      const rows = (await result.json()) as Array<{
-        interactionId?: string;
-        payload?: string;
-        routeShape?: string;
-      }>;
       const latest = new Map<string, { interactionId: string; payload: string; routeShape?: string }>();
-      for (const row of rows) {
-        if (!row.interactionId || !row.payload) continue;
-        latest.set(row.interactionId, {
-          interactionId: row.interactionId,
-          payload: row.payload,
-          routeShape: row.routeShape || undefined,
+      for (let offset = 0; offset < interactionIds.length; offset += INTERACTION_PAYLOAD_LOOKUP_BATCH_SIZE) {
+        if (signal?.aborted) return null;
+        const result = await this.client.query({
+          query: `
+            SELECT interactionId, revision, payload, routeShape
+            FROM ${AGENT_INTERACTION_TABLE}
+            WHERE interactionId IN {interactionIds:Array(String)}
+            ORDER BY interactionId, revision`,
+          query_params: {
+            interactionIds: interactionIds.slice(offset, offset + INTERACTION_PAYLOAD_LOOKUP_BATCH_SIZE),
+          },
+          clickhouse_settings: { max_execution_time: 10 },
+          ...(signal ? { abort_signal: signal } : {}),
+          format: "JSONEachRow",
         });
+        const append = (row: {
+          interactionId?: string;
+          payload?: string;
+          routeShape?: string;
+        }): void => {
+          if (!row.interactionId || !row.payload) return;
+          latest.set(row.interactionId, {
+            interactionId: row.interactionId,
+            payload: row.payload,
+            routeShape: row.routeShape || undefined,
+          });
+        };
+        if (typeof result.stream === 'function') {
+          const lines = createInterface({ input: result.stream(), crlfDelay: Infinity });
+          for await (const line of lines) {
+            if (line.trim()) append(JSON.parse(line) as Parameters<typeof append>[0]);
+          }
+        } else {
+          const rows = (await result.json()) as Array<Parameters<typeof append>[0]>;
+          for (const row of rows) append(row);
+        }
       }
       return [...latest.values()];
     } catch (error) {
