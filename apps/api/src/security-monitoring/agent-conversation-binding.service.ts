@@ -60,6 +60,35 @@ function canonicalJson(value: unknown): string {
     `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
 }
 
+class EstimatedMap<K, V> extends Map<K, V> {
+  estimatedBytes = 0;
+
+  private static valueBytes(value: unknown): number {
+    try { return Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return 1_024; }
+  }
+
+  set(key: K, value: V): this {
+    const previousBytes = super.has(key) ? EstimatedMap.valueBytes(super.get(key)) : 0;
+    const nextBytes = EstimatedMap.valueBytes(value);
+    super.set(key, value);
+    this.estimatedBytes = Math.max(0, this.estimatedBytes + nextBytes - previousBytes);
+    return this;
+  }
+
+  delete(key: K): boolean {
+    if (!super.has(key)) return false;
+    const previousBytes = EstimatedMap.valueBytes(super.get(key));
+    const deleted = super.delete(key);
+    if (deleted) this.estimatedBytes = Math.max(0, this.estimatedBytes - previousBytes);
+    return deleted;
+  }
+
+  clear(): void {
+    super.clear();
+    this.estimatedBytes = 0;
+  }
+}
+
 function userLineage(record: T.AgentInteractionRecord): string[] {
   return (record.request.messages ?? [])
     .filter((message) => ['user', 'human'].includes(message.role.toLowerCase()))
@@ -675,12 +704,12 @@ export function deriveConversationSegmentsFromRecords(
 
 @Injectable()
 export class AgentConversationBindingService implements OnModuleDestroy {
-  private readonly bindings = new Map<string, T.AgentConversationBindingRecord>();
-  private readonly threads = new Map<string, T.AgentConversationThreadRecord>();
-  private readonly segments = new Map<string, T.ConversationInstanceSegment>();
-  private readonly routeAliases = new Map<string, ConversationRouteAliasV1>();
-  private readonly technicalActivities = new Map<string, TechnicalActivityProjection>();
-  private readonly membershipsV2 = new Map<string, ConversationMembershipV2>();
+  private readonly bindings = new EstimatedMap<string, T.AgentConversationBindingRecord>();
+  private readonly threads = new EstimatedMap<string, T.AgentConversationThreadRecord>();
+  private readonly segments = new EstimatedMap<string, T.ConversationInstanceSegment>();
+  private readonly routeAliases = new EstimatedMap<string, ConversationRouteAliasV1>();
+  private readonly technicalActivities = new EstimatedMap<string, TechnicalActivityProjection>();
+  private readonly membershipsV2 = new EstimatedMap<string, ConversationMembershipV2>();
   private readonly persistenceFingerprints = new Map<string, {
     fingerprint: string;
     bytes: number;
@@ -767,14 +796,12 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     prune(this.routeAliases, (value) => value.createdAt);
     prune(this.technicalActivities, (value) => nsMillis(value.endedAtUnixNs));
     prune(this.membershipsV2, (value) => value.decidedAt);
-    const maps: Array<Map<string, unknown>> = [
-      this.bindings as Map<string, unknown>, this.threads as Map<string, unknown>,
-      this.segments as Map<string, unknown>, this.routeAliases as Map<string, unknown>,
-      this.technicalActivities as Map<string, unknown>, this.membershipsV2 as Map<string, unknown>,
+    const maps: Array<EstimatedMap<string, unknown>> = [
+      this.bindings as EstimatedMap<string, unknown>, this.threads as EstimatedMap<string, unknown>,
+      this.segments as EstimatedMap<string, unknown>, this.routeAliases as EstimatedMap<string, unknown>,
+      this.technicalActivities as EstimatedMap<string, unknown>, this.membershipsV2 as EstimatedMap<string, unknown>,
     ];
-    const estimate = () => maps.reduce<number>((sum, map) => sum + [...map.values()].reduce<number>((inner, value) => {
-      try { return inner + Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return inner + 1_024; }
-    }, 0), 0);
+    const estimate = () => maps.reduce((sum, map) => sum + map.estimatedBytes, 0);
     let bytes = estimate();
     while (bytes > this.hotStateMaxBytes) {
       const largest = maps.sort((left, right) => right.size - left.size)[0];
@@ -805,14 +832,12 @@ export class AgentConversationBindingService implements OnModuleDestroy {
   } {
     this.pruneHotState();
     this.prunePersistenceFingerprints();
-    const maps: Array<Map<string, unknown>> = [
-      this.bindings as Map<string, unknown>, this.threads as Map<string, unknown>,
-      this.segments as Map<string, unknown>, this.routeAliases as Map<string, unknown>,
-      this.technicalActivities as Map<string, unknown>, this.membershipsV2 as Map<string, unknown>,
+    const maps: Array<EstimatedMap<string, unknown>> = [
+      this.bindings as EstimatedMap<string, unknown>, this.threads as EstimatedMap<string, unknown>,
+      this.segments as EstimatedMap<string, unknown>, this.routeAliases as EstimatedMap<string, unknown>,
+      this.technicalActivities as EstimatedMap<string, unknown>, this.membershipsV2 as EstimatedMap<string, unknown>,
     ];
-    const estimatedBytes = maps.reduce<number>((sum, map) => sum + [...map.values()].reduce<number>((inner, value) => {
-      try { return inner + Buffer.byteLength(JSON.stringify(value), 'utf8'); } catch { return inner + 1_024; }
-    }, 0), 0);
+    const estimatedBytes = maps.reduce((sum, map) => sum + map.estimatedBytes, 0);
     return {
       entries: maps.reduce((sum, map) => sum + map.size, 0),
       estimatedBytes,

@@ -1215,4 +1215,36 @@ assert.ok(
   'directory projection of a shared run must keep two hop Threads',
 );
 
+// Hot-state memory accounting is incremental: stats and pruning must not serialize the full map.
+{
+  const statsService = new AgentConversationBindingService();
+  const originalStringify = JSON.stringify;
+  let serializations = 0;
+  JSON.stringify = (...args) => {
+    serializations += 1;
+    return originalStringify(...args);
+  };
+  try {
+    for (let index = 0; index < 1_000; index += 1) {
+      statsService.bindings.set(`mi_hot_state_${index}`, {
+        interactionId: `mi_hot_state_${index}`,
+        conversationId: 'cv_hot_state',
+        segmentId: 'seg_hot_state',
+        updatedAt: Date.now(),
+      });
+    }
+    const afterWrites = serializations;
+    for (let index = 0; index < 20; index += 1) statsService.hotStateStats();
+    assert.equal(serializations, afterWrites, 'hot-state stats must not reserialize every record');
+    const beforeDelete = statsService.hotStateStats().estimatedBytes;
+    statsService.bindings.delete('mi_hot_state_0');
+    assert.ok(statsService.hotStateStats().estimatedBytes < beforeDelete,
+      'deleting a record must decrement the incremental byte estimate');
+    assert.equal(serializations, afterWrites + 1,
+      'only the deleted value may be serialized during incremental accounting');
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+}
+
 console.log('Agent Conversation durable Thread/Segment binding verification passed');
