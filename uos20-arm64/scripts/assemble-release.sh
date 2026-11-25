@@ -32,7 +32,9 @@ for file in \
   systemd/anysentry-observer.service \
   systemd/anysentry-prometheus.service \
   systemd/anysentry-node-exporter.service \
-  systemd/anysentry-postgresql.service
+  systemd/anysentry-postgresql.service \
+  systemd/anysentry-data-cleanup.service \
+  systemd/anysentry-data-cleanup.timer
 do
   install -m 0644 "$CHANNEL_DIR/package/$file" "$STAGE_DIR/$file"
 done

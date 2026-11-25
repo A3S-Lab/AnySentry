@@ -100,6 +100,9 @@ grep -Fq 'ANYSENTRY_DATA_TTL_DAYS=1' "$CHANNEL/package/config/anysentry.env.exam
 grep -Fq 'log.retention.hours=24' "$CHANNEL/package/config/kafka-server.properties" || fail "Kafka retention is not 24 hours"
 grep -Fq -- '--storage.tsdb.retention.time=24h' "$CHANNEL/package/systemd/anysentry-prometheus.service" || fail "Prometheus retention is not 24 hours"
 grep -Fq 'systemctl enable --now anysentry-data-cleanup.timer' "$CHANNEL/package/install.sh" || fail "daily data cleanup timer is not enabled"
+grep -Fq 'systemd/anysentry-data-cleanup.service' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the cleanup service"
+grep -Fq 'systemd/anysentry-data-cleanup.timer' "$CHANNEL/scripts/assemble-release.sh" || fail "assembler omits the cleanup timer"
+grep -Fq 'systemd/anysentry-data-cleanup.timer' "$CHANNEL/scripts/verify-release.sh" || fail "release verifier omits the cleanup timer"
 grep -Fq '<old_parts_lifetime>120</old_parts_lifetime>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse dead-part lifetime is not bounded"
 if grep -Fq '<opentelemetry_span_log><ttl>' "$CHANNEL/package/config/clickhouse-config.xml"; then
   fail "opentelemetry_span_log carries a sibling ttl (base config has a custom engine; ClickHouse rejects it at startup)"

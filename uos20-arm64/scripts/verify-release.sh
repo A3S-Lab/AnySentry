@@ -31,6 +31,7 @@ required=(
   app/node_modules/@a3s-lab/code/index.linux-arm64-gnu.node 
   install.sh verify.sh inspect-host.sh RUN_HEALTH_SMOKE.sh ACCEPTANCE_CHECK.sh FIELD_DIAGNOSTIC.sh collect-support-bundle.sh anysentry-data-cleanup.sh DEPLOYMENT.md
   AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md 现场问题采集.md UOS现场诊断规则.md
+  systemd/anysentry-data-cleanup.service systemd/anysentry-data-cleanup.timer
   VERSION PROVENANCE manifest.sha256
 )
 for file in "${required[@]}"; do [[ -f "$release/$file" ]] || die "release file missing: $file"; done
