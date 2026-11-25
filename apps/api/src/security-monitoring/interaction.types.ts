@@ -1536,7 +1536,11 @@ export function interactionContentMetadata(record: InteractionContentRecord) {
  * Fingerprint only the immutable logical observation. Receipt/projection timestamps are
  * deliberately excluded so a lost HTTP response can be retried without creating a conflict.
  */
+const interactionFingerprintCache = new WeakMap<InteractionRecord, string>();
+
 export function interactionPayloadFingerprint(record: InteractionRecord): string {
+  const cached = interactionFingerprintCache.get(record);
+  if (cached) return cached;
   const immutable = {
     schemaVersion: record.schemaVersion,
     eventType: record.eventType,
@@ -1567,7 +1571,9 @@ export function interactionPayloadFingerprint(record: InteractionRecord): string
         : { output: record.output, turn: record.turn, assistantResponse: record.assistantResponse }),
     capture: record.capture,
   };
-  return createHash('sha256').update(JSON.stringify(immutable)).digest('hex');
+  const fingerprint = createHash('sha256').update(JSON.stringify(immutable)).digest('hex');
+  interactionFingerprintCache.set(record, fingerprint);
+  return fingerprint;
 }
 
 export function deduplicateInteractionRecords(
@@ -1592,10 +1598,11 @@ export function deduplicateInteractionRecords(
 
 export function summarizeInteractionRecords(
   records: readonly InteractionRecord[],
+  alreadyDeduplicated = false,
 ): InteractionConversationSummary[] {
   const summaries = new Map<string, InteractionConversationSummary>();
   const turnRoles = new Map<string, Set<'user' | 'assistant'>>();
-  for (const record of deduplicateInteractionRecords(records)) {
+  for (const record of alreadyDeduplicated ? records : deduplicateInteractionRecords(records)) {
     const current = summaries.get(record.conversationId);
     if (!current) {
       const transport = record.eventType === 'LlmTransportObserved'

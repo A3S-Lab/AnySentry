@@ -285,6 +285,18 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     64 * 1024,
     256 * 1024 * 1024,
   );
+  private lastConversationRead?: {
+    at: string;
+    limit: number;
+    totalMs: number;
+    loadRecordsMs: number;
+    summarizeMs: number;
+    contentLookupMs: number;
+    enrichmentMs: number;
+    recordCount: number;
+    summaryCount: number;
+    resultCount: number;
+  };
   private readonly counters = {
     accepted: 0,
     rejected: 0,
@@ -365,6 +377,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
         maxInFlightBytes: this.maxInFlightBytes,
       },
       ...this.counters,
+      lastConversationRead: this.lastConversationRead,
       lastError: this.lastDurabilityError ?? lastProjectionError,
     };
   }
@@ -613,6 +626,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
   }
 
   async conversations(query: InteractionQuery = {}): Promise<InteractionConversationList> {
+    const readStarted = performance.now();
     const limit = boundedInteger(query.limit, 100, 1, 500);
     // `limit` is a conversation-page size, not an observation cap. A single native Agent thread
     // can legitimately contain hundreds of user/assistant items; summarize the full bounded
@@ -623,7 +637,9 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       limit: MAX_QUERY_RECORDS,
       summaryLimit: limit,
     }, undefined, uosSummary);
-    const summaries = summarizeInteractionRecords(records);
+    const recordsLoadedAt = performance.now();
+    const summaries = summarizeInteractionRecords(records, true);
+    const summarizedAt = performance.now();
     const contentRecords = records.filter(
       (record): record is InteractionContentRecord =>
         record.eventType === 'AgentInputObserved'
@@ -637,6 +653,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     const availableIds = projectedContentIds.length > 0
       ? await this.contents.availableInteractionIds(projectedContentIds)
       : new Set<string>();
+    const contentResolvedAt = performance.now();
     // UOS plaintext records carry their content in the stored payload itself; their uos://
     // contentRef is always readable through the adapter, so mark them available directly.
     for (const record of contentRecords) {
@@ -698,6 +715,19 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       }
     }
     const contentAvailable = summaries.some((item) => item.contentAvailable);
+    const enrichedAt = performance.now();
+    this.lastConversationRead = {
+      at: new Date().toISOString(),
+      limit,
+      totalMs: Math.round(enrichedAt - readStarted),
+      loadRecordsMs: Math.round(recordsLoadedAt - readStarted),
+      summarizeMs: Math.round(summarizedAt - recordsLoadedAt),
+      contentLookupMs: Math.round(contentResolvedAt - summarizedAt),
+      enrichmentMs: Math.round(enrichedAt - contentResolvedAt),
+      recordCount: records.length,
+      summaryCount: summaries.length,
+      resultCount: Math.min(limit, summaries.length),
+    };
     return {
       schemaVersion: 'anysentry.interaction-conversations.v1',
       items: summaries.slice(0, limit),
@@ -716,7 +746,7 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     const cleanId = conversationId.trim().slice(0, 160);
     if (!cleanId) return null;
     const observations = await this.loadRecords({ limit: MAX_QUERY_RECORDS }, cleanId);
-    const conversation = summarizeInteractionRecords(observations)[0];
+    const conversation = summarizeInteractionRecords(observations, true)[0];
     if (!conversation) return null;
     // Detail header parity with the list: surface the first user instruction as the title so the
     // page header never falls back to the raw "LLM 会话 sess_*" anchor when plaintext is available.
