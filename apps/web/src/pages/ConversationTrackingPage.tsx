@@ -1622,9 +1622,9 @@ export default function LocalRecordTrackingPage() {
             </span>
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold text-slate-950">记录追踪</h1>
+                <h1 className="text-lg font-semibold text-slate-950">对话追踪</h1>
                 <span className="rounded-full border border-teal-200 bg-teal-50 px-2 py-0.5 text-[10px] text-teal-700">
-                  本地只读
+                  Observer 明文只读
                 </span>
                 <span
                   className={cn(
@@ -1679,12 +1679,12 @@ export default function LocalRecordTrackingPage() {
           caption={
             listUnavailable
               ? "API 暂不可用，正在自动重试"
-              : status?.rootDisplay || "等待本地 Session 目录"
+              : status?.rootDisplay || "等待 Observer 明文会话"
           }
           icon={ShieldCheck}
         />
         <KpiCard
-          label="本地记录"
+          label="明文会话"
           value={compactNumber(listRequest.data?.total)}
           caption={status?.adapter === "multi" ? "多 Agent Session" : status?.adapter ? `${adapterLabel(status.adapter)} Session` : "Agent Session"}
           icon={Database}
@@ -1713,7 +1713,7 @@ export default function LocalRecordTrackingPage() {
         <KpiCard
           label="已观测 Token"
           value={compactNumber(aggregates?.observedTokens)}
-          caption={`本地文件 ${bytes(aggregates?.totalBytes)}`}
+          caption={`明文累计 ${bytes(aggregates?.totalBytes)}`}
           icon={Gauge}
           tone="violet"
         />
@@ -1730,7 +1730,7 @@ export default function LocalRecordTrackingPage() {
         <div className="m-4 rounded-xl border border-rose-200 bg-rose-50 p-4">
           <div className="flex items-center gap-2 text-sm font-semibold text-rose-800">
             <TriangleAlert aria-hidden="true" className="size-4" />
-            本地记录 API 暂时不可用
+            对话追踪 API 暂时不可用
           </div>
           <p className="mt-2 text-xs leading-5 text-rose-900">
             {listRequest.error?.message || "连接失败"}。页面正在自动重试，也可以点击右上角刷新。
@@ -1740,13 +1740,13 @@ export default function LocalRecordTrackingPage() {
         <div className="m-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
           <div className="flex items-center gap-2 text-sm font-semibold text-amber-800">
             <TriangleAlert aria-hidden="true" className="size-4" />
-            本地记录源尚不可用
+            明文会话源尚不可用
           </div>
           <p className="mt-2 text-xs leading-5 text-amber-900">
             {status.lastError || (
               status.enabled
-                ? "已启用读取，但容器内没有挂载可访问的 Agent sessions 目录。"
-                : "设置 ANYSENTRY_LOCAL_RECORD_TRACKING=on，并以只读方式挂载 Codex、A3S Code、Claude Code 或 Gemini CLI Session 目录。"
+                ? "已启用读取，但当前时间窗口内没有获取到 Observer 明文会话。"
+                : "请检查 Observer 明文采集、管理令牌和当前页面时间窗口。"
             )}
           </p>
         </div>
@@ -1767,7 +1767,7 @@ export default function LocalRecordTrackingPage() {
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="text-sm font-semibold text-slate-950">Agent 会话全景</h2>
                     <span className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[9px] text-slate-600">
-                      {filteredItems.length} / {allItems.length} 条
+                      {listUnavailable ? "读取失败" : `${filteredItems.length} / ${allItems.length} 条`}
                     </span>
                   </div>
                 </div>
@@ -1883,13 +1883,13 @@ export default function LocalRecordTrackingPage() {
             {listRequest.loading && allItems.length === 0 ? (
               <div className="flex h-full min-h-52 items-center justify-center gap-2 text-xs text-slate-600">
                 <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                正在读取本地记录
+                正在读取对话记录
               </div>
             ) : listUnavailable ? (
               <OperationalEmptyState
                 appearance="light"
                 icon={TriangleAlert}
-                title="本地记录 API 连接失败"
+                title="对话追踪 API 连接失败"
                 description="服务恢复后页面会自动重试；也可以点击右上角刷新。"
               />
             ) : filteredItems.length > 0 ? (
@@ -1900,7 +1900,7 @@ export default function LocalRecordTrackingPage() {
               <OperationalEmptyState
                 appearance="light"
                 icon={FileText}
-                title="没有匹配的本地记录"
+                title="没有匹配的对话记录"
                 description="调整搜索条件，或确认本机 Agent sessions 目录已经只读挂载。"
               />
             )}
@@ -1931,7 +1931,7 @@ export default function LocalRecordTrackingPage() {
             <OperationalEmptyState
               appearance="light"
               icon={TriangleAlert}
-              title="本地记录读取失败"
+              title="对话详情读取失败"
               description={detailRequest.error.message}
             />
           ) : detail ? (
@@ -2101,7 +2101,7 @@ export default function LocalRecordTrackingPage() {
                       <div
                         data-conversation-transcript
                         role="list"
-                        aria-label="本地 Session 对话记录"
+                        aria-label="Agent 对话记录"
                         className="space-y-4 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-5"
                       >
                         {visibleEvents.map((event) => (

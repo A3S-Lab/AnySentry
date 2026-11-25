@@ -29,6 +29,11 @@ function LegacyCaptureRulesRedirect() {
   return <Navigate replace to={`/filter-rules${location.search}${location.hash}`} />;
 }
 
+function LegacyRecordTrackingRedirect() {
+  const location = useLocation();
+  return <Navigate replace to={`/conversations${location.search}${location.hash}`} />;
+}
+
 export const router = createBrowserRouter(
   [{
     element: <AppShell />,
@@ -44,7 +49,7 @@ export const router = createBrowserRouter(
       { path: "/capabilities", lazy: lazyRoute("/capabilities") },
       { path: "/collectors", lazy: lazyRoute("/collectors") },
       { path: "/conversations", lazy: lazyRoute("/conversations") },
-      { path: "/record-tracking", lazy: lazyRoute("/record-tracking") },
+      { path: "/record-tracking", element: <LegacyRecordTrackingRedirect /> },
       { path: "/coverage", lazy: lazyRoute("/coverage") },
       { path: "/evidence", lazy: lazyRoute("/evidence") },
       { path: "/events", lazy: lazyRoute("/events") },
