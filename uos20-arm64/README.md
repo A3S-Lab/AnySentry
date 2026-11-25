@@ -97,10 +97,10 @@ bash uos20-arm64/build.sh --version 0.4.0-compat34 --component assemble
 5. 只改 Observer 的现场热修：
    先 `cp -a` 上一版 stage 到新版号，删除新版 stage 的 `observer/`，再执行
    `--component observer`，最后 `--component assemble`。
-6. 重编 `app` 后必须跟跑 `--component l3`，否则 a3s-code 的 `.node` 与 zvec 会被
+6. 重编 `app` 后必须跟跑 `--component l3`，否则 a3s-code 的 `.node` 与本地重建运行时配套的 zvec 会被
    fresh pnpm 安装清掉。
 7. 每次交付必须校验 tar `.sha256`、解包 `manifest.sha256`、`@RELEASE_VERSION@` 零残留、
-   `install.sh --help`、a3s-code `.node`/zvec，以及 PROVENANCE 中的三个提交号。
+   `install.sh --help`、a3s-code `.node`（本地重建运行时还需配套 zvec），以及 PROVENANCE 中的三个提交号。
 8. 现场未验收前，问题台账只能写“待现场验证”，不能写“已闭环”。
 9. 现场会话默认不推远程；打包工程师在完成上述检查和门禁后，按任务要求推送 integration 分支。
 
