@@ -8672,6 +8672,27 @@ export class SecurityMonitoringController implements OnModuleDestroy {
     return result;
   }
 
+  @Post('agents/conversations/repair-persistence')
+  @RequireManagementAuth()
+  @HttpCode(200)
+  async repairConversationPersistence(
+    @Body() body: { conversationId?: string },
+    @Headers() headers: HeaderBag,
+  ) {
+    const conversationId = strictIdentityText(body?.conversationId, 512);
+    if (!conversationId) throw new BadRequestException('a valid conversationId is required');
+    const result = await this.agg.repairConversationPersistence(conversationId);
+    this.audit.record({
+      actor: auditActor(headers),
+      action: 'agent.conversation.persistence.repair',
+      resourceType: 'agent',
+      resourceId: conversationId,
+      summary: `Repaired ${result.persistedMembershipCount} persisted conversation membership(s)`,
+      details: result,
+    });
+    return result;
+  }
+
   @Post('agents/semantic-events/evidence')
   @HttpCode(200)
   async agentSemanticEvidence(

@@ -5141,6 +5141,7 @@ export type AuditAction =
   | 'agent.interaction.content.read'
   | 'agent.conversation.content.list'
   | 'agent.conversation.content.read'
+  | 'agent.conversation.persistence.repair'
   | 'agent.semantic_evidence.read'
   | 'maintenance.window.updated'
   | 'notification.channel.updated'

@@ -3978,6 +3978,59 @@ export class AggregationService implements OnModuleDestroy {
     };
   }
 
+  async repairConversationPersistence(conversationId: string): Promise<{
+    conversationId: string;
+    interactionCount: number;
+    projectedThreadCount: number;
+    persistedMembershipCount: number;
+    savedV1?: boolean;
+    savedV2?: boolean;
+  }> {
+    if (!this.conversationBindings || !this.relationalStore?.configured()) {
+      throw new ServiceUnavailableException('PostgreSQL conversation persistence is unavailable');
+    }
+    const thread = (await this.relationalStore.loadAgentConversationThreadsByIds([conversationId]))
+      .find((item) => item.conversationId === conversationId);
+    const sessionId = thread?.sessionId?.trim() || this.conversationSessionHint([conversationId]);
+    if (!sessionId) throw new ServiceUnavailableException('Thread has no sessionId for keyed repair');
+    const interactions = await this.readAgentInteractions({
+      timeType: 'custom',
+      startTime: new Date(Math.max(0, Date.now() - 24 * 60 * 60_000)).toISOString(),
+      endTime: new Date().toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      sessionId,
+      limit: CONVERSATION_INTERACTIONS_TOTAL,
+    }, { totalLimit: CONVERSATION_INTERACTIONS_TOTAL });
+    if (interactions.items.length === 0) {
+      throw new ServiceUnavailableException('No retained interactions match the Thread sessionId');
+    }
+    const resolutionSink: { resolution?: ConversationResolutionV2 } = {};
+    const bound = await this.conversationBindings.applyPersistedBindings(
+      interactions.items,
+      resolutionSink,
+    );
+    const projection = projectAgentConversations(bound, [], {
+      timeType: 'custom',
+      startTime: new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
+      endTime: new Date().toISOString(),
+      scope: 'agent',
+      classificationView: 'current_effective',
+      includeBackground: true,
+    });
+    await this.conversationBindings.persistProjection(projection, resolutionSink.resolution);
+    const persisted = await this.conversationBindings.interactionIdsForConversation(conversationId, 10_000);
+    const last = this.conversationBindings.hotStateStats().lastPersistence;
+    return {
+      conversationId,
+      interactionCount: interactions.items.length,
+      projectedThreadCount: projection.summaries.length,
+      persistedMembershipCount: persisted.interactionIds.length,
+      ...(last?.savedV1 !== undefined ? { savedV1: last.savedV1 } : {}),
+      ...(last?.savedV2 !== undefined ? { savedV2: last.savedV2 } : {}),
+    };
+  }
+
   async agentConversations(filter: T.AgentConversationQuery): Promise<T.AgentConversationList> {
     const { projection, interactions, inventory } = await this.agentConversationProjection(filter);
     const limit = Math.max(1, Math.min(200, filter.limit ?? 80));

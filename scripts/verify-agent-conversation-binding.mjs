@@ -681,6 +681,51 @@ assert.ok(hintedTimeline.turns.length > 0,
 assert.equal(hintedTimeline.coverage.partial, true);
 assert.equal(hintedTimeline.coverage.partialReason, 'membership_records_missing');
 
+// Explicit single-Thread repair replays only the retained session point-read and verifies durable rows.
+const repairConversationId = 'cv_repair_missing_membership';
+const repairRecords = [0, 1].map((index) => ({
+  ...interaction({
+    id: `mi_repair_${index}`,
+    at: fixtureNow + 100_000 + index * 1_000,
+    instance: 'host-root:thread:repair',
+    users: [`repair ${index}`],
+  }),
+  sessionId: 'thread-repair-session',
+  conversationId: repairConversationId,
+  conversationIdSource: 'runtime',
+  conversationBindingVersion: 2,
+}));
+storedThreads.set(repairConversationId, {
+  schemaVersion: 'anysentry.agent_conversation_thread.v1',
+  conversationId: repairConversationId,
+  logicalScopeKey: conversationLogicalScopeKey(repairRecords[0]),
+  idSource: 'runtime',
+  agentProduct: 'Codex',
+  workspacePath: '/workspace/thread-fixture',
+  sessionId: 'thread-repair-session',
+  agentInstanceIds: ['host-root:thread:repair'],
+  userLineageHashes: [],
+  pendingToolCallIds: [],
+  startedAtUnixNs: repairRecords[0].startedAtUnixNs,
+  lastActivityAtUnixNs: repairRecords.at(-1).endedAtUnixNs,
+  resolverVersion: 2,
+  updatedAt: Date.now(),
+});
+const repairBinding = new AgentConversationBindingService(fakeStore);
+const repairAggregation = new AggregationService({
+  storedAgentInteractions: async (queryInput) => queryInput.sessionId === 'thread-repair-session'
+    ? repairRecords.map((record) => structuredClone(record)) : [],
+}, {
+  identitySnapshotVersion: () => 0,
+  canonicalAgentAssetId: (value) => value,
+}, {}, {}, {}, undefined, repairBinding, fakeStore);
+const repaired = await repairAggregation.repairConversationPersistence(repairConversationId);
+assert.equal(repaired.interactionCount, 2);
+assert.ok(repaired.persistedMembershipCount > 0);
+assert.equal(repaired.savedV1, true);
+assert.equal(repaired.savedV2, true);
+assert.ok(repairRecords.every((record) => storedBindings.has(record.interactionId)));
+
 // Parent and child hops can share sessionId/runId. Session hydration must not fold the peer
 // hop into the selected Thread, and hop-fenced aliases must still pick the owning summary.
 const hopSession = 'shared-parent-child-session';
