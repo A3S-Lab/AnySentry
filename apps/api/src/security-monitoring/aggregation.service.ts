@@ -77,6 +77,7 @@ import {
   pointReadCanonicalConversationId,
   trafficRoleForInteraction,
   repairEmptyRouteAliasConversationId,
+  type ConversationResolutionV2,
 } from './agent-conversation-resolution-v2';
 import { RelationalBusinessStore } from './relational-business-store.service';
 import { CanonicalObservabilityService } from './canonical-observability.service';
@@ -3087,7 +3088,8 @@ export class AggregationService implements OnModuleDestroy {
       ...(trigger.agentInstanceId ? { agentInstanceId: trigger.agentInstanceId } : {}),
       limit: 500,
     }, { totalLimit: 500 });
-    const bound = await this.conversationBindings.applyPersistedBindings(interactionList.items);
+    const resolutionSink: { resolution?: ConversationResolutionV2 } = {};
+    const bound = await this.conversationBindings.applyPersistedBindings(interactionList.items, resolutionSink);
     const projection = projectAgentConversations(bound, [], {
       timeType: 'custom',
       startTime: new Date(startMs).toISOString(),
@@ -3097,7 +3099,7 @@ export class AggregationService implements OnModuleDestroy {
       agentAssetId: trigger.agentAssetId,
       limit: 200,
     });
-    await this.conversationBindings.persistProjection(projection);
+    await this.conversationBindings.persistProjection(projection, resolutionSink.resolution);
 
     const relationInputs = projection.summaries
       .filter((summary) => summary.hasContent)

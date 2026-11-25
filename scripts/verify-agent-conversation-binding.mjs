@@ -171,9 +171,11 @@ const query = { timeType: 'last_30d', scope: 'agent', limit: 100 };
 // would be pruned before the continuation assertion and make the test depend on the calendar.
 const fixtureNow = Date.now();
 const resolveAndPersist = async (service, records) => {
-  const bound = await service.applyPersistedBindings(records);
+  const resolutionSink = {};
+  const bound = await service.applyPersistedBindings(records, resolutionSink);
+  assert.ok(resolutionSink.resolution, 'each projection task must carry its own resolution');
   const projection = projectAgentConversations(bound, [], query);
-  await service.persistProjection(projection);
+  await service.persistProjection(projection, resolutionSink.resolution);
   return { bound, projection };
 };
 
@@ -195,6 +197,11 @@ const first = interaction({
 const firstProjection = await resolveAndPersist(service, [first]);
 const conversationId = firstProjection.projection.summaries[0].conversationId;
 assert.ok(conversationId.startsWith('cv_'));
+const firstPersistenceStats = service.hotStateStats().lastPersistence;
+assert.ok(firstPersistenceStats.bindings > 0);
+assert.ok(firstPersistenceStats.pendingMemberships > 0);
+assert.equal(firstPersistenceStats.savedV1, true);
+assert.equal(firstPersistenceStats.savedV2, true);
 const persistedAfterFirstProjection = persistedV1Items + persistedV2Items;
 await resolveAndPersist(service, [structuredClone(first)]);
 assert.equal(persistedV1Items + persistedV2Items, persistedAfterFirstProjection,

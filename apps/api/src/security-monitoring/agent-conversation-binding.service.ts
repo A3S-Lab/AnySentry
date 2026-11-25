@@ -732,6 +732,15 @@ export class AgentConversationBindingService implements OnModuleDestroy {
   private readonly hotStateMaxBytes = 64 * 1024 * 1024;
   private hotStateEvictions = 0;
   private pendingResolution?: ConversationResolutionV2;
+  private lastPersistence?: {
+    at: number;
+    threads: number;
+    segments: number;
+    bindings: number;
+    pendingMemberships: number;
+    savedV1?: boolean;
+    savedV2?: boolean;
+  };
   private resolutionRevision = 0;
   private resolutionInputFingerprint?: string;
 
@@ -834,6 +843,15 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       expired: number;
       dropped: number;
     };
+    lastPersistence?: {
+      at: number;
+      threads: number;
+      segments: number;
+      bindings: number;
+      pendingMemberships: number;
+      savedV1?: boolean;
+      savedV2?: boolean;
+    };
   } {
     this.pruneHotState();
     this.prunePersistenceFingerprints();
@@ -860,6 +878,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
         expired: this.persistenceFingerprintExpired,
         dropped: this.persistenceFingerprintDropped,
       },
+      ...(this.lastPersistence ? { lastPersistence: { ...this.lastPersistence } } : {}),
     };
   }
 
@@ -1029,6 +1048,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
 
   async applyPersistedBindings(
     interactions: T.AgentInteractionRecord[],
+    resolutionSink?: { resolution?: ConversationResolutionV2 },
   ): Promise<T.AgentInteractionRecord[]> {
     this.pruneHotState();
     if (interactions.length === 0) return [];
@@ -1268,6 +1288,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     }
     const resolution = resolveAgentConversationsV2(projected, this.resolutionRevision || 1);
     this.pendingResolution = resolution;
+    if (resolutionSink) resolutionSink.resolution = resolution;
     this.resolutionRevision = Math.max(this.resolutionRevision, resolution.resolutionRevision);
     for (const aliasId of resolution.aliasConflicts ?? []) {
       this.canonicalObservability?.recordGap('correlation', 'relation_ambiguous', aliasId, {
@@ -1472,8 +1493,8 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     threads: T.AgentConversationThreadRecord[],
     segments: T.ConversationInstanceSegment[],
     bindings: T.AgentConversationBindingRecord[],
+    pending = this.pendingResolution,
   ): void {
-    const pending = this.pendingResolution;
     if (!pending?.memberships.length) return;
     const hopLocalByInteraction = new Map<string, string>();
     for (const membership of pending.memberships) {
@@ -1536,8 +1557,12 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     }
   }
 
-  async persistProjection(projection: AgentConversationProjection): Promise<void> {
+  async persistProjection(
+    projection: AgentConversationProjection,
+    resolution?: ConversationResolutionV2,
+  ): Promise<void> {
     this.pruneHotState();
+    const pending = resolution ?? this.pendingResolution;
     const threads: T.AgentConversationThreadRecord[] = [];
     const segments: T.ConversationInstanceSegment[] = [];
     const bindings: T.AgentConversationBindingRecord[] = [];
@@ -1744,7 +1769,14 @@ export class AgentConversationBindingService implements OnModuleDestroy {
       if (segment) segments.push(segment);
     }
 
-    this.applyHopLocalPersistence(threads, segments, bindings);
+    this.applyHopLocalPersistence(threads, segments, bindings, pending);
+    this.lastPersistence = {
+      at: Date.now(),
+      threads: threads.length,
+      segments: segments.length,
+      bindings: bindings.length,
+      pendingMemberships: pending?.memberships.length ?? 0,
+    };
 
     for (const segment of segments) this.segments.set(segment.segmentId, segment);
     for (const binding of bindings) this.bindings.set(binding.interactionId, binding);
@@ -1754,7 +1786,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
     // compatibility fields while `sessionKey`/hash carry the namespaced identity.
     if (this.canonicalObservability && bindings.length) {
       const pendingByInteraction = new Map(
-        [...(this.pendingResolution?.memberships ?? [])].map((membership) => [membership.interactionId, membership]),
+        [...(pending?.memberships ?? [])].map((membership) => [membership.interactionId, membership]),
       );
       const recordByInteraction = new Map(
         [...projection.interactionsByConversation.values()].flat().map((record) => [record.interactionId, record]),
@@ -1880,12 +1912,12 @@ export class AgentConversationBindingService implements OnModuleDestroy {
         changedSegments,
         changedBindings,
       );
+      if (this.lastPersistence) this.lastPersistence.savedV1 = savedV1;
       if (savedV1) {
         this.rememberPersisted('thread', changedThreads, (item) => item.conversationId);
         this.rememberPersisted('segment', changedSegments, (item) => item.segmentId);
         this.rememberPersisted('binding', changedBindings, (item) => item.interactionId);
       }
-      const pending = this.pendingResolution;
       if (pending) {
         const bindingByInteraction = new Map(bindings.map((binding) => [
           binding.interactionId,
@@ -1976,6 +2008,7 @@ export class AgentConversationBindingService implements OnModuleDestroy {
             },
           );
         }
+        if (this.lastPersistence) this.lastPersistence.savedV2 = savedV2;
         if (savedV2) {
           this.rememberPersisted('anchor', changedAnchors, (item) => [
             item.interactionId,
