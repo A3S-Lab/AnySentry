@@ -1507,6 +1507,7 @@ export class AggregationService implements OnModuleDestroy {
   private conversationProjectionRecentExpired = 0;
   private conversationProjectionRecentDropped = 0;
   private conversationInteractionRevision = 0;
+  private readonly conversationSessionHints = new Map<string, { sessionId: string; at: number }>();
   private readonly semanticRelationProjectionTimers = new Map<string, {
     timer: NodeJS.Timeout;
     firstQueuedAt: number;
@@ -3421,6 +3422,33 @@ export class AggregationService implements OnModuleDestroy {
     };
   }
 
+  private rememberConversationSessionHints(summaries: readonly T.AgentConversationSummary[]): void {
+    const at = Date.now();
+    for (const summary of summaries) {
+      if (!summary.hasContent || !summary.sessionId?.trim()) continue;
+      this.conversationSessionHints.delete(summary.conversationId);
+      this.conversationSessionHints.set(summary.conversationId, { sessionId: summary.sessionId.trim(), at });
+    }
+    while (this.conversationSessionHints.size > 5_000) {
+      const oldest = this.conversationSessionHints.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.conversationSessionHints.delete(oldest);
+    }
+  }
+
+  private conversationSessionHint(conversationIds: readonly string[]): string | undefined {
+    for (const conversationId of conversationIds) {
+      const hint = this.conversationSessionHints.get(conversationId);
+      if (!hint) continue;
+      if (Date.now() - hint.at > 30 * 60_000) {
+        this.conversationSessionHints.delete(conversationId);
+        continue;
+      }
+      return hint.sessionId;
+    }
+    return undefined;
+  }
+
   private conversationProjectionKey(filter: T.AgentConversationQuery): string {
     return JSON.stringify({
       timeType: filter.timeType,
@@ -3609,7 +3637,12 @@ export class AggregationService implements OnModuleDestroy {
           thread.conversationId === initialConversationId
           || thread.conversationId === requestedConversationId)
       : undefined;
-    const correlationSessionId = pointReadThread?.sessionId?.trim() ?? '';
+    const hintedSessionId = resolveConversationId
+      ? this.conversationSessionHint([
+          ...new Set([initialConversationId, requestedConversationId].filter((value): value is string => Boolean(value))),
+        ])
+      : undefined;
+    const correlationSessionId = pointReadThread?.sessionId?.trim() || hintedSessionId || '';
     const keyedSessionRead = Boolean(
       resolveConversationId
       && correlationSessionId
@@ -3633,7 +3666,7 @@ export class AggregationService implements OnModuleDestroy {
       // interaction query performs GROUP BY/argMax before LIMIT, so a large limit still causes a
       // wide merge sort and can exceed the node memory budget before pagination happens.
       limit: CONVERSATION_INTERACTIONS_PER_AGENT,
-      ...(keyedSessionRead ? { runId: correlationSessionId } : {}),
+      ...(keyedSessionRead ? { sessionId: correlationSessionId } : {}),
       // Content search must reach ClickHouse before the fair-per-agent cap, otherwise matching
       // interactions outside the first page would be invisible to the conversation filter below.
       ...(filter.contentQuery ? { contentQuery: filter.contentQuery } : {}),
@@ -3817,6 +3850,7 @@ export class AggregationService implements OnModuleDestroy {
       // drop every member and return an empty complete timeline.
       ...(resolveConversationId ? { conversationId: undefined } : {}),
     });
+    this.rememberConversationSessionHints(projection.summaries);
     if (resolveConversationId) {
       const membershipIdSet = new Set(exactMembershipIds ?? []);
       const selected = projection.summaries.find((summary) =>
@@ -3857,6 +3891,20 @@ export class AggregationService implements OnModuleDestroy {
           canonicalConversationId = projection.summaries[0].conversationId;
         }
       }
+    }
+    const membershipRecordsMissing = resolveConversationId
+      && membershipSelection?.durable === true
+      && (exactMembershipIds?.length ?? 0) === 0
+      && Boolean(pointReadThread || hintedSessionId || projection.summaries.some((summary) => summary.hasContent));
+    if (membershipRecordsMissing) {
+      interactions.coverage = {
+        ...interactions.coverage,
+        completeness: 'partial',
+        partial: true,
+        partialReason: 'membership_records_missing',
+        totalMode: 'omitted',
+      };
+      interactions.totalMode = 'omitted';
     }
     // Read APIs are pure projections. Durable Thread/Segment/Relation state is updated by the
     // bounded post-ingest materializer; polling this page must never create PostgreSQL WAL churn.

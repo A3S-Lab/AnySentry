@@ -625,8 +625,54 @@ assert.ok(
   sessionFallbackQueries.some((query) =>
     query.sessionId === 'thread-session-fallback' || query.runId === 'thread-session-fallback'),
   'empty membership must hydrate the selected Thread from its durable session/run id');
-assert.equal(sessionFallbackTimeline.coverage.partialReason, undefined);
-assert.equal(sessionFallbackTimeline.coverage.partial, false);
+assert.ok(sessionFallbackTimeline.turns.length > 0,
+  'durable Thread session fallback must return actual conversation content');
+assert.equal(sessionFallbackTimeline.coverage.partialReason, 'membership_records_missing');
+assert.equal(sessionFallbackTimeline.coverage.partial, true,
+  'recovered content must still report missing durable membership rows');
+
+// A newly visible Thread may still be waiting for the debounced durable materializer. Reuse its
+// bounded session hint for a keyed point read instead of returning an empty complete timeline.
+const hintedAggregation = new AggregationService({
+  storedAgentInteractions: async (queryInput) => queryInput.runId === 'thread-session-fallback'
+    || !queryInput.conversationId
+    ? sessionFallbackRecords
+    : [],
+}, {
+  identitySnapshotVersion: () => 0,
+  canonicalAgentAssetId: (value) => value,
+}, {}, {}, {}, undefined, {
+  resolveRouteAlias: async () => undefined,
+  interactionIdsForConversation: async () => ({ interactionIds: [], durable: true, truncated: false }),
+  applyPersistedBindings: async (records) => records,
+  routeAlias: () => undefined,
+  segmentsForConversation: () => [],
+  conversationTimelineSupport: async () => ({ segments: [], technicalActivities: [] }),
+}, {
+  configured: () => true,
+  loadAgentConversationThreadsByIds: async () => [],
+});
+hintedAggregation.agentInventory = exactMembershipAggregation.agentInventory;
+const hintedList = await hintedAggregation.agentConversations({
+  timeType: 'custom',
+  startTime: new Date(sessionFallbackRecords[0].at).toISOString(),
+  endTime: new Date(sessionFallbackRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  limit: 20,
+});
+assert.equal(hintedList.items.length, 1);
+const hintedTimeline = await hintedAggregation.agentConversationTimelineV2({
+  timeType: 'custom',
+  startTime: new Date(sessionFallbackRecords[0].at).toISOString(),
+  endTime: new Date(sessionFallbackRecords.at(-1).at + 10).toISOString(),
+  scope: 'agent',
+  conversationId: hintedList.items[0].conversationId,
+  limit: 100,
+});
+assert.ok(hintedTimeline.turns.length > 0,
+  'a list-derived session hint must hydrate a not-yet-materialized Thread');
+assert.equal(hintedTimeline.coverage.partial, true);
+assert.equal(hintedTimeline.coverage.partialReason, 'membership_records_missing');
 
 // Parent and child hops can share sessionId/runId. Session hydration must not fold the peer
 // hop into the selected Thread, and hop-fenced aliases must still pick the owning summary.
