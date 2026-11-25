@@ -763,19 +763,17 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
         .map((record) => record.interactionId)
         .filter((interactionId) => isUosContentInteractionId(interactionId))
         .slice(0, 200);
-      await Promise.all(uosIds.map(async (interactionId) => {
-        const view = await this.uosPlaintextContent(interactionId);
-        if (view) {
-          uosInlineContentById.set(interactionId, {
-            ...(view.content
-              ? { content: view.content.length > 12_000 ? `${view.content.slice(0, 12_000)}…` : view.content }
-              : {}),
-            ...(view.rawBody ? { rawBody: view.rawBody } : {}),
-            ...(view.rawMeta ? { rawMeta: view.rawMeta as Record<string, unknown> } : {}),
-            ...(view.toolEvents?.length ? { toolEvents: view.toolEvents } : {}),
-          });
-        }
-      }));
+      const views = await this.uosPlaintextContents(uosIds);
+      for (const [interactionId, view] of views) {
+        uosInlineContentById.set(interactionId, {
+          ...(view.content
+            ? { content: view.content.length > 12_000 ? `${view.content.slice(0, 12_000)}…` : view.content }
+            : {}),
+          ...(view.rawBody ? { rawBody: view.rawBody } : {}),
+          ...(view.rawMeta ? { rawMeta: view.rawMeta as Record<string, unknown> } : {}),
+          ...(view.toolEvents?.length ? { toolEvents: view.toolEvents } : {}),
+        });
+      }
       // A response that was never captured (capture window spent on a giant request) leaves
       // the :out view null. Keep the tool timeline on the :in entry in that case; when both
       // views exist the :out copy wins and the :in duplicate is dropped here.
@@ -1274,6 +1272,22 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       });
   }
 
+  private async uosPlaintextContents(interactionIds: readonly string[]) {
+    const ids = [...new Set(interactionIds)];
+    const baseIds = [...new Set(ids.map(uosBaseInteractionId))];
+    const views = new Map<string, NonNullable<ReturnType<InteractionService['parseUosPlaintextContent']>>>();
+    if (baseIds.length === 0) return views;
+    const payloadById = await this.clickhouse.queryAgentInteractionPayloadsByIds(baseIds);
+    if (!payloadById) return views;
+    for (const interactionId of ids) {
+      const payload = payloadById.get(uosBaseInteractionId(interactionId));
+      if (payload === undefined) continue;
+      const view = this.parseUosPlaintextContent(interactionId, payload);
+      if (view) views.set(interactionId, view);
+    }
+    return views;
+  }
+
   /** Build a content view straight from a stored plaintext payload (no encrypted store involved). */
   private async uosPlaintextContent(interactionId: string) {
     const baseId = uosBaseInteractionId(interactionId);
@@ -1284,8 +1298,12 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
       limit: 1,
     });
     const row = rows?.[0];
-    if (!row) return null;
-    const parsed = parseUosPayload(row.payload);
+    return row ? this.parseUosPlaintextContent(interactionId, row.payload) : null;
+  }
+
+  private parseUosPlaintextContent(interactionId: string, payload: string) {
+    const baseId = uosBaseInteractionId(interactionId);
+    const parsed = parseUosPayload(payload);
     if (!parsed) return null;
     const isInput = interactionId.endsWith(':in');
     let content = isInput

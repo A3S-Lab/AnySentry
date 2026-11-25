@@ -1399,12 +1399,12 @@ export default function LocalRecordTrackingPage() {
   const [evidenceLimit, setEvidenceLimit] = useState(SYSTEM_EVIDENCE_BATCH_SIZE);
 
   const listRequest = useRequest(
-    () => conversationRecordList({ limit: 300 }),
+    () => conversationRecordList({ limit: 100 }),
     {
-      pollingInterval: 15_000,
+      pollingInterval: 30_000,
       pollingWhenHidden: false,
-      retryCount: 5,
-      retryInterval: 1_500,
+      retryCount: 1,
+      retryInterval: 5_000,
     },
   );
   const detailRequest = useRequest(
@@ -1419,7 +1419,7 @@ export default function LocalRecordTrackingPage() {
     {
       ready: Boolean(selectedRecordId),
       refreshDeps: [selectedRecordId],
-      pollingInterval: 15_000,
+      pollingInterval: 30_000,
       pollingWhenHidden: false,
       cacheKey: `local-record-detail:${selectedRecordId}`,
       // A fresh-cache return skips ahooks onFinally after cancelling its polling timer.
@@ -1445,14 +1445,15 @@ export default function LocalRecordTrackingPage() {
   const systemEvidenceRequest = useRequest(
     () => conversationRecordSystemEvidence(selectedRecordId, {
       evidenceLimit,
-    }),
+    }, detailRequest.data),
     {
-      ready: Boolean(selectedRecordId) && (detailTab === "system_evidence" || detailTab === "link_awareness" || detailTab === "trace" || detailTab === "metrics"),
+      ready: Boolean(selectedRecordId && detailRequest.data)
+        && (detailTab === "system_evidence" || detailTab === "link_awareness" || detailTab === "trace" || detailTab === "metrics"),
       refreshDeps: [selectedRecordId, evidenceLimit],
       cacheKey: `local-record-system-evidence:${selectedRecordId}:${evidenceLimit}`,
       // A normal conversation keeps producing events after this tab was opened. Re-read late
       // arrivals and resumed generations without requiring the user to refresh each tool call.
-      pollingInterval: 15_000,
+      pollingInterval: 30_000,
       pollingWhenHidden: false,
       // Explicit refresh/retry must revalidate, not return a recently cached success.
       staleTime: 0,

@@ -154,7 +154,7 @@ const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
 const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
 const CONVERSATION_LIST_INTERACTIONS_TOTAL = 512;
 const CONVERSATION_LIST_MODEL_INTERACTIONS_TOTAL = 256;
-const CONVERSATION_PROJECTION_CONCURRENCY = 4;
+const CONVERSATION_PROJECTION_CONCURRENCY = 1;
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
   communication_risk: '#38bdf8', systemic_risk: '#f43f5e', privilege_escalation: '#fb7185', other: '#94a3b8',
@@ -1316,9 +1316,8 @@ export class AggregationService implements OnModuleDestroy {
 
   /**
    * Bound a downstream query/projection Promise independently of its transport implementation.
-   * The timeout callback removes the single-flight key immediately; the original Promise is still
-   * observed so a late result cannot become an unhandled rejection, but it is treated as an orphan
-   * and cannot hold the bounded map indefinitely.
+   * The original Promise remains observed after a caller timeout. Conversation projections retain
+   * their single-flight entry until settlement so later requests cannot duplicate orphaned work.
    */
   private withInFlightTimeout<T>(
     request: Promise<T>,
@@ -3510,12 +3509,6 @@ export class AggregationService implements OnModuleDestroy {
     operation = this.withInFlightTimeout(
       baseOperation,
       () => {
-        if (this.conversationProjectionInFlight.get(key) !== operation) return;
-        this.conversationProjectionInFlight.delete(key);
-        this.conversationProjectionInFlightBytes = Math.max(
-          0,
-          this.conversationProjectionInFlightBytes - reservation.bytes,
-        );
         this.conversationProjectionInFlightTimeouts += 1;
       },
       'Agent conversation projection timed out; retry the latest selection',

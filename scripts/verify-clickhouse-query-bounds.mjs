@@ -57,6 +57,8 @@ const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
   assert.equal(modelRead.limit, 256);
   assert.equal(modelRead.fairPerAgentLimit, 64);
   assert.equal(result.items.length, 0);
+  assert.equal(agg.cacheStateStats().conversationProjectionGate.concurrency, 1,
+    'only one heavy conversation projection may execute at a time');
 }
 
 // Kernel evidence is loaded once for the visible page, then scoped back to each Thread.

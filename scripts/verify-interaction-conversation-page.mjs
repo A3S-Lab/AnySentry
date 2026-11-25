@@ -39,12 +39,21 @@ const indexRows = [...payloads.keys()].map((interactionId, index) => ({
   at: at - index * 100,
 }));
 const fetched = [];
+const indexQueries = [];
+let pointReads = 0;
 const clickhouse = {
   enabled: true,
-  queryAgentInteractionIndex: async () => indexRows,
+  queryAgentInteractionIndex: async (query) => {
+    indexQueries.push({ ...query });
+    return indexRows.filter((row) => !query.sessionId || row.sessionId === query.sessionId);
+  },
   queryAgentInteractionPayloadsByIds: async (ids) => {
     fetched.push([...ids]);
     return new Map(ids.map((id) => [id, payloads.get(id)]));
+  },
+  queryAgentInteractionPayloads: async () => {
+    pointReads += 1;
+    return [];
   },
   loadInteractionMetadata: async () => [],
 };
@@ -52,7 +61,10 @@ const relational = {
   isReady: () => false,
   loadInteractionMetadata: async () => null,
 };
-const contents = { availableInteractionIds: async () => new Set() };
+const contents = {
+  availableInteractionIds: async () => new Set(),
+  directViewEnabled: () => true,
+};
 const service = new InteractionService(relational, clickhouse, contents);
 
 const first = await service.conversations({ limit: 1 });
@@ -66,5 +78,16 @@ const second = await service.conversations({ limit: 2 });
 assert.equal(second.items.length, 2);
 assert.equal(second.total, 2);
 assert.deepEqual(fetched.flat().sort(), ['mi_new1', 'mi_new2', 'mi_old1', 'mi_old2']);
+
+const beforeDetail = fetched.length;
+const detail = await service.conversation('uosconv:sess_new');
+assert.equal(detail.observations.length, 4, JSON.stringify({
+  conversationIds: detail.observations.map((item) => item.conversationId),
+  indexQueries,
+}));
+assert.ok(detail.observations.every((item) => item.contentAvailability === 'available'));
+assert.equal(fetched.length, beforeDetail + 1, 'detail must batch all inline plaintext reads');
+assert.deepEqual(fetched.at(-1).sort(), ['mi_new1', 'mi_new2'], JSON.stringify(fetched));
+assert.equal(pointReads, 0, 'detail must not fan out into one ClickHouse query per observation');
 
 console.log('Interaction conversation page verification passed');

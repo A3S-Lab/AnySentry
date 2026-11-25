@@ -301,15 +301,17 @@ export async function conversationRecordDetail(
 export async function conversationRecordSystemEvidence(
   recordId: string,
   options: Record<string, unknown> = {},
+  existingDetail?: LocalRecordDetail | null,
 ): Promise<LocalRecordDetail | null> {
   const evidenceLimit = typeof options.evidenceLimit === "number"
     ? options.evidenceLimit
     : undefined;
-  const [detail, systemEvidence] = await Promise.all([
-    conversationRecordDetail(recordId, options),
-    securityCenterApi.interactionConversationSystemEvidence(recordId, { evidenceLimit })
-      .catch(() => null),
-  ]);
+  const detail = existingDetail === undefined
+    ? await conversationRecordDetail(recordId, options)
+    : existingDetail;
   if (!detail) return null;
+  const systemEvidence = await securityCenterApi
+    .interactionConversationSystemEvidence(recordId, { evidenceLimit })
+    .catch(() => null);
   return systemEvidence ? { ...detail, systemEvidence } : detail;
 }
