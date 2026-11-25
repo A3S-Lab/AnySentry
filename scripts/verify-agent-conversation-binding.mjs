@@ -1215,6 +1215,26 @@ assert.ok(
   'directory projection of a shared run must keep two hop Threads',
 );
 
+// A normal read that already covers every Agent's model records must not repeat a model-only scan.
+{
+  const reads = [];
+  const modelRecord = interaction({
+    id: 'mi_model_read_dedupe', at: fixtureNow + 90_000, instance: 'model-read-1', users: ['model read dedupe'],
+  });
+  const agg = new AggregationService({
+    storedAgentInteractions: async (query) => {
+      reads.push(query);
+      return [modelRecord];
+    },
+  }, { identitySnapshotVersion: () => 0, canonicalAgentAssetId: (value) => value }, {}, {}, {});
+  const emptyInventory = { items: [], coverage: { partial: false }, total: 0, totalMode: 'exact' };
+  agg.storedAgentInventory = async () => emptyInventory;
+  agg.agentInventory = async () => emptyInventory;
+  const result = await agg.agentConversations({ timeType: 'last_1h', scope: 'agent', limit: 20 });
+  assert.equal(result.items.length, 1);
+  assert.equal(reads.length, 1, 'model-covered Agents must not trigger a duplicate model scan');
+}
+
 // Hot-state memory accounting is incremental: stats and pruning must not serialize the full map.
 {
   const statsService = new AgentConversationBindingService();

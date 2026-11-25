@@ -3692,21 +3692,28 @@ export class AggregationService implements OnModuleDestroy {
               totalLimit: CONVERSATION_LIST_INTERACTIONS_TOTAL,
             }
           : undefined;
-    const modelInteractionsPromise = resolveConversationId
-      ? Promise.resolve(undefined)
-      : this.readAgentInteractions(
+    const [interactions, inventory] = await Promise.all([
+      this.readAgentInteractions(interactionQuery, interactionReadOptions),
+      inventoryPromise,
+    ]).finally(() => {
+      if (inventoryTimer) clearTimeout(inventoryTimer);
+    });
+    const modelCoverageByAsset = new Map<string, boolean>();
+    for (const item of interactions.items) {
+      const asset = this.agentMetadata.canonicalAgentAssetId(item.agentAssetId);
+      modelCoverageByAsset.set(asset, (modelCoverageByAsset.get(asset) ?? false)
+        || item.interactionType === 'model');
+    }
+    const needsModelSupplement = !resolveConversationId
+      && (interactions.items.length === 0 || [...modelCoverageByAsset.values()].some((covered) => !covered));
+    const modelInteractions = needsModelSupplement
+      ? await this.readAgentInteractions(
           { ...interactionQuery, interactionType: 'model' },
           fairHistoryRead
             ? { ...interactionReadOptions, totalLimit: CONVERSATION_LIST_MODEL_INTERACTIONS_TOTAL }
             : interactionReadOptions,
-        );
-    const [interactions, inventory, modelInteractions] = await Promise.all([
-      this.readAgentInteractions(interactionQuery, interactionReadOptions),
-      inventoryPromise,
-      modelInteractionsPromise,
-    ]).finally(() => {
-      if (inventoryTimer) clearTimeout(inventoryTimer);
-    });
+        )
+      : undefined;
     if (modelInteractions?.items.length) {
       const merged = new Map<string, T.AgentInteractionRecord>();
       for (const item of interactions.items) merged.set(item.interactionId, item);

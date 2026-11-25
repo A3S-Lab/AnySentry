@@ -1405,6 +1405,8 @@ export default function LocalRecordTrackingPage() {
       pollingWhenHidden: false,
       retryCount: 1,
       retryInterval: 5_000,
+      cacheKey: "local-record-list:100",
+      staleTime: 30_000,
     },
   );
   const detailRequest = useRequest(
@@ -1424,7 +1426,7 @@ export default function LocalRecordTrackingPage() {
       cacheKey: `local-record-detail:${selectedRecordId}`,
       // A fresh-cache return skips ahooks onFinally after cancelling its polling timer.
       // Revalidate on refresh so a quick click cannot freeze native events indefinitely.
-      staleTime: 0,
+      staleTime: 30_000,
     },
   );
   const observerContentRequest = useRequest(
@@ -1439,7 +1441,7 @@ export default function LocalRecordTrackingPage() {
       refreshDeps: [selectedRecordId, detailRequest.data?.observedLlmRequests.map((request) => request.interactionId).join(",")],
       cacheKey: `local-record-observer-content:${selectedRecordId}`,
       // Keep cached data visible, but refresh/retry must actually revalidate permissions/body state.
-      staleTime: 0,
+      staleTime: 30_000,
     },
   );
   const systemEvidenceRequest = useRequest(
@@ -1456,7 +1458,7 @@ export default function LocalRecordTrackingPage() {
       pollingInterval: 30_000,
       pollingWhenHidden: false,
       // Explicit refresh/retry must revalidate, not return a recently cached success.
-      staleTime: 0,
+      staleTime: 30_000,
     },
   );
   const olderRequest = useRequest(

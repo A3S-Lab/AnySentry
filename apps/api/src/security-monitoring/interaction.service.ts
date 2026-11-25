@@ -1170,10 +1170,13 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
     }
     const records: InteractionRecord[] = [];
     let projectedConversations = 0;
-    for (const rows of groups.values()) {
-      const uncachedIds = rows
+    const groupedRows = [...groups.values()];
+    const CONVERSATION_PAYLOAD_BATCH_SIZE = Math.min(64, Math.max(1, normalized.summaryLimit ?? 64));
+    for (let start = 0; start < groupedRows.length; start += CONVERSATION_PAYLOAD_BATCH_SIZE) {
+      const batch = groupedRows.slice(start, start + CONVERSATION_PAYLOAD_BATCH_SIZE);
+      const uncachedIds = [...new Set(batch.flatMap((rows) => rows
         .map((row) => row.interactionId)
-        .filter((id) => !this.uosParsedCache.has(id));
+        .filter((id) => !this.uosParsedCache.has(id))))];
       const payloadById = uncachedIds.length > 0
         ? await this.clickhouse.queryAgentInteractionPayloadsByIds(uncachedIds)
         : new Map<string, string>();
@@ -1181,10 +1184,13 @@ export class InteractionService implements OnModuleInit, OnModuleDestroy {
         return { records: [], conversationCount: 0 };
       }
       const payloadOf = (interactionId: string): string | undefined => payloadById?.get(interactionId);
-      const projected = this.projectUosPlaintextRows(rows, normalized, conversationId, payloadOf);
-      if (projected.length > 0) {
-        records.push(...projected);
-        projectedConversations += 1;
+      for (const rows of batch) {
+        const projected = this.projectUosPlaintextRows(rows, normalized, conversationId, payloadOf);
+        if (projected.length > 0) {
+          records.push(...projected);
+          projectedConversations += 1;
+        }
+        if (normalized.summaryLimit !== undefined && projectedConversations >= normalized.summaryLimit) break;
       }
       if (normalized.summaryLimit !== undefined && projectedConversations >= normalized.summaryLimit) break;
     }
