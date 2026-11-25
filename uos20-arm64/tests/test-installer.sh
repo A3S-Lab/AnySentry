@@ -42,7 +42,8 @@ grep -Fq 'attachedProbes' "$VERIFY" || fail "verifier does not inspect runtime p
 grep -Fq 'attached_probes -ge 8' "$VERIFY" || fail "verifier does not require eight runtime probes"
 grep -Fq 'wait_for_collector_health' "$VERIFY" || fail "verifier does not wait for collector health visibility"
 collector_wait_body=$(sed -n '/^wait_for_collector_health()/,/^}/p' "$VERIFY")
-grep -Fq 'seq 1 180' <<<"$collector_wait_body" || fail "collector health wait is shorter than 180 seconds"
+grep -Fq 'seq 1 20' <<<"$collector_wait_body" || fail "collector health wait no longer uses 20 bounded attempts"
+grep -Fq 'sleep 15' <<<"$collector_wait_body" || fail "collector health wait is shorter than the 300-second drain budget"
 grep -Fq 'Collector health response:' "$VERIFY" || fail "collector health failure omits the raw API response"
 grep -Fq 'acceptedEvents' "$VERIFY" || fail "verifier does not inspect Source acceptance"
 grep -Fq 'outputDropped' "$VERIFY" || fail "verifier does not inspect forwarder drops"
