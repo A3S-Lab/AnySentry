@@ -59,8 +59,13 @@ grep -Fq '/tmp/anysentry-install-' "$INSTALLER" || fail "installer does not publ
 grep -Fq 'capture_diagnostics' "$INSTALLER" || fail "installer does not capture activation and rollback diagnostics"
 grep -Fq 'anysentry-observer.service) name=observer' "$INSTALLER" || fail "installer does not map the Observer journal"
 grep -Fq 'journal-$name.log' "$INSTALLER" || fail "installer does not retain service journal output"
-grep -Fq 'systemctl start anysentry.service anysentry-observer.service' "$INSTALLER" ||
-  fail "installer does not start the API and Observer together"
+api_start_line=$(grep -n 'if ! systemctl start anysentry.service;' "$INSTALLER" | cut -d: -f1)
+api_health_line=$(grep -n 'API did not become healthy before observer start' "$INSTALLER" | cut -d: -f1)
+observer_start_line=$(grep -n 'if ! systemctl start anysentry-observer.service;' "$INSTALLER" | cut -d: -f1)
+[[ -n $api_start_line && -n $api_health_line && -n $observer_start_line ]] ||
+  fail "installer omits API/Observer staged startup"
+[[ $api_start_line -lt $api_health_line && $api_health_line -lt $observer_start_line ]] ||
+  fail "Observer starts before the API health barrier"
 grep -Fq 'a3s-code-startup.txt' "$INSTALLER" ||
   fail "installer does not record the a3s code load result"
 grep -Fq 'startup-$name.log' "$INSTALLER" || fail "installer does not keep per-service startup journals"
