@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=anysentry
 Group=anysentry
-ExecStart=/opt/anysentry/prometheus/bin/prometheus --config.file=/opt/anysentry/prometheus/conf/prometheus.yml --storage.tsdb.path=/var/lib/anysentry/prometheus --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle
+ExecStart=/opt/anysentry/prometheus/bin/prometheus --config.file=/opt/anysentry/prometheus/conf/prometheus.yml --storage.tsdb.path=/var/lib/anysentry/prometheus --storage.tsdb.retention.time=24h --web.listen-address=127.0.0.1:9090 --web.enable-lifecycle
 WorkingDirectory=/var/lib/anysentry/prometheus
 StateDirectory=anysentry/prometheus
 Restart=on-failure

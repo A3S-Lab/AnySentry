@@ -112,14 +112,14 @@ ClickHouse 事件数据。
 
 ```bash
 /opt/anysentry/anysentry-data-cleanup.sh                          # 只读报告（默认）
-/opt/anysentry/anysentry-data-cleanup.sh --keep-days 30           # 只保留最近 30 天事件
+/opt/anysentry/anysentry-data-cleanup.sh --keep-days 1 --yes --skip-vacuum-full  # 仅保留当天数据
 /opt/anysentry/anysentry-data-cleanup.sh --drop-oldest-days 7     # 删除最早 7 天的事件
 ```
 
-不带参数时不修改任何数据。删除只作用于事件族四张表（`events`、`event_locators_v1`、
-`kernel_fact_locators_v1`、`agent_interactions_v1`），审核记录等配置数据不受影响；
-执行前会显示将删除的行数并要求输入 `YES` 确认（可用 `--yes` 跳过）。删除通过
-ClickHouse mutation 完成，磁盘空间在分区分配合并后归还，脚本会等待 mutation 结束。
+不带参数时不修改任何数据。清理覆盖 ClickHouse 事件/明文/定位表、PostgreSQL 原始观测和会话投影，
+以及 Flink 旧检查点等运行数据；审核记录仍由 ClickHouse 的一天 TTL 管理。执行前会显示将删除的
+行数并要求输入 `YES` 确认（可用 `--yes` 跳过）。删除通过 ClickHouse mutation 完成，脚本会等待
+mutation 结束。安装后由 `anysentry-data-cleanup.timer` 每天执行一次 `--keep-days 1 --skip-vacuum-full`。
 
 ### `collect-support-bundle.sh`
 

@@ -5,8 +5,8 @@
 # 语义：--keep-days N = 保留最近 N 天（含今天），删除更早数据。
 # 用法：
 #   bash anysentry-data-cleanup.sh                          # 只读报告
-#   bash anysentry-data-cleanup.sh --keep-days 2 --yes      # 清理（CH+PG+杂项）
-#   bash anysentry-data-cleanup.sh --keep-days 2 --yes --purge-rollbacks
+#   bash anysentry-data-cleanup.sh --keep-days 1 --yes --skip-vacuum-full
+#   bash anysentry-data-cleanup.sh --keep-days 1 --yes --purge-rollbacks
 #   bash anysentry-data-cleanup.sh --drop-oldest-days 7 --yes
 #   可选：--skip-vacuum-full（PG 只标记复用不还磁盘空间）
 set -uo pipefail

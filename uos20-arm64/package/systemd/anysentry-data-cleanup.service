@@ -1,0 +1,8 @@
+[Unit]
+Description=AnySentry one-day data retention cleanup
+After=anysentry-postgresql.service anysentry-clickhouse.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/anysentry/anysentry-data-cleanup.sh --keep-days 1 --yes --skip-vacuum-full
+TimeoutStartSec=3600

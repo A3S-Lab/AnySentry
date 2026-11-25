@@ -256,7 +256,7 @@ HTTP 201 为创建成功状态；随包脚本已支持标准响应信封。脚�
 
 ### 验证失败但服务为 active
 
-执行 `/opt/anysentry/verify.sh` 并检查 Source/collector 指标。页面健康接口中的 `events.total=100000` 是内存热窗口上限，不是 ClickHouse 总存储上限；历史数据由 ClickHouse 保存并按 90 天 TTL 清理。
+执行 `/opt/anysentry/verify.sh` 并检查 Source/collector 指标。页面健康接口中的 `events.total=100000` 是内存热窗口上限，不是 ClickHouse 总存储上限；历史数据由 ClickHouse 保存，默认按 1 天 TTL 清理；`anysentry-data-cleanup.timer` 每天同步清理 PostgreSQL、Flink 和杂项历史数据。
 
 ### 手工恢复上一程序
 

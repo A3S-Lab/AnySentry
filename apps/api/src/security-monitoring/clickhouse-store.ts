@@ -91,6 +91,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const DATA_TTL_DAYS = boundedPositiveInt(process.env.ANYSENTRY_DATA_TTL_DAYS, 1, 1, 365);
 const TABLE = "events";
 const EVENT_LOCATOR_TABLE = "event_locators_v1";
 const EVENT_LOCATOR_MV = "event_locators_v1_mv";
@@ -105,7 +106,7 @@ const EVENT_LOCATOR_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_LOCATOR_TABLE} (
 ENGINE = ReplacingMergeTree(decisionUpdatedAt)
 PARTITION BY toYYYYMM(ts)
 ORDER BY eventId
-TTL ts + INTERVAL 90 DAY DELETE`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY DELETE`;
 const EVENT_LOCATOR_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_LOCATOR_MV}
 TO ${EVENT_LOCATOR_TABLE}
 AS SELECT eventId, at, decisionRevision, decisionUpdatedAt, ingestedAt FROM ${TABLE}`;
@@ -127,7 +128,7 @@ const KERNEL_FACT_LOCATOR_DDL = `CREATE TABLE IF NOT EXISTS ${KERNEL_FACT_LOCATO
 ENGINE = ReplacingMergeTree(decisionUpdatedAt)
 PARTITION BY toYYYYMM(ts)
 ORDER BY kernelFactId
-TTL ts + INTERVAL 90 DAY DELETE`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY DELETE`;
 const KERNEL_FACT_LOCATOR_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${KERNEL_FACT_LOCATOR_MV}
 TO ${KERNEL_FACT_LOCATOR_TABLE}
 AS SELECT
@@ -190,7 +191,7 @@ const AGENT_INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS ${AGENT_INTERACTION_TA
 ENGINE = ReplacingMergeTree(revision)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (tenantId, environmentId, agentAssetId, at, interactionId)
-TTL ts + INTERVAL 30 DAY DELETE`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY DELETE`;
 const INTERACTION_METADATA_TABLE = "interaction_metadata_v1";
 const INTERACTION_METADATA_DDL = `CREATE TABLE IF NOT EXISTS ${INTERACTION_METADATA_TABLE} (
   schemaVersion LowCardinality(String),
@@ -213,7 +214,7 @@ const INTERACTION_METADATA_DDL = `CREATE TABLE IF NOT EXISTS ${INTERACTION_METAD
 ) ENGINE = ReplacingMergeTree(projectedAt)
 PARTITION BY toYYYYMM(observedTs)
 ORDER BY (tenantId, conversationId, observedAt, interactionId)
-TTL toDateTime(observedTs) + INTERVAL 90 DAY DELETE
+TTL toDateTime(observedTs) + INTERVAL ${DATA_TTL_DAYS} DAY DELETE
 SETTINGS index_granularity = 8192`;
 // `at` is raw epoch-ms (matches the aggregator); `ts` is a derived DateTime only for TTL/partitioning.
 // PostgreSQL-free deployments persist the canonical SessionMembership projection here so the
@@ -231,7 +232,7 @@ const SESSION_MEMBERSHIP_DDL = `CREATE TABLE IF NOT EXISTS ${SESSION_MEMBERSHIP_
 ENGINE = ReplacingMergeTree(at)
 PARTITION BY toYYYYMM(ts)
 ORDER BY (membershipId, resolutionRevision)
-TTL ts + INTERVAL 30 DAY DELETE`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY DELETE`;
 const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   schemaVersion LowCardinality(String),
   eventId String,
@@ -352,7 +353,7 @@ const DDL = (table: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY at
-TTL ts + INTERVAL 90 DAY
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY
 SETTINGS non_replicated_deduplication_window = 1000`;
 
 const EVENT_DEDUPLICATION_WINDOW = 1_000;
@@ -582,7 +583,7 @@ const COLLECTOR_HEARTBEAT_DDL = `CREATE TABLE IF NOT EXISTS ${COLLECTOR_HEARTBEA
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY (collectorId, at)
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 // Singleton policy config (the config panels' persistence). ReplacingMergeTree keeps only the latest
 // row per key; `FINAL` collapses to it on read.
@@ -610,7 +611,7 @@ const NOTIFICATION_DELIVERY_DDL = `CREATE TABLE IF NOT EXISTS ${NOTIFICATION_DEL
   ts DateTime MATERIALIZED toDateTime(intDiv(sentAt, 1000))
 ) ENGINE = MergeTree
 ORDER BY (deliveryId, sentAt, ingestedAt)
-TTL ts + INTERVAL 365 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const IDENTITY_AI_REVIEW_TABLE = "identity_ai_review_revisions";
 const IDENTITY_AI_REVIEW_DDL = `CREATE TABLE IF NOT EXISTS ${IDENTITY_AI_REVIEW_TABLE} (
@@ -624,7 +625,7 @@ const IDENTITY_AI_REVIEW_DDL = `CREATE TABLE IF NOT EXISTS ${IDENTITY_AI_REVIEW_
   ts DateTime MATERIALIZED toDateTime(intDiv(createdAt, 1000))
 ) ENGINE = MergeTree
 ORDER BY (reviewId, revision, ingestedAt)
-TTL ts + INTERVAL 365 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const AUDIT_FACT_TABLE = "audit_facts";
 const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
@@ -635,7 +636,7 @@ const AUDIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${AUDIT_FACT_TABLE} (
   ts DateTime MATERIALIZED toDateTime(intDiv(at, 1000))
 ) ENGINE = MergeTree
 ORDER BY (auditId, at, ingestedAt)
-TTL ts + INTERVAL 365 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 // The journal observes inserts from every judge process, so cache invalidation is not limited to
 // this API process's local write queue.
@@ -651,7 +652,7 @@ const EVENT_COMMIT_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_COMMIT_FACT_TA
   ts DateTime MATERIALIZED toDateTime(intDiv(committedAt, 1000))
 ) ENGINE = MergeTree
 ORDER BY (committedAt, commitBatchId, eventId, decisionRevision)
-TTL ts + INTERVAL 7 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 const EVENT_COMMIT_FACT_MV = "event_commit_facts_v2_mv";
 const EVENT_COMMIT_FACT_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_COMMIT_FACT_MV}
 TO ${EVENT_COMMIT_FACT_TABLE}
@@ -682,7 +683,7 @@ const EVENT_REVISION_CONFLICT_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION
   ts DateTime MATERIALIZED toDateTime(intDiv(observedAt, 1000))
 ) ENGINE = MergeTree
 ORDER BY (eventLogicalKey, observedAt, commitBatchId)
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const EVENT_REVISION_IDENTITY_TABLE = "event_revision_identities";
 const EVENT_REVISION_IDENTITY_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION_IDENTITY_TABLE} (
@@ -697,7 +698,7 @@ const EVENT_REVISION_IDENTITY_DDL = `CREATE TABLE IF NOT EXISTS ${EVENT_REVISION
   ts DateTime MATERIALIZED toDateTime(intDiv(committedAt, 1000))
 ) ENGINE = MergeTree
 ORDER BY (eventLogicalKey, committedAt, commitBatchId)
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 const EVENT_REVISION_IDENTITY_MV = "event_revision_identities_mv";
 const EVENT_REVISION_IDENTITY_MV_DDL = `CREATE MATERIALIZED VIEW IF NOT EXISTS ${EVENT_REVISION_IDENTITY_MV}
 TO ${EVENT_REVISION_IDENTITY_TABLE}
@@ -749,7 +750,7 @@ const TOOL_EVIDENCE_RELATION_DDL = `CREATE TABLE IF NOT EXISTS ${TOOL_EVIDENCE_R
   ts DateTime MATERIALIZED toDateTime(intDiv(updatedAt, 1000))
 ) ENGINE = ReplacingMergeTree(updatedAt)
 ORDER BY (invocationId, workspacePath, sourceId, agentInstanceId, toolCallId, relationVersion)
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const PROCESS_LIFECYCLE_FACT_TABLE = "process_lifecycle_facts";
 const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYCLE_FACT_TABLE} (
@@ -798,7 +799,7 @@ const PROCESS_LIFECYCLE_FACT_DDL = `CREATE TABLE IF NOT EXISTS ${PROCESS_LIFECYC
   INDEX idx_process_lifecycle_ppid ppid TYPE bloom_filter(0.01) GRANULARITY 1
 ) ENGINE = ReplacingMergeTree(receivedAt)
 ORDER BY (processInstanceKey, factKind, at, eventId)
-TTL ts + INTERVAL 30 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const PROCESS_LIFECYCLE_FACT_ALTERS = [
   "MODIFY COLUMN exitStatus UInt32 DEFAULT 0",
@@ -910,7 +911,7 @@ ORDER BY (
   snapshotDecisionRevision,
   snapshotVersion
 )
-TTL ts + INTERVAL 14 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 // Dashboard reads must coexist with sustained Observer writes inside the bundled 2 GiB
 // ClickHouse budget. Large window aggregations spill early and use at most two read threads;

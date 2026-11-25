@@ -10,6 +10,7 @@ import {
 import { resolveTimeWindow } from './time-window';
 import { SecurityTimeFilter } from './types';
 
+const DATA_TTL_DAYS = Math.min(365, Math.max(1, Math.trunc(Number(process.env.ANYSENTRY_DATA_TTL_DAYS)) || 1));
 const PROFILE_TABLE = 'stream_risk_profiles';
 const COMPOSITE_TABLE = 'stream_composite_risks';
 const LEGACY_COMPOSITE_JUDGMENT_TABLE = 'stream_composite_judgments';
@@ -38,7 +39,7 @@ const PROFILE_DDL = `CREATE TABLE IF NOT EXISTS ${PROFILE_TABLE} (
   ts DateTime MATERIALIZED toDateTime(intDiv(calculatedAt, 1000))
 ) ENGINE = ReplacingMergeTree(version)
 ORDER BY profileId
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const COMPOSITE_DDL = `CREATE TABLE IF NOT EXISTS ${COMPOSITE_TABLE} (
   correlationId String,
@@ -67,7 +68,7 @@ const COMPOSITE_DDL = `CREATE TABLE IF NOT EXISTS ${COMPOSITE_TABLE} (
   ts DateTime MATERIALIZED toDateTime(intDiv(calculatedAt, 1000))
 ) ENGINE = ReplacingMergeTree(version)
 ORDER BY correlationId
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const compositeJudgmentDdl = (table: string, orderBy: string) => `CREATE TABLE IF NOT EXISTS ${table} (
   episodeId String,
@@ -105,7 +106,7 @@ const compositeJudgmentDdl = (table: string, orderBy: string) => `CREATE TABLE I
   ts DateTime MATERIALIZED toDateTime(intDiv(judgedAt, 1000))
 ) ENGINE = ReplacingMergeTree(recordVersion)
 ORDER BY ${orderBy}
-TTL ts + INTERVAL 90 DAY`;
+TTL ts + INTERVAL ${DATA_TTL_DAYS} DAY`;
 
 const compositeJudgmentAlters = (table: string) => [
   `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS classification LowCardinality(String) AFTER confidence`,

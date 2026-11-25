@@ -28,6 +28,80 @@ const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
   assert.equal(await gate.run(async () => 'second'), 'second');
 }
 
+// The unfiltered conversation page has smaller bounded read budgets than an exact Thread read.
+{
+  const reads = [];
+  const agg = new AggregationService({
+    storedAgentInteractions: async (query) => {
+      reads.push(query);
+      return [];
+    },
+  }, {
+    identitySnapshotVersion: () => 0,
+    canonicalAgentAssetId: (value) => value,
+  }, {}, {}, {});
+  const emptyInventory = {
+    items: [],
+    coverage: { partial: false },
+    total: 0,
+    totalMode: 'exact',
+  };
+  agg.storedAgentInventory = async () => emptyInventory;
+  agg.agentInventory = async () => emptyInventory;
+  const result = await agg.agentConversations({ timeType: 'last_1h', scope: 'agent', limit: 20 });
+  assert.equal(reads.length, 2);
+  const generalRead = reads.find((query) => query.interactionType === undefined);
+  const modelRead = reads.find((query) => query.interactionType === 'model');
+  assert.equal(generalRead.limit, 512);
+  assert.equal(generalRead.fairPerAgentLimit, 64);
+  assert.equal(modelRead.limit, 256);
+  assert.equal(modelRead.fairPerAgentLimit, 64);
+  assert.equal(result.items.length, 0);
+}
+
+// Kernel evidence is loaded once for the visible page, then scoped back to each Thread.
+{
+  const agg = Object.create(AggregationService.prototype);
+  agg.agentMetadata = { identitySnapshotVersion: () => 0 };
+  const records = [
+    { interactionId: 'mi_page_a', toolCalls: [], toolResults: [] },
+    { interactionId: 'mi_page_b', toolCalls: [], toolResults: [] },
+  ];
+  const summaries = ['cv_page_a', 'cv_page_b'].map((conversationId) => ({
+    conversationId,
+    coverage: {
+      status: 'complete',
+      reasons: [],
+      completeInteractions: 1,
+      partialInteractions: 0,
+    },
+  }));
+  agg.agentConversationProjection = async () => ({
+    projection: {
+      summaries,
+      interactionsByConversation: new Map([
+        ['cv_page_a', [records[0]]],
+        ['cv_page_b', [records[1]]],
+      ]),
+    },
+    interactions: {
+      coverage: { partial: false },
+      totalMode: 'exact',
+      dataSource: 'clickhouse',
+    },
+    inventory: { coverage: { partial: false } },
+  });
+  const evidenceReads = [];
+  agg.toolEvidenceItemsForInteractions = async (input) => {
+    evidenceReads.push(input.map((record) => record.interactionId));
+    return [];
+  };
+  const result = await agg.agentConversations({ timeType: 'last_1h', scope: 'agent', limit: 20 });
+  assert.deepEqual(evidenceReads, [['mi_page_a', 'mi_page_b']]);
+  assert.equal(result.items.length, 2);
+  assert.ok(result.items.every((item) => item.coverageLayers));
+}
+
 function fakeClient() {
   const state = {
     active: 0,

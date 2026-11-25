@@ -95,7 +95,11 @@ grep -Fq 'maxmemory 4gb' "$CHANNEL/package/config/redis.conf" || fail "Redis que
 grep -Fq 'MemoryHigh=32G' "$CHANNEL/package/systemd/anysentry-clickhouse.service" || fail "ClickHouse MemoryHigh is not configured"
 grep -Fq 'MemoryMax=40G' "$CHANNEL/package/systemd/anysentry-clickhouse.service" || fail "ClickHouse MemoryMax is not configured"
 grep -Fq '<trace_log remove="remove"/>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse profiler logs are not disabled"
-grep -Fq '<asynchronous_metric_log><ttl>event_date + INTERVAL 3 DAY DELETE</ttl></asynchronous_metric_log>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse system logs are not TTL-bounded"
+grep -Fq '<asynchronous_metric_log><ttl>event_date + INTERVAL 1 DAY DELETE</ttl></asynchronous_metric_log>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse system logs are not retained for one day"
+grep -Fq 'ANYSENTRY_DATA_TTL_DAYS=1' "$CHANNEL/package/config/anysentry.env.example" || fail "business data retention is not one day"
+grep -Fq 'log.retention.hours=24' "$CHANNEL/package/config/kafka-server.properties" || fail "Kafka retention is not 24 hours"
+grep -Fq -- '--storage.tsdb.retention.time=24h' "$CHANNEL/package/systemd/anysentry-prometheus.service" || fail "Prometheus retention is not 24 hours"
+grep -Fq 'systemctl enable --now anysentry-data-cleanup.timer' "$CHANNEL/package/install.sh" || fail "daily data cleanup timer is not enabled"
 grep -Fq '<old_parts_lifetime>120</old_parts_lifetime>' "$CHANNEL/package/config/clickhouse-config.xml" || fail "ClickHouse dead-part lifetime is not bounded"
 if grep -Fq '<opentelemetry_span_log><ttl>' "$CHANNEL/package/config/clickhouse-config.xml"; then
   fail "opentelemetry_span_log carries a sibling ttl (base config has a custom engine; ClickHouse rejects it at startup)"

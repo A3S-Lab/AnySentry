@@ -49,6 +49,8 @@ SERVICES=(
   anysentry-prometheus.service
   anysentry-node-exporter.service
   anysentry-postgresql.service
+  anysentry-data-cleanup.service
+  anysentry-data-cleanup.timer
 )
 START_SERVICES=(
   anysentry-postgresql.service
@@ -242,7 +244,7 @@ write_install_summary() {
     printf 'startup_failures=%s\n' "$START_FAILURES"
   } >"$INSTALL_LOG_ROOT/summary.txt"
 echo "Data retention hint: observation data grows ~2GB/day. Schedule "
-echo "  bash $(dirname "$0")/anysentry-data-cleanup.sh --keep-days 3 --yes periodically"
+echo "  bash $(dirname "$0")/anysentry-data-cleanup.sh --keep-days 1 --yes --skip-vacuum-full periodically"
 echo "  (cron) to keep disk usage bounded."
   echo "Installation summary: $INSTALL_LOG_ROOT/summary.txt"
 }
@@ -425,6 +427,8 @@ verify_package() {
     systemd/anysentry-composite-judge.service systemd/anysentry-supply-chain.service
     systemd/anysentry-fast-judge.service systemd/anysentry-l3-worker.service
     systemd/anysentry-observer.service
+    systemd/anysentry-data-cleanup.service systemd/anysentry-data-cleanup.timer
+    anysentry-data-cleanup.sh
     provision-observer.mjs wait-clickhouse.sh run-kafka.sh init-kafka-topics.sh
     run-flink.sh verify.sh inspect-host.sh anysentry-services.sh
     AnySentry部署手册.md AnySentry使用手册.md AnySentry脚本说明.md
@@ -807,6 +811,7 @@ activate_release() {
     install -m 0644 "$INSTALL_ROOT/systemd/$unit" "$SYSTEMD_DIR/$unit"
   done
   systemctl daemon-reload
+  systemctl enable --now anysentry-data-cleanup.timer
   : >"$INSTALL_LOG_ROOT/startup-failures.txt"
   set_stage wire-postgresql-paths
   wire_postgresql_paths

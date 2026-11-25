@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule AnySentry one-day data retention cleanup
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=false
+Unit=anysentry-data-cleanup.service
+
+[Install]
+WantedBy=timers.target

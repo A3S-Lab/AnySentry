@@ -152,6 +152,8 @@ const TOOL_EVIDENCE_RELATION_SETTLE_MS = 10_000;
 const TOOL_EVIDENCE_INCREMENTAL_LOOKBACK_MS = 60_000;
 const CONVERSATION_INTERACTIONS_PER_AGENT = 64;
 const CONVERSATION_INTERACTIONS_TOTAL = 2_000;
+const CONVERSATION_LIST_INTERACTIONS_TOTAL = 512;
+const CONVERSATION_LIST_MODEL_INTERACTIONS_TOTAL = 256;
 const CONVERSATION_PROJECTION_CONCURRENCY = 4;
 const CATEGORY_COLOR: Record<string, string> = {
   command_danger: '#fb7185', data_leak: '#f59e0b', secret_exfil: '#f59e0b', prompt_injection: '#a855f7',
@@ -3694,14 +3696,16 @@ export class AggregationService implements OnModuleDestroy {
         : fairHistoryRead
           ? {
               fairPerAgentLimit: CONVERSATION_INTERACTIONS_PER_AGENT,
-              totalLimit: CONVERSATION_INTERACTIONS_TOTAL,
+              totalLimit: CONVERSATION_LIST_INTERACTIONS_TOTAL,
             }
           : undefined;
     const modelInteractionsPromise = resolveConversationId
       ? Promise.resolve(undefined)
       : this.readAgentInteractions(
           { ...interactionQuery, interactionType: 'model' },
-          interactionReadOptions,
+          fairHistoryRead
+            ? { ...interactionReadOptions, totalLimit: CONVERSATION_LIST_MODEL_INTERACTIONS_TOTAL }
+            : interactionReadOptions,
         );
     const [interactions, inventory, modelInteractions] = await Promise.all([
       this.readAgentInteractions(interactionQuery, interactionReadOptions),
@@ -3932,22 +3936,15 @@ export class AggregationService implements OnModuleDestroy {
       const pageRecords = items.flatMap((item) =>
         projection.interactionsByConversation.get(item.conversationId) ?? []);
       if (pageRecords.length) {
-        // Kernel search must stay hop/conversation-scoped. A page-wide load over last_1h
-        // truncates later Egress rows, so LLM aliases (run_python) cannot fold onto execute.
-        // Page items resolve in bounded concurrent chunks — the former serial per-conversation
-        // await multiplied the kernel-read latency by the conversation count on every call.
-        const CONVERSATION_EVIDENCE_CHUNK = 8;
-        for (let start = 0; start < items.length; start += CONVERSATION_EVIDENCE_CHUNK) {
-          await Promise.all(items.slice(start, start + CONVERSATION_EVIDENCE_CHUNK).map(async (item) => {
-            const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
-            if (!records.length) return;
-            const toolItems = await this.toolEvidenceItemsForInteractions(records);
-            item.coverageLayers = observabilityCoverageLayers(
-              records,
-              toolItems,
-              item.coverage,
-            );
-          }));
+        const pageToolItems = await this.toolEvidenceItemsForInteractions(pageRecords);
+        for (const item of items) {
+          const records = projection.interactionsByConversation.get(item.conversationId) ?? [];
+          if (!records.length) continue;
+          item.coverageLayers = observabilityCoverageLayers(
+            records,
+            toolEvidenceForInteractions(pageToolItems, records),
+            item.coverage,
+          );
         }
       }
     }
