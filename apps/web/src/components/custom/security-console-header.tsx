@@ -12,6 +12,7 @@ import {
   useState,
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { AdminTokenControl } from "@/components/custom/admin-token-control";
 import { LanguageSelector } from "@/components/custom/language-selector";
 import { MobileSecurityNavigation } from "@/components/custom/mobile-security-navigation";
 import { Button } from "@/components/ui/button";
@@ -331,6 +332,7 @@ export function SecurityConsoleProvider({ children }: { children: ReactNode }) {
                 {refreshing ? <LoaderCircle className="mr-1.5 size-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 size-3.5" />}
                 {t("刷新")}
               </Button>
+              <AdminTokenControl compact />
               <LanguageSelector />
               <div className="flex items-center gap-1.5 whitespace-nowrap text-xs text-zinc-500">
                 <Clock3 className="size-3.5" />
